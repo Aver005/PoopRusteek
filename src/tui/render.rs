@@ -62,7 +62,7 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                 .title_style(Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
                 .style(Style::default().bg(theme.bg));
 
-            let mut lines = vec![
+            let lines = vec![
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(
@@ -198,6 +198,6 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     }
 }
 
-fn inner_area(area: Rect, popup: Rect) -> Rect {
+fn inner_area(_area: Rect, popup: Rect) -> Rect {
     popup
 }

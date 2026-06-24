@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod debug_log;
 mod error;
 mod provider;
 mod agent;
@@ -22,6 +23,9 @@ use config::Config;
 struct Args {
     #[arg(long)]
     acp: bool,
+
+    #[arg(long)]
+    debug_log: bool,
 }
 
 #[tokio::main]
@@ -36,6 +40,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    debug_log::init(args.debug_log)?;
     let mut config: Config = config::load().unwrap_or_default();
 
     if args.acp {

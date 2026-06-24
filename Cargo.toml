@@ -58,6 +58,7 @@ unicode-width = "0.2"
 sha3 = "0.10"
 base64 = "0.22"
 regex = "1"
+wasmtime = "27"
 
 [profile.release]
 opt-level = 3
