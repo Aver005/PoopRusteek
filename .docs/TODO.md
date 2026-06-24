@@ -24,9 +24,12 @@
 - [ ] Tool approval dialog
 
 ## Phase 3: Integration
-- [ ] MCP stdio transport
-- [ ] MCP HTTP transport
-- [ ] MCP auto-discovery (IDE configs)
+- [x] MCP stdio transport
+- [x] MCP HTTP transport
+- [x] MCP auto-discovery (Claude Desktop, VS Code, Cursor, Trae)
+- [x] MCP manager with tool resolution
+- [x] MCP JSON-RPC client
+- [ ] Wire MCP tools into agent loop
 - [ ] ACP server mode
 - [ ] RAG (codebase semantic search)
 

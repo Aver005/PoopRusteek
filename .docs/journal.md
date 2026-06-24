@@ -165,3 +165,29 @@ pub trait LLMProvider: Send + Sync {
 - syntect uses OnceLock for static SyntaxSet/ThemeSet
 - HighlightLines is stateful (tracks context across lines)
 - Need to flush_line before rendering highlighted code blocks
+
+## 2026-06-24 — Phase 3: MCP Integration
+
+### What was done
+- JSON-RPC 2.0 client for MCP protocol
+- Stdio transport: spawns subprocess, communicates via stdin/stdout
+- HTTP transport: reqwest-based with auth headers
+- MCP client: initialize, list_tools, list_resources, call_tool, read_resource
+- MCP manager: server lifecycle, tool name resolution (mcp__server__tool)
+- Auto-discovery from 5 sources: workspace, global, Claude Desktop, VS Code, Cursor
+- Tool result flattening (text, image, resource content types)
+
+### Files added
+- `src/mcp/jsonrpc.rs` — JSON-RPC 2.0 types
+- `src/mcp/transport.rs` — Stdio + HTTP transports
+- `src/mcp/client.rs` — MCP client with full protocol support
+- `src/mcp/manager.rs` — Server management and tool resolution
+- `src/mcp/config.rs` — Multi-source config auto-discovery
+- `src/mcp/types.rs` — Updated with ServerCapabilities, MCPToolResult
+
+### Learnings
+- MCP uses newline-delimited JSON-RPC over stdio
+- Tool naming convention: `mcp__<server>__<tool>` (double underscores)
+- Claude Desktop config uses camelCase keys
+- VS Code settings.json has nested mcp.servers structure
+- Need to merge process.env with config env for stdio transport

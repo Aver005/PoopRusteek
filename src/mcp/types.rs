@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport")]
@@ -9,13 +10,15 @@ pub enum MCPServerConfig {
         #[serde(default)]
         args: Vec<String>,
         #[serde(default)]
-        env: std::collections::HashMap<String, String>,
+        env: Option<HashMap<String, String>>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     #[serde(rename = "http")]
     Http {
         url: String,
         #[serde(default)]
-        headers: std::collections::HashMap<String, String>,
+        headers: HashMap<String, String>,
     },
 }
 
@@ -52,4 +55,22 @@ pub struct MCPResource {
     pub description: Option<String>,
     pub mime_type: Option<String>,
     pub server_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerCapabilities {
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub resources: Option<serde_json::Value>,
+    #[serde(default)]
+    pub prompts: Option<serde_json::Value>,
+    #[serde(default)]
+    pub logging: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MCPToolResult {
+    pub content: String,
+    pub is_error: bool,
 }
