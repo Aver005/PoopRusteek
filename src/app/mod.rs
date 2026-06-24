@@ -7,7 +7,7 @@ use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::commands::CommandResult;
 use crate::tools::registry::ToolRegistry;
-use events::{AgentResult, AppEvent};
+use events::{AgentResult, AppEvent, Modal};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -30,6 +30,8 @@ pub struct AppState {
     pub status_message: String,
     pub scroll_offset: u32,
     pub error: Option<String>,
+    pub modal: Option<Modal>,
+    pub approved_tools: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -56,6 +58,8 @@ impl App {
             status_message: if provider.is_some() { "Ready" } else { "No token configured" }.to_string(),
             scroll_offset: 0,
             error: None,
+            modal: None,
+            approved_tools: std::collections::HashSet::new(),
         };
 
         Ok(Self {
@@ -154,6 +158,12 @@ impl App {
             AppEvent::ToolError { id: _, error } => {
                 self.state.status_message = format!("Tool error: {error}");
             }
+            AppEvent::PushModal(modal) => {
+                self.state.modal = Some(modal);
+            }
+            AppEvent::PopModal => {
+                self.state.modal = None;
+            }
             AppEvent::Notification(n) => {
                 self.state.status_message = n.message;
             }
@@ -164,6 +174,45 @@ impl App {
 
     async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        if let Some(modal) = &self.state.modal {
+            match modal {
+                Modal::ToolApproval { tool_name, .. } => {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            self.state.approved_tools.insert(tool_name.clone());
+                            self.state.modal = None;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            self.state.modal = None;
+                        }
+                        _ => {}
+                    }
+                    return Ok(false);
+                }
+                Modal::Confirm { .. } => {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            self.state.modal = None;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            self.state.modal = None;
+                        }
+                        _ => {}
+                    }
+                    return Ok(false);
+                }
+                Modal::Input { .. } => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.state.modal = None;
+                        }
+                        _ => {}
+                    }
+                    return Ok(false);
+                }
+            }
+        }
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {

@@ -21,7 +21,7 @@
 - [x] Context compaction (/compact command)
 - [x] File mentions (@file with line ranges)
 - [x] Syntax highlighting for code blocks (syntect)
-- [ ] Tool approval dialog
+- [x] Tool approval dialog (modal overlay, Y/N)
 
 ## Phase 3: Integration
 - [x] MCP stdio transport
