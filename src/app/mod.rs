@@ -181,8 +181,9 @@ impl App {
                             }
                         }
                     } else {
-                        self.state.messages.push(ChatMessage::user(&input));
-                        self.send_to_agent(input).await?;
+                        let expanded = self.expand_file_mentions(&input);
+                        self.state.messages.push(ChatMessage::user(&expanded));
+                        self.send_to_agent(expanded).await?;
                     }
                 }
             }
@@ -286,5 +287,25 @@ impl App {
 
     fn render(&self, terminal: &mut crate::tui::TuiTerminal) -> AppResult<()> {
         crate::tui::render::render(terminal, &self.state, &self.config)
+    }
+
+    fn expand_file_mentions(&self, input: &str) -> String {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mentions = crate::cli::file_mentions::extract_mentions(input, &workspace);
+
+        if mentions.is_empty() {
+            return input.to_string();
+        }
+
+        let mut result = input.to_string();
+        for mention in &mentions {
+            let tag = format!("@{}", mention.path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file"));
+            let replacement = crate::cli::file_mentions::format_mention(mention);
+            result = result.replace(&tag, &replacement);
+        }
+
+        result
     }
 }

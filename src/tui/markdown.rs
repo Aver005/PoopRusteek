@@ -1,7 +1,26 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::text::{Line, Span};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use crate::tui::theme::Theme;
+use std::sync::OnceLock;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{ThemeSet, Style as SynStyle};
+use syntect::parsing::SyntaxSet;
+
+fn syntax_set() -> &'static SyntaxSet {
+    static SS: OnceLock<SyntaxSet> = OnceLock::new();
+    SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
+}
+
+fn theme_set() -> &'static ThemeSet {
+    static TS: OnceLock<ThemeSet> = OnceLock::new();
+    TS.get_or_init(|| ThemeSet::load_defaults())
+}
+
+fn syntect_to_ratatui(style: SynStyle) -> Style {
+    let fg = style.foreground;
+    Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b))
+}
 
 pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut options = Options::empty();
@@ -12,6 +31,8 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut in_code_block = false;
+    let mut code_block_lang = String::new();
+    let mut code_buffer: Vec<String> = Vec::new();
 
     for event in parser {
         match event {
@@ -41,17 +62,11 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 }
                 Tag::CodeBlock(lang) => {
                     in_code_block = true;
-                    let lang_str = match lang {
+                    code_block_lang = match lang {
                         pulldown_cmark::CodeBlockKind::Fenced(cow) => cow.to_string(),
                         pulldown_cmark::CodeBlockKind::Indented => String::new(),
                     };
-                    if !lang_str.is_empty() {
-                        flush_line(&mut lines, &mut current_line);
-                        current_line.push(Span::styled(
-                            format!("  [{lang_str}]"),
-                            Style::default().fg(theme.accent_dim),
-                        ));
-                    }
+                    code_buffer.clear();
                     flush_line(&mut lines, &mut current_line);
                 }
                 Tag::List(_) => {}
@@ -89,7 +104,13 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                     flush_line(&mut lines, &mut current_line);
                 }
                 TagEnd::CodeBlock => {
+                    if !code_buffer.is_empty() {
+                        let highlighted = highlight_code(&code_buffer.join("\n"), &code_block_lang, theme);
+                        lines.extend(highlighted);
+                    }
                     in_code_block = false;
+                    code_block_lang.clear();
+                    code_buffer.clear();
                     flush_line(&mut lines, &mut current_line);
                 }
                 TagEnd::Item => {
@@ -101,12 +122,11 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 _ => {}
             },
             Event::Text(text) => {
-                let style = if in_code_block {
-                    Style::default().fg(theme.warning)
+                if in_code_block {
+                    code_buffer.push(text.to_string());
                 } else {
-                    Style::default().fg(theme.fg)
-                };
-                current_line.push(Span::styled(text.to_string(), style));
+                    current_line.push(Span::styled(text.to_string(), Style::default().fg(theme.fg)));
+                }
             }
             Event::Code(code) => {
                 current_line.push(Span::styled(
@@ -115,7 +135,11 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
-                flush_line(&mut lines, &mut current_line);
+                if in_code_block {
+                    flush_line(&mut lines, &mut current_line);
+                } else {
+                    flush_line(&mut lines, &mut current_line);
+                }
             }
             Event::Rule => {
                 flush_line(&mut lines, &mut current_line);
@@ -139,6 +163,51 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
+    if lang.is_empty() {
+        return code.lines().map(|line| {
+            Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.warning),
+            ))
+        }).collect();
+    }
+
+    let ss = syntax_set();
+    let ts = theme_set();
+
+    let syntax = ss.find_syntax_by_token(lang)
+        .or_else(|| ss.find_syntax_by_extension(lang))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let syn_theme = &ts.themes["base16.ocean.dark"];
+    let mut h = HighlightLines::new(syntax, syn_theme);
+
+    let mut result = Vec::new();
+    for line in code.lines() {
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled("  ", Style::default()));
+
+        if let Ok(highlighted) = h.highlight_line(line, ss) {
+            for (style, text) in highlighted {
+                spans.push(Span::styled(
+                    text.to_string(),
+                    syntect_to_ratatui(style),
+                ));
+            }
+        } else {
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default().fg(theme.warning),
+            ));
+        }
+
+        result.push(Line::from(spans));
+    }
+
+    result
 }
 
 fn flush_line(lines: &mut Vec<Line<'static>>, current_line: &mut Vec<Span<'static>>) {

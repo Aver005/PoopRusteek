@@ -13,14 +13,14 @@
 - [x] Streaming response in TUI (real-time tokens)
 - [x] First cargo build
 
-## Phase 2: Features
+## Phase 2: Features (Complete)
 - [x] Onboarding flow (first launch)
 - [x] Session persistence (save/load)
 - [x] Slash commands (/help, /clear, /compact, etc.)
 - [x] Markdown rendering in TUI (pulldown-cmark)
 - [x] Context compaction (/compact command)
-- [ ] File mentions (@file)
-- [ ] Syntax highlighting for code blocks
+- [x] File mentions (@file with line ranges)
+- [x] Syntax highlighting for code blocks (syntect)
 - [ ] Tool approval dialog
 
 ## Phase 3: Integration

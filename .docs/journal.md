@@ -147,3 +147,21 @@ pub trait LLMProvider: Send + Sync {
 - pulldown-cmark v0.12 uses struct variants for Tag (not tuple variants)
 - CodeBlockKind::Fenced contains CowStr, needs pattern matching
 - Onboarding runs before TUI starts (raw terminal mode)
+
+## 2026-06-24 — File Mentions + Syntax Highlighting
+
+### What was done
+- File mention support: `@file.rs`, `@file.rs:10-20` (line ranges)
+- Mentions expanded before sending to agent
+- Syntax highlighting for code blocks using syntect
+- Automatic language detection from markdown code fences
+- Theme: base16.ocean.dark for syntax colors
+
+### Files added
+- `src/cli/file_mentions.rs` — @file parser and expander
+- `src/tui/markdown.rs` — Updated with syntect highlighting
+
+### Learnings
+- syntect uses OnceLock for static SyntaxSet/ThemeSet
+- HighlightLines is stateful (tracks context across lines)
+- Need to flush_line before rendering highlighted code blocks

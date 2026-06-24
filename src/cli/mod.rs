@@ -1,4 +1,5 @@
 pub mod onboarding;
+pub mod file_mentions;
 
 use crate::config::Config;
 
