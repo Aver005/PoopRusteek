@@ -9,8 +9,20 @@ mod mcp;
 mod commands;
 mod session;
 mod cli;
+mod acp;
 
+use std::sync::Arc;
 use color_eyre::Result;
+use clap::Parser;
+use config::Config;
+
+#[derive(Parser)]
+#[command(name = "pooprusteek")]
+#[command(about = "A fast TUI coding agent powered by DeepSeek")]
+struct Args {
+    #[arg(long)]
+    acp: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,7 +35,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let mut config = config::load().unwrap_or_default();
+    let args = Args::parse();
+    let mut config: Config = config::load().unwrap_or_default();
+
+    if args.acp {
+        return run_acp_server(&config);
+    }
 
     if cli::should_run_onboarding(&config) {
         config = cli::onboarding::run_onboarding()?;
@@ -32,5 +49,18 @@ async fn main() -> Result<()> {
     let mut app = app::App::new(config).await?;
     app.run().await?;
 
+    Ok(())
+}
+
+fn run_acp_server(config: &Config) -> Result<()> {
+    if config.provider.token.is_empty() {
+        eprintln!("Error: No token configured. Run without --acp to set up.");
+        std::process::exit(1);
+    }
+
+    let provider = crate::provider::deepseek::DeepseekProvider::new(&config.provider)?;
+    let provider = Arc::new(provider);
+    let mut server = acp::server::AcpServer::new(provider);
+    server.run()?;
     Ok(())
 }

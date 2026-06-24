@@ -212,3 +212,24 @@ pub trait LLMProvider: Send + Sync {
 2. Tool names injected into system prompt
 3. LLM can call tools via [TOOL:tool_name] {args} syntax
 4. Tool calls parsed from response and routed to MCP/built-in tools
+
+## 2026-06-24 — ACP Server Mode + Tool Approval
+
+### What was done
+- ACP server mode: `pooprusteek --acp` runs as ACP server
+- ND-JSON over stdio protocol (initialize, prompt, ping)
+- Tool approval dialog: modal overlay with Y/N confirmation
+- Modal state in AppState, approved_tools HashSet tracking
+- TUI modal rendering (centered popup with borders)
+
+### Files added
+- `src/acp/mod.rs` — ACP module
+- `src/acp/types.rs` — ACP protocol types
+- `src/acp/server.rs` — ACP server implementation
+- `src/tui/render.rs` — Updated with modal rendering
+
+### How ACP works
+1. Run `pooprusteek --acp` from IDE (Zed/JetBrains/Neovim)
+2. Server reads ND-JSON from stdin, writes to stdout
+3. Handles initialize, prompt, ping methods
+4. Returns text responses via ContentBlock format

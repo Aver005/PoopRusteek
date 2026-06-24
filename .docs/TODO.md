@@ -23,7 +23,7 @@
 - [x] Syntax highlighting for code blocks (syntect)
 - [x] Tool approval dialog (modal overlay, Y/N)
 
-## Phase 3: Integration
+## Phase 3: Integration (Complete)
 - [x] MCP stdio transport
 - [x] MCP HTTP transport
 - [x] MCP auto-discovery (Claude Desktop, VS Code, Cursor, Trae)
@@ -32,7 +32,7 @@
 - [x] Wire MCP tools into agent loop
 - [x] System prompt with MCP tool descriptions
 - [x] Tool call parser ([TOOL:name] format)
-- [ ] ACP server mode
+- [x] ACP server mode (--acp flag, ND-JSON over stdio)
 - [ ] RAG (codebase semantic search)
 
 ## Phase 4: Polish
