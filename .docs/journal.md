@@ -191,3 +191,24 @@ pub trait LLMProvider: Send + Sync {
 - Claude Desktop config uses camelCase keys
 - VS Code settings.json has nested mcp.servers structure
 - Need to merge process.env with config env for stdio transport
+
+## 2026-06-24 — MCP Tools Wired into Agent
+
+### What was done
+- Added MCPManager to App struct, initialized on startup
+- System prompt now includes MCP tool descriptions
+- Tool call parser: extracts [TOOL:name] {args} from LLM response
+- MCP tool names passed to spawned agent task
+- Added regex crate for tool call parsing
+
+### Files changed
+- `src/app/mod.rs` — MCP manager integration, system prompt builder
+- `src/agent/mod.rs` — Added tool_parser module
+- `src/agent/tool_parser.rs` — NEW: Tool call parser
+- `Cargo.toml` — Added regex
+
+### How MCP tools work now
+1. MCP servers initialize on app startup
+2. Tool names injected into system prompt
+3. LLM can call tools via [TOOL:tool_name] {args} syntax
+4. Tool calls parsed from response and routed to MCP/built-in tools

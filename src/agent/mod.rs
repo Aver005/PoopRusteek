@@ -1,6 +1,7 @@
 pub mod loop_runner;
 pub mod context;
 pub mod streaming;
+pub mod tool_parser;
 
 pub struct AgentResult {
     pub text: String,

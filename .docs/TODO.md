@@ -29,7 +29,9 @@
 - [x] MCP auto-discovery (Claude Desktop, VS Code, Cursor, Trae)
 - [x] MCP manager with tool resolution
 - [x] MCP JSON-RPC client
-- [ ] Wire MCP tools into agent loop
+- [x] Wire MCP tools into agent loop
+- [x] System prompt with MCP tool descriptions
+- [x] Tool call parser ([TOOL:name] format)
 - [ ] ACP server mode
 - [ ] RAG (codebase semantic search)
 

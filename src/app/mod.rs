@@ -3,8 +3,10 @@ pub mod events;
 use crate::commands::CommandRegistry;
 use crate::config::Config;
 use crate::error::AppResult;
+use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::commands::CommandResult;
+use crate::tools::registry::ToolRegistry;
 use events::{AgentResult, AppEvent};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -16,6 +18,8 @@ pub struct App {
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     provider: Option<Arc<dyn LLMProvider>>,
     commands: CommandRegistry,
+    pub mcp: MCPManager,
+    tools: ToolRegistry,
 }
 
 pub struct AppState {
@@ -39,6 +43,11 @@ impl App {
             Some(Arc::new(ds))
         };
 
+        let mut mcp = MCPManager::new();
+        if let Err(e) = mcp.initialize().await {
+            tracing::warn!("MCP initialization failed: {e}");
+        }
+
         let state = AppState {
             messages: Vec::new(),
             input_buffer: String::new(),
@@ -56,6 +65,8 @@ impl App {
             event_rx,
             provider,
             commands: CommandRegistry::new(),
+            mcp,
+            tools: ToolRegistry::new(),
         })
     }
 
@@ -229,6 +240,35 @@ impl App {
         Ok(false)
     }
 
+    fn build_system_prompt(&self) -> String {
+        let mut prompt = String::from(
+            "You are Pooprusteek, a helpful AI coding assistant. \
+             You can help with coding, file operations, and terminal commands.\n"
+        );
+
+        let mcp_tools = self.mcp.get_dynamic_tool_names();
+        if !mcp_tools.is_empty() {
+            prompt.push_str("\nYou have access to the following MCP tools:\n");
+            for tool_name in &mcp_tools {
+                if let Some(desc) = self.mcp.get_tool_description(tool_name) {
+                    prompt.push_str(&format!("  - {tool_name}: {desc}\n"));
+                }
+            }
+            prompt.push_str("\nTo use an MCP tool, respond with: [TOOL:tool_name] {\"arg\": \"value\"}\n");
+        }
+
+        let builtin_tools = self.tools.names();
+        if !builtin_tools.is_empty() {
+            prompt.push_str("\nYou have access to the following built-in tools:\n");
+            for tool_name in &builtin_tools {
+                prompt.push_str(&format!("  - {tool_name}\n"));
+            }
+            prompt.push_str("\nTo use a built-in tool, respond with: [TOOL:tool_name] {\"arg\": \"value\"}\n");
+        }
+
+        prompt
+    }
+
     async fn send_to_agent(&mut self, _input: String) -> AppResult<()> {
         let provider = match &self.provider {
             Some(p) => Arc::clone(p),
@@ -241,10 +281,17 @@ impl App {
         };
 
         let event_tx = self.event_tx.clone();
-        let messages: Vec<ChatMessage> = self.state.messages.clone();
+        let mut messages: Vec<ChatMessage> = self.state.messages.clone();
+
+        let system_prompt = self.build_system_prompt();
+        messages.insert(0, ChatMessage::system(&system_prompt));
+
         let model = self.config.provider.model.clone();
         let temperature = self.config.provider.temperature;
         let max_tokens = self.config.provider.max_tokens;
+
+        let mcp_tool_names: Vec<String> = self.mcp.get_dynamic_tool_names();
+        let builtin_tool_names: Vec<String> = self.tools.names();
 
         let _ = event_tx.send(AppEvent::AgentStarted);
 
@@ -265,8 +312,11 @@ impl App {
                 return;
             }
 
+            let mut full_response = String::new();
+
             while let Some(chunk) = rx.recv().await {
                 if !chunk.content.is_empty() {
+                    full_response.push_str(&chunk.content);
                     let _ = event_tx.send(AppEvent::AgentChunk(chunk.content));
                 }
                 if let Some(reason) = &chunk.finish_reason {
@@ -277,9 +327,13 @@ impl App {
             }
 
             let _ = event_tx.send(AppEvent::AgentDone(AgentResult {
-                text: String::new(),
+                text: full_response.clone(),
                 tool_calls: Vec::new(),
             }));
+
+            let _ = full_response;
+            let _ = mcp_tool_names;
+            let _ = builtin_tool_names;
         });
 
         Ok(())

@@ -6,4 +6,3 @@ pub mod config;
 pub mod types;
 
 pub use manager::MCPManager;
-pub use types::*;
