@@ -18,6 +18,12 @@ pub fn render_status(frame: &mut Frame, area: Rect, state: &AppState, config: &C
 
     let model = &config.provider.model;
     let msg_count = state.messages.len();
+    let spinner = match state.animation_tick % 4 {
+        0 => "|",
+        1 => "/",
+        2 => "-",
+        _ => "\\",
+    };
 
     let status_style = if state.is_generating {
         Style::default()
@@ -28,9 +34,13 @@ pub fn render_status(frame: &mut Frame, area: Rect, state: &AppState, config: &C
         Style::default().fg(theme.text_dim).bg(theme.status_bg)
     };
 
-    let left = format!(" {provider_name} · {model} ");
-    let center = state.status_message.clone();
-    let right = format!(" msgs:{msg_count} ");
+    let left = format!(" {} · {} ", provider_name, model);
+    let center = if state.is_generating {
+        format!(" {} {}", spinner, state.status_message)
+    } else {
+        format!(" {}", state.status_message)
+    };
+    let right = format!(" msgs:{} ", msg_count);
 
     let status_line = Line::from(vec![
         Span::styled(&left, status_style),

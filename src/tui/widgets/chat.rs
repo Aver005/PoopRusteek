@@ -14,7 +14,9 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style(false))
-        .style(Style::default().bg(theme.bg));
+        .title(" Conversation ")
+        .title_style(Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(theme.panel));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -70,17 +72,18 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             Role::User => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "You",
+                        " prompt ",
                         Style::default()
-                            .fg(theme.accent)
+                            .fg(theme.bg)
+                            .bg(theme.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
-                for line in msg.content.lines() {
+                for line in msg.visible_content().lines() {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("  {line}"),
-                            Style::default().fg(theme.fg),
+                            Style::default().fg(theme.fg).bg(theme.user_bg),
                         ),
                     ]));
                 }
@@ -89,9 +92,10 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             Role::Assistant => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "Assistant",
+                        " pooprusteek ",
                         Style::default()
-                            .fg(theme.success)
+                            .fg(theme.bg)
+                            .bg(theme.success)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -103,10 +107,13 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                         ),
                     ]));
                 } else {
-                    let mut md_lines = render_markdown(&msg.content, theme);
+                    let mut md_lines = render_markdown(msg.visible_content(), theme);
                     for line in &mut md_lines {
                         let mut styled_spans: Vec<Span> = Vec::new();
-                        styled_spans.push(Span::styled("  ", Style::default().fg(theme.fg)));
+                        styled_spans.push(Span::styled(
+                            "  ",
+                            Style::default().fg(theme.fg).bg(theme.assistant_bg),
+                        ));
                         for span in line.spans.iter() {
                             styled_spans.push(span.clone());
                         }
@@ -119,11 +126,11 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             Role::System => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "[system]",
-                        Style::default().fg(theme.warning),
+                        " system ",
+                        Style::default().fg(theme.bg).bg(theme.warning),
                     ),
                     Span::styled(
-                        format!(" {}", msg.content),
+                        format!(" {}", msg.visible_content()),
                         Style::default().fg(theme.text_dim),
                     ),
                 ]));
@@ -131,14 +138,19 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             Role::Tool => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "[tool]",
-                        Style::default().fg(theme.accent_dim),
-                    ),
-                    Span::styled(
-                        format!(" {}", msg.content),
-                        Style::default().fg(theme.text_dim),
+                        format!(" tool · {} ", msg.name.as_deref().unwrap_or("unknown")),
+                        Style::default().fg(theme.bg).bg(theme.accent_soft),
                     ),
                 ]));
+                for line in msg.visible_content().lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {line}"),
+                            Style::default().fg(theme.text_soft).bg(theme.tool_bg),
+                        ),
+                    ]));
+                }
+                lines.push(Line::from(""));
             }
         }
     }
@@ -151,7 +163,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let visible: Vec<Line> = lines.into_iter().skip(start).take(visible_height).collect();
 
     let paragraph = Paragraph::new(visible)
-        .style(Style::default().bg(theme.bg))
+        .style(Style::default().bg(theme.panel))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
 }

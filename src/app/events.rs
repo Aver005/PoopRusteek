@@ -1,3 +1,5 @@
+use crate::provider::ChatMessage;
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     // TUI events
@@ -10,6 +12,9 @@ pub enum AppEvent {
     AgentChunk(String),
     AgentDone(AgentResult),
     AgentError(String),
+    BeginAssistantMessage,
+    DiscardEmptyAssistantMessage,
+    AddMessage(ChatMessage),
 
     // Tool events
     ToolStarted { name: String, id: String },

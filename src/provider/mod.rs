@@ -22,6 +22,8 @@ pub struct ChatMessage {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip)]
+    pub display_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -31,6 +33,7 @@ impl ChatMessage {
             content: content.to_string(),
             name: None,
             tool_call_id: None,
+            display_content: None,
         }
     }
 
@@ -40,6 +43,7 @@ impl ChatMessage {
             content: content.to_string(),
             name: None,
             tool_call_id: None,
+            display_content: None,
         }
     }
 
@@ -49,6 +53,7 @@ impl ChatMessage {
             content: content.to_string(),
             name: None,
             tool_call_id: None,
+            display_content: None,
         }
     }
 
@@ -58,7 +63,22 @@ impl ChatMessage {
             content: content.to_string(),
             name: None,
             tool_call_id: Some(tool_call_id.to_string()),
+            display_content: None,
         }
+    }
+
+    pub fn tool_with_display(tool_call_id: &str, tool_name: &str, content: &str, display: &str) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.to_string(),
+            name: Some(tool_name.to_string()),
+            tool_call_id: Some(tool_call_id.to_string()),
+            display_content: Some(display.to_string()),
+        }
+    }
+
+    pub fn visible_content(&self) -> &str {
+        self.display_content.as_deref().unwrap_or(&self.content)
     }
 }
 

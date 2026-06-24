@@ -4,9 +4,11 @@ use crate::commands::CommandRegistry;
 use crate::config::Config;
 use crate::error::AppResult;
 use crate::mcp::MCPManager;
+use crate::prompts::{self, PromptFiles};
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::commands::CommandResult;
 use crate::tools::registry::ToolRegistry;
+use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use events::{AgentResult, AppEvent, Modal};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -18,8 +20,9 @@ pub struct App {
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     provider: Option<Arc<dyn LLMProvider>>,
     commands: CommandRegistry,
-    pub mcp: MCPManager,
-    tools: ToolRegistry,
+    pub mcp: Arc<tokio::sync::Mutex<MCPManager>>,
+    tools: Arc<ToolRegistry>,
+    prompts: PromptFiles,
 }
 
 pub struct AppState {
@@ -32,6 +35,7 @@ pub struct AppState {
     pub error: Option<String>,
     pub modal: Option<Modal>,
     pub approved_tools: std::collections::HashSet<String>,
+    pub animation_tick: u64,
 }
 
 impl App {
@@ -45,10 +49,13 @@ impl App {
             Some(Arc::new(ds))
         };
 
-        let mut mcp = MCPManager::new();
-        if let Err(e) = mcp.initialize().await {
+        let mut mcp_manager = MCPManager::new();
+        if let Err(e) = mcp_manager.initialize().await {
             tracing::warn!("MCP initialization failed: {e}");
         }
+        let mcp = Arc::new(tokio::sync::Mutex::new(mcp_manager));
+        let tools = Arc::new(ToolRegistry::new());
+        let prompts = prompts::load_prompt_files()?;
 
         let state = AppState {
             messages: Vec::new(),
@@ -60,6 +67,7 @@ impl App {
             error: None,
             modal: None,
             approved_tools: std::collections::HashSet::new(),
+            animation_tick: 0,
         };
 
         Ok(Self {
@@ -70,7 +78,8 @@ impl App {
             provider,
             commands: CommandRegistry::new(),
             mcp,
-            tools: ToolRegistry::new(),
+            tools,
+            prompts,
         })
     }
 
@@ -133,13 +142,27 @@ impl App {
             AppEvent::Quit => return Ok(true),
             AppEvent::AgentStarted => {
                 self.state.is_generating = true;
-                self.state.status_message = "Generating...".to_string();
-                self.state.messages.push(ChatMessage {
-                    role: Role::Assistant,
-                    content: String::new(),
-                    name: None,
-                    tool_call_id: None,
-                });
+                self.state.status_message = "Thinking...".to_string();
+            }
+            AppEvent::BeginAssistantMessage => {
+                let should_push = self
+                    .state
+                    .messages
+                    .last()
+                    .is_none_or(|message| message.role != Role::Assistant || !message.content.is_empty());
+                if should_push {
+                    self.state.messages.push(ChatMessage::assistant(""));
+                }
+            }
+            AppEvent::DiscardEmptyAssistantMessage => {
+                if self
+                    .state
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
+                {
+                    self.state.messages.pop();
+                }
             }
             AppEvent::AgentChunk(chunk) => {
                 if let Some(last) = self.state.messages.last_mut() {
@@ -151,17 +174,36 @@ impl App {
             AppEvent::AgentDone(_result) => {
                 self.state.is_generating = false;
                 self.state.status_message = "Ready".to_string();
+                if self
+                    .state
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
+                {
+                    self.state.messages.pop();
+                }
             }
             AppEvent::AgentError(err) => {
                 self.state.is_generating = false;
                 self.state.error = Some(err.clone());
                 self.state.status_message = err;
+                if self
+                    .state
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
+                {
+                    self.state.messages.pop();
+                }
+            }
+            AppEvent::AddMessage(message) => {
+                self.state.messages.push(message);
             }
             AppEvent::ToolStarted { name, id: _ } => {
                 self.state.status_message = format!("Running {name}...");
             }
             AppEvent::ToolDone { id: _, result: _ } => {
-                self.state.status_message = "Ready".to_string();
+                self.state.status_message = "Tool finished".to_string();
             }
             AppEvent::ToolError { id: _, error } => {
                 self.state.status_message = format!("Tool error: {error}");
@@ -174,6 +216,9 @@ impl App {
             }
             AppEvent::Notification(n) => {
                 self.state.status_message = n.message;
+            }
+            AppEvent::Tick => {
+                self.state.animation_tick = self.state.animation_tick.wrapping_add(1);
             }
             _ => {}
         }
@@ -307,33 +352,58 @@ impl App {
         Ok(false)
     }
 
-    fn build_system_prompt(&self) -> String {
-        let mut prompt = String::from(
-            "You are Pooprusteek, a helpful AI coding assistant. \
-             You can help with coding, file operations, and terminal commands.\n"
-        );
+    async fn build_system_prompt(&self) -> String {
+        let workspace = std::env::current_dir()
+            .ok()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let user = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "user".to_string());
+        let os = std::env::consts::OS.to_string();
 
-        let mcp_tools = self.mcp.get_dynamic_tool_names();
-        if !mcp_tools.is_empty() {
-            prompt.push_str("\nYou have access to the following MCP tools:\n");
-            for tool_name in &mcp_tools {
-                if let Some(desc) = self.mcp.get_tool_description(tool_name) {
-                    prompt.push_str(&format!("  - {tool_name}: {desc}\n"));
-                }
-            }
-            prompt.push_str("\nTo use an MCP tool, respond with: [TOOL:tool_name] {\"arg\": \"value\"}\n");
-        }
+        let builtin_tools = self.tools.definitions();
+        let builtin_section = if builtin_tools.is_empty() {
+            "- none".to_string()
+        } else {
+            builtin_tools
+                .iter()
+                .map(|tool| format!("- `{}`: {}", tool.name, tool.description))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
-        let builtin_tools = self.tools.names();
-        if !builtin_tools.is_empty() {
-            prompt.push_str("\nYou have access to the following built-in tools:\n");
-            for tool_name in &builtin_tools {
-                prompt.push_str(&format!("  - {tool_name}\n"));
-            }
-            prompt.push_str("\nTo use a built-in tool, respond with: [TOOL:tool_name] {\"arg\": \"value\"}\n");
-        }
+        let mcp = self.mcp.lock().await;
+        let dynamic_tool_names = mcp.get_dynamic_tool_names();
+        let mcp_section = if dynamic_tool_names.is_empty() {
+            "- none".to_string()
+        } else {
+            dynamic_tool_names
+                .iter()
+                .map(|tool_name| {
+                    let description = mcp
+                        .get_tool_description(tool_name)
+                        .unwrap_or_else(|| "No description".to_string());
+                    format!("- `{tool_name}`: {description}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        drop(mcp);
 
-        prompt
+        let base_prompt = self
+            .prompts
+            .base_prompt
+            .replace("{{user}}", &user)
+            .replace("{{folder}}", &workspace)
+            .replace("{{os}}", &os);
+        let tools_prompt = self
+            .prompts
+            .tools_prompt
+            .replace("{{builtin_tools}}", &builtin_section)
+            .replace("{{mcp_tools}}", &mcp_section);
+
+        format!("{}\n\n{}", base_prompt.trim(), tools_prompt.trim())
     }
 
     async fn send_to_agent(&mut self, _input: String) -> AppResult<()> {
@@ -349,58 +419,145 @@ impl App {
 
         let event_tx = self.event_tx.clone();
         let mut messages: Vec<ChatMessage> = self.state.messages.clone();
-
-        let system_prompt = self.build_system_prompt();
-        messages.insert(0, ChatMessage::system(&system_prompt));
+        let system_prompt = self.build_system_prompt().await;
 
         let model = self.config.provider.model.clone();
         let temperature = self.config.provider.temperature;
         let max_tokens = self.config.provider.max_tokens;
-
-        let mcp_tool_names: Vec<String> = self.mcp.get_dynamic_tool_names();
-        let builtin_tool_names: Vec<String> = self.tools.names();
+        let max_steps = self.config.agent.max_steps_per_turn.max(1);
+        let max_tools_per_step = self.config.agent.max_tools_per_step.max(1);
+        let tools = Arc::clone(&self.tools);
+        let mcp = Arc::clone(&self.mcp);
 
         let _ = event_tx.send(AppEvent::AgentStarted);
 
         tokio::spawn(async move {
-            let request = CompletionRequest {
-                messages,
-                model,
-                temperature,
-                max_tokens,
-                stream: true,
-            };
+            let mut collected_tool_calls = Vec::new();
 
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            for _step in 0..max_steps {
+                let _ = event_tx.send(AppEvent::BeginAssistantMessage);
+                let mut request_messages = Vec::with_capacity(messages.len() + 1);
+                request_messages.push(ChatMessage::system(&system_prompt));
+                request_messages.extend(messages.clone());
 
-            let stream_result = provider.complete_stream(request, tx).await;
-            if let Err(e) = stream_result {
-                let _ = event_tx.send(AppEvent::AgentError(e.to_string()));
-                return;
-            }
+                let request = CompletionRequest {
+                    messages: request_messages,
+                    model: model.clone(),
+                    temperature,
+                    max_tokens,
+                    stream: true,
+                };
 
-            let mut full_response = String::new();
-
-            while let Some(chunk) = rx.recv().await {
-                if !chunk.content.is_empty() {
-                    full_response.push_str(&chunk.content);
-                    let _ = event_tx.send(AppEvent::AgentChunk(chunk.content));
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                if let Err(error) = provider.complete_stream(request, tx).await {
+                    let _ = event_tx.send(AppEvent::AgentError(error.to_string()));
+                    return;
                 }
-                if let Some(reason) = &chunk.finish_reason {
-                    if reason == "stop" {
+
+                let mut full_response = String::new();
+                let mut streamed_visible = String::new();
+                while let Some(chunk) = rx.recv().await {
+                    if !chunk.content.is_empty() {
+                        full_response.push_str(&chunk.content);
+                        let next_visible = stream_visible_text(&full_response);
+                        if next_visible.starts_with(&streamed_visible) {
+                            let delta = &next_visible[streamed_visible.len()..];
+                            if !delta.is_empty() {
+                                let _ = event_tx.send(AppEvent::AgentChunk(delta.to_string()));
+                            }
+                        } else if !next_visible.is_empty() {
+                            let _ = event_tx.send(AppEvent::AgentError(
+                                "Streaming state desynchronized while hiding tool blocks".to_string(),
+                            ));
+                            return;
+                        }
+                        streamed_visible = next_visible;
+                    }
+                    if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
                         break;
+                    }
+                }
+
+                let tool_calls = parse_tool_calls(&full_response);
+                let visible_text = strip_tool_calls(&full_response);
+
+                if !visible_text.is_empty() {
+                    messages.push(ChatMessage::assistant(&visible_text));
+                } else {
+                    let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
+                }
+
+                if tool_calls.is_empty() {
+                    let _ = event_tx.send(AppEvent::AgentDone(AgentResult {
+                        text: visible_text,
+                        tool_calls: collected_tool_calls,
+                    }));
+                    return;
+                }
+
+                for tool_call in tool_calls.into_iter().take(max_tools_per_step) {
+                    let tool_id = uuid::Uuid::new_v4().to_string();
+                    let _ = event_tx.send(AppEvent::ToolStarted {
+                        name: tool_call.name.clone(),
+                        id: tool_id.clone(),
+                    });
+
+                    let execution = if tool_call.name.starts_with("mcp__") {
+                        let mut mcp = mcp.lock().await;
+                        match mcp.call_tool(&tool_call.name, tool_call.arguments.clone()).await {
+                            Ok(result) => (result.content, result.is_error),
+                            Err(error) => (error.to_string(), true),
+                        }
+                    } else {
+                        let result = tools.execute(&tool_call.name, tool_call.arguments.clone()).await;
+                        (result.content, result.is_error)
+                    };
+
+                    let (tool_result, is_error) = execution;
+                    let preview = summarize_tool_result(&tool_result);
+                    let display = if is_error {
+                        format!(
+                            "Tool {} failed. Raw output is attached internally.\n{}",
+                            tool_call.name, preview
+                        )
+                    } else {
+                        format!(
+                            "Tool {} completed. Raw output is attached internally.\n{}",
+                            tool_call.name, preview
+                        )
+                    };
+
+                    let tool_message = ChatMessage::tool_with_display(
+                        &tool_id,
+                        &tool_call.name,
+                        &tool_result,
+                        &display,
+                    );
+                    messages.push(tool_message.clone());
+                    collected_tool_calls.push(events::ToolCallInfo {
+                        name: tool_call.name.clone(),
+                        arguments: tool_call.arguments.clone(),
+                        result: Some(tool_result.clone()),
+                    });
+                    let _ = event_tx.send(AppEvent::AddMessage(tool_message));
+
+                    if is_error {
+                        let _ = event_tx.send(AppEvent::ToolError {
+                            id: tool_id,
+                            error: preview,
+                        });
+                    } else {
+                        let _ = event_tx.send(AppEvent::ToolDone {
+                            id: tool_id,
+                            result: preview,
+                        });
                     }
                 }
             }
 
-            let _ = event_tx.send(AppEvent::AgentDone(AgentResult {
-                text: full_response.clone(),
-                tool_calls: Vec::new(),
-            }));
-
-            let _ = full_response;
-            let _ = mcp_tool_names;
-            let _ = builtin_tool_names;
+            let _ = event_tx.send(AppEvent::AgentError(
+                "Reached max agent steps before producing a final answer".to_string(),
+            ));
         });
 
         Ok(())
@@ -436,4 +593,16 @@ fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
         .nth(char_pos)
         .map(|(i, _)| i)
         .unwrap_or_else(|| s.len())
+}
+
+fn summarize_tool_result(result: &str) -> String {
+    const MAX_LEN: usize = 160;
+    let compact = result.lines().take(3).collect::<Vec<_>>().join(" ");
+    if compact.len() > MAX_LEN {
+        format!("{}...", &compact[..MAX_LEN])
+    } else if compact.is_empty() {
+        "No visible output.".to_string()
+    } else {
+        compact
+    }
 }
