@@ -1,8 +1,10 @@
 pub mod events;
 
+use crate::commands::CommandRegistry;
 use crate::config::Config;
 use crate::error::AppResult;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
+use crate::commands::CommandResult;
 use events::{AgentResult, AppEvent};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -13,6 +15,7 @@ pub struct App {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     provider: Option<Arc<dyn LLMProvider>>,
+    commands: CommandRegistry,
 }
 
 pub struct AppState {
@@ -52,6 +55,7 @@ impl App {
             event_tx,
             event_rx,
             provider,
+            commands: CommandRegistry::new(),
         })
     }
 
@@ -161,10 +165,25 @@ impl App {
             KeyCode::Enter if !self.state.is_generating => {
                 let input = self.state.input_buffer.trim().to_string();
                 if !input.is_empty() {
-                    self.state.messages.push(ChatMessage::user(&input));
                     self.state.input_buffer.clear();
                     self.state.input_cursor = 0;
-                    self.send_to_agent(input).await?;
+
+                    if input.starts_with('/') {
+                        let result = self.commands.execute(&input, &mut self.state, &self.config);
+                        match result {
+                            CommandResult::Handled => {}
+                            CommandResult::NeedsAgent(msg) => {
+                                self.state.messages.push(ChatMessage::user(&input));
+                                self.send_to_agent(msg).await?;
+                            }
+                            CommandResult::Error(err) => {
+                                self.state.messages.push(ChatMessage::system(&err));
+                            }
+                        }
+                    } else {
+                        self.state.messages.push(ChatMessage::user(&input));
+                        self.send_to_agent(input).await?;
+                    }
                 }
             }
             KeyCode::Char(c) => {

@@ -124,3 +124,26 @@ pub trait LLMProvider: Send + Sync {
 - `src/tui/widgets/chat.rs` — Streaming indicator, scroll fix
 - `src/mcp/manager.rs` — Fixed borrow checker
 - `Cargo.toml` — Added sha3, base64
+
+## 2026-06-24 — Phase 2: Commands, Onboarding, Markdown
+
+### What was done
+- Slash commands system: /help, /clear, /compact, /version, /quit, /reset
+- Command registry with trait-based dispatch
+- Onboarding flow for first launch (token + model selection)
+- Session persistence (save/load/list/delete to JSON files)
+- Markdown rendering in TUI using pulldown-cmark
+- Assistant messages now render with styled headings, code blocks, lists, links
+
+### Files added
+- `src/commands/mod.rs` — Command registry + trait
+- `src/commands/defs/` — 6 command implementations
+- `src/cli/mod.rs` — CLI utilities
+- `src/cli/onboarding.rs` — First-launch setup
+- `src/session.rs` — Session persistence
+- `src/tui/markdown.rs` — Markdown renderer for TUI
+
+### Learnings
+- pulldown-cmark v0.12 uses struct variants for Tag (not tuple variants)
+- CodeBlockKind::Fenced contains CowStr, needs pattern matching
+- Onboarding runs before TUI starts (raw terminal mode)

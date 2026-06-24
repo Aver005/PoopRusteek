@@ -1,5 +1,6 @@
 use crate::app::AppState;
 use crate::provider::Role;
+use crate::tui::markdown::render_markdown;
 use crate::tui::theme::Theme;
 use ratatui::{
     layout::Rect,
@@ -102,14 +103,16 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                         ),
                     ]));
                 } else {
-                    for line in msg.content.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("  {line}"),
-                                Style::default().fg(theme.fg),
-                            ),
-                        ]));
+                    let mut md_lines = render_markdown(&msg.content, theme);
+                    for line in &mut md_lines {
+                        let mut styled_spans: Vec<Span> = Vec::new();
+                        styled_spans.push(Span::styled("  ", Style::default().fg(theme.fg)));
+                        for span in line.spans.iter() {
+                            styled_spans.push(span.clone());
+                        }
+                        *line = Line::from(styled_spans);
                     }
+                    lines.extend(md_lines);
                 }
                 lines.push(Line::from(""));
             }

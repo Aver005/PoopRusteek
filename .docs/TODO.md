@@ -14,13 +14,13 @@
 - [x] First cargo build
 
 ## Phase 2: Features
-- [ ] Onboarding flow (first launch)
-- [ ] Session persistence (save/load)
-- [ ] Slash commands (/help, /clear, /compact, etc.)
+- [x] Onboarding flow (first launch)
+- [x] Session persistence (save/load)
+- [x] Slash commands (/help, /clear, /compact, etc.)
+- [x] Markdown rendering in TUI (pulldown-cmark)
+- [x] Context compaction (/compact command)
 - [ ] File mentions (@file)
-- [ ] Markdown rendering in TUI
 - [ ] Syntax highlighting for code blocks
-- [ ] Context compaction (auto-summarize)
 - [ ] Tool approval dialog
 
 ## Phase 3: Integration

@@ -1,6 +1,7 @@
 pub mod render;
 pub mod widgets;
 pub mod theme;
+pub mod markdown;
 
 use color_eyre::Result;
 use crossterm::{

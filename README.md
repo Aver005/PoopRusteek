@@ -1,8 +1,8 @@
-# Pooprusteek (Пупрастик)
+# Pooprústeek (Пупра́стик)
 
 A fast, beautiful TUI coding agent written in Rust, powered by DeepSeek.
 
-Fork of [Poopseek](https://github.com/poopseek/poopseek) — a free Claude Code alternative.
+Fork of [Poopseek](https://github.com/aver005/poopseek) — a free Claude Code alternative.
 
 ## Features
 
