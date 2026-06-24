@@ -18,7 +18,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if state.messages.is_empty() {
+    if state.messages.is_empty() && !state.is_generating {
         let welcome = vec![
             Line::from(""),
             Line::from(vec![
@@ -49,7 +49,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             ]),
             Line::from(vec![
                 Span::styled(
-                    "  Press Ctrl+C to quit.",
+                    "  Ctrl+C quit  |  Ctrl+L clear",
                     Style::default().fg(theme.text_dim),
                 ),
             ]),
@@ -94,13 +94,22 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
-                for line in msg.content.lines() {
+                if msg.content.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("  {line}"),
-                            Style::default().fg(theme.fg),
+                            "  Thinking...",
+                            Style::default().fg(theme.text_dim),
                         ),
                     ]));
+                } else {
+                    for line in msg.content.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {line}"),
+                                Style::default().fg(theme.fg),
+                            ),
+                        ]));
+                    }
                 }
                 lines.push(Line::from(""));
             }
@@ -131,9 +140,12 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
     }
 
-    let visible_lines = lines.len().saturating_sub(state.scroll_offset as usize);
-    let start = lines.len().saturating_sub(visible_lines);
-    let visible: Vec<Line> = lines.into_iter().skip(start).collect();
+    let total_lines = lines.len();
+    let visible_height = inner.height as usize;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = (state.scroll_offset as usize).min(max_scroll);
+    let start = scroll;
+    let visible: Vec<Line> = lines.into_iter().skip(start).take(visible_height).collect();
 
     let paragraph = Paragraph::new(visible)
         .style(Style::default().bg(theme.bg))

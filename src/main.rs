@@ -5,16 +5,19 @@ mod provider;
 mod agent;
 mod tools;
 mod tui;
+mod mcp;
 
 use color_eyre::Result;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("pooprusteek=debug".parse()?))
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pooprusteek=info")),
+        )
         .init();
 
     let config = config::load().unwrap_or_default();

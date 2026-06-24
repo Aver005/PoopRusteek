@@ -1,4 +1,5 @@
 use super::*;
+use super::pow;
 use crate::config::ProviderConfig;
 use crate::error::AppResult;
 use async_trait::async_trait;
@@ -7,7 +8,8 @@ use reqwest::Client;
 
 const DEEPSEEK_CHAT_URL: &str = "https://chat.deepseek.com";
 const DEEPSEEK_API_URL: &str = "https://chat.deepseek.com/api/v0/chat";
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const TARGET_PATH: &str = "/api/v0/chat/completion";
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 YandexBrowser/25.8.0.0";
 
 pub struct DeepseekProvider {
     client: Client,
@@ -32,34 +34,64 @@ impl DeepseekProvider {
         })
     }
 
-    fn headers(&self) -> reqwest::header::HeaderMap {
+    fn base_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("authorization", format!("Bearer {}", self.token).parse().unwrap());
         headers.insert("content-type", "application/json".parse().unwrap());
         headers.insert("origin", DEEPSEEK_CHAT_URL.parse().unwrap());
         headers.insert("referer", format!("{DEEPSEEK_CHAT_URL}/").parse().unwrap());
+        headers.insert("x-client-platform", "android".parse().unwrap());
+        headers.insert("x-client-version", "1.8.0".parse().unwrap());
+        headers.insert("x-client-locale", "en_US".parse().unwrap());
         headers
     }
 
-    async fn create_pow_challenge(&self) -> AppResult<String> {
+    async fn get_pow_header(&self) -> AppResult<reqwest::header::HeaderMap> {
+        let mut headers = self.base_headers();
+
+        match self.solve_pow_challenge().await {
+            Ok(pow_b64) => {
+                headers.insert("x-ds-pow-response", pow_b64.parse().unwrap());
+            }
+            Err(e) => {
+                tracing::warn!("PoW challenge failed, proceeding without: {e}");
+            }
+        }
+
+        Ok(headers)
+    }
+
+    async fn solve_pow_challenge(&self) -> AppResult<String> {
+        let body = serde_json::json!({
+            "target_path": TARGET_PATH,
+        });
+
         let resp = self.client
             .post(format!("{DEEPSEEK_API_URL}/create_pow_challenge"))
-            .headers(self.headers())
-            .body("{}")
+            .headers(self.base_headers())
+            .json(&body)
             .send()
             .await?;
 
-        let _challenge: serde_json::Value = resp.json().await?;
-        // TODO: Implement actual PoW solution
-        // For now, return empty string
-        Ok(String::new())
-    }
-}
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::AppError::Provider(
+                format!("PoW challenge HTTP {status}: {text}")
+            ));
+        }
 
-#[async_trait]
-impl LLMProvider for DeepseekProvider {
-    async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
-        let messages: Vec<serde_json::Value> = request.messages
+        let raw: pow::PowChallengeResponse = resp.json().await?;
+        let challenge = raw.biz_data.challenge;
+
+        let solution = pow::solve_pow(&challenge)
+            .ok_or_else(|| crate::error::AppError::Provider("Failed to solve PoW challenge".to_string()))?;
+
+        Ok(pow::encode_solution(&solution))
+    }
+
+    fn build_messages_payload(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+        messages
             .iter()
             .map(|m| {
                 let mut obj = serde_json::json!({
@@ -79,7 +111,15 @@ impl LLMProvider for DeepseekProvider {
                 }
                 obj
             })
-            .collect();
+            .collect()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for DeepseekProvider {
+    async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
+        let messages = Self::build_messages_payload(&request.messages);
+        let headers = self.get_pow_header().await?;
 
         let body = serde_json::json!({
             "messages": messages,
@@ -91,7 +131,7 @@ impl LLMProvider for DeepseekProvider {
 
         let resp = self.client
             .post(format!("{DEEPSEEK_API_URL}/completion"))
-            .headers(self.headers())
+            .headers(headers)
             .json(&body)
             .send()
             .await?;
@@ -128,20 +168,8 @@ impl LLMProvider for DeepseekProvider {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
     ) -> AppResult<()> {
-        let messages: Vec<serde_json::Value> = request.messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "tool",
-                    },
-                    "content": m.content,
-                })
-            })
-            .collect();
+        let messages = Self::build_messages_payload(&request.messages);
+        let headers = self.get_pow_header().await?;
 
         let body = serde_json::json!({
             "messages": messages,
@@ -153,7 +181,7 @@ impl LLMProvider for DeepseekProvider {
 
         let resp = self.client
             .post(format!("{DEEPSEEK_API_URL}/completion"))
-            .headers(self.headers())
+            .headers(headers)
             .json(&body)
             .send()
             .await?;

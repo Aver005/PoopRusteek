@@ -81,8 +81,9 @@ pub trait LLMProvider: Send + Sync {
 ```
 
 ### TODO
-- [ ] Wire up agent loop to app event loop
-- [ ] Implement DeepSeek PoW challenge
+- [x] Wire up agent loop to app event loop
+- [x] Implement DeepSeek PoW challenge
+- [x] Add keyboard shortcuts (Ctrl+L clear)
 - [ ] Add MCP connection (stdio transport)
 - [ ] Implement tool execution in agent loop
 - [ ] Add onboarding flow
@@ -91,7 +92,6 @@ pub trait LLMProvider: Send + Sync {
 - [ ] Add syntax highlighting
 - [ ] Add slash commands
 - [ ] Add file mention (@file) support
-- [ ] Add keyboard shortcuts (Ctrl+L clear, etc.)
 
 ### FIX
 - (none yet)
@@ -100,3 +100,27 @@ pub trait LLMProvider: Send + Sync {
 - Ratatui v0.29 works well with crossterm v0.28
 - `tokio::spawn` requires `'static` lifetime — use `Arc` for shared providers
 - `color_eyre::Report` needs manual `From` impl for custom error types
+- DeepSeek PoW uses SHA-3_256 with difficulty-based target calculation
+- PoW prefix format: `{salt}_{expire_at}_{nonce}`
+- PoW response sent as `x-ds-pow-response` header (Base64-encoded JSON)
+
+## 2026-06-24 — Agent Wiring + PoW + Streaming
+
+### What was done
+- Wired agent loop to app event loop (spawned task streams chunks via mpsc)
+- Implemented DeepSeek PoW challenge (SHA-3_256 nonce finding)
+- Added `x-ds-pow-response` header to all DeepSeek requests
+- Streaming response works: chunks flow from provider → event channel → TUI
+- "Thinking..." indicator shown during streaming
+- Auto-scroll chat to bottom
+- Fixed borrow checker issues in MCP manager
+- First successful `cargo build`!
+
+### Files changed
+- `src/app/mod.rs` — Agent wiring, spawn task, event handling
+- `src/provider/deepseek.rs` — PoW integration, headers
+- `src/provider/pow.rs` — NEW: SHA-3 PoW solver
+- `src/provider/mod.rs` — Added pow module
+- `src/tui/widgets/chat.rs` — Streaming indicator, scroll fix
+- `src/mcp/manager.rs` — Fixed borrow checker
+- `Cargo.toml` — Added sha3, base64

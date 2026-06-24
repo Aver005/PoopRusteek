@@ -36,25 +36,30 @@ impl MCPManager {
     }
 
     pub async fn connect_all(&mut self) -> AppResult<()> {
-        for (name, server) in &mut self.servers {
-            server.status = MCPServerStatus::Connecting;
-            match self.connect_server(server).await {
-                Ok(()) => {
-                    server.status = MCPServerStatus::Connected;
-                    tracing::info!("MCP server '{name}' connected");
-                }
-                Err(e) => {
-                    server.status = MCPServerStatus::Error(e.to_string());
-                    tracing::warn!("MCP server '{name}' failed: {e}");
+        let names: Vec<String> = self.servers.keys().cloned().collect();
+        for name in names {
+            if let Some(server) = self.servers.get_mut(&name) {
+                server.status = MCPServerStatus::Connecting;
+            }
+            let result = self.try_connect(&name).await;
+            if let Some(server) = self.servers.get_mut(&name) {
+                match result {
+                    Ok(()) => {
+                        server.status = MCPServerStatus::Connected;
+                        tracing::info!("MCP server '{name}' connected");
+                    }
+                    Err(e) => {
+                        server.status = MCPServerStatus::Error(e.to_string());
+                        tracing::warn!("MCP server '{name}' failed: {e}");
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    async fn connect_server(&self, _server: &mut MCPServer) -> AppResult<()> {
+    async fn try_connect(&self, _name: &str) -> AppResult<()> {
         // TODO: Implement actual MCP connection via stdio or HTTP
-        // For now, stub
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 # Pooprusteek TODO
 
-## Phase 1: Core (Current)
+## Phase 1: Core (Complete)
 - [x] Project setup (Cargo.toml, modules)
 - [x] TUI skeleton (render loop, widgets)
 - [x] Provider trait + DeepSeek implementation
@@ -8,9 +8,10 @@
 - [x] Tool trait + bash/powershell tools
 - [x] MCP type definitions
 - [x] Event-driven architecture
-- [ ] Wire agent loop to app (send_to_agent)
-- [ ] DeepSeek PoW challenge implementation
-- [ ] Streaming response in TUI (real-time tokens)
+- [x] Wire agent loop to app (send_to_agent)
+- [x] DeepSeek PoW challenge implementation
+- [x] Streaming response in TUI (real-time tokens)
+- [x] First cargo build
 
 ## Phase 2: Features
 - [ ] Onboarding flow (first launch)
@@ -30,7 +31,7 @@
 - [ ] RAG (codebase semantic search)
 
 ## Phase 4: Polish
-- [ ] Keyboard shortcuts (Ctrl+L, Ctrl+K, etc.)
+- [x] Keyboard shortcuts (Ctrl+L clear)
 - [ ] Multiple themes
 - [ ] Mouse support
 - [ ] Copy/paste support

@@ -2,8 +2,9 @@ pub mod events;
 
 use crate::config::Config;
 use crate::error::AppResult;
-use crate::provider::ChatMessage;
-use events::{AppEvent, View};
+use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
+use events::{AgentResult, AppEvent};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub struct App {
@@ -11,10 +12,10 @@ pub struct App {
     pub state: AppState,
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
+    provider: Option<Arc<dyn LLMProvider>>,
 }
 
 pub struct AppState {
-    pub current_view: View,
     pub messages: Vec<ChatMessage>,
     pub input_buffer: String,
     pub input_cursor: usize,
@@ -28,13 +29,19 @@ impl App {
     pub async fn new(config: Config) -> AppResult<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+        let provider: Option<Arc<dyn LLMProvider>> = if config.provider.token.is_empty() {
+            None
+        } else {
+            let ds = crate::provider::deepseek::DeepseekProvider::new(&config.provider)?;
+            Some(Arc::new(ds))
+        };
+
         let state = AppState {
-            current_view: View::Chat,
             messages: Vec::new(),
             input_buffer: String::new(),
             input_cursor: 0,
             is_generating: false,
-            status_message: "Ready".to_string(),
+            status_message: if provider.is_some() { "Ready" } else { "No token configured" }.to_string(),
             scroll_offset: 0,
             error: None,
         };
@@ -44,6 +51,7 @@ impl App {
             state,
             event_tx,
             event_rx,
+            provider,
         })
     }
 
@@ -61,7 +69,7 @@ impl App {
         use crossterm::event::EventStream;
         use futures::StreamExt;
 
-        let tick_rate = std::time::Duration::from_millis(100);
+        let tick_rate = std::time::Duration::from_millis(50);
         let mut tick_interval = tokio::time::interval(tick_rate);
         let mut event_stream = EventStream::new();
 
@@ -99,25 +107,28 @@ impl App {
             AppEvent::AgentStarted => {
                 self.state.is_generating = true;
                 self.state.status_message = "Generating...".to_string();
+                self.state.messages.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: String::new(),
+                    name: None,
+                    tool_call_id: None,
+                });
             }
             AppEvent::AgentChunk(chunk) => {
                 if let Some(last) = self.state.messages.last_mut() {
-                    if last.role == crate::provider::Role::Assistant {
+                    if last.role == Role::Assistant {
                         last.content.push_str(&chunk);
                     }
                 }
             }
-            AppEvent::AgentDone(result) => {
+            AppEvent::AgentDone(_result) => {
                 self.state.is_generating = false;
                 self.state.status_message = "Ready".to_string();
-                if !result.text.is_empty() {
-                    self.state.messages.push(ChatMessage::assistant(&result.text));
-                }
             }
             AppEvent::AgentError(err) => {
                 self.state.is_generating = false;
-                self.state.error = Some(err);
-                self.state.status_message = "Error".to_string();
+                self.state.error = Some(err.clone());
+                self.state.status_message = err;
             }
             AppEvent::ToolStarted { name, id: _ } => {
                 self.state.status_message = format!("Running {name}...");
@@ -143,13 +154,14 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(true);
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Copy mode - TODO
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.messages.clear();
+                self.state.scroll_offset = 0;
             }
             KeyCode::Enter if !self.state.is_generating => {
                 let input = self.state.input_buffer.trim().to_string();
                 if !input.is_empty() {
-                    self.state.messages.push(crate::provider::ChatMessage::user(&input));
+                    self.state.messages.push(ChatMessage::user(&input));
                     self.state.input_buffer.clear();
                     self.state.input_cursor = 0;
                     self.send_to_agent(input).await?;
@@ -198,11 +210,58 @@ impl App {
     }
 
     async fn send_to_agent(&mut self, _input: String) -> AppResult<()> {
-        // TODO: Implement agent loop
-        // For now, just echo back
-        self.state.messages.push(crate::provider::ChatMessage::assistant(
-            "Agent not yet implemented. This is a placeholder response."
-        ));
+        let provider = match &self.provider {
+            Some(p) => Arc::clone(p),
+            None => {
+                self.state.messages.push(ChatMessage::assistant(
+                    "No provider configured. Set your DeepSeek token in config.",
+                ));
+                return Ok(());
+            }
+        };
+
+        let event_tx = self.event_tx.clone();
+        let messages: Vec<ChatMessage> = self.state.messages.clone();
+        let model = self.config.provider.model.clone();
+        let temperature = self.config.provider.temperature;
+        let max_tokens = self.config.provider.max_tokens;
+
+        let _ = event_tx.send(AppEvent::AgentStarted);
+
+        tokio::spawn(async move {
+            let request = CompletionRequest {
+                messages,
+                model,
+                temperature,
+                max_tokens,
+                stream: true,
+            };
+
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let stream_result = provider.complete_stream(request, tx).await;
+            if let Err(e) = stream_result {
+                let _ = event_tx.send(AppEvent::AgentError(e.to_string()));
+                return;
+            }
+
+            while let Some(chunk) = rx.recv().await {
+                if !chunk.content.is_empty() {
+                    let _ = event_tx.send(AppEvent::AgentChunk(chunk.content));
+                }
+                if let Some(reason) = &chunk.finish_reason {
+                    if reason == "stop" {
+                        break;
+                    }
+                }
+            }
+
+            let _ = event_tx.send(AppEvent::AgentDone(AgentResult {
+                text: String::new(),
+                tool_calls: Vec::new(),
+            }));
+        });
+
         Ok(())
     }
 

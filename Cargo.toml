@@ -55,6 +55,8 @@ uuid = { version = "1", features = ["v4"] }
 strip-ansi-escapes = "0.2"
 textwrap = "0.16"
 unicode-width = "0.2"
+sha3 = "0.10"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3
