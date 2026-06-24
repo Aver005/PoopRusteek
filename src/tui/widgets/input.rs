@@ -36,17 +36,13 @@ pub fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             Style::default().fg(theme.text_dim),
         ));
     } else {
-        let before_cursor = &input[..cursor];
-        let at_cursor = if cursor < input.len() {
-            &input[cursor..cursor + 1]
-        } else {
-            ""
-        };
-        let after_cursor = if cursor < input.len() {
-            &input[cursor + 1..]
-        } else {
-            ""
-        };
+        let char_count = input.chars().count();
+        let cursor = cursor.min(char_count);
+
+        let before_cursor: String = input.chars().take(cursor).collect();
+        let mut chars = input.chars().skip(cursor);
+        let at_cursor = chars.next().map(|c| c.to_string()).unwrap_or_default();
+        let after_cursor: String = chars.collect();
 
         spans.push(Span::styled(before_cursor, Style::default().fg(theme.fg)));
         if at_cursor.is_empty() {

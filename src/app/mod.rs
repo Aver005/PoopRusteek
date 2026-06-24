@@ -20,6 +20,7 @@ pub struct App {
     commands: CommandRegistry,
     pub mcp: MCPManager,
     tools: ToolRegistry,
+    last_key: Option<crossterm::event::KeyEvent>,
 }
 
 pub struct AppState {
@@ -71,6 +72,7 @@ impl App {
             commands: CommandRegistry::new(),
             mcp,
             tools: ToolRegistry::new(),
+            last_key: None,
         })
     }
 
@@ -99,8 +101,13 @@ impl App {
                 }
                 Some(Ok(event)) = event_stream.next() => {
                     match event {
-                        crossterm::event::Event::Key(key) => {
-                            self.handle_event(AppEvent::Key(key)).await?;
+                        crossterm::event::Event::Key(key)
+                            if key.kind == crossterm::event::KeyEventKind::Press =>
+                        {
+                            if self.last_key.as_ref() != Some(&key) {
+                                self.last_key = Some(key);
+                                self.handle_event(AppEvent::Key(key)).await?;
+                            }
                         }
                         crossterm::event::Event::Resize(w, h) => {
                             self.handle_event(AppEvent::Resize(w, h)).await?;
@@ -248,30 +255,35 @@ impl App {
                 }
             }
             KeyCode::Char(c) => {
-                self.state.input_buffer.insert(self.state.input_cursor, c);
+                let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
+                self.state.input_buffer.insert(byte_pos, c);
                 self.state.input_cursor += 1;
             }
             KeyCode::Backspace => {
                 if self.state.input_cursor > 0 {
                     self.state.input_cursor -= 1;
-                    self.state.input_buffer.remove(self.state.input_cursor);
+                    let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
+                    self.state.input_buffer.remove(byte_pos);
                 }
             }
             KeyCode::Delete => {
-                if self.state.input_cursor < self.state.input_buffer.len() {
-                    self.state.input_buffer.remove(self.state.input_cursor);
+                let char_count = self.state.input_buffer.chars().count();
+                if self.state.input_cursor < char_count {
+                    let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
+                    self.state.input_buffer.remove(byte_pos);
                 }
             }
             KeyCode::Left => {
                 self.state.input_cursor = self.state.input_cursor.saturating_sub(1);
             }
             KeyCode::Right => {
-                if self.state.input_cursor < self.state.input_buffer.len() {
+                let char_count = self.state.input_buffer.chars().count();
+                if self.state.input_cursor < char_count {
                     self.state.input_cursor += 1;
                 }
             }
             KeyCode::Home => self.state.input_cursor = 0,
-            KeyCode::End => self.state.input_cursor = self.state.input_buffer.len(),
+            KeyCode::End => self.state.input_cursor = self.state.input_buffer.chars().count(),
             KeyCode::Up => {
                 self.state.scroll_offset = self.state.scroll_offset.saturating_sub(1);
             }
@@ -411,4 +423,11 @@ impl App {
 
         result
     }
+}
+
+fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| s.len())
 }

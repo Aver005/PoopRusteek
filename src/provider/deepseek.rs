@@ -5,6 +5,7 @@ use crate::error::AppResult;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
+use uuid::Uuid;
 
 const DEEPSEEK_CHAT_URL: &str = "https://chat.deepseek.com";
 const DEEPSEEK_API_URL: &str = "https://chat.deepseek.com/api/v0/chat";
@@ -17,6 +18,8 @@ pub struct DeepseekProvider {
     model: String,
     temperature: f32,
     max_tokens: u32,
+    session_id: String,
+    parent_message_id: Option<String>,
 }
 
 impl DeepseekProvider {
@@ -31,6 +34,8 @@ impl DeepseekProvider {
             model: config.model.clone(),
             temperature: config.temperature,
             max_tokens: config.max_tokens,
+            session_id: Uuid::new_v4().to_string(),
+            parent_message_id: None,
         })
     }
 
@@ -113,6 +118,23 @@ impl DeepseekProvider {
             })
             .collect()
     }
+
+    fn build_body(&self, messages: Vec<serde_json::Value>, stream: bool) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "messages": messages,
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": stream,
+            "chat_session_id": self.session_id,
+        });
+
+        if let Some(parent_id) = &self.parent_message_id {
+            body["parent_message_id"] = serde_json::json!(parent_id);
+        }
+
+        body
+    }
 }
 
 #[async_trait]
@@ -120,14 +142,7 @@ impl LLMProvider for DeepseekProvider {
     async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
         let messages = Self::build_messages_payload(&request.messages);
         let headers = self.get_pow_header().await?;
-
-        let body = serde_json::json!({
-            "messages": messages,
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": false,
-        });
+        let body = self.build_body(messages, false);
 
         let resp = self.client
             .post(format!("{DEEPSEEK_API_URL}/completion"))
@@ -170,14 +185,7 @@ impl LLMProvider for DeepseekProvider {
     ) -> AppResult<()> {
         let messages = Self::build_messages_payload(&request.messages);
         let headers = self.get_pow_header().await?;
-
-        let body = serde_json::json!({
-            "messages": messages,
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": true,
-        });
+        let body = self.build_body(messages, true);
 
         let resp = self.client
             .post(format!("{DEEPSEEK_API_URL}/completion"))

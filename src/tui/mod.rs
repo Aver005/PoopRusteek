@@ -22,8 +22,8 @@ pub fn init() -> Result<TuiTerminal> {
 }
 
 pub fn restore(terminal: &mut TuiTerminal) -> Result<()> {
+    terminal.show_cursor()?;
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
     Ok(())
 }
