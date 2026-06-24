@@ -82,12 +82,12 @@ pub fn stream_visible_text(text: &str) -> String {
     let mut visible = without_complete.to_string();
 
     let cut_markers = [
-        "<tool_use",
-        "</tool_use",
+        "<tool",
+        "</tool",
         "<name",
         "</name",
-        "<arguments",
-        "</arguments",
+        "<arg",
+        "</arg",
         "[TOOL:",
     ];
 

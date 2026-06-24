@@ -37,6 +37,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             render_modal(frame, area, modal, &theme);
         }
     })?;
+    terminal.hide_cursor()?;
     Ok(())
 }
 

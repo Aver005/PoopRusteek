@@ -182,7 +182,22 @@ fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
         .or_else(|| ss.find_syntax_by_extension(lang))
         .unwrap_or_else(|| ss.find_syntax_plain_text());
 
-    let syn_theme = &ts.themes["base16.ocean.dark"];
+    let syn_theme = ts
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| ts.themes.get("InspiredGitHub"))
+        .or_else(|| ts.themes.values().next());
+    let Some(syn_theme) = syn_theme else {
+        return code
+            .lines()
+            .map(|line| {
+                Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(theme.warning),
+                ))
+            })
+            .collect();
+    };
     let mut h = HighlightLines::new(syntax, syn_theme);
 
     let mut result = Vec::new();

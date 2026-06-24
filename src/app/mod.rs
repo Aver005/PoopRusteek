@@ -97,7 +97,7 @@ impl App {
         use crossterm::event::EventStream;
         use futures::StreamExt;
 
-        let tick_rate = std::time::Duration::from_millis(50);
+        let tick_rate = std::time::Duration::from_millis(180);
         let mut tick_interval = tokio::time::interval(tick_rate);
         let mut event_stream = EventStream::new();
 
@@ -218,7 +218,9 @@ impl App {
                 self.state.status_message = n.message;
             }
             AppEvent::Tick => {
-                self.state.animation_tick = self.state.animation_tick.wrapping_add(1);
+                if self.state.is_generating || self.state.messages.is_empty() {
+                    self.state.animation_tick = self.state.animation_tick.wrapping_add(1);
+                }
             }
             _ => {}
         }
