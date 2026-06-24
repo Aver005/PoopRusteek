@@ -1,0 +1,66 @@
+# --- Cargo / Rust ---
+/target/
+/**/target/
+
+# Cargo lockfiles
+Cargo.lock
+
+# Rust build artifacts (extra safety)
+/*.rs.bk
+**/*.rmeta
+**/*.rlib
+**/*.so
+**/*.dylib
+**/*.dll
+
+# --- IDE / Editors ---
+.vscode/
+.idea/
+*.iml
+
+# --- OS / misc ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- Env / secrets / local config ---
+.env
+.env.*
+!.env.example
+*.env
+config.local.*
+secrets.*
+/secrets.json
+*.pem
+*.key
+*.crt
+
+# --- Local runtime state ---
+*.pid
+*.sock
+*.tmp
+tmp/
+temp/
+
+# --- TUI/CLI app artifacts ---
+/data/
+data/
+/cache/
+cache/
+
+# --- Backups ---
+*~
+*.swp
+*.swo
+
+# --- Coverage / profiling ---
+/coverage/
+/grcov*.out
+*.profraw
+*.heap
+
+# --- Dev ---
+.dev/
+*.dev.*

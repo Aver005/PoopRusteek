@@ -1,0 +1,49 @@
+# Pooprusteek TODO
+
+## Phase 1: Core (Current)
+- [x] Project setup (Cargo.toml, modules)
+- [x] TUI skeleton (render loop, widgets)
+- [x] Provider trait + DeepSeek implementation
+- [x] Agent loop + context manager
+- [x] Tool trait + bash/powershell tools
+- [x] MCP type definitions
+- [x] Event-driven architecture
+- [ ] Wire agent loop to app (send_to_agent)
+- [ ] DeepSeek PoW challenge implementation
+- [ ] Streaming response in TUI (real-time tokens)
+
+## Phase 2: Features
+- [ ] Onboarding flow (first launch)
+- [ ] Session persistence (save/load)
+- [ ] Slash commands (/help, /clear, /compact, etc.)
+- [ ] File mentions (@file)
+- [ ] Markdown rendering in TUI
+- [ ] Syntax highlighting for code blocks
+- [ ] Context compaction (auto-summarize)
+- [ ] Tool approval dialog
+
+## Phase 3: Integration
+- [ ] MCP stdio transport
+- [ ] MCP HTTP transport
+- [ ] MCP auto-discovery (IDE configs)
+- [ ] ACP server mode
+- [ ] RAG (codebase semantic search)
+
+## Phase 4: Polish
+- [ ] Keyboard shortcuts (Ctrl+L, Ctrl+K, etc.)
+- [ ] Multiple themes
+- [ ] Mouse support
+- [ ] Copy/paste support
+- [ ] Error recovery
+- [ ] Rate limiting
+- [ ] Request retry with backoff
+
+## Phase 5: Distribution
+- [ ] Release builds (LTO, strip)
+- [ ] Cross-compilation (Windows, Linux, macOS)
+- [ ] Installer scripts
+- [ ] GitHub Actions CI/CD
+- [ ] Man page
+
+## Known Issues
+- (none yet)
