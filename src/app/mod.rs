@@ -20,7 +20,6 @@ pub struct App {
     commands: CommandRegistry,
     pub mcp: MCPManager,
     tools: ToolRegistry,
-    last_key: Option<crossterm::event::KeyEvent>,
 }
 
 pub struct AppState {
@@ -72,7 +71,6 @@ impl App {
             commands: CommandRegistry::new(),
             mcp,
             tools: ToolRegistry::new(),
-            last_key: None,
         })
     }
 
@@ -102,11 +100,14 @@ impl App {
                 Some(Ok(event)) = event_stream.next() => {
                     match event {
                         crossterm::event::Event::Key(key)
-                            if key.kind == crossterm::event::KeyEventKind::Press =>
+                            if matches!(
+                                key.kind,
+                                crossterm::event::KeyEventKind::Press
+                                    | crossterm::event::KeyEventKind::Repeat
+                            ) =>
                         {
-                            if self.last_key.as_ref() != Some(&key) {
-                                self.last_key = Some(key);
-                                self.handle_event(AppEvent::Key(key)).await?;
+                            if self.handle_event(AppEvent::Key(key)).await? {
+                                return Ok(());
                             }
                         }
                         crossterm::event::Event::Resize(w, h) => {
@@ -222,7 +223,12 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
+            {
+                return Ok(true);
+            }
+            KeyCode::Esc => {
                 return Ok(true);
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
