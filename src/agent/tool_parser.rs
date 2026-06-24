@@ -81,6 +81,10 @@ pub fn stream_visible_text(text: &str) -> String {
     let without_complete = legacy_pattern.replace_all(&without_xml, "");
     let mut visible = without_complete.to_string();
 
+    if let Some(index) = visible.find('<') {
+        visible.truncate(index);
+    }
+
     let cut_markers = [
         "<tool",
         "</tool",

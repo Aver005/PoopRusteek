@@ -1,4 +1,6 @@
 use crate::provider::ChatMessage;
+use std::sync::Arc;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -21,6 +23,7 @@ pub enum AppEvent {
     ToolProgress { id: String, message: String },
     ToolDone { id: String, result: String },
     ToolError { id: String, error: String },
+    RequestToolApproval(ToolApprovalRequest),
 
     // UI events
     SwitchView(View),
@@ -43,6 +46,45 @@ pub struct ToolCallInfo {
     pub name: String,
     pub arguments: serde_json::Value,
     pub result: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolApprovalRequest {
+    pub tool_name: String,
+    pub arguments: String,
+    decision: Arc<Mutex<Option<bool>>>,
+    notify: Arc<Notify>,
+}
+
+impl ToolApprovalRequest {
+    pub fn new(tool_name: String, arguments: String) -> Self {
+        Self {
+            tool_name,
+            arguments,
+            decision: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub async fn wait(&self) -> bool {
+        loop {
+            {
+                let decision = self.decision.lock().await;
+                if let Some(value) = *decision {
+                    return value;
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    pub async fn resolve(&self, value: bool) {
+        {
+            let mut decision = self.decision.lock().await;
+            *decision = Some(value);
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -7,7 +7,7 @@ use crate::tui::widgets;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> crate::error::AppResult<()> {
@@ -37,7 +37,11 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             render_modal(frame, area, modal, &theme);
         }
     })?;
-    terminal.hide_cursor()?;
+    if state.modal.is_some() || state.is_generating {
+        terminal.hide_cursor()?;
+    } else {
+        terminal.show_cursor()?;
+    }
     Ok(())
 }
 
@@ -144,7 +148,7 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
 fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     let popup_width = area.width.min(60);
     let popup_height = match modal {
-        Modal::ToolApproval { .. } => 8,
+        Modal::ToolApproval { .. } => 12,
         Modal::Confirm { .. } => 6,
         Modal::Input { .. } => 6,
     };
@@ -178,18 +182,19 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(
-                        "  Args: ",
+                        "  Arguments:",
                         Style::default().fg(theme.text_dim),
-                    ),
-                    Span::styled(
-                        arguments.clone(),
-                        Style::default().fg(theme.fg),
                     ),
                 ]),
                 Line::from(""),
+                Line::from(vec![Span::styled(
+                    format!("  {}", arguments.replace('\n', "\n  ")),
+                    Style::default().fg(theme.fg),
+                )]),
+                Line::from(""),
                 Line::from(vec![
                     Span::styled(
-                        "  Allow this tool call?",
+                        "  Allow this tool call? Press Y to allow, N/Esc to deny.",
                         Style::default().fg(theme.fg),
                     ),
                 ]),
@@ -213,7 +218,8 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                 ]),
             ];
 
-            let inner = block.inner(inner_area(area, popup_area));
+            frame.render_widget(Clear, popup_area);
+            let inner = block.inner(popup_area);
             frame.render_widget(block, popup_area);
             let paragraph = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -257,6 +263,7 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                 ]),
             ];
 
+            frame.render_widget(Clear, popup_area);
             let inner = block.inner(popup_area);
             frame.render_widget(block, popup_area);
             let paragraph = Paragraph::new(lines)
@@ -289,6 +296,7 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                 ]),
             ];
 
+            frame.render_widget(Clear, popup_area);
             let inner = block.inner(popup_area);
             frame.render_widget(block, popup_area);
             let paragraph = Paragraph::new(lines)
@@ -297,10 +305,6 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
             frame.render_widget(paragraph, inner);
         }
     }
-}
-
-fn inner_area(_area: Rect, popup: Rect) -> Rect {
-    popup
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -322,7 +326,7 @@ fn animated_title(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
     text.chars()
         .enumerate()
         .map(|(index, ch)| {
-            let pulse = ((state.animation_tick as usize / 6) + index) % 6;
+            let pulse = ((state.animation_tick as usize / 5) + index) % 6;
             let color = match pulse {
                 0 | 1 => theme.accent_soft,
                 2 | 3 => theme.accent,

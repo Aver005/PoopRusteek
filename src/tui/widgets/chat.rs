@@ -158,8 +158,10 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let total_lines = lines.len();
     let visible_height = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible_height);
-    let scroll = (state.scroll_offset as usize).min(max_scroll);
-    let start = scroll;
+    let scroll_from_bottom = (state.scroll_offset as usize).min(max_scroll);
+    let start = total_lines
+        .saturating_sub(visible_height)
+        .saturating_sub(scroll_from_bottom);
     let visible: Vec<Line> = lines.into_iter().skip(start).take(visible_height).collect();
 
     let paragraph = Paragraph::new(visible)

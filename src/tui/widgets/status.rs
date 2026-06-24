@@ -24,7 +24,6 @@ pub fn render_status(frame: &mut Frame, area: Rect, state: &AppState, config: &C
         2 => "-",
         _ => "\\",
     };
-
     let status_style = if state.is_generating {
         Style::default()
             .fg(theme.warning)

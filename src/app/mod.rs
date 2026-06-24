@@ -9,7 +9,7 @@ use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::commands::CommandResult;
 use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
-use events::{AgentResult, AppEvent, Modal};
+use events::{AgentResult, AppEvent, Modal, ToolApprovalRequest};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -35,6 +35,7 @@ pub struct AppState {
     pub error: Option<String>,
     pub modal: Option<Modal>,
     pub approved_tools: std::collections::HashSet<String>,
+    pub pending_tool_approval: Option<ToolApprovalRequest>,
     pub animation_tick: u64,
 }
 
@@ -67,6 +68,7 @@ impl App {
             error: None,
             modal: None,
             approved_tools: std::collections::HashSet::new(),
+            pending_tool_approval: None,
             animation_tick: 0,
         };
 
@@ -97,7 +99,7 @@ impl App {
         use crossterm::event::EventStream;
         use futures::StreamExt;
 
-        let tick_rate = std::time::Duration::from_millis(180);
+        let tick_rate = std::time::Duration::from_millis(120);
         let mut tick_interval = tokio::time::interval(tick_rate);
         let mut event_stream = EventStream::new();
 
@@ -208,6 +210,15 @@ impl App {
             AppEvent::ToolError { id: _, error } => {
                 self.state.status_message = format!("Tool error: {error}");
             }
+            AppEvent::RequestToolApproval(request) => {
+                self.state.is_generating = false;
+                self.state.status_message = format!("Approve tool {}?", request.tool_name);
+                self.state.modal = Some(Modal::ToolApproval {
+                    tool_name: request.tool_name.clone(),
+                    arguments: request.arguments.clone(),
+                });
+                self.state.pending_tool_approval = Some(request);
+            }
             AppEvent::PushModal(modal) => {
                 self.state.modal = Some(modal);
             }
@@ -218,7 +229,7 @@ impl App {
                 self.state.status_message = n.message;
             }
             AppEvent::Tick => {
-                if self.state.is_generating || self.state.messages.is_empty() {
+                if self.state.is_generating || (self.state.messages.is_empty() && self.state.modal.is_none()) {
                     self.state.animation_tick = self.state.animation_tick.wrapping_add(1);
                 }
             }
@@ -230,16 +241,26 @@ impl App {
     async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        if let Some(modal) = &self.state.modal {
+        if let Some(modal) = self.state.modal.clone() {
             match modal {
                 Modal::ToolApproval { tool_name, .. } => {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             self.state.approved_tools.insert(tool_name.clone());
+                            if let Some(request) = self.state.pending_tool_approval.take() {
+                                request.resolve(true).await;
+                            }
                             self.state.modal = None;
+                            self.state.is_generating = true;
+                            self.state.status_message = format!("Running {}", tool_name);
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            if let Some(request) = self.state.pending_tool_approval.take() {
+                                request.resolve(false).await;
+                            }
                             self.state.modal = None;
+                            self.state.is_generating = true;
+                            self.state.status_message = format!("Denied {}", tool_name);
                         }
                         _ => {}
                     }
@@ -338,16 +359,16 @@ impl App {
             KeyCode::Home => self.state.input_cursor = 0,
             KeyCode::End => self.state.input_cursor = self.state.input_buffer.chars().count(),
             KeyCode::Up => {
-                self.state.scroll_offset = self.state.scroll_offset.saturating_sub(1);
-            }
-            KeyCode::Down => {
                 self.state.scroll_offset = self.state.scroll_offset.saturating_add(1);
             }
+            KeyCode::Down => {
+                self.state.scroll_offset = self.state.scroll_offset.saturating_sub(1);
+            }
             KeyCode::PageUp => {
-                self.state.scroll_offset = self.state.scroll_offset.saturating_sub(10);
+                self.state.scroll_offset = self.state.scroll_offset.saturating_add(10);
             }
             KeyCode::PageDown => {
-                self.state.scroll_offset = self.state.scroll_offset.saturating_add(10);
+                self.state.scroll_offset = self.state.scroll_offset.saturating_sub(10);
             }
             _ => {}
         }
@@ -499,20 +520,32 @@ impl App {
 
                 for tool_call in tool_calls.into_iter().take(max_tools_per_step) {
                     let tool_id = uuid::Uuid::new_v4().to_string();
-                    let _ = event_tx.send(AppEvent::ToolStarted {
-                        name: tool_call.name.clone(),
-                        id: tool_id.clone(),
-                    });
+                    let arguments_preview = serde_json::to_string_pretty(&tool_call.arguments)
+                        .unwrap_or_else(|_| tool_call.arguments.to_string());
+                    let approval = ToolApprovalRequest::new(
+                        tool_call.name.clone(),
+                        arguments_preview,
+                    );
+                    let _ = event_tx.send(AppEvent::RequestToolApproval(approval.clone()));
+                    let approved = approval.wait().await;
 
-                    let execution = if tool_call.name.starts_with("mcp__") {
-                        let mut mcp = mcp.lock().await;
-                        match mcp.call_tool(&tool_call.name, tool_call.arguments.clone()).await {
-                            Ok(result) => (result.content, result.is_error),
-                            Err(error) => (error.to_string(), true),
+                    let execution = if approved {
+                        let _ = event_tx.send(AppEvent::ToolStarted {
+                            name: tool_call.name.clone(),
+                            id: tool_id.clone(),
+                        });
+                        if tool_call.name.starts_with("mcp__") {
+                            let mut mcp = mcp.lock().await;
+                            match mcp.call_tool(&tool_call.name, tool_call.arguments.clone()).await {
+                                Ok(result) => (result.content, result.is_error),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else {
+                            let result = tools.execute(&tool_call.name, tool_call.arguments.clone()).await;
+                            (result.content, result.is_error)
                         }
                     } else {
-                        let result = tools.execute(&tool_call.name, tool_call.arguments.clone()).await;
-                        (result.content, result.is_error)
+                        ("Execution denied by user.".to_string(), true)
                     };
 
                     let (tool_result, is_error) = execution;
