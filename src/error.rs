@@ -29,6 +29,9 @@ pub enum AppError {
     #[error("Task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 
+    #[error("Session not found: {0}")]
+    SessionNotFound(String),
+
     #[error("{0}")]
     Custom(String),
 }

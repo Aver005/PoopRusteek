@@ -2,75 +2,145 @@ use crate::config::Config;
 use crate::error::AppResult;
 use crate::provider::ChatMessage;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+
+const SESSION_VERSION: i32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Session {
+    pub version: i32,
     pub id: String,
-    pub messages: Vec<ChatMessage>,
     pub created_at: String,
     pub updated_at: String,
+    pub workspace_root: String,
+    pub model_type: String,
+    pub messages: Vec<ChatMessage>,
 }
 
-impl Session {
-    pub fn new() -> Self {
-        let now = chrono::Utc::now().to_rfc3339();
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            messages: Vec::new(),
-            created_at: now.clone(),
-            updated_at: now,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub workspace_root: String,
+    pub message_count: usize,
+    pub title: String,
+}
+
+pub fn create_session_id() -> String {
+    let now = chrono::Utc::now();
+    let ts = now.format("%Y-%m-%dT%H-%M-%S-%3fZ").to_string();
+    let uuid_string = uuid::Uuid::new_v4().to_string();
+    let suffix = uuid_string.split('-').next().unwrap_or("abc123");
+    format!("{ts}-{suffix}")
+}
+
+pub fn save_session(
+    id: &str,
+    created_at: &str,
+    messages: &[ChatMessage],
+    config: &Config,
+) -> AppResult<()> {
+    let dir = Config::sessions_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let session = Session {
+        version: SESSION_VERSION,
+        id: id.to_string(),
+        created_at: created_at.to_string(),
+        updated_at: now,
+        workspace_root: std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        model_type: config.provider.model.clone(),
+        messages: messages.to_vec(),
+    };
+
+    let path = dir.join(format!("{id}.json"));
+    let json = serde_json::to_string_pretty(&session)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+pub fn load_local(id: &str, _config: &Config) -> AppResult<Session> {
+    let dir = Config::sessions_dir();
+    let path = dir.join(format!("{id}.json"));
+    if !path.exists() {
+        return Err(crate::error::AppError::SessionNotFound(id.to_string()));
+    }
+    let json = std::fs::read_to_string(&path)?;
+    let session: Session = serde_json::from_str(&json)?;
+    Ok(session)
+}
+
+pub fn list_sessions(_config: &Config) -> AppResult<Vec<SessionSummary>> {
+    let dir = Config::sessions_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut sessions: Vec<SessionSummary> = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
         }
-    }
-
-    pub fn save(&self, _config: &Config) -> AppResult<PathBuf> {
-        let dir = Config::sessions_dir();
-        std::fs::create_dir_all(&dir)?;
-
-        let path = dir.join(format!("{}.json", self.id));
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
-
-        Ok(path)
-    }
-
-    pub fn load(path: &PathBuf) -> AppResult<Self> {
-        let json = std::fs::read_to_string(path)?;
-        let session: Session = serde_json::from_str(&json)?;
-        Ok(session)
-    }
-
-    pub fn list_sessions(_config: &Config) -> AppResult<Vec<PathBuf>> {
-        let dir = Config::sessions_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut sessions: Vec<PathBuf> = std::fs::read_dir(&dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext == "json")
-                    .unwrap_or(false)
-            })
-            .map(|e| e.path())
-            .collect();
-
-        sessions.sort_by(|a, b| {
-            let ma = std::fs::metadata(a).ok().and_then(|m| m.modified().ok());
-            let mb = std::fs::metadata(b).ok().and_then(|m| m.modified().ok());
-            mb.cmp(&ma)
+        let json = match std::fs::read_to_string(&path) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        let session: Session = match serde_json::from_str(&json) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let title = derive_title(&session.messages);
+        sessions.push(SessionSummary {
+            id: session.id,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            workspace_root: session.workspace_root,
+            message_count: session.messages.len(),
+            title,
         });
-
-        Ok(sessions)
     }
 
-    pub fn delete(&self, _config: &Config) -> AppResult<()> {
-        let path = Config::sessions_dir().join(format!("{}.json", self.id));
-        if path.exists() {
-            std::fs::remove_file(path)?;
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(sessions)
+}
+
+pub fn timestamp_now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+pub fn save_local(session: &Session, _config: &Config) -> AppResult<()> {
+    let dir = Config::sessions_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    let path = dir.join(format!("{}.json", session.id));
+    let json = serde_json::to_string_pretty(session)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+pub fn derive_title(messages: &[ChatMessage]) -> String {
+    for msg in messages.iter().rev() {
+        let text = match msg.role {
+            crate::provider::Role::User | crate::provider::Role::Assistant => {
+                msg.visible_content()
+            }
+            _ => continue,
+        };
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let first_line = trimmed.lines().next().unwrap_or(trimmed);
+            if first_line.chars().count() > 80 {
+                let truncated: String = first_line.chars().take(80).collect();
+                return format!("{}...", truncated);
+            }
+            return first_line.to_string();
         }
-        Ok(())
     }
+    "Empty conversation".to_string()
 }

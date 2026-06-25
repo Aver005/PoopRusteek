@@ -24,6 +24,8 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip)]
     pub display_content: Option<String>,
+    #[serde(skip)]
+    pub tool_error: bool,
 }
 
 impl ChatMessage {
@@ -34,6 +36,7 @@ impl ChatMessage {
             name: None,
             tool_call_id: None,
             display_content: None,
+            tool_error: false,
         }
     }
 
@@ -44,6 +47,7 @@ impl ChatMessage {
             name: None,
             tool_call_id: None,
             display_content: None,
+            tool_error: false,
         }
     }
 
@@ -54,6 +58,7 @@ impl ChatMessage {
             name: None,
             tool_call_id: None,
             display_content: None,
+            tool_error: false,
         }
     }
 
@@ -64,16 +69,24 @@ impl ChatMessage {
             name: None,
             tool_call_id: Some(tool_call_id.to_string()),
             display_content: None,
+            tool_error: false,
         }
     }
 
-    pub fn tool_with_display(tool_call_id: &str, tool_name: &str, content: &str, display: &str) -> Self {
+    pub fn tool_with_display(
+        tool_call_id: &str,
+        tool_name: &str,
+        content: &str,
+        display: &str,
+        is_error: bool,
+    ) -> Self {
         Self {
             role: Role::Tool,
             content: content.to_string(),
             name: Some(tool_name.to_string()),
             tool_call_id: Some(tool_call_id.to_string()),
             display_content: Some(display.to_string()),
+            tool_error: is_error,
         }
     }
 
@@ -121,4 +134,16 @@ pub trait LLMProvider: Send + Sync {
     ) -> crate::error::AppResult<()>;
     fn name(&self) -> &str;
     fn model(&self) -> &str;
+    async fn reset(&self) -> crate::error::AppResult<()> {
+        Ok(())
+    }
+
+    async fn fetch_remote_session_messages(
+        &self,
+        _session_id: &str,
+    ) -> crate::error::AppResult<Vec<ChatMessage>> {
+        Err(crate::error::AppError::Custom(
+            "Remote session fetching not supported by this provider".to_string(),
+        ))
+    }
 }

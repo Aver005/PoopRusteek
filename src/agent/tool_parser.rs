@@ -68,17 +68,21 @@ pub fn has_tool_calls(text: &str) -> bool {
 }
 
 pub fn strip_tool_calls(text: &str) -> String {
-    let xml_pattern = Regex::new(r"(?s)<tool_use>\s*.*?\s*</tool_use>").unwrap();
+    let tool_xml = Regex::new(r"(?s)<tool_use>\s*.*?\s*</tool_use>").unwrap();
+    let thinking = Regex::new(r"(?s)<thinking>\s*.*?\s*</thinking>").unwrap();
     let legacy_pattern = Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").unwrap();
-    let without_xml = xml_pattern.replace_all(text, "");
-    legacy_pattern.replace_all(without_xml.trim(), "").trim().to_string()
+    let without_xml = tool_xml.replace_all(text, "");
+    let without_thinking = thinking.replace_all(&without_xml, "");
+    legacy_pattern.replace_all(without_thinking.trim(), "").trim().to_string()
 }
 
 pub fn stream_visible_text(text: &str) -> String {
-    let xml_pattern = Regex::new(r"(?s)<tool_use>\s*.*?\s*</tool_use>").unwrap();
+    let tool_xml = Regex::new(r"(?s)<tool_use>\s*.*?\s*</tool_use>").unwrap();
+    let thinking = Regex::new(r"(?s)<thinking>\s*.*?\s*</thinking>").unwrap();
     let legacy_pattern = Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").unwrap();
-    let without_xml = xml_pattern.replace_all(text, "");
-    let without_complete = legacy_pattern.replace_all(&without_xml, "");
+    let without_xml = tool_xml.replace_all(text, "");
+    let without_thinking = thinking.replace_all(&without_xml, "");
+    let without_complete = legacy_pattern.replace_all(&without_thinking, "");
     let mut visible = without_complete.to_string();
 
     if let Some(index) = visible.find('<') {

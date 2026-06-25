@@ -13,6 +13,10 @@ impl Command for VersionCommand {
         "Show version info"
     }
 
+    fn usage(&self) -> &str {
+        "/version"
+    }
+
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         let version = env!("CARGO_PKG_VERSION");
         let info = format!(

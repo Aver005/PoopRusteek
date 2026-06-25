@@ -13,11 +13,17 @@ impl Command for ResetCommand {
         "Reset session completely"
     }
 
+    fn usage(&self) -> &str {
+        "/reset"
+    }
+
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         state.messages.clear();
         state.scroll_offset = 0;
         state.input_buffer.clear();
         state.input_cursor = 0;
+        state.input_selection_anchor = None;
+        state.autocomplete = Default::default();
         state.is_generating = false;
         state.status_message = "Ready".to_string();
         state.error = None;
@@ -26,6 +32,6 @@ impl Command for ResetCommand {
             "Session reset. How can I help you?"
         ));
 
-        CommandResult::Handled
+        CommandResult::ResetProvider
     }
 }

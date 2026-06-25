@@ -1,171 +1,148 @@
 use crate::app::AppState;
 use crate::provider::Role;
-use crate::tui::markdown::render_markdown;
 use crate::tui::theme::Theme;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 
 pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.border_style(false))
-        .title(" Conversation ")
-        .title_style(Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD))
-        .style(Style::default().bg(theme.panel));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if state.messages.is_empty() && !state.is_generating {
-        let welcome = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "  Pooprusteek",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " v0.1.0",
-                    Style::default().fg(theme.text_dim),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "  A fast TUI coding agent powered by DeepSeek",
-                    Style::default().fg(theme.text_dim),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "  Type your message and press Enter to start.",
-                    Style::default().fg(theme.text_dim),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "  Ctrl+C quit  |  Ctrl+L clear",
-                    Style::default().fg(theme.text_dim),
-                ),
-            ]),
-        ];
-
-        let paragraph = Paragraph::new(welcome)
-            .style(Style::default().bg(theme.bg))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, inner);
-        return;
-    }
-
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &state.messages {
         match msg.role {
             Role::User => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " prompt ",
-                        Style::default()
-                            .fg(theme.bg)
-                            .bg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                for line in msg.visible_content().lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("  {line}"),
-                            Style::default().fg(theme.fg).bg(theme.user_bg),
-                        ),
-                    ]));
-                }
-                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled(
+                    format!(" {} ", msg.visible_content()),
+                    Style::default().fg(theme.fg).bg(theme.user_bg),
+                )]));
             }
             Role::Assistant => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " pooprusteek ",
-                        Style::default()
-                            .fg(theme.bg)
-                            .bg(theme.success)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+                let header = Span::styled(
+                    " pooprusteek ",
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(theme.success)
+                        .add_modifier(Modifier::BOLD),
+                );
                 if msg.content.is_empty() {
                     lines.push(Line::from(vec![
+                        header,
                         Span::styled(
-                            "  Thinking...",
+                            " Thinking...",
                             Style::default().fg(theme.text_dim),
                         ),
                     ]));
                 } else {
-                    let mut md_lines = render_markdown(msg.visible_content(), theme);
-                    for line in &mut md_lines {
-                        let mut styled_spans: Vec<Span> = Vec::new();
-                        styled_spans.push(Span::styled(
-                            "  ",
-                            Style::default().fg(theme.fg).bg(theme.assistant_bg),
-                        ));
-                        for span in line.spans.iter() {
-                            styled_spans.push(span.clone());
+                    let mut md_lines = crate::tui::markdown::render_markdown(msg.visible_content(), theme);
+                    for md_line in &mut md_lines {
+                        let mut styled: Vec<Span> = Vec::new();
+                        for span in md_line.spans.iter() {
+                            styled.push(span.clone());
                         }
-                        *line = Line::from(styled_spans);
+                        *md_line = Line::from(styled);
                     }
+                    lines.push(Line::from(vec![header]));
                     lines.extend(md_lines);
                 }
-                lines.push(Line::from(""));
             }
             Role::System => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        " system ",
-                        Style::default().fg(theme.bg).bg(theme.warning),
+                        " \u{2139} ",
+                        Style::default().fg(theme.warning).bg(theme.bg),
                     ),
                     Span::styled(
-                        format!(" {}", msg.visible_content()),
-                        Style::default().fg(theme.text_dim),
+                        msg.visible_content(),
+                        Style::default().fg(theme.text_dim).bg(theme.bg),
                     ),
                 ]));
             }
             Role::Tool => {
+                let tool_name = msg.name.as_deref().unwrap_or("unknown");
+                let icon = if msg.tool_error { "\u{2717}" } else { "\u{2713}" };
+                let status_color = if msg.tool_error { theme.error } else { theme.success };
+
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!(" tool · {} ", msg.name.as_deref().unwrap_or("unknown")),
-                        Style::default().fg(theme.bg).bg(theme.accent_soft),
+                        format!(" {icon} "),
+                        Style::default()
+                            .fg(theme.bg)
+                            .bg(status_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {tool_name} "),
+                        Style::default()
+                            .fg(theme.bg)
+                            .bg(if msg.tool_error { theme.error } else { theme.accent })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if msg.tool_error { " failed " } else { " done " },
+                        Style::default().fg(theme.text_dim).bg(theme.tool_bg),
                     ),
                 ]));
-                for line in msg.visible_content().lines() {
+
+                let body = msg.visible_content();
+                let body_lines: Vec<&str> = body.lines().collect();
+                if body_lines.iter().all(|l| l.trim().is_empty()) {
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("  {line}"),
-                            Style::default().fg(theme.text_soft).bg(theme.tool_bg),
+                            "  (no output)",
+                            Style::default().fg(theme.text_dim).bg(theme.tool_bg),
                         ),
                     ]));
+                } else {
+                    for line_text in &body_lines {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                " \u{2502} ",
+                                Style::default().fg(theme.accent_soft).bg(theme.tool_bg),
+                            ),
+                            Span::styled(
+                                (*line_text).to_string(),
+                                Style::default()
+                                    .fg(if msg.tool_error { theme.error } else { theme.text_soft })
+                                    .bg(theme.tool_bg),
+                            ),
+                        ]));
+                    }
                 }
-                lines.push(Line::from(""));
             }
         }
+        lines.push(Line::from(""));
     }
 
-    let total_lines = lines.len();
-    let visible_height = inner.height as usize;
-    let max_scroll = total_lines.saturating_sub(visible_height);
+    let total_rows = count_wrapped_rows(&lines, area.width as usize);
+    let visible_height = area.height as usize;
+    let max_scroll = total_rows.saturating_sub(visible_height);
     let scroll_from_bottom = (state.scroll_offset as usize).min(max_scroll);
-    let start = total_lines
-        .saturating_sub(visible_height)
-        .saturating_sub(scroll_from_bottom);
-    let visible: Vec<Line> = lines.into_iter().skip(start).take(visible_height).collect();
+    let top_row = max_scroll.saturating_sub(scroll_from_bottom);
 
-    let paragraph = Paragraph::new(visible)
-        .style(Style::default().bg(theme.panel))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().bg(theme.bg))
+        .wrap(Wrap { trim: false })
+        .scroll((top_row as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn count_wrapped_rows(lines: &[Line], width: usize) -> usize {
+    if width == 0 {
+        return lines.len().max(1);
+    }
+    let mut total = 0usize;
+    for line in lines {
+        let text: String = line.spans.iter().map(|s| &*s.content).collect();
+        if text.is_empty() {
+            total += 1;
+            continue;
+        }
+        let wrapped = textwrap::wrap(&text, width);
+        total += wrapped.len().max(1);
+    }
+    total.max(1)
 }

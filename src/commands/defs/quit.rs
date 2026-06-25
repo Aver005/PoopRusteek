@@ -13,6 +13,10 @@ impl Command for QuitCommand {
         "Exit application"
     }
 
+    fn usage(&self) -> &str {
+        "/quit"
+    }
+
     fn execute(&self, _args: &str, _state: &mut AppState, _config: &Config) -> CommandResult {
         std::process::exit(0);
     }

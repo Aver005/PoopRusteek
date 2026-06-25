@@ -9,6 +9,7 @@ use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::commands::CommandResult;
 use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
+use crate::commands::CommandSuggestion;
 use events::{AgentResult, AppEvent, Modal, ToolApprovalRequest};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -29,6 +30,7 @@ pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub input_buffer: String,
     pub input_cursor: usize,
+    pub input_selection_anchor: Option<usize>,
     pub is_generating: bool,
     pub status_message: String,
     pub scroll_offset: u32,
@@ -37,7 +39,19 @@ pub struct AppState {
     pub approved_tools: std::collections::HashSet<String>,
     pub pending_tool_approval: Option<ToolApprovalRequest>,
     pub animation_tick: u64,
+    pub autocomplete: AutocompleteState,
+    pub current_session_id: String,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct AutocompleteState {
+    pub visible: bool,
+    pub items: Vec<CommandSuggestion>,
+    pub selected: usize,
+    pub scroll_offset: usize,
+}
+
+const AUTOCOMPLETE_VISIBLE: usize = 8;
 
 impl App {
     pub async fn new(config: Config) -> AppResult<Self> {
@@ -62,6 +76,7 @@ impl App {
             messages: Vec::new(),
             input_buffer: String::new(),
             input_cursor: 0,
+            input_selection_anchor: None,
             is_generating: false,
             status_message: if provider.is_some() { "Ready" } else { "No token configured" }.to_string(),
             scroll_offset: 0,
@@ -70,6 +85,8 @@ impl App {
             approved_tools: std::collections::HashSet::new(),
             pending_tool_approval: None,
             animation_tick: 0,
+            autocomplete: AutocompleteState::default(),
+            current_session_id: crate::session::create_session_id(),
         };
 
         Ok(Self {
@@ -184,6 +201,7 @@ impl App {
                 {
                     self.state.messages.pop();
                 }
+                self.auto_save_session();
             }
             AppEvent::AgentError(err) => {
                 self.state.is_generating = false;
@@ -197,6 +215,7 @@ impl App {
                 {
                     self.state.messages.pop();
                 }
+                self.auto_save_session();
             }
             AppEvent::AddMessage(message) => {
                 self.state.messages.push(message);
@@ -211,13 +230,21 @@ impl App {
                 self.state.status_message = format!("Tool error: {error}");
             }
             AppEvent::RequestToolApproval(request) => {
-                self.state.is_generating = false;
-                self.state.status_message = format!("Approve tool {}?", request.tool_name);
-                self.state.modal = Some(Modal::ToolApproval {
-                    tool_name: request.tool_name.clone(),
-                    arguments: request.arguments.clone(),
-                });
-                self.state.pending_tool_approval = Some(request);
+                if self.state.approved_tools.contains(&request.tool_name) {
+                    request.resolve(true).await;
+                    self.state.is_generating = true;
+                    self.state.status_message = format!("Running {} (auto-approved)", request.tool_name);
+                } else {
+                    self.state.is_generating = false;
+                    self.state.status_message = format!("Approve tool {}?", request.tool_name);
+                    self.state.modal = Some(Modal::ToolApproval {
+                        tool_name: request.tool_name.clone(),
+                        arguments: request.arguments.clone(),
+                        scroll_offset: 0,
+                        always_allow: false,
+                    });
+                    self.state.pending_tool_approval = Some(request);
+                }
             }
             AppEvent::PushModal(modal) => {
                 self.state.modal = Some(modal);
@@ -241,12 +268,56 @@ impl App {
     async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // Global Tab/Up/Down are intercepted by autocomplete when visible.
+        let ac_visible = self.state.autocomplete.visible
+            && !self.state.autocomplete.items.is_empty()
+            && self.state.modal.is_none();
+        if ac_visible {
+            match key.code {
+                KeyCode::Tab => {
+                    let n = self.state.autocomplete.items.len();
+                    self.state.autocomplete.selected =
+                        (self.state.autocomplete.selected + 1) % n;
+                    self.clamp_autocomplete_scroll();
+                    return Ok(false);
+                }
+                KeyCode::BackTab => {
+                    let n = self.state.autocomplete.items.len();
+                    self.state.autocomplete.selected =
+                        (self.state.autocomplete.selected + n - 1) % n;
+                    self.clamp_autocomplete_scroll();
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    let n = self.state.autocomplete.items.len();
+                    self.state.autocomplete.selected =
+                        (self.state.autocomplete.selected + 1) % n;
+                    self.clamp_autocomplete_scroll();
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    let n = self.state.autocomplete.items.len();
+                    self.state.autocomplete.selected =
+                        (self.state.autocomplete.selected + n - 1) % n;
+                    self.clamp_autocomplete_scroll();
+                    return Ok(false);
+                }
+                KeyCode::Enter if !self.state.is_generating => {
+                    self.accept_autocomplete();
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
         if let Some(modal) = self.state.modal.clone() {
             match modal {
-                Modal::ToolApproval { tool_name, .. } => {
+                Modal::ToolApproval { tool_name, arguments, scroll_offset, always_allow } => {
                     match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            self.state.approved_tools.insert(tool_name.clone());
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            if always_allow {
+                                self.state.approved_tools.insert(tool_name.clone());
+                            }
                             if let Some(request) = self.state.pending_tool_approval.take() {
                                 request.resolve(true).await;
                             }
@@ -261,6 +332,32 @@ impl App {
                             self.state.modal = None;
                             self.state.is_generating = true;
                             self.state.status_message = format!("Denied {}", tool_name);
+                        }
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            self.state.modal = Some(Modal::ToolApproval {
+                                tool_name, arguments,
+                                scroll_offset,
+                                always_allow: !always_allow,
+                            });
+                        }
+                        KeyCode::Up => {
+                            let new_offset = scroll_offset.saturating_sub(3);
+                            self.state.modal = Some(Modal::ToolApproval {
+                                tool_name, arguments,
+                                scroll_offset: new_offset,
+                                always_allow,
+                            });
+                        }
+                        KeyCode::Down => {
+                            let arg_lines = arguments.lines().count();
+                            let max_visible = 12usize;
+                            let max_scroll = arg_lines.saturating_sub(max_visible);
+                            let new_offset = (scroll_offset + 3).min(max_scroll);
+                            self.state.modal = Some(Modal::ToolApproval {
+                                tool_name, arguments,
+                                scroll_offset: new_offset,
+                                always_allow,
+                            });
                         }
                         _ => {}
                     }
@@ -303,61 +400,153 @@ impl App {
                 self.state.messages.clear();
                 self.state.scroll_offset = 0;
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input_selection_anchor = Some(0);
+                self.state.input_cursor = self.state.input_buffer.chars().count();
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                insert_newline(&mut self.state);
+            }
             KeyCode::Enter if !self.state.is_generating => {
-                let input = self.state.input_buffer.trim().to_string();
-                if !input.is_empty() {
-                    self.state.input_buffer.clear();
-                    self.state.input_cursor = 0;
+                let buf = &self.state.input_buffer;
+                let ends_with_backslash = buf
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c == '\\')
+                    && self.state.input_cursor == buf.chars().count();
+                if ends_with_backslash {
+                    self.state.input_buffer.pop();
+                    self.state.input_cursor -= 1;
+                    let byte_pos =
+                        char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
+                    self.state.input_buffer.insert(byte_pos, '\n');
+                    self.state.input_cursor += 1;
+                    self.state.input_selection_anchor = None;
+                } else {
+                    let input = self.state.input_buffer.trim().to_string();
+                    if !input.is_empty() {
+                        self.state.input_buffer.clear();
+                        self.state.input_cursor = 0;
+                        self.state.input_selection_anchor = None;
+                        self.state.autocomplete = AutocompleteState::default();
 
-                    if input.starts_with('/') {
-                        let result = self.commands.execute(&input, &mut self.state, &self.config);
-                        match result {
-                            CommandResult::Handled => {}
-                            CommandResult::NeedsAgent(msg) => {
-                                self.state.messages.push(ChatMessage::user(&input));
-                                self.send_to_agent(msg).await?;
+                        if input.starts_with('/') {
+                            let result =
+                                self.commands.execute(&input, &mut self.state, &self.config);
+                            match result {
+                                CommandResult::Handled => {}
+                                CommandResult::NeedsAgent(msg) => {
+                                    self.state.messages.push(ChatMessage::user(&input));
+                                    self.send_to_agent(msg).await?;
+                                }
+                                CommandResult::LoadSession(id) => {
+                                    self.handle_load_session(&id).await?;
+                                }
+                                CommandResult::ResetProvider => {
+                                    if let Some(provider) = &self.provider {
+                                        let _ = provider.reset().await;
+                                    }
+                                    self.state.current_session_id =
+                                        crate::session::create_session_id();
+                                }
+                                CommandResult::Error(err) => {
+                                    self.state.messages.push(ChatMessage::system(&err));
+                                }
                             }
-                            CommandResult::Error(err) => {
-                                self.state.messages.push(ChatMessage::system(&err));
-                            }
+                        } else {
+                            let expanded = self.expand_file_mentions(&input);
+                            self.state.messages.push(ChatMessage::user(&expanded));
+                            self.send_to_agent(expanded).await?;
                         }
-                    } else {
-                        let expanded = self.expand_file_mentions(&input);
-                        self.state.messages.push(ChatMessage::user(&expanded));
-                        self.send_to_agent(expanded).await?;
                     }
                 }
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_selection_if_any();
                 let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
                 self.state.input_buffer.insert(byte_pos, c);
                 self.state.input_cursor += 1;
+                self.state.input_selection_anchor = None;
             }
             KeyCode::Backspace => {
-                if self.state.input_cursor > 0 {
-                    self.state.input_cursor -= 1;
-                    let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
-                    self.state.input_buffer.remove(byte_pos);
+                if self.state.input_selection_anchor.is_some() {
+                    self.delete_selection_if_any();
+                } else {
+                    let char_count = self.state.input_buffer.chars().count();
+                    if self.state.input_cursor > 0 && self.state.input_cursor <= char_count {
+                        self.state.input_cursor -= 1;
+                        let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
+                        if byte_pos < self.state.input_buffer.len() {
+                            self.state.input_buffer.remove(byte_pos);
+                        }
+                    }
                 }
             }
             KeyCode::Delete => {
-                let char_count = self.state.input_buffer.chars().count();
-                if self.state.input_cursor < char_count {
-                    let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
-                    self.state.input_buffer.remove(byte_pos);
+                if self.state.input_selection_anchor.is_some() {
+                    self.delete_selection_if_any();
+                } else {
+                    let char_count = self.state.input_buffer.chars().count();
+                    if self.state.input_cursor < char_count {
+                        let byte_pos =
+                            char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
+                        if byte_pos < self.state.input_buffer.len() {
+                            self.state.input_buffer.remove(byte_pos);
+                        }
+                    }
                 }
             }
             KeyCode::Left => {
-                self.state.input_cursor = self.state.input_cursor.saturating_sub(1);
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                if !shift {
+                    self.state.input_selection_anchor = None;
+                } else if self.state.input_selection_anchor.is_none() {
+                    self.state.input_selection_anchor = Some(self.state.input_cursor);
+                }
+                let char_count = self.state.input_buffer.chars().count();
+                let clamped = self.state.input_cursor.min(char_count);
+                let new_cursor = if ctrl {
+                    prev_word_start(&self.state.input_buffer, clamped)
+                } else {
+                    clamped.saturating_sub(1)
+                };
+                self.state.input_cursor = new_cursor;
             }
             KeyCode::Right => {
-                let char_count = self.state.input_buffer.chars().count();
-                if self.state.input_cursor < char_count {
-                    self.state.input_cursor += 1;
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                if !shift {
+                    self.state.input_selection_anchor = None;
+                } else if self.state.input_selection_anchor.is_none() {
+                    self.state.input_selection_anchor = Some(self.state.input_cursor);
                 }
+                let char_count = self.state.input_buffer.chars().count();
+                let new_cursor = if ctrl {
+                    next_word_end(&self.state.input_buffer, self.state.input_cursor)
+                } else if self.state.input_cursor < char_count {
+                    self.state.input_cursor + 1
+                } else {
+                    self.state.input_cursor
+                };
+                self.state.input_cursor = new_cursor;
             }
-            KeyCode::Home => self.state.input_cursor = 0,
-            KeyCode::End => self.state.input_cursor = self.state.input_buffer.chars().count(),
+            KeyCode::Home => {
+                if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.state.input_selection_anchor = None;
+                } else if self.state.input_selection_anchor.is_none() {
+                    self.state.input_selection_anchor = Some(self.state.input_cursor);
+                }
+                self.state.input_cursor = 0;
+            }
+            KeyCode::End => {
+                if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.state.input_selection_anchor = None;
+                } else if self.state.input_selection_anchor.is_none() {
+                    self.state.input_selection_anchor = Some(self.state.input_cursor);
+                }
+                self.state.input_cursor = self.state.input_buffer.chars().count();
+            }
             KeyCode::Up => {
                 self.state.scroll_offset = self.state.scroll_offset.saturating_add(1);
             }
@@ -372,7 +561,78 @@ impl App {
             }
             _ => {}
         }
+        self.refresh_autocomplete();
         Ok(false)
+    }
+
+    fn refresh_autocomplete(&mut self) {
+        let buf = self.state.input_buffer.clone();
+        let query_main = buf
+            .strip_prefix('/')
+            .map(|rest| rest.split_whitespace().next().unwrap_or(""))
+            .unwrap_or("");
+        let active = buf.starts_with('/')
+            && !self.state.is_generating
+            && self.state.modal.is_none()
+            && !buf[1..].contains(char::is_whitespace);
+        if !active {
+            self.state.autocomplete.visible = false;
+            self.state.autocomplete.items.clear();
+            self.state.autocomplete.selected = 0;
+            return;
+        }
+        let items = self.commands.suggest(query_main);
+        self.state.autocomplete.items = items;
+        self.state.autocomplete.visible = !self.state.autocomplete.items.is_empty();
+        self.state.autocomplete.selected = 0;
+        self.state.autocomplete.scroll_offset = 0;
+    }
+
+    fn clamp_autocomplete_scroll(&mut self) {
+        let n = self.state.autocomplete.items.len();
+        if n <= AUTOCOMPLETE_VISIBLE {
+            return;
+        }
+        let sel = self.state.autocomplete.selected;
+        let off = &mut self.state.autocomplete.scroll_offset;
+        if sel < *off {
+            *off = sel;
+        } else if sel >= *off + AUTOCOMPLETE_VISIBLE {
+            *off = sel + 1 - AUTOCOMPLETE_VISIBLE;
+        }
+    }
+
+    fn accept_autocomplete(&mut self) {
+        if !self.state.autocomplete.visible || self.state.autocomplete.items.is_empty() {
+            return;
+        }
+        let idx = self
+            .state
+            .autocomplete
+            .selected
+            .min(self.state.autocomplete.items.len() - 1);
+        let suggestion = self.state.autocomplete.items[idx].name.clone();
+        let new_buf = format!("/{} ", suggestion);
+        self.state.input_buffer = new_buf;
+        self.state.input_cursor = self.state.input_buffer.chars().count();
+        self.state.input_selection_anchor = None;
+        self.state.autocomplete = AutocompleteState::default();
+    }
+
+    fn delete_selection_if_any(&mut self) -> Option<usize> {
+        if let Some(anchor) = self.state.input_selection_anchor.take() {
+            let cursor = self.state.input_cursor;
+            let (start, end) = if anchor <= cursor {
+                (anchor, cursor)
+            } else {
+                (cursor, anchor)
+            };
+            let bs = char_to_byte_pos(&self.state.input_buffer, start);
+            let be = char_to_byte_pos(&self.state.input_buffer, end);
+            self.state.input_buffer.drain(bs..be);
+            self.state.input_cursor = start;
+        }
+        None
     }
 
     async fn build_system_prompt(&self) -> String {
@@ -489,10 +749,9 @@ impl App {
                                 let _ = event_tx.send(AppEvent::AgentChunk(delta.to_string()));
                             }
                         } else if !next_visible.is_empty() {
-                            let _ = event_tx.send(AppEvent::AgentError(
-                                "Streaming state desynchronized while hiding tool blocks".to_string(),
-                            ));
-                            return;
+                            let _ = event_tx.send(AppEvent::AddMessage(ChatMessage::system(
+                                "⚠ Streaming sync issue — agent will continue",
+                            )));
                         }
                         streamed_visible = next_visible;
                     }
@@ -550,23 +809,14 @@ impl App {
 
                     let (tool_result, is_error) = execution;
                     let preview = summarize_tool_result(&tool_result);
-                    let display = if is_error {
-                        format!(
-                            "Tool {} failed. Raw output is attached internally.\n{}",
-                            tool_call.name, preview
-                        )
-                    } else {
-                        format!(
-                            "Tool {} completed. Raw output is attached internally.\n{}",
-                            tool_call.name, preview
-                        )
-                    };
+                    let display = preview.clone();
 
                     let tool_message = ChatMessage::tool_with_display(
                         &tool_id,
                         &tool_call.name,
                         &tool_result,
                         &display,
+                        is_error,
                     );
                     messages.push(tool_message.clone());
                     collected_tool_calls.push(events::ToolCallInfo {
@@ -598,6 +848,105 @@ impl App {
         Ok(())
     }
 
+    async fn handle_load_session(&mut self, session_id: &str) -> AppResult<()> {
+        use crate::session;
+
+        match session::load_local(session_id, &self.config) {
+            Ok(s) => {
+                self.state.messages = s.messages;
+                self.state.current_session_id = s.id;
+                self.state.scroll_offset = 0;
+                self.state.input_buffer.clear();
+                self.state.input_cursor = 0;
+                self.state.input_selection_anchor = None;
+                self.state.autocomplete = Default::default();
+                self.state.is_generating = false;
+                self.state.error = None;
+
+                if let Some(provider) = &self.provider {
+                    let _ = provider.reset().await;
+                }
+
+                let count = self.state.messages.len();
+                self.state.status_message = format!(
+                    "Loaded local session {session_id} ({count} messages)"
+                );
+            }
+            Err(_) => {
+                if let Some(provider) = &self.provider {
+                    match provider.fetch_remote_session_messages(session_id).await {
+                        Ok(messages) => {
+                            if messages.is_empty() {
+                                self.state.messages.push(ChatMessage::system(
+                                    &format!("Remote session {session_id} has no messages"),
+                                ));
+                                return Ok(());
+                            }
+                            self.state.messages = messages;
+                            self.state.current_session_id = session_id.to_string();
+                            self.state.scroll_offset = 0;
+                            self.state.input_buffer.clear();
+                            self.state.input_cursor = 0;
+                            self.state.input_selection_anchor = None;
+                            self.state.autocomplete = Default::default();
+                            self.state.is_generating = false;
+                            self.state.error = None;
+
+                            let _ = provider.reset().await;
+
+                            let count = self.state.messages.len();
+                            let title = session::derive_title(&self.state.messages);
+                            let now = session::timestamp_now();
+                            if let Err(e) = session::save_local(
+                                &session::Session {
+                                    version: 1,
+                                    id: session_id.to_string(),
+                                    created_at: now.clone(),
+                                    updated_at: now,
+                                    workspace_root: std::env::current_dir()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string(),
+                                    model_type: self.config.provider.model.clone(),
+                                    messages: self.state.messages.clone(),
+                                },
+                                &self.config,
+                            ) {
+                                tracing::warn!("Failed to save imported session: {e}");
+                            }
+                            self.state.status_message = format!(
+                                "Imported remote session {session_id}: {title} ({count} msgs)"
+                            );
+                        }
+                        Err(e) => {
+                            self.state.messages.push(ChatMessage::system(
+                                &format!("Session {session_id} not found locally and remote fetch failed: {e}"),
+                            ));
+                        }
+                    }
+                } else {
+                    self.state.messages.push(ChatMessage::system(
+                        &format!("Session {session_id} not found locally"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn auto_save_session(&self) {
+        use crate::session;
+        let id = &self.state.current_session_id;
+        let messages = &self.state.messages;
+        if messages.is_empty() {
+            return;
+        }
+        let now = session::timestamp_now();
+        if let Err(e) = session::save_session(id, &now, messages, &self.config) {
+            tracing::warn!("Failed to auto-save session: {e}");
+        }
+    }
+
     fn render(&self, terminal: &mut crate::tui::TuiTerminal) -> AppResult<()> {
         crate::tui::render::render(terminal, &self.state, &self.config)
     }
@@ -623,11 +972,72 @@ impl App {
     }
 }
 
-fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
+pub fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
     s.char_indices()
         .nth(char_pos)
         .map(|(i, _)| i)
         .unwrap_or_else(|| s.len())
+}
+
+fn char_is_word(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn prev_word_start(s: &str, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = cursor;
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return 0;
+    }
+    let word = char_is_word(chars[i - 1]);
+    while i > 0 && char_is_word(chars[i - 1]) == word && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+fn next_word_end(s: &str, cursor: usize) -> usize {
+    let total = s.chars().count();
+    if cursor >= total {
+        return total;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = cursor;
+    while i < total && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= total {
+        return total;
+    }
+    let word = char_is_word(chars[i]);
+    while i < total && !chars[i].is_whitespace() && char_is_word(chars[i]) == word {
+        i += 1;
+    }
+    i
+}
+
+fn insert_newline(state: &mut crate::app::AppState) {
+    if let Some(anchor) = state.input_selection_anchor.take() {
+        let (start, end) = if anchor <= state.input_cursor {
+            (anchor, state.input_cursor)
+        } else {
+            (state.input_cursor, anchor)
+        };
+        let bs = char_to_byte_pos(&state.input_buffer, start);
+        let be = char_to_byte_pos(&state.input_buffer, end);
+        state.input_buffer.drain(bs..be);
+        state.input_cursor = start;
+    }
+    let byte_pos = char_to_byte_pos(&state.input_buffer, state.input_cursor);
+    state.input_buffer.insert(byte_pos, '\n');
+    state.input_cursor += 1;
+    state.input_selection_anchor = None;
 }
 
 fn summarize_tool_result(result: &str) -> String {

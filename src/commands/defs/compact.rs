@@ -13,6 +13,10 @@ impl Command for CompactCommand {
         "Compact context by summarizing history"
     }
 
+    fn usage(&self) -> &str {
+        "/compact"
+    }
+
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         if state.messages.is_empty() {
             state.messages.push(crate::provider::ChatMessage::system("Nothing to compact."));

@@ -11,13 +11,25 @@ pub struct CommandRegistry {
 pub trait Command: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn usage(&self) -> &str {
+        ""
+    }
     fn execute(&self, args: &str, state: &mut AppState, config: &Config) -> CommandResult;
 }
 
 pub enum CommandResult {
     Handled,
     NeedsAgent(String),
+    LoadSession(String),
+    ResetProvider,
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandSuggestion {
+    pub name: String,
+    pub description: String,
+    pub usage: String,
 }
 
 impl CommandRegistry {
@@ -35,6 +47,9 @@ impl CommandRegistry {
         self.register(Box::new(defs::quit::QuitCommand));
         self.register(Box::new(defs::version::VersionCommand));
         self.register(Box::new(defs::compact::CompactCommand));
+        self.register(Box::new(defs::load::LoadCommand));
+        self.register(Box::new(defs::session_info::SessionInfoCommand));
+        self.register(Box::new(defs::session_list::SessionListCommand));
         self.register(Box::new(defs::reset::ResetCommand));
     }
 
@@ -60,5 +75,21 @@ impl CommandRegistry {
 
     pub fn completions(&self) -> Vec<String> {
         self.commands.keys().map(|k| format!("/{k}")).collect()
+    }
+
+    pub fn suggest(&self, query: &str) -> Vec<CommandSuggestion> {
+        let q = query.trim_start_matches('/').to_ascii_lowercase();
+        let mut out: Vec<CommandSuggestion> = self
+            .commands
+            .values()
+            .map(|c| CommandSuggestion {
+                name: c.name().to_string(),
+                description: c.description().to_string(),
+                usage: c.usage().to_string(),
+            })
+            .filter(|s| q.is_empty() || s.name.to_ascii_lowercase().starts_with(&q))
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 }

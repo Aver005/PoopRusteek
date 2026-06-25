@@ -104,6 +104,8 @@ pub enum Modal {
     ToolApproval {
         tool_name: String,
         arguments: String,
+        scroll_offset: usize,
+        always_allow: bool,
     },
     Input {
         prompt: String,
