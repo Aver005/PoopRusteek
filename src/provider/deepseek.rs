@@ -11,7 +11,9 @@ use reqwest::{
     Client, Response,
 };
 use serde_json::{json, Value};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
 
 const DEEPSEEK_HOST: &str = "chat.deepseek.com";
 const CREATE_POW_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
@@ -22,6 +24,10 @@ const SESSION_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history
 const TARGET_PATH: &str = "/api/v0/chat/completion";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
+
+static LONG_CODE_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)```.{300,}?```").expect("hardcoded regex is valid")
+});
 
 #[derive(Debug, Default)]
 struct SessionState {
@@ -49,10 +55,13 @@ pub struct DeepseekProvider {
     temperature: f32,
     max_tokens: u32,
     session_state: Mutex<SessionState>,
+    rate_limit_ms: u64,
+    max_retries: i32,
+    last_request: Mutex<Instant>,
 }
 
 impl DeepseekProvider {
-    pub fn new(config: &ProviderConfig) -> AppResult<Self> {
+    pub fn new(config: &ProviderConfig, rate_limit_ms: u64, max_retries: i32) -> AppResult<Self> {
         let client = Client::builder().build()?;
 
         let provider = Self {
@@ -62,6 +71,9 @@ impl DeepseekProvider {
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             session_state: Mutex::new(SessionState::default()),
+            rate_limit_ms,
+            max_retries,
+            last_request: Mutex::new(Instant::now()),
         };
 
         debug_log::log(
@@ -78,7 +90,7 @@ impl DeepseekProvider {
         Ok(provider)
     }
 
-    fn auth_headers(&self) -> HeaderMap {
+    fn auth_headers(&self) -> AppResult<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert("Host", HeaderValue::from_static(DEEPSEEK_HOST));
         headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
@@ -89,11 +101,13 @@ impl DeepseekProvider {
         headers.insert("x-client-version", HeaderValue::from_static("1.8.0"));
         headers.insert("x-client-locale", HeaderValue::from_static("zh_CN"));
         headers.insert("accept-charset", HeaderValue::from_static("UTF-8"));
+        let bearer = format!("Bearer {}", self.token);
         headers.insert(
             "Authorization",
-            HeaderValue::from_str(&format!("Bearer {}", self.token)).unwrap(),
+            HeaderValue::from_str(&bearer)
+                .map_err(|e| AppError::Provider(format!("Invalid auth header: {e}")))?,
         );
-        headers
+        Ok(headers)
     }
 
     fn redact_value(key: &str, value: &str) -> String {
@@ -133,36 +147,72 @@ impl DeepseekProvider {
         );
     }
 
+    async fn enforce_rate_limit(&self) {
+        let elapsed = self
+            .last_request
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(Duration::from_secs(60));
+        let min_interval = Duration::from_millis(self.rate_limit_ms);
+        if elapsed < min_interval {
+            sleep(min_interval - elapsed).await;
+        }
+        let _ = self.last_request.lock().map(|mut last| *last = Instant::now());
+    }
+
     async fn send_json_request(
         &self,
         action: &str,
         url: &str,
-        headers: HeaderMap,
-        body: Value,
+        headers: &HeaderMap,
+        body: &Value,
     ) -> AppResult<Response> {
-        self.log_http_request(action, url, &headers, &body);
+        self.enforce_rate_limit().await;
 
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                debug_log::log(
-                    action,
-                    format!("request failed before HTTP response: {error}"),
-                );
-                AppError::Http(error)
-            })?;
+        let max_attempts = match self.max_retries {
+            -1 => usize::MAX,
+            0 => 1,
+            n => (n as usize) + 1,
+        };
 
-        debug_log::log(
-            action,
-            format!("response status={} headers={}", response.status(), Self::headers_to_debug_json(response.headers())),
-        );
+        let mut attempt = 0;
+        loop {
+            self.log_http_request(action, url, headers, body);
 
-        Ok(response)
+            match self.client.post(url).headers(headers.clone()).json(body).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    debug_log::log(
+                        action,
+                        format!("response status={status} headers={}", Self::headers_to_debug_json(response.headers())),
+                    );
+
+                    if !status.is_server_error() || attempt + 1 >= max_attempts {
+                        return Ok(response);
+                    }
+
+                    attempt += 1;
+                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32 - 1));
+                    let capped = delay.min(Duration::from_secs(30));
+                    tracing::warn!("{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}");
+                    sleep(capped).await;
+                }
+                Err(error) => {
+                    if attempt + 1 >= max_attempts {
+                        debug_log::log(
+                            action,
+                            format!("request failed before HTTP response: {error}"),
+                        );
+                        return Err(AppError::Http(error));
+                    }
+                    attempt += 1;
+                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32 - 1));
+                    let capped = delay.min(Duration::from_secs(30));
+                    tracing::warn!("{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}");
+                    sleep(capped).await;
+                }
+            }
+        }
     }
 
     async fn read_error_response(action: &str, response: Response, label: &str) -> AppError {
@@ -176,7 +226,7 @@ impl DeepseekProvider {
     }
 
     async fn get_chat_headers(&self) -> AppResult<HeaderMap> {
-        let mut headers = self.auth_headers();
+        let mut headers = self.auth_headers()?;
         let pow_b64 = self.solve_pow_challenge().await?;
         headers.insert(
             "x-ds-pow-response",
@@ -187,12 +237,13 @@ impl DeepseekProvider {
 
     async fn solve_pow_challenge(&self) -> AppResult<String> {
         let body = json!({ "target_path": TARGET_PATH });
+        let headers = self.auth_headers()?;
         let response = self
             .send_json_request(
                 "pow.challenge.request",
                 CREATE_POW_URL,
-                self.auth_headers(),
-                body,
+                &headers,
+                &body,
             )
             .await?;
 
@@ -229,17 +280,18 @@ impl DeepseekProvider {
         let solution = pow::solve_pow(&challenge)
             .ok_or_else(|| AppError::Provider("Failed to solve PoW challenge".to_string()))?;
         debug_log::log_json("pow.challenge.solution", &solution);
-        Ok(pow::encode_solution(&solution))
+        pow::encode_solution(&solution)
     }
 
     async fn create_session(&self) -> AppResult<String> {
         let body = json!({ "character_id": Value::Null });
+        let headers = self.auth_headers()?;
         let response = self
             .send_json_request(
                 "session.create.request",
                 CREATE_SESSION_URL,
-                self.auth_headers(),
-                body,
+                &headers,
+                &body,
             )
             .await?;
 
@@ -325,8 +377,7 @@ impl DeepseekProvider {
     }
 
     fn strip_long_code_blocks(text: &str) -> String {
-        let regex = Regex::new(r"(?s)```.{300,}?```").unwrap();
-        regex.replace_all(text, "[...]").into_owned()
+        LONG_CODE_BLOCK_RE.replace_all(text, "[...]").into_owned()
     }
 
     fn format_history_message(message: &ChatMessage) -> String {
@@ -487,7 +538,7 @@ impl DeepseekProvider {
         let headers = self.get_chat_headers().await?;
 
         let response = self
-            .send_json_request("completion.request", COMPLETION_URL, headers, body)
+            .send_json_request("completion.request", COMPLETION_URL, &headers, &body)
             .await?;
 
         let status = response.status();
@@ -790,12 +841,13 @@ impl DeepseekProvider {
 
     async fn list_remote_sessions(&self) -> AppResult<Vec<(String, String, i64)>> {
         let body = json!({"count": 100});
+        let headers = self.auth_headers()?;
         let response = self
             .send_json_request(
                 "session.list.request",
                 SESSION_LIST_URL,
-                self.auth_headers(),
-                body,
+                &headers,
+                &body,
             )
             .await?;
         if !response.status().is_success() {
@@ -830,12 +882,13 @@ impl DeepseekProvider {
             "parent_message_id": Value::Null,
             "count": 1000,
         });
+        let headers = self.auth_headers()?;
         let response = self
             .send_json_request(
                 "session.history.request",
                 SESSION_HISTORY_URL,
-                self.auth_headers(),
-                body,
+                &headers,
+                &body,
             )
             .await?;
         if !response.status().is_success() {

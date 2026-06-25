@@ -1,6 +1,7 @@
 use crate::app::AppState;
-use crate::app::events::{Modal, PickerMode, PickerState, QuestionState};
+use crate::app::events::{Modal, PickerMode, PickerState, QuestionState, View};
 use crate::config::Config;
+use crate::mcp::types::McpViewState;
 use crate::tui::TuiTerminal;
 use crate::tui::theme::Theme;
 use crate::tui::widgets;
@@ -21,7 +22,9 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             area,
         );
 
-        if state.messages.is_empty() && !state.is_generating {
+        if state.view == View::Mcp {
+            render_mcp_view(frame, area, &state.mcp_view, &theme);
+        } else if state.messages.is_empty() && !state.is_generating {
             render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
             let chunks = Layout::default()
@@ -55,7 +58,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         use crossterm::cursor::MoveTo;
         crossterm::execute!(terminal.backend_mut(), MoveTo(cx, cy))?;
     }
-    if state.modal.is_some() || state.is_generating {
+    if state.modal.is_some() || state.is_generating || state.view == View::Mcp {
         terminal.hide_cursor()?;
     } else {
         terminal.show_cursor()?;
@@ -294,6 +297,191 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         ])),
         area,
     );
+}
+
+fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    // Header
+    let header = Block::default()
+        .borders(Borders::ALL)
+        .title(" MCP Server Management ")
+        .border_style(Style::default().fg(theme.accent));
+    frame.render_widget(header, chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Manage your MCP servers — toggle, reconnect, or remove",
+            Style::default().fg(theme.text_dim),
+        )))
+        .alignment(Alignment::Center),
+        chunks[0],
+    );
+
+    // Body
+    let body_area = chunks[1];
+    if let Some(detail_name) = &mcp.details_server {
+        render_mcp_details(frame, body_area, mcp, detail_name, theme);
+    } else {
+        render_mcp_list(frame, body_area, mcp, theme);
+    }
+
+    // Footer with keybindings
+    let footer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+    let hints = if mcp.details_server.is_some() {
+        "  j/k ↑↓ scroll  Enter back  Esc/q close  "
+    } else {
+        "  j/k ↑↓ navigate  Space toggle  r reconnect  d remove  Enter details  Esc/q back  "
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(theme.text_dim))))
+            .alignment(Alignment::Center),
+        chunks[2],
+    );
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
+    let list_height = area.height.saturating_sub(1) as usize;
+    let visible = mcp.servers.len().min(list_height);
+
+    let header_line = Line::from(vec![
+        Span::styled("  STATUS  ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("SERVER", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(area.width.saturating_sub(30) as usize).min(
+            " ".repeat(20).to_string(),
+        )),
+        Span::styled("TYPE   TOOLS", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(Paragraph::new(header_line), area);
+
+    let start = mcp.scroll_offset;
+    for i in 0..visible {
+        let idx = start + i;
+        if idx >= mcp.servers.len() {
+            break;
+        }
+        let server = &mcp.servers[idx];
+        let selected = idx == mcp.selected;
+        let bg = if selected { theme.accent_dim } else { theme.bg };
+
+        let status_icon = match server.status.as_str() {
+            "disabled" => " ○ ",
+            _ if server.status.starts_with("error") => " ✗ ",
+            "connected" => " ● ",
+            "pending" | "connecting" => " ◌ ",
+            _ => " ? ",
+        };
+        let status_color = match server.status.as_str() {
+            "disabled" => theme.text_dim,
+            _ if server.status.starts_with("error") => theme.error,
+            "connected" => theme.success,
+            "pending" | "connecting" => theme.warning,
+            _ => theme.fg,
+        };
+        let status_short = match server.status.as_str() {
+            s if s.starts_with("error") => "ERR ",
+            "disabled" => "OFF ",
+            "connected" => "ON  ",
+            "pending" => "WAIT",
+            "connecting" => "CONN",
+            _ => "?   ",
+        };
+        let dim_style = Style::default().fg(theme.text_dim).bg(bg);
+
+        let line = Line::from(vec![
+            Span::styled(format!(" {} ", status_short), Style::default().fg(status_color).bg(bg).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {} ", status_icon), dim_style),
+            Span::styled(
+                format!("{:<20} ", server.name),
+                if selected {
+                    Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg).bg(bg)
+                },
+            ),
+            Span::styled(
+                format!("{:<6}", server.transport),
+                dim_style,
+            ),
+            Span::styled(
+                format!("{}t", server.tool_count),
+                Style::default().fg(theme.fg).bg(bg),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(area.x, area.y + 1 + i as u16, area.width, 1),
+        );
+    }
+
+    // Status message
+    if !mcp.status_message.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                &mcp.status_message,
+                Style::default().fg(theme.success),
+            )))
+            .alignment(Alignment::Center),
+            Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+        );
+    }
+}
+
+fn render_mcp_details(frame: &mut Frame, area: Rect, mcp: &McpViewState, server_name: &str, theme: &Theme) {
+    let Some(server) = mcp.servers.iter().find(|s| s.name == server_name) else {
+        return;
+    };
+
+    let lines: Vec<Line> = {
+        let mut out = Vec::new();
+        out.push(Line::from(Span::styled(
+            format!(" Server: {}", server.name),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )));
+        out.push(Line::from(Span::styled(
+            format!(" Status: {} ({})", server.status, if server.enabled { "enabled" } else { "disabled" }),
+            Style::default().fg(theme.fg),
+        )));
+        out.push(Line::from(Span::styled(
+            format!(" Transport: {}", server.transport),
+            Style::default().fg(theme.text_dim),
+        )));
+        out.push(Line::from(Span::styled(
+            format!(" Tools: {}", server.tool_count),
+            Style::default().fg(theme.fg),
+        )));
+        out.push(Line::from(Span::styled(
+            format!(" Resources: {}", server.resource_count),
+            Style::default().fg(theme.fg),
+        )));
+        out.push(Line::from(Span::styled("─".repeat(area.width as usize), Style::default().fg(theme.border))));
+        out.push(Line::from(Span::styled(
+            " j/k scroll  Enter back ",
+            Style::default().fg(theme.text_dim),
+        )));
+        out
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", server_name))
+        .border_style(Style::default().fg(theme.accent));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .scroll((mcp.scroll_offset as u16, 0));
+    frame.render_widget(paragraph, area);
+
+    // Prevent scroll beyond content
+    // (handled in the keyboard handler)
 }
 
 fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
@@ -668,7 +856,7 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
                 Span::styled("  ", Style::default().fg(theme.fg)),
                 Span::styled(before_cursor, Style::default().fg(theme.fg).bg(theme.input_bg)),
                 Span::styled(
-                    qs.custom_input.chars().nth(qs.custom_cursor).unwrap().to_string(),
+                    qs.custom_input.chars().nth(qs.custom_cursor).map(|c| c.to_string()).unwrap_or_default(),
                     Style::default()
                         .fg(theme.bg)
                         .bg(theme.accent)

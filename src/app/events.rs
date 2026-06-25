@@ -156,6 +156,7 @@ pub enum View {
     Sessions,
     Settings,
     Help,
+    Mcp,
 }
 
 #[derive(Debug, Clone)]

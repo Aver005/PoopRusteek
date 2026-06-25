@@ -4,13 +4,14 @@ use crate::commands::CommandRegistry;
 use crate::config::Config;
 use crate::error::AppResult;
 use crate::mcp::MCPManager;
+use crate::mcp::types::McpViewState;
 use crate::prompts::{self, PromptFiles};
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::commands::CommandResult;
 use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use crate::commands::CommandSuggestion;
-use events::{AgentResult, AppEvent, Modal, QuestionRequest, QuestionState, ToolApprovalRequest};
+use events::{AgentResult, AppEvent, Modal, QuestionRequest, QuestionState, ToolApprovalRequest, View};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -42,6 +43,8 @@ pub struct AppState {
     pub animation_tick: u64,
     pub autocomplete: AutocompleteState,
     pub current_session_id: String,
+    pub view: View,
+    pub mcp_view: McpViewState,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,7 +64,11 @@ impl App {
         let provider: Option<Arc<dyn LLMProvider>> = if config.provider.token.is_empty() {
             None
         } else {
-            let ds = crate::provider::deepseek::DeepseekProvider::new(&config.provider)?;
+            let ds = crate::provider::deepseek::DeepseekProvider::new(
+                &config.provider,
+                config.agent.rate_limit_ms,
+                config.agent.max_retries,
+            )?;
             Some(Arc::new(ds))
         };
 
@@ -89,6 +96,8 @@ impl App {
             animation_tick: 0,
             autocomplete: AutocompleteState::default(),
             current_session_id: crate::session::create_session_id(),
+            view: View::Chat,
+            mcp_view: McpViewState::default(),
         };
 
         Ok(Self {
@@ -153,8 +162,17 @@ impl App {
                 }
             }
 
+            self.refresh_mcp_view().await;
             self.render(terminal)?;
         }
+    }
+
+    async fn refresh_mcp_view(&mut self) {
+        if self.state.view != View::Mcp || !self.state.mcp_view.servers.is_empty() {
+            return;
+        }
+        let mcp = self.mcp.lock().await;
+        self.state.mcp_view.servers = mcp.get_servers_info();
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
@@ -432,6 +450,10 @@ impl App {
             }
         }
 
+        if self.state.view == View::Mcp {
+            return self.handle_mcp_key(key).await;
+        }
+
         match key.code {
             KeyCode::Char(c)
                 if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
@@ -488,9 +510,18 @@ impl App {
                                     self.handle_load_session(&id).await?;
                                 }
                                 CommandResult::ResetProvider => {
-                                    if let Some(provider) = &self.provider {
-                                        let _ = provider.reset().await;
+                                    if let Ok(config) = crate::config::load() {
+                                        self.config = config;
                                     }
+                                    self.provider = if self.config.provider.token.is_empty() {
+                                        None
+                                    } else {
+                                        crate::provider::deepseek::DeepseekProvider::new(
+                                            &self.config.provider,
+                                            self.config.agent.rate_limit_ms,
+                                            self.config.agent.max_retries,
+                                        ).ok().map(|ds| Arc::new(ds) as Arc<dyn LLMProvider>)
+                                    };
                                     self.state.current_session_id =
                                         crate::session::create_session_id();
                                 }
@@ -608,6 +639,100 @@ impl App {
         }
         self.refresh_autocomplete();
         Ok(false)
+    }
+
+    async fn handle_mcp_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+        use crossterm::event::KeyCode;
+
+        if self.state.mcp_view.servers.is_empty() {
+            let mcp = self.mcp.lock().await;
+            self.state.mcp_view.servers = mcp.get_servers_info();
+        }
+
+        let details_open = self.state.mcp_view.details_server.is_some();
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.state.mcp_view.active = false;
+                self.state.mcp_view.details_server = None;
+                self.state.view = View::Chat;
+            }
+            KeyCode::Up | KeyCode::Char('k') if !details_open => {
+                self.state.mcp_view.selected = self.state.mcp_view.selected.saturating_sub(1);
+                self.clamp_mcp_scroll();
+            }
+            KeyCode::Down | KeyCode::Char('j') if !details_open => {
+                let max = self.state.mcp_view.servers.len().saturating_sub(1);
+                self.state.mcp_view.selected = self.state.mcp_view.selected.min(max);
+                self.state.mcp_view.selected += 1;
+                self.state.mcp_view.selected = self.state.mcp_view.selected.min(max);
+                self.clamp_mcp_scroll();
+            }
+            KeyCode::Enter => {
+                if details_open {
+                    self.state.mcp_view.details_server = None;
+                } else if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected) {
+                    self.state.mcp_view.details_server = Some(info.name.clone());
+                    self.state.mcp_view.scroll_offset = 0;
+                }
+            }
+            KeyCode::Char(' ') if !details_open => {
+                if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected).cloned() {
+                    let name = info.name.clone();
+                    let mut mcp = self.mcp.lock().await;
+                    if let Err(e) = mcp.toggle_server(&name).await {
+                        self.state.mcp_view.status_message = format!("Toggle failed: {e}");
+                    } else {
+                        self.state.mcp_view.status_message = format!(
+                            "{} {}",
+                            name,
+                            if info.enabled { "disabled" } else { "enabled" },
+                        );
+                    }
+                    self.state.mcp_view.servers = mcp.get_servers_info();
+                }
+            }
+            KeyCode::Char('r') if !details_open => {
+                if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected).cloned() {
+                    let name = info.name.clone();
+                    self.state.mcp_view.status_message = format!("Reconnecting {name}...");
+                    let mut mcp = self.mcp.lock().await;
+                    if let Err(e) = mcp.reconnect_server(&name).await {
+                        self.state.mcp_view.status_message = format!("Reconnect failed: {e}");
+                    } else {
+                        self.state.mcp_view.status_message = format!("{name} reconnected");
+                    }
+                    self.state.mcp_view.servers = mcp.get_servers_info();
+                }
+            }
+            KeyCode::Char('d') if !details_open => {
+                if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected).cloned() {
+                    let name = info.name.clone();
+                    let mut mcp = self.mcp.lock().await;
+                    if let Err(e) = mcp.remove_server(&name).await {
+                        self.state.mcp_view.status_message = format!("Remove failed: {e}");
+                    } else {
+                        self.state.mcp_view.status_message = format!("{name} removed");
+                    }
+                    self.state.mcp_view.servers = mcp.get_servers_info();
+                    self.state.mcp_view.selected = self.state.mcp_view.selected.min(
+                        self.state.mcp_view.servers.len().saturating_sub(1),
+                    );
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') if details_open => {
+                self.state.mcp_view.scroll_offset = self.state.mcp_view.scroll_offset.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if details_open => {
+                self.state.mcp_view.scroll_offset += 1;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn clamp_mcp_scroll(&self) {
+        // no-op for now, we manage scroll in the renderer
     }
 
     fn refresh_autocomplete(&mut self) {

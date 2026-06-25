@@ -29,6 +29,14 @@ impl MCPClient {
         })
     }
 
+    pub fn dummy(server_name: &str) -> Self {
+        Self {
+            transport: Arc::new(Mutex::new(super::transport::DummyTransport)),
+            server_name: server_name.to_string(),
+            next_id: 0,
+        }
+    }
+
     pub async fn from_http(
         server_name: &str,
         url: &str,
@@ -155,7 +163,15 @@ impl MCPClient {
 
         let request = JsonRpcRequest::new(id, method, params);
         let mut transport = self.transport.lock().await;
-        transport.send_request(&request).await
+        let response = transport.send_request(&request).await?;
+
+        if let Some(err) = &response.error {
+            return Err(crate::error::AppError::Mcp(
+                format!("JSON-RPC error (method={method}): code={}, message={}", err.code, err.message)
+            ));
+        }
+
+        Ok(response)
     }
 
     pub async fn close(&mut self) -> AppResult<()> {

@@ -41,6 +41,8 @@ pub struct AgentConfig {
     pub max_tools_per_step: usize,
     pub max_context_messages: usize,
     pub auto_compact: bool,
+    pub rate_limit_ms: u64,
+    pub max_retries: i32,
 }
 
 impl Default for Config {
@@ -65,6 +67,8 @@ impl Default for Config {
                 max_tools_per_step: 10,
                 max_context_messages: 256,
                 auto_compact: true,
+                rate_limit_ms: 0,
+                max_retries: 0,
             },
         }
     }

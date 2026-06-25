@@ -64,7 +64,11 @@ fn run_acp_server(config: &Config) -> Result<()> {
         std::process::exit(1);
     }
 
-    let provider = crate::provider::deepseek::DeepseekProvider::new(&config.provider)?;
+    let provider = crate::provider::deepseek::DeepseekProvider::new(
+        &config.provider,
+        config.agent.rate_limit_ms,
+        config.agent.max_retries,
+    )?;
     let provider = Arc::new(provider);
     let mut server = acp::server::AcpServer::new(provider);
     server.run()?;

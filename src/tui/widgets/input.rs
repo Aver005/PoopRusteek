@@ -111,7 +111,7 @@ pub fn render_input(
             let seg_bytes = seg.as_bytes();
             let mut idx = 0usize;
             while idx < seg_bytes.len() {
-                let ch = seg[idx..].chars().next().unwrap();
+                let Some(ch) = seg[idx..].chars().next() else { break };
                 let ch_len = ch.len_utf8();
                 let abs_byte = seg_byte_start + idx;
                 let in_sel = match sel {
@@ -128,7 +128,7 @@ pub fn render_input(
                     if next_in != in_sel {
                         break;
                     }
-                    let nch = seg[j..].chars().next().unwrap();
+                    let Some(nch) = seg[j..].chars().next() else { break };
                     j += nch.len_utf8();
                 }
                 let text = &seg[chunk_start..j];

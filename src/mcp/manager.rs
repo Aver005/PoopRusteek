@@ -1,5 +1,5 @@
 use super::client::MCPClient;
-use super::config::load_mcp_config;
+use super::config::{load_mcp_config, load_own_enabled_map, save_mcp_config};
 use super::types::*;
 use crate::error::AppResult;
 use serde_json::Value;
@@ -16,6 +16,7 @@ struct MCPServerEntry {
     status: MCPServerStatus,
     tools: Vec<MCPTool>,
     resources: Vec<MCPResource>,
+    enabled: bool,
 }
 
 impl MCPManager {
@@ -28,16 +29,30 @@ impl MCPManager {
 
     pub async fn initialize(&mut self) -> AppResult<()> {
         let configs = load_mcp_config();
+        let enabled_map = load_own_enabled_map();
 
         for (name, config) in configs {
-            self.add_server(name, config).await;
+            let enabled = enabled_map.get(&name).copied().unwrap_or(true);
+            self.add_server(name, config, enabled).await;
         }
 
         self.connect_all().await;
         Ok(())
     }
 
-    async fn add_server(&mut self, name: String, config: MCPServerConfig) {
+    async fn add_server(&mut self, name: String, config: MCPServerConfig, enabled: bool) {
+        if !enabled {
+            let entry = MCPServerEntry {
+                client: MCPClient::dummy(&name),
+                config,
+                status: MCPServerStatus::Disabled,
+                tools: Vec::new(),
+                resources: Vec::new(),
+                enabled: false,
+            };
+            self.servers.insert(name, entry);
+            return;
+        }
         let client = match &config {
             MCPServerConfig::Stdio { command, args, env, cwd } => {
                 match MCPClient::from_stdio(
@@ -72,6 +87,7 @@ impl MCPManager {
                 status: MCPServerStatus::Pending,
                 tools: Vec::new(),
                 resources: Vec::new(),
+                enabled: true,
             });
         }
     }
@@ -124,7 +140,7 @@ impl MCPManager {
                 entry.resources = resources;
             }
             Err(e) => {
-                tracing::warn!("MCP '{name}' list_resources failed: {e}");
+                tracing::info!("MCP '{name}' list_resources (optional): {e}");
             }
         }
 
@@ -197,6 +213,117 @@ impl MCPManager {
             entry.resources.clear();
         }
         self.tool_name_map.clear();
+    }
+
+    pub fn get_servers_info(&self) -> Vec<ServerDisplayInfo> {
+        let mut list: Vec<ServerDisplayInfo> = self.servers.iter().map(|(name, entry)| {
+            let transport = match &entry.config {
+                MCPServerConfig::Stdio { .. } => "stdio",
+                MCPServerConfig::Http { .. } => "http",
+            }.to_string();
+            ServerDisplayInfo {
+                name: name.clone(),
+                transport,
+                status: match &entry.status {
+                    MCPServerStatus::Pending => "pending".to_string(),
+                    MCPServerStatus::Connecting => "connecting".to_string(),
+                    MCPServerStatus::Connected => "connected".to_string(),
+                    MCPServerStatus::Error(e) => format!("error: {e}"),
+                    MCPServerStatus::Disabled => "disabled".to_string(),
+                },
+                tool_count: entry.tools.len(),
+                resource_count: entry.resources.len(),
+                enabled: entry.enabled,
+            }
+        }).collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    }
+
+    pub fn get_server_config(&self, name: &str) -> Option<MCPServerConfig> {
+        self.servers.get(name).map(|e| e.config.clone())
+    }
+
+    pub fn get_server_tools(&self, name: &str) -> Vec<MCPTool> {
+        self.servers.get(name).map(|e| e.tools.clone()).unwrap_or_default()
+    }
+
+    pub fn get_server_resources(&self, name: &str) -> Vec<MCPResource> {
+        self.servers.get(name).map(|e| e.resources.clone()).unwrap_or_default()
+    }
+
+    pub async fn toggle_server(&mut self, name: &str) -> AppResult<()> {
+        let enabled = self.servers.get(name).map(|e| !e.enabled).unwrap_or(true);
+        if let Some(entry) = self.servers.get_mut(name) {
+            let config = entry.config.clone();
+            entry.enabled = enabled;
+            if enabled {
+                // recreate client and connect
+                let client = match &config {
+                    MCPServerConfig::Stdio { command, args, env, cwd } => {
+                        MCPClient::from_stdio(name, command, args, env.as_ref(), cwd.as_deref()).await?
+                    }
+                    MCPServerConfig::Http { url, headers } => {
+                        MCPClient::from_http(name, url, headers.clone()).await?
+                    }
+                };
+                entry.client = client;
+                entry.status = MCPServerStatus::Pending;
+                self.connect_server(name).await;
+            } else {
+                entry.status = MCPServerStatus::Disabled;
+                entry.tools.clear();
+                entry.resources.clear();
+                entry.client = MCPClient::dummy(name);
+                self.tool_name_map.retain(|_, (s, _)| s != name);
+            }
+        }
+        self.persist_config().await;
+        Ok(())
+    }
+
+    pub async fn reconnect_server(&mut self, name: &str) -> AppResult<()> {
+        let config = self.servers.get(name).map(|e| e.config.clone());
+        let Some(config) = config else {
+            return Err(crate::error::AppError::Mcp(format!("Server '{name}' not found")));
+        };
+        let enabled = true;
+        let client = match &config {
+            MCPServerConfig::Stdio { command, args, env, cwd } => {
+                MCPClient::from_stdio(name, command, args, env.as_ref(), cwd.as_deref()).await?
+            }
+            MCPServerConfig::Http { url, headers } => {
+                MCPClient::from_http(name, url, headers.clone()).await?
+            }
+        };
+        // remove old tool mappings
+        self.tool_name_map.retain(|_, (s, _)| s != name);
+        if let Some(entry) = self.servers.get_mut(name) {
+            entry.client = client;
+            entry.enabled = enabled;
+            entry.status = MCPServerStatus::Pending;
+            entry.tools.clear();
+            entry.resources.clear();
+        }
+        self.connect_server(name).await;
+        self.persist_config().await;
+        Ok(())
+    }
+
+    pub async fn remove_server(&mut self, name: &str) -> AppResult<()> {
+        self.tool_name_map.retain(|_, (s, _)| s != name);
+        self.servers.remove(name);
+        self.persist_config().await;
+        Ok(())
+    }
+
+    async fn persist_config(&self) {
+        let servers: HashMap<String, (MCPServerConfig, bool)> = self.servers.iter()
+            .map(|(name, entry)| (name.clone(), (entry.config.clone(), entry.enabled)))
+            .collect();
+        if let Err(e) = save_mcp_config(&servers) {
+            tracing::warn!("Failed to save MCP config: {e}");
+        }
     }
 }
 

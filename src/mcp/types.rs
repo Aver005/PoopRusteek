@@ -74,3 +74,33 @@ pub struct MCPToolResult {
     pub content: String,
     pub is_error: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerDef {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub config: MCPServerConfig,
+}
+
+fn default_enabled() -> bool { true }
+
+#[derive(Debug, Clone, Default)]
+pub struct McpViewState {
+    pub active: bool,
+    pub selected: usize,
+    pub scroll_offset: usize,
+    pub details_server: Option<String>,
+    pub servers: Vec<ServerDisplayInfo>,
+    pub status_message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerDisplayInfo {
+    pub name: String,
+    pub transport: String,
+    pub status: String,
+    pub tool_count: usize,
+    pub resource_count: usize,
+    pub enabled: bool,
+}

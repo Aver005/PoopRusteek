@@ -71,10 +71,22 @@ impl AcpServer {
                         "prompt": true,
                     }),
                 };
+                let result_value = match serde_json::to_value(result) {
+                    Ok(v) => v,
+                    Err(e) => return Some(AcpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: request.id,
+                        result: None,
+                        error: Some(AcpError {
+                            code: -32603,
+                            message: format!("Internal error: {e}"),
+                        }),
+                    }),
+                };
                 Some(AcpResponse {
                     jsonrpc: "2.0".to_string(),
                     id: request.id,
-                    result: Some(serde_json::to_value(result).unwrap()),
+                    result: Some(result_value),
                     error: None,
                 })
             }
@@ -90,10 +102,22 @@ impl AcpServer {
                 let rt = tokio::runtime::Runtime::new().ok()?;
                 let result = rt.block_on(self.handle_prompt(&params));
 
+                let result_value = match serde_json::to_value(result) {
+                    Ok(v) => v,
+                    Err(e) => return Some(AcpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: request.id,
+                        result: None,
+                        error: Some(AcpError {
+                            code: -32603,
+                            message: format!("Internal error: {e}"),
+                        }),
+                    }),
+                };
                 Some(AcpResponse {
                     jsonrpc: "2.0".to_string(),
                     id: request.id,
-                    result: Some(serde_json::to_value(result).unwrap()),
+                    result: Some(result_value),
                     error: None,
                 })
             }

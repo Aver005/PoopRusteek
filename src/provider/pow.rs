@@ -1,5 +1,6 @@
 use base64::Engine as _;
 use crate::debug_log;
+use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -190,9 +191,10 @@ impl WasmPowRuntime {
     }
 }
 
-pub fn encode_solution(solution: &PowSolution) -> String {
-    let json = serde_json::to_string(solution).unwrap();
-    base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+pub fn encode_solution(solution: &PowSolution) -> AppResult<String> {
+    let json = serde_json::to_string(solution)
+        .map_err(|e| AppError::Custom(format!("Failed to serialize PoW solution: {e}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(json.as_bytes()))
 }
 
 fn encode_string(

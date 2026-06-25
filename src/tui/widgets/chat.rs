@@ -139,10 +139,10 @@ fn count_wrapped_rows(lines: &[Line], width: usize) -> usize {
         let text: String = line.spans.iter().map(|s| &*s.content).collect();
         if text.is_empty() {
             total += 1;
-            continue;
+        } else {
+            let char_count = text.chars().count();
+            total += char_count.div_ceil(width).max(1);
         }
-        let wrapped = textwrap::wrap(&text, width);
-        total += wrapped.len().max(1);
     }
     total.max(1)
 }

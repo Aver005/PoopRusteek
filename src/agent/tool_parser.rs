@@ -1,5 +1,28 @@
 use regex::Regex;
 use serde_json::Value;
+use std::sync::LazyLock;
+
+static XML_TOOL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<tool_use>\s*(.*?)\s*</tool_use>").expect("hardcoded regex is valid")
+});
+static XML_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<name>\s*(.*?)\s*</name>").expect("hardcoded regex is valid")
+});
+static XML_ARGS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<arguments>\s*(.*?)\s*</arguments>").expect("hardcoded regex is valid")
+});
+static LEGACY_TOOL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[TOOL:([^\]]+)\]\s*(\{[^}]*\})").expect("hardcoded regex is valid")
+});
+static STRIP_TOOL_XML_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<tool_use>\s*.*?\s*</tool_use>").expect("hardcoded regex is valid")
+});
+static STRIP_THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<thinking>\s*.*?\s*</thinking>").expect("hardcoded regex is valid")
+});
+static STRIP_LEGACY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").expect("hardcoded regex is valid")
+});
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -10,17 +33,12 @@ pub struct ParsedToolCall {
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
-    let xml_pattern = Regex::new(r"(?s)<tool_use>\s*(.*?)\s*</tool_use>").unwrap();
-    let name_pattern = Regex::new(r"(?s)<name>\s*(.*?)\s*</name>").unwrap();
-    let args_pattern = Regex::new(r"(?s)<arguments>\s*(.*?)\s*</arguments>").unwrap();
-    let legacy_pattern = Regex::new(r"\[TOOL:([^\]]+)\]\s*(\{[^}]*\})").unwrap();
-
-    for cap in xml_pattern.captures_iter(text) {
+    for cap in XML_TOOL_RE.captures_iter(text) {
         let body = cap[1].trim();
 
         if let (Some(name_cap), Some(args_cap)) = (
-            name_pattern.captures(body),
-            args_pattern.captures(body),
+            XML_NAME_RE.captures(body),
+            XML_ARGS_RE.captures(body),
         ) {
             let name = name_cap[1].trim().to_string();
             let args_str = args_cap[1].trim();
@@ -46,7 +64,7 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
         }
     }
 
-    for cap in legacy_pattern.captures_iter(text) {
+    for cap in LEGACY_TOOL_RE.captures_iter(text) {
         let name = cap[1].to_string();
         let args_str = &cap[2];
 
@@ -68,21 +86,15 @@ pub fn has_tool_calls(text: &str) -> bool {
 }
 
 pub fn strip_tool_calls(text: &str) -> String {
-    let tool_xml = Regex::new(r"(?s)<tool_use>\s*.*?\s*</tool_use>").unwrap();
-    let thinking = Regex::new(r"(?s)<thinking>\s*.*?\s*</thinking>").unwrap();
-    let legacy_pattern = Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").unwrap();
-    let without_xml = tool_xml.replace_all(text, "");
-    let without_thinking = thinking.replace_all(&without_xml, "");
-    legacy_pattern.replace_all(without_thinking.trim(), "").trim().to_string()
+    let without_xml = STRIP_TOOL_XML_RE.replace_all(text, "");
+    let without_thinking = STRIP_THINKING_RE.replace_all(&without_xml, "");
+    STRIP_LEGACY_RE.replace_all(without_thinking.trim(), "").trim().to_string()
 }
 
 pub fn stream_visible_text(text: &str) -> String {
-    let tool_xml = Regex::new(r"(?s)<tool_use>\s*.*?\s*</tool_use>").unwrap();
-    let thinking = Regex::new(r"(?s)<thinking>\s*.*?\s*</thinking>").unwrap();
-    let legacy_pattern = Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").unwrap();
-    let without_xml = tool_xml.replace_all(text, "");
-    let without_thinking = thinking.replace_all(&without_xml, "");
-    let without_complete = legacy_pattern.replace_all(&without_thinking, "");
+    let without_xml = STRIP_TOOL_XML_RE.replace_all(text, "");
+    let without_thinking = STRIP_THINKING_RE.replace_all(&without_xml, "");
+    let without_complete = STRIP_LEGACY_RE.replace_all(&without_thinking, "");
     let mut visible = without_complete.to_string();
 
     if let Some(index) = visible.find('<') {

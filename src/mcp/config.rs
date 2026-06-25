@@ -1,5 +1,5 @@
 use super::types::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -40,6 +40,7 @@ struct VSCodeMCPServer {
 pub fn load_mcp_config() -> HashMap<String, MCPServerConfig> {
     let mut configs = HashMap::new();
 
+    load_own_config(&mut configs);
     load_workspace_config(&mut configs);
     load_global_config(&mut configs);
     load_opencode_config(&mut configs);
@@ -49,6 +50,73 @@ pub fn load_mcp_config() -> HashMap<String, MCPServerConfig> {
     load_cursor_config(&mut configs);
 
     configs
+}
+
+pub fn own_config_path() -> PathBuf {
+    crate::config::Config::data_dir().join("mcp.json")
+}
+
+pub fn load_own_enabled_map() -> HashMap<String, bool> {
+    let path = own_config_path();
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    #[derive(Deserialize)]
+    struct OwnConfig {
+        #[serde(rename = "mcpServers")]
+        mcp_servers: HashMap<String, McpServerDef>,
+    }
+    let Ok(parsed) = serde_json::from_str::<OwnConfig>(&content) else {
+        return HashMap::new();
+    };
+    parsed.mcp_servers.into_iter().map(|(k, v)| (k, v.enabled)).collect()
+}
+
+fn load_own_config(configs: &mut HashMap<String, MCPServerConfig>) {
+    let path = own_config_path();
+    if !path.exists() {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    #[derive(Deserialize)]
+    struct OwnConfig {
+        #[serde(rename = "mcpServers")]
+        mcp_servers: HashMap<String, McpServerDef>,
+    }
+    let Ok(parsed) = serde_json::from_str::<OwnConfig>(&content) else {
+        return;
+    };
+    for (name, def) in parsed.mcp_servers {
+        if def.enabled {
+            configs.entry(name).or_insert(def.config);
+        }
+    }
+}
+
+pub fn save_mcp_config(servers: &HashMap<String, (MCPServerConfig, bool)>) -> crate::error::AppResult<()> {
+    #[derive(Serialize)]
+    struct OwnConfig {
+        #[serde(rename = "mcpServers")]
+        mcp_servers: HashMap<String, McpServerDef>,
+    }
+    let mcp_servers = servers.iter().map(|(name, (config, enabled))| {
+        (name.clone(), McpServerDef { enabled: *enabled, config: config.clone() })
+    }).collect();
+    let own = OwnConfig { mcp_servers };
+    let content = serde_json::to_string_pretty(&own)
+        .map_err(|e| crate::error::AppError::Config(e.to_string()))?;
+    let path = own_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| crate::error::AppError::Config(e.to_string()))?;
+    }
+    std::fs::write(&path, content)
+        .map_err(|e| crate::error::AppError::Config(e.to_string()))
 }
 
 fn load_workspace_config(configs: &mut HashMap<String, MCPServerConfig>) {

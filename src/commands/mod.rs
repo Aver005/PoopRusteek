@@ -51,6 +51,9 @@ impl CommandRegistry {
         self.register(Box::new(defs::session_info::SessionInfoCommand));
         self.register(Box::new(defs::session_list::SessionListCommand));
         self.register(Box::new(defs::reset::ResetCommand));
+        self.register(Box::new(defs::rate::RateCommand));
+        self.register(Box::new(defs::retry::RetryCommand));
+        self.register(Box::new(defs::mcp::McpCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {
