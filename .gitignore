@@ -64,3 +64,4 @@ cache/
 # --- Dev ---
 .dev/
 *.dev.*
+.playwright-mcp

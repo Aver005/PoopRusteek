@@ -3,6 +3,7 @@ use crate::error::AppResult;
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::time::{timeout, Duration};
 use std::collections::HashMap;
 
 #[async_trait]
@@ -66,7 +67,9 @@ impl Transport for StdioTransport {
         }
 
         let mut line = String::new();
-        self.reader.read_line(&mut line).await?;
+        timeout(Duration::from_secs(60), self.reader.read_line(&mut line))
+            .await
+            .map_err(|_| crate::error::AppError::Mcp("MCP request timed out after 60s".to_string()))??;
 
         let response: JsonRpcResponse = serde_json::from_str(&line)?;
         Ok(response)

@@ -10,7 +10,7 @@ use crate::commands::CommandResult;
 use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use crate::commands::CommandSuggestion;
-use events::{AgentResult, AppEvent, Modal, ToolApprovalRequest};
+use events::{AgentResult, AppEvent, Modal, QuestionRequest, QuestionState, ToolApprovalRequest};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -38,6 +38,7 @@ pub struct AppState {
     pub modal: Option<Modal>,
     pub approved_tools: std::collections::HashSet<String>,
     pub pending_tool_approval: Option<ToolApprovalRequest>,
+    pub pending_question: Option<QuestionRequest>,
     pub animation_tick: u64,
     pub autocomplete: AutocompleteState,
     pub current_session_id: String,
@@ -84,6 +85,7 @@ impl App {
             modal: None,
             approved_tools: std::collections::HashSet::new(),
             pending_tool_approval: None,
+            pending_question: None,
             animation_tick: 0,
             autocomplete: AutocompleteState::default(),
             current_session_id: crate::session::create_session_id(),
@@ -246,6 +248,12 @@ impl App {
                     self.state.pending_tool_approval = Some(request);
                 }
             }
+            AppEvent::RequestQuestion(request, state) => {
+                self.state.pending_question = Some(request);
+                self.state.modal = Some(Modal::Question(state));
+                self.state.is_generating = false;
+                self.state.status_message = "Question pending...".to_string();
+            }
             AppEvent::PushModal(modal) => {
                 self.state.modal = Some(modal);
             }
@@ -381,6 +389,43 @@ impl App {
                             self.state.modal = None;
                         }
                         _ => {}
+                    }
+                    return Ok(false);
+                }
+                Modal::Picker(mut picker) => {
+                    let action = events::handle_picker_key(&mut picker, key.code);
+                    match action {
+                        events::PickerAction::Selected(indices) => {
+                            if let Some(idx) = indices.first() {
+                                if let Some(item) = picker.items.get(*idx) {
+                                    let id = item.value.clone();
+                                    self.state.modal = None;
+                                    self.handle_load_session(&id).await?;
+                                }
+                            }
+                            self.state.modal = None;
+                        }
+                        events::PickerAction::Cancelled => {
+                            self.state.modal = None;
+                        }
+                        events::PickerAction::None => {
+                            self.state.modal = Some(Modal::Picker(picker));
+                        }
+                    }
+                    return Ok(false);
+                }
+                Modal::Question(mut qs) => {
+                    let result = events::handle_question_key(&mut qs, key.code);
+                    if let Some(answer) = result {
+                        if let Some(request) = self.state.pending_question.take() {
+                            request.resolve(answer).await;
+                        }
+                        self.state.modal = None;
+                        self.state.is_generating = true;
+                        self.state.status_message = "Answer received".to_string();
+                    } else {
+                        self.state.modal = Some(Modal::Question(qs));
+                        self.state.status_message = "Answering question...".to_string();
                     }
                     return Ok(false);
                 }
@@ -651,27 +696,41 @@ impl App {
         } else {
             builtin_tools
                 .iter()
-                .map(|tool| format!("- `{}`: {}", tool.name, tool.description))
+                .map(|tool| format_tool_definition(&tool.name, &tool.description, &tool.parameters))
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n\n")
         };
 
         let mcp = self.mcp.lock().await;
-        let dynamic_tool_names = mcp.get_dynamic_tool_names();
-        let mcp_section = if dynamic_tool_names.is_empty() {
+        let all_mcp_tools = mcp.get_all_tools();
+        let all_mcp_resources = mcp.get_all_resources();
+        let mcp_tool_section = if all_mcp_tools.is_empty() {
             "- none".to_string()
         } else {
-            dynamic_tool_names
+            all_mcp_tools
                 .iter()
-                .map(|tool_name| {
-                    let description = mcp
-                        .get_tool_description(tool_name)
-                        .unwrap_or_else(|| "No description".to_string());
-                    format!("- `{tool_name}`: {description}")
+                .map(|full| {
+                    format_tool_definition(
+                        &full.full_name,
+                        &full.tool.description,
+                        &full.tool.input_schema,
+                    )
                 })
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n\n")
         };
+        let mcp_resource_section = if all_mcp_resources.is_empty() {
+            String::new()
+        } else {
+            let mut lines = vec!["\n\n### Available MCP resources:".to_string()];
+            for r in &all_mcp_resources {
+                let desc = r.description.as_deref().unwrap_or("");
+                let name = if r.name.is_empty() { &r.uri } else { &r.name };
+                lines.push(format!("- `{}`: {} ({})", name, desc, r.uri));
+            }
+            lines.join("\n")
+        };
+        let mcp_section = format!("{mcp_tool_section}{mcp_resource_section}");
         drop(mcp);
 
         let base_prompt = self
@@ -779,35 +838,88 @@ impl App {
 
                 for tool_call in tool_calls.into_iter().take(max_tools_per_step) {
                     let tool_id = uuid::Uuid::new_v4().to_string();
-                    let arguments_preview = serde_json::to_string_pretty(&tool_call.arguments)
-                        .unwrap_or_else(|_| tool_call.arguments.to_string());
-                    let approval = ToolApprovalRequest::new(
-                        tool_call.name.clone(),
-                        arguments_preview,
-                    );
-                    let _ = event_tx.send(AppEvent::RequestToolApproval(approval.clone()));
-                    let approved = approval.wait().await;
 
-                    let execution = if approved {
+                    let (tool_result, is_error) = if tool_call.name == "question" {
+                        let question_text = tool_call.arguments["question"]
+                            .as_str()
+                            .unwrap_or("(no question)");
+                        let options: Vec<String> = tool_call.arguments["options"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let allow_custom = tool_call.arguments["allow_custom"]
+                            .as_bool()
+                            .unwrap_or(false);
+
+                        let qs = QuestionState::new(
+                            question_text.to_string(),
+                            options,
+                            allow_custom,
+                        );
+                        let request = QuestionRequest::new();
+                        let _ = event_tx
+                            .send(AppEvent::RequestQuestion(request.clone(), qs));
+
                         let _ = event_tx.send(AppEvent::ToolStarted {
                             name: tool_call.name.clone(),
                             id: tool_id.clone(),
                         });
-                        if tool_call.name.starts_with("mcp__") {
-                            let mut mcp = mcp.lock().await;
-                            match mcp.call_tool(&tool_call.name, tool_call.arguments.clone()).await {
-                                Ok(result) => (result.content, result.is_error),
-                                Err(error) => (error.to_string(), true),
+
+                        match request.wait().await {
+                            Some(answer) if !answer.is_empty() => {
+                                (format!("User answered: {answer}"), false)
                             }
-                        } else {
-                            let result = tools.execute(&tool_call.name, tool_call.arguments.clone()).await;
-                            (result.content, result.is_error)
+                            _ => {
+                                ("User cancelled the question".to_string(), true)
+                            }
                         }
                     } else {
-                        ("Execution denied by user.".to_string(), true)
+                        let arguments_preview =
+                            serde_json::to_string_pretty(&tool_call.arguments)
+                                .unwrap_or_else(|_| tool_call.arguments.to_string());
+                        let approval = ToolApprovalRequest::new(
+                            tool_call.name.clone(),
+                            arguments_preview,
+                        );
+                        let _ = event_tx
+                            .send(AppEvent::RequestToolApproval(approval.clone()));
+                        let approved = approval.wait().await;
+
+                        if approved {
+                            let _ = event_tx.send(AppEvent::ToolStarted {
+                                name: tool_call.name.clone(),
+                                id: tool_id.clone(),
+                            });
+                            if tool_call.name.starts_with("mcp__") {
+                                let mut mcp = mcp.lock().await;
+                                match mcp
+                                    .call_tool(
+                                        &tool_call.name,
+                                        tool_call.arguments.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(result) => (result.content, result.is_error),
+                                    Err(error) => (error.to_string(), true),
+                                }
+                            } else {
+                                let result = tools
+                                    .execute(
+                                        &tool_call.name,
+                                        tool_call.arguments.clone(),
+                                    )
+                                    .await;
+                                (result.content, result.is_error)
+                            }
+                        } else {
+                            ("Execution denied by user.".to_string(), true)
+                        }
                     };
 
-                    let (tool_result, is_error) = execution;
                     let preview = summarize_tool_result(&tool_result);
                     let display = preview.clone();
 
@@ -1050,4 +1162,52 @@ fn summarize_tool_result(result: &str) -> String {
     } else {
         compact
     }
+}
+
+fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Value) -> String {
+    let mut result = format!("- `{name}`: {description}");
+
+    if let Some(props) = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+    {
+        if !props.is_empty() {
+            result.push_str("\n  Parameters:");
+            let required = schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
+            let mut params: Vec<(&String, &serde_json::Value)> = props.iter().collect();
+            params.sort_by(|a, b| {
+                let a_req = required.contains(a.0);
+                let b_req = required.contains(b.0);
+                b_req.cmp(&a_req).then(a.0.cmp(b.0))
+            });
+            for (param_name, param_info) in params {
+                let param_type = param_info
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("any");
+                let param_desc = param_info
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                let req_str = if required.contains(param_name) {
+                    "required"
+                } else {
+                    "optional"
+                };
+                result.push_str(&format!(
+                    "\n    \u{2022} `{param_name}` ({param_type}, {req_str}): {param_desc}"
+                ));
+            }
+        }
+    }
+
+    result
 }

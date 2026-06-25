@@ -18,6 +18,7 @@ impl ToolRegistry {
     fn register_default_tools(&mut self) {
         self.register(Arc::new(bash::BashTool));
         self.register(Arc::new(powershell::PowerShellTool));
+        self.register(Arc::new(question::QuestionTool));
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {

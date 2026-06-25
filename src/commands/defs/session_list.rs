@@ -1,3 +1,4 @@
+use crate::app::events::{Modal, PickerItem, PickerMode, PickerState};
 use crate::app::AppState;
 use crate::commands::{Command, CommandResult};
 use crate::config::Config;
@@ -31,17 +32,20 @@ impl Command for SessionListCommand {
             return CommandResult::Handled;
         }
 
-        let mut lines = Vec::new();
-        lines.push("--- Local sessions ---".to_string());
-        for s in &sessions {
-            lines.push(format!(
-                "  {} | {} msgs | {}",
-                s.id, s.message_count, s.title
-            ));
-        }
-        lines.push(format!("Total: {} sessions ---", sessions.len()));
+        let items: Vec<PickerItem> = sessions
+            .iter()
+            .map(|s| {
+                let date = s.updated_at.split('T').next().unwrap_or(&s.updated_at);
+                let text = format!("{} [{}, {} msgs]", s.title, date, s.message_count);
+                PickerItem::new(&text, s.id.clone())
+            })
+            .collect();
 
-        state.messages.push(crate::provider::ChatMessage::system(&lines.join("\n")));
+        state.modal = Some(Modal::Picker(PickerState::new(
+            "\u{1F4C2} Sessions",
+            items,
+            PickerMode::Single,
+        )));
         CommandResult::Handled
     }
 }

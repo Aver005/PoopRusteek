@@ -1,6 +1,7 @@
 pub mod registry;
 pub mod bash;
 pub mod powershell;
+pub mod question;
 
 use async_trait::async_trait;
 use serde_json::Value;

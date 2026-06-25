@@ -42,6 +42,8 @@ pub fn load_mcp_config() -> HashMap<String, MCPServerConfig> {
 
     load_workspace_config(&mut configs);
     load_global_config(&mut configs);
+    load_opencode_config(&mut configs);
+    load_claude_cli_config(&mut configs);
     load_claude_desktop_config(&mut configs);
     load_vscode_config(&mut configs);
     load_cursor_config(&mut configs);
@@ -167,6 +169,119 @@ fn load_cursor_config(configs: &mut HashMap<String, MCPServerConfig>) {
                     }
                 }
             }
+        }
+    }
+}
+
+fn load_opencode_config(configs: &mut HashMap<String, MCPServerConfig>) {
+    let base = dirs::home_dir().map(|h| h.join(".config").join("opencode"));
+    let Some(base) = base else { return };
+
+    // Check opencode.json (canonical), then other possible names
+    let candidates = [
+        base.join("opencode.json"),
+        base.join("opencode.jsonc"),
+        base.join("mcp.json"),
+        base.join("mcp.config.json"),
+        base.join("opencode.mcp.json"),
+    ];
+
+    for path in &candidates {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                // try opencode format first, fall back to standard mcp format
+                let is_opencode = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("opencode"))
+                    .unwrap_or(false);
+
+                if is_opencode {
+                    if let Ok(mut parsed) = parse_opencode_json(&content) {
+                        for (name, config) in parsed.drain() {
+                            configs.entry(name).or_insert(config);
+                        }
+                        return;
+                    }
+                    // fall through to standard parser if opencode format fails
+                }
+
+                if let Ok(mut parsed) = parse_mcp_json(&content) {
+                    for (name, config) in parsed.drain() {
+                        configs.entry(name).or_insert(config);
+                    }
+                }
+            }
+            return;
+        }
+    }
+}
+
+fn parse_opencode_json(content: &str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(content)?;
+    let mut configs = HashMap::new();
+
+    if let Some(mcp) = value.get("mcp") {
+        if let Some(obj) = mcp.as_object() {
+            for (name, server) in obj {
+                // skip disabled servers
+                if server.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                    continue;
+                }
+
+                let config = match server.get("type").and_then(|t| t.as_str()) {
+                    Some("remote") => {
+                        let url = server.get("url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let headers = server.get("headers")
+                            .and_then(|h| serde_json::from_value(h.clone()).ok())
+                            .unwrap_or_default();
+                        MCPServerConfig::Http { url, headers }
+                    }
+                    Some("local") => {
+                        let (command, args) = if let Some(cmd_arr) = server.get("command").and_then(|c| c.as_array()) {
+                            let mut parts: Vec<String> = cmd_arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect();
+                            let cmd = if parts.is_empty() { String::new() } else { parts.remove(0) };
+                            (cmd, parts)
+                        } else {
+                            (String::new(), vec![])
+                        };
+                        let env = server.get("env")
+                            .and_then(|e| serde_json::from_value(e.clone()).ok());
+                        MCPServerConfig::Stdio { command, args, env, cwd: None }
+                    }
+                    _ => continue,
+                };
+                configs.insert(name.clone(), config);
+            }
+        }
+    }
+
+    Ok(configs)
+}
+
+fn load_claude_cli_config(configs: &mut HashMap<String, MCPServerConfig>) {
+    let candidates = [
+        // ~/.claude/mcp.json (standard Claude CLI location)
+        dirs::home_dir().map(|h| h.join(".claude").join("mcp.json")),
+        // Also check XDG-like ~/.config/claude/mcp.json
+        dirs::config_dir().map(|c| c.join("claude").join("mcp.json")),
+    ];
+
+    for candidate in candidates.iter().flatten() {
+        if candidate.exists() {
+            if let Ok(content) = std::fs::read_to_string(candidate) {
+                if let Ok(mut claude_configs) = parse_mcp_json(&content) {
+                    for (name, config) in claude_configs.drain() {
+                        configs.entry(name).or_insert(config);
+                    }
+                }
+            }
+            // take the first found file only
+            return;
         }
     }
 }

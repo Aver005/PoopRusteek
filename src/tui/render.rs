@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::app::events::Modal;
+use crate::app::events::{Modal, PickerMode, PickerState, QuestionState};
 use crate::config::Config;
 use crate::tui::TuiTerminal;
 use crate::tui::theme::Theme;
@@ -495,7 +495,301 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                 inner,
             );
         }
+        Modal::Picker(picker) => render_picker(frame, area, picker, theme),
+        Modal::Question(qs) => render_question(frame, area, qs, theme),
     }
+}
+
+fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Theme) {
+    let popup_width = area.width.min(80).max(48);
+    let visible = picker.items.len().min(12).max(3);
+    let popup_h = (visible + 5) as u16;
+    let popup_h = popup_h.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_h);
+
+    let is_multi = picker.mode == PickerMode::Multi;
+    let hints = if is_multi {
+        " \u{2191}\u{2193} navigate  Space toggle  Enter confirm  Esc cancel "
+    } else {
+        " \u{2191}\u{2193} navigate  Enter select  Esc close "
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(format!(" {} ", picker.title))
+        .title_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(theme.panel));
+
+    let inner = block.inner(popup_area);
+    let inner_w = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    let end = (picker.scroll_offset + visible).min(picker.items.len());
+
+    if picker.scroll_offset > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("  \u{2191} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
+        ]));
+    }
+
+    for i in picker.scroll_offset..end {
+        let is_cursor = i == picker.cursor;
+        let is_checked = picker.checked.contains(&i);
+
+        let indicator = if is_multi {
+            if is_checked { "\u{2611} " } else { "\u{2610} " }
+        } else {
+            if is_cursor { "\u{25B6} " } else { "  " }
+        };
+
+        let bg = if is_cursor { theme.selection } else { theme.panel };
+        let fg = if is_cursor { theme.fg } else { theme.text_soft };
+
+        let item = &picker.items[i];
+        let text = truncate(&item.text, inner_w.saturating_sub(6));
+
+        let row_style = Style::default().fg(fg).bg(bg);
+        let ind_style = Style::default()
+            .fg(if is_cursor { theme.accent } else { theme.text_dim })
+            .bg(bg);
+
+        lines.push(Line::from(vec![
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(indicator, ind_style),
+            Span::styled(text, row_style),
+            Span::styled(" ", Style::default().bg(bg)),
+        ]));
+    }
+
+    if picker.scroll_offset + visible < picker.items.len() {
+        lines.push(Line::from(vec![
+            Span::styled("  \u{2193} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
+        ]));
+    }
+
+    // Fill remaining
+    while lines.len() < inner.height.saturating_sub(3) as usize {
+        lines.push(Line::from(vec![
+            Span::styled(" ".repeat(inner_w.saturating_sub(2)), Style::default().bg(theme.panel)),
+        ]));
+    }
+
+    // Separator
+    let sep = "\u{2500}".repeat(inner_w.saturating_sub(4));
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {}", sep), Style::default().fg(theme.border)),
+    ]));
+
+    // Footer
+    let count = picker.items.len();
+    let count_str = if is_multi {
+        format!("{}/{} sel", picker.checked.len(), count)
+    } else {
+        format!("{}/{}", picker.cursor + 1, count)
+    };
+    let total_w = inner_w.saturating_sub(4);
+    let pad = total_w.saturating_sub(count_str.len() + hints.len().saturating_sub(2));
+    let pad_str = " ".repeat(pad);
+
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default().fg(theme.fg)),
+        Span::styled(count_str, Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled(pad_str, Style::default().fg(theme.fg)),
+        Span::styled(hints, Style::default().fg(theme.text_dim)),
+    ]));
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+        inner,
+    );
+}
+
+fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Theme) {
+    let popup_width = area.width.min(72).max(48);
+    let is_custom_mode = qs.is_custom_mode;
+    let is_yes_no = qs.options.is_empty();
+
+    let popup_height = if is_custom_mode {
+        10u16
+    } else if is_yes_no {
+        8u16
+    } else {
+        let visible = qs.options.len().min(10).max(3) + 1;
+        (visible + 5) as u16
+    };
+    let popup_h = popup_height.min(area.height.saturating_sub(2));
+
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" Question ")
+        .title_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(theme.panel));
+
+    let inner = block.inner(popup_area);
+    let inner_w = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Question text
+    let wrapped = textwrap::wrap(&qs.question, inner_w.saturating_sub(4));
+    for (i, wline) in wrapped.iter().enumerate() {
+        let prefix = if i == 0 { "  " } else { "    " };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(theme.fg)),
+            Span::styled(wline.to_string(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    if is_custom_mode {
+        // Custom text input sub-mode
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(theme.text_dim)),
+            Span::styled("Enter your answer:", Style::default().fg(theme.text_dim)),
+        ]));
+        lines.push(Line::from(""));
+
+        let cursor_visible = qs.custom_cursor < qs.custom_input.chars().count();
+        let before_cursor: String = qs.custom_input.chars().take(qs.custom_cursor).collect();
+
+        if cursor_visible {
+            let after_cursor: String = qs.custom_input.chars().skip(qs.custom_cursor).collect();
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme.fg)),
+                Span::styled(before_cursor, Style::default().fg(theme.fg).bg(theme.input_bg)),
+                Span::styled(
+                    qs.custom_input.chars().nth(qs.custom_cursor).unwrap().to_string(),
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::REVERSED),
+                ),
+                Span::styled(after_cursor, Style::default().fg(theme.fg).bg(theme.input_bg)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme.fg)),
+                Span::styled(before_cursor, Style::default().fg(theme.fg).bg(theme.input_bg)),
+                Span::styled(" ", Style::default().fg(theme.fg).bg(theme.accent).add_modifier(Modifier::REVERSED)),
+            ]));
+        }
+
+        while lines.len() < inner.height.saturating_sub(3) as usize {
+            lines.push(Line::from(vec![
+                Span::styled(" ".repeat(inner_w.saturating_sub(2)), Style::default().bg(theme.panel)),
+            ]));
+        }
+
+        let sep = "\u{2500}".repeat(inner_w.saturating_sub(4));
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}", sep), Style::default().fg(theme.border)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(theme.fg)),
+            Span::styled("Enter", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(" submit  ", Style::default().fg(theme.text_dim)),
+            Span::styled("Esc", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel", Style::default().fg(theme.text_dim)),
+        ]));
+    } else if is_yes_no {
+        // Yes/No mode
+        let pad = inner_w.saturating_sub(14) / 2;
+        lines.push(Line::from(vec![
+            Span::styled(" ".repeat(pad), Style::default().fg(theme.fg)),
+            Span::styled("Y", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(" Yes  ", Style::default().fg(theme.text_dim)),
+            Span::styled("N", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+            Span::styled(" No", Style::default().fg(theme.text_dim)),
+        ]));
+    } else {
+        // Multiple choice mode
+        let visible = inner.height.saturating_sub(4) as usize;
+        let end = (qs.scroll_offset + visible).min(qs.options.len());
+
+        if qs.scroll_offset > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("  \u{2191} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
+            ]));
+        }
+
+        for i in qs.scroll_offset..end {
+            let is_cursor = i == qs.selected;
+            let is_custom_entry = qs.allow_custom && i >= qs.options.len().saturating_sub(1);
+            let bg = if is_cursor { theme.selection } else { theme.panel };
+            let fg = if is_cursor { theme.fg } else { theme.text_soft };
+
+            let indicator = if is_cursor { "\u{25B6} " } else { "  " };
+            let label = if is_custom_entry {
+                "Custom...".to_string()
+            } else {
+                qs.options[i].clone()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(" ", Style::default().bg(bg)),
+                Span::styled(
+                    indicator,
+                    Style::default()
+                        .fg(if is_cursor { theme.accent } else { theme.text_dim })
+                        .bg(bg),
+                ),
+                Span::styled(label, Style::default().fg(fg).bg(bg)),
+                Span::styled(" ", Style::default().bg(bg)),
+            ]));
+        }
+
+        if qs.scroll_offset + visible < qs.options.len() {
+            lines.push(Line::from(vec![
+                Span::styled("  \u{2193} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
+            ]));
+        }
+
+        while lines.len() < inner.height.saturating_sub(3) as usize {
+            lines.push(Line::from(vec![
+                Span::styled(" ".repeat(inner_w.saturating_sub(2)), Style::default().bg(theme.panel)),
+            ]));
+        }
+
+        let sep = "\u{2500}".repeat(inner_w.saturating_sub(4));
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}", sep), Style::default().fg(theme.border)),
+        ]));
+
+        let count = qs.options.len();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}/{}", qs.selected + 1, count),
+                Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "    ".to_string(),
+                Style::default().fg(theme.fg),
+            ),
+            Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
+            Span::styled(" nav  ", Style::default().fg(theme.text_dim)),
+            Span::styled("Enter", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(" select  ", Style::default().fg(theme.text_dim)),
+            Span::styled("Esc", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel", Style::default().fg(theme.text_dim)),
+        ]));
+    }
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+        inner,
+    );
 }
 
 fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {

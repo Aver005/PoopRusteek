@@ -163,6 +163,14 @@ impl MCPManager {
         Some(format!("{}: {}", tool.name, tool.description))
     }
 
+    pub fn get_all_resources(&self) -> Vec<MCPResource> {
+        let mut result = Vec::new();
+        for entry in self.servers.values() {
+            result.extend(entry.resources.clone());
+        }
+        result
+    }
+
     pub fn get_all_tools(&self) -> Vec<FullMCPTool> {
         let mut result = Vec::new();
         for (full_name, (server_name, tool_name)) in &self.tool_name_map {
