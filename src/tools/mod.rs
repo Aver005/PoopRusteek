@@ -4,6 +4,7 @@ pub mod powershell;
 pub mod question;
 pub mod background;
 pub mod shell_control;
+pub mod skill;
 
 use async_trait::async_trait;
 use serde_json::Value;

@@ -15,3 +15,4 @@ pub mod retry;
 pub mod mcp;
 pub mod tools;
 pub mod whitelist;
+pub mod skills;

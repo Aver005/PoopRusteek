@@ -27,6 +27,8 @@ pub enum CommandResult {
     ReloadMcp,
     ShowTools,
     OpenWhitelist,
+    ShowSkills,
+    ToggleSkill(String, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::mcp::McpCommand));
         self.register(Box::new(defs::tools::ToolsCommand));
         self.register(Box::new(defs::whitelist::WhitelistCommand));
+        self.register(Box::new(defs::skills::SkillsCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {

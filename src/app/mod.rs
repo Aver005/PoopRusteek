@@ -12,6 +12,7 @@ use crate::provider::estimate_tokens;
 use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use crate::commands::CommandSuggestion;
+use crate::skills::{discovery::discover_all_skills, SkillDefinition};
 use events::{AgentResult, AppEvent, Modal, QuestionRequest, QuestionState, ToolApprovalRequest, View};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ pub struct App {
     pub mcp: Arc<tokio::sync::Mutex<MCPManager>>,
     tools: Arc<ToolRegistry>,
     prompts: PromptFiles,
+    skills: Vec<SkillDefinition>,
     agent_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -93,6 +95,14 @@ impl App {
         let tools = Arc::new(ToolRegistry::new());
         let prompts = prompts::load_prompt_files()?;
 
+        let mut skills = discover_all_skills(&config.skills.paths);
+        for skill in &mut skills {
+            if config.skills.enabled.contains(&skill.slug) || config.skills.enabled.contains(&skill.name) {
+                skill.enabled = true;
+            }
+        }
+        tools.update_skills(skills.clone());
+
         let mut state = AppState {
             messages: Vec::new(),
             input_buffer: String::new(),
@@ -149,6 +159,7 @@ impl App {
             mcp,
             tools,
             prompts,
+            skills,
             agent_task: None,
         })
     }
@@ -533,6 +544,30 @@ impl App {
                                     self.state.approved_tools = selected_names;
                                     self.state.modal = None;
                                 }
+                                events::PickerKind::Skills => {
+                                    let mut config = match crate::config::load() {
+                                        Ok(c) => c,
+                                        Err(_) => {
+                                            self.state.modal = None;
+                                            return Ok(false);
+                                        }
+                                    };
+                                    let enabled: Vec<String> = indices
+                                        .iter()
+                                        .filter_map(|&i| picker.items.get(i))
+                                        .map(|item| item.value.clone())
+                                        .collect();
+                                    config.skills.enabled = enabled.clone();
+                                    if let Err(e) = crate::config::save(&config) {
+                                        tracing::warn!("Failed to save skills config: {e}");
+                                    }
+                                    self.config.skills.enabled = enabled.clone();
+                                    for skill in &mut self.skills {
+                                        skill.enabled = enabled.contains(&skill.slug) || enabled.contains(&skill.name);
+                                    }
+                                    self.tools.update_skills(self.skills.clone());
+                                    self.state.modal = None;
+                                }
                                 _ => {
                                     if let Some(idx) = indices.first() {
                                         if let Some(item) = picker.items.get(*idx) {
@@ -714,6 +749,12 @@ impl App {
                                 CommandResult::ShowTools => {
                                     let tools_text = self.build_tools_display().await;
                                     self.state.messages.push(ChatMessage::system(&tools_text));
+                                }
+                                CommandResult::ShowSkills => {
+                                    self.open_skill_picker().await;
+                                }
+                                CommandResult::ToggleSkill(name, enable) => {
+                                    self.toggle_skill(&name, enable).await;
                                 }
                                 CommandResult::OpenWhitelist => {
                                     self.open_whitelist_picker().await;
@@ -1100,7 +1141,14 @@ impl App {
             .replace("{{builtin_tools}}", &builtin_section)
             .replace("{{mcp_tools}}", &mcp_section);
 
-        format!("{}\n\n{}", base_prompt.trim(), tools_prompt.trim())
+        let skills_section = crate::skills::discovery::load_enabled_skills_content(&self.skills);
+
+        format!(
+            "{}\n\n{}{}",
+            base_prompt.trim(),
+            tools_prompt.trim(),
+            skills_section
+        )
     }
 
     async fn send_to_agent(&mut self, _input: String) -> AppResult<()> {
@@ -1513,6 +1561,87 @@ impl App {
         picker.checked = checked;
         picker.persistent_checked = whitelist.into_iter().collect();
         self.state.modal = Some(crate::app::events::Modal::Picker(picker));
+    }
+
+    async fn open_skill_picker(&mut self) {
+        use crate::app::events::{PickerItem, PickerMode, PickerKind, PickerState};
+        let mut items: Vec<PickerItem> = Vec::new();
+        let mut checked: Vec<usize> = Vec::new();
+        let enabled_slugs: HashSet<String> = self.config.skills.enabled.iter().cloned().collect();
+
+        for skill in &self.skills {
+            let is_enabled = enabled_slugs.contains(&skill.slug) || enabled_slugs.contains(&skill.name);
+            let status = if is_enabled { "\u{2611}" } else { "\u{2610}" };
+            items.push(PickerItem::new(
+                format!(
+                    "{}  {}  [{}] {}",
+                    status, skill.name, skill.source, skill.description
+                ),
+                skill.slug.clone(),
+            ));
+            if is_enabled {
+                checked.push(items.len() - 1);
+            }
+        }
+
+        if items.is_empty() {
+            self.state.messages.push(crate::provider::ChatMessage::system(
+                "No skills found. Install skills with `npx skills add <owner/repo>` or create SKILL.md files in `.skills/` directory.",
+            ));
+            return;
+        }
+
+        let mut picker = PickerState::new_with_kind(
+            " Skills (Space to toggle, Enter to save)",
+            items,
+            PickerMode::Multi,
+            PickerKind::Skills,
+        );
+        picker.checked = checked;
+        picker.persistent_checked = self.config.skills.enabled.clone();
+        self.state.modal = Some(crate::app::events::Modal::Picker(picker));
+    }
+
+    async fn toggle_skill(&mut self, name: &str, enable: bool) {
+        let mut changed = false;
+        let name_lower = name.to_lowercase();
+        for skill in &mut self.skills {
+            if skill.slug.to_lowercase() == name_lower || skill.name.to_lowercase() == name_lower {
+                if skill.enabled != enable {
+                    skill.enabled = enable;
+                    changed = true;
+                }
+                break;
+            }
+        }
+
+        if changed {
+            let enabled: Vec<String> = self.skills.iter()
+                .filter(|s| s.enabled)
+                .map(|s| s.slug.clone())
+                .collect();
+            self.config.skills.enabled = enabled.clone();
+            let mut config = match crate::config::load() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            config.skills.enabled = enabled;
+            if let Err(e) = crate::config::save(&config) {
+                tracing::warn!("Failed to save skills config: {e}");
+            }
+            self.tools.update_skills(self.skills.clone());
+
+            let msg = if enable {
+                format!("Skill '{name}' enabled. Its content will be included in the system prompt on next request.")
+            } else {
+                format!("Skill '{name}' disabled.")
+            };
+            self.state.messages.push(crate::provider::ChatMessage::system(&msg));
+        } else if enable {
+            self.state.messages.push(crate::provider::ChatMessage::system(
+                &format!("Skill '{name}' not found. Use /skills list to see available skills."),
+            ));
+        }
     }
 
     async fn build_tools_display(&self) -> String {

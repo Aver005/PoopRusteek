@@ -182,6 +182,7 @@ pub enum PickerMode {
 pub enum PickerKind {
     Sessions,
     Whitelist,
+    Skills,
 }
 
 #[derive(Debug, Clone)]

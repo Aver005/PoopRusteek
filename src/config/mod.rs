@@ -8,6 +8,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub agent: AgentConfig,
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,21 @@ impl Default for McpConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    pub enabled: Vec<String>,
+    pub paths: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -83,6 +100,7 @@ impl Default for Config {
                 max_retries: 0,
             },
             mcp: McpConfig::default(),
+            skills: SkillsConfig::default(),
         }
     }
 }

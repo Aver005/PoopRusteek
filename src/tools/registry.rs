@@ -1,21 +1,24 @@
 use super::*;
+use crate::skills::SkillDefinition;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: Mutex<HashMap<String, Arc<dyn Tool>>>,
+    pub skill_tool: Mutex<Option<Arc<skill::SkillTool>>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let mut registry = Self {
-            tools: HashMap::new(),
+        let registry = Self {
+            tools: Mutex::new(HashMap::new()),
+            skill_tool: Mutex::new(None),
         };
         registry.register_default_tools();
         registry
     }
 
-    fn register_default_tools(&mut self) {
+    fn register_default_tools(&self) {
         self.register(Arc::new(bash::BashTool));
         self.register(Arc::new(powershell::PowerShellTool));
         self.register(Arc::new(question::QuestionTool));
@@ -25,21 +28,21 @@ impl ToolRegistry {
         self.register(Arc::new(shell_control::ShellInputTool));
     }
 
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+    pub fn register(&self, tool: Arc<dyn Tool>) {
         let name = tool.definition().name.clone();
-        self.tools.insert(name, tool);
+        self.tools.lock().unwrap().insert(name, tool);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.tools.lock().unwrap().get(name).cloned()
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|t| t.definition()).collect()
+        self.tools.lock().unwrap().values().map(|t| t.definition()).collect()
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        self.tools.lock().unwrap().keys().cloned().collect()
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult {
@@ -47,5 +50,14 @@ impl ToolRegistry {
             Some(tool) => tool.execute(args).await,
             None => ToolResult::error(&format!("Unknown tool: {name}")),
         }
+    }
+
+    pub fn update_skills(&self, skills: Vec<SkillDefinition>) {
+        let shared = Arc::new(std::sync::RwLock::new(skills));
+        let skill_tool = Arc::new(skill::SkillTool {
+            skills: Arc::clone(&shared),
+        });
+        *self.skill_tool.lock().unwrap() = Some(Arc::clone(&skill_tool));
+        self.tools.lock().unwrap().insert("skill".to_string(), skill_tool);
     }
 }
