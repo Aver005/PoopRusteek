@@ -39,6 +39,7 @@ pub fn save_session(
     created_at: &str,
     messages: &[ChatMessage],
     config: &Config,
+    workspace_root: &str,
 ) -> AppResult<()> {
     let dir = Config::sessions_dir();
     std::fs::create_dir_all(&dir)?;
@@ -49,10 +50,7 @@ pub fn save_session(
         id: id.to_string(),
         created_at: created_at.to_string(),
         updated_at: now,
-        workspace_root: std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
+        workspace_root: workspace_root.to_string(),
         model_type: config.provider.model.clone(),
         messages: messages.to_vec(),
     };

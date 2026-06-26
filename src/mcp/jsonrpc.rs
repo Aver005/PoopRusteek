@@ -8,6 +8,8 @@ pub struct JsonRpcRequest {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _meta: Option<Value>,
 }
 
 impl JsonRpcRequest {
@@ -17,6 +19,7 @@ impl JsonRpcRequest {
             id,
             method: method.to_string(),
             params,
+            _meta: None,
         }
     }
 }
@@ -29,6 +32,8 @@ pub struct JsonRpcResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub _meta: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,4 +50,9 @@ pub struct JsonRpcNotification {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _meta: Option<Value>,
+}
+
+impl JsonRpcNotification {
 }

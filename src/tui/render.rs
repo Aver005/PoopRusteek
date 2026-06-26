@@ -165,6 +165,8 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
                 Span::styled("send  ", Style::default().fg(theme.text_dim)),
                 Span::styled("/ ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
                 Span::styled("commands  ", Style::default().fg(theme.text_dim)),
+                Span::styled("Esc ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+                Span::styled("home  ", Style::default().fg(theme.text_dim)),
                 Span::styled("Ctrl+C ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
                 Span::styled("quit", Style::default().fg(theme.text_dim)),
             ]),
@@ -276,7 +278,13 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         format!(" {} ", state.status_message)
     };
-    let right = format!(" {} msgs", msg_count);
+    let mcp_color = Color::Rgb(255, 140, 0);
+    let mcp_part = if state.mcp_server_count > 0 {
+        format!(" \u{25CF} {}/{} MCP ", state.mcp_server_connected_count, state.mcp_server_count)
+    } else {
+        String::new()
+    };
+    let right = format!("{}{} msgs", mcp_part, msg_count);
 
     let gap = area.width.saturating_sub((left.len() + center.len() + right.len()) as u16).max(1) as usize;
 
@@ -293,7 +301,15 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
                 }
                 .bg(theme.bg),
             ),
-            Span::styled(right, Style::default().fg(theme.text_dim).bg(theme.bg)),
+            Span::styled(
+                right,
+                if state.mcp_server_count > 0 {
+                    Style::default().fg(mcp_color).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text_dim)
+                }
+                .bg(theme.bg),
+            ),
         ])),
         area,
     );
@@ -691,7 +707,7 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
 fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Theme) {
     let popup_width = area.width.min(80).max(48);
     let visible = picker.items.len().min(12).max(3);
-    let popup_h = (visible + 5) as u16;
+    let popup_h = (visible + 8) as u16;
     let popup_h = popup_h.min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_h)) / 2;
@@ -699,7 +715,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
 
     let is_multi = picker.mode == PickerMode::Multi;
     let hints = if is_multi {
-        " \u{2191}\u{2193} navigate  Space toggle  Enter confirm  Esc cancel "
+        " \u{2191}\u{2193} navigate  Space toggle  Ctrl+A all  Enter confirm  Esc cancel "
     } else {
         " \u{2191}\u{2193} navigate  Enter select  Esc close "
     };
@@ -715,6 +731,25 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
     let inner_w = inner.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
+
+    // Search bar line
+    let search_display = if picker.search.is_empty() {
+        "type to filter...".to_string()
+    } else {
+        picker.search.clone()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" \u{1F50D} ", Style::default().fg(theme.text_dim).bg(theme.panel)),
+        Span::styled(search_display, Style::default().fg(if picker.search.is_empty() { theme.text_dim } else { theme.fg }).bg(theme.panel)),
+    ]));
+
+    // Separator after search
+    let sep_short = "\u{2500}".repeat(inner_w.saturating_sub(4));
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {}", sep_short), Style::default().fg(theme.border).bg(theme.panel)),
+    ]));
+
+    // Item list
     let end = (picker.scroll_offset + visible).min(picker.items.len());
 
     if picker.scroll_offset > 0 {
@@ -772,11 +807,14 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
     ]));
 
     // Footer
-    let count = picker.items.len();
+    let total = picker.all_items.len();
+    let shown = picker.items.len();
     let count_str = if is_multi {
-        format!("{}/{} sel", picker.checked.len(), count)
+        format!("{}/{} sel", picker.checked.len(), total)
+    } else if shown < total {
+        format!("{}/{} (of {})", picker.cursor + 1, shown, total)
     } else {
-        format!("{}/{}", picker.cursor + 1, count)
+        format!("{}/{}", picker.cursor + 1, total)
     };
     let total_w = inner_w.saturating_sub(4);
     let pad = total_w.saturating_sub(count_str.len() + hints.len().saturating_sub(2));

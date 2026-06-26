@@ -1,5 +1,5 @@
 use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse, JsonRpcNotification};
-use super::transport::{Transport, StdioTransport, HttpTransport};
+use super::transport::{Transport, StdioTransport, HttpTransport, SseTransport};
 use super::types::*;
 use crate::error::AppResult;
 use serde_json::{json, Value};
@@ -50,6 +50,19 @@ impl MCPClient {
         })
     }
 
+    pub async fn from_sse(
+        server_name: &str,
+        url: &str,
+        headers: HashMap<String, String>,
+    ) -> AppResult<Self> {
+        let transport = SseTransport::new(url, headers)?;
+        Ok(Self {
+            transport: Arc::new(Mutex::new(transport)),
+            server_name: server_name.to_string(),
+            next_id: 1,
+        })
+    }
+
     pub async fn initialize(&mut self) -> AppResult<ServerCapabilities> {
         let params = json!({
             "protocolVersion": "2024-11-05",
@@ -60,7 +73,17 @@ impl MCPClient {
             }
         });
 
-        let response = self.call("initialize", Some(params)).await?;
+        let response = self.call_impl("initialize", Some(params)).await?;
+
+        // Log session ID from transport (set via MCP-Session-Id HTTP header)
+        let transport = self.transport.lock().await;
+        if let Some(sid) = transport.session_id() {
+            tracing::debug!("MCP '{}' session: {}", self.server_name, sid);
+        } else {
+            tracing::debug!("MCP '{}': no session ID from transport", self.server_name);
+        }
+        drop(transport);
+
         let caps: ServerCapabilities = serde_json::from_value(
             response.result.unwrap_or(json!({}))
         )?;
@@ -72,6 +95,7 @@ impl MCPClient {
             jsonrpc: "2.0".to_string(),
             method: "notifications/initialized".to_string(),
             params: None,
+            _meta: None,
         };
         let json = serde_json::to_string(&notification)?;
         let mut data = json.into_bytes();
@@ -158,10 +182,19 @@ impl MCPClient {
     }
 
     async fn call(&mut self, method: &str, params: Option<Value>) -> AppResult<JsonRpcResponse> {
+        self.call_impl(method, params).await
+    }
+
+    async fn call_impl(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+    ) -> AppResult<JsonRpcResponse> {
         let id = self.next_id;
         self.next_id += 1;
 
         let request = JsonRpcRequest::new(id, method, params);
+
         let mut transport = self.transport.lock().await;
         let response = transport.send_request(&request).await?;
 

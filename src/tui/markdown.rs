@@ -33,10 +33,15 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut in_code_block = false;
     let mut code_block_lang = String::new();
     let mut code_buffer: Vec<String> = Vec::new();
+    let mut in_table = false;
 
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
+                Tag::Table(_) => {
+                    in_table = true;
+                    flush_line(&mut lines, &mut current_line);
+                }
                 Tag::Heading { level, .. } => {
                     use pulldown_cmark::HeadingLevel;
                     let style = match level {
@@ -100,6 +105,23 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 _ => {}
             },
             Event::End(tag) => match tag {
+                TagEnd::Table => {
+                    in_table = false;
+                    flush_line(&mut lines, &mut current_line);
+                }
+                TagEnd::TableRow => {
+                    if in_table {
+                        flush_line(&mut lines, &mut current_line);
+                    }
+                }
+                TagEnd::TableCell => {
+                    if in_table {
+                        current_line.push(Span::styled(
+                            " | ",
+                            Style::default().fg(theme.text_dim),
+                        ));
+                    }
+                }
                 TagEnd::Heading(_) => {
                     flush_line(&mut lines, &mut current_line);
                 }

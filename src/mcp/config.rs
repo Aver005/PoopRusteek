@@ -305,7 +305,10 @@ fn parse_opencode_json(content: &str) -> Result<HashMap<String, MCPServerConfig>
                         let headers = server.get("headers")
                             .and_then(|h| serde_json::from_value(h.clone()).ok())
                             .unwrap_or_default();
-                        MCPServerConfig::Http { url, headers }
+                        match server.get("subtype").and_then(|t| t.as_str()) {
+                            Some("sse") => MCPServerConfig::Sse { url, headers },
+                            _ => MCPServerConfig::Http { url, headers },
+                        }
                     }
                     Some("local") => {
                         let (command, args) = if let Some(cmd_arr) = server.get("command").and_then(|c| c.as_array()) {
@@ -365,9 +368,14 @@ fn parse_mcp_json(content: &str) -> Result<HashMap<String, MCPServerConfig>, ser
                     let headers = server.get("headers")
                         .and_then(|h| serde_json::from_value(h.clone()).ok())
                         .unwrap_or_default();
-                    MCPServerConfig::Http {
-                        url: url.to_string(),
-                        headers,
+                    let is_sse = server.get("transport")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.eq_ignore_ascii_case("sse"))
+                        .unwrap_or(false);
+                    if is_sse {
+                        MCPServerConfig::Sse { url: url.to_string(), headers }
+                    } else {
+                        MCPServerConfig::Http { url: url.to_string(), headers }
                     }
                 } else {
                     let command = server.get("command")

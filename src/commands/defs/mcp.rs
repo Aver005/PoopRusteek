@@ -1,7 +1,6 @@
 use crate::app::AppState;
 use crate::commands::{Command, CommandResult};
-use crate::config::Config;
-use crate::mcp::types::McpViewState;
+use crate::config::{self, Config};
 
 pub struct McpCommand;
 
@@ -11,23 +10,57 @@ impl Command for McpCommand {
     }
 
     fn description(&self) -> &str {
-        "Open MCP server management"
+        "Open MCP server management, set cache TTL, or reload all servers"
     }
 
     fn usage(&self) -> &str {
-        "/mcp"
+        "/mcp — open management view\n/mcp ttl <secs> — set cache TTL (default: 300s)\n/mcp reload — force reload all servers"
     }
 
-    fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        state.view = crate::app::events::View::Mcp;
-        state.mcp_view = McpViewState {
-            active: true,
-            selected: 0,
-            scroll_offset: 0,
-            details_server: None,
-            servers: Vec::new(),
-            status_message: String::new(),
-        };
-        CommandResult::Handled
+    fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
+        let args = args.trim();
+
+        if args.is_empty() {
+            state.view = crate::app::events::View::Mcp;
+            state.mcp_view = crate::mcp::types::McpViewState {
+                active: true,
+                selected: 0,
+                scroll_offset: 0,
+                details_server: None,
+                servers: Vec::new(),
+                status_message: String::new(),
+            };
+            return CommandResult::Handled;
+        }
+
+        if args == "reload" {
+            return CommandResult::ReloadMcp;
+        }
+
+        if let Some(ttl_str) = args.strip_prefix("ttl ") {
+            let trimmed = ttl_str.trim();
+            match trimmed.parse::<u64>() {
+                Ok(ttl) if ttl > 0 && ttl <= 86400 => {
+                    let mut config = match config::load() {
+                        Ok(c) => c,
+                        Err(_) => return CommandResult::Error("Failed to load config".to_string()),
+                    };
+                    config.mcp.cache_ttl = ttl;
+                    if let Err(e) = config::save(&config) {
+                        return CommandResult::Error(format!("Failed to save config: {e}"));
+                    }
+                    CommandResult::TtlUpdate(ttl)
+                }
+                Ok(_) => CommandResult::Error("TTL must be between 1 and 86400 seconds".to_string()),
+                Err(_) => CommandResult::Error(
+                    format!("Invalid TTL value: '{trimmed}'. Usage: /mcp ttl <seconds>")
+                ),
+            }
+        } else {
+            CommandResult::Error(
+                "Unknown subcommand. Usage:\n  /mcp — open management view\n  /mcp ttl <secs> — set cache TTL\n  /mcp reload — force reload all servers"
+                    .to_string(),
+            )
+        }
     }
 }

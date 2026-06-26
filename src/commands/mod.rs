@@ -23,6 +23,10 @@ pub enum CommandResult {
     LoadSession(String),
     ResetProvider,
     Error(String),
+    TtlUpdate(u64),
+    ReloadMcp,
+    ShowTools,
+    OpenWhitelist,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +47,10 @@ impl CommandRegistry {
 
     fn register_defaults(&mut self) {
         self.register(Box::new(defs::help::HelpCommand));
+        self.register(Box::new(defs::home::HomeCommand));
+        self.register(Box::new(defs::cwd::CwdCommand { name: "cwd" }));
+        self.register(Box::new(defs::cwd::CwdCommand { name: "cd" }));
+        self.register(Box::new(defs::cwd::CwdCommand { name: "move" }));
         self.register(Box::new(defs::clear::ClearCommand));
         self.register(Box::new(defs::quit::QuitCommand));
         self.register(Box::new(defs::version::VersionCommand));
@@ -54,6 +62,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::rate::RateCommand));
         self.register(Box::new(defs::retry::RetryCommand));
         self.register(Box::new(defs::mcp::McpCommand));
+        self.register(Box::new(defs::tools::ToolsCommand));
+        self.register(Box::new(defs::whitelist::WhitelistCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {

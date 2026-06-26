@@ -11,6 +11,60 @@ use ratatui::{
 use std::cell::Cell;
 use unicode_width::UnicodeWidthStr;
 
+struct VisualLine {
+    logical_idx: usize,
+    char_start: usize,
+    char_end: usize,
+}
+
+fn build_visual_lines(input: &str, area_width: u16) -> Vec<VisualLine> {
+    let logical: Vec<&str> = input.split('\n').collect();
+    let mut visual = Vec::new();
+    for (li, seg) in logical.iter().enumerate() {
+        let chars: Vec<char> = seg.chars().collect();
+        if chars.is_empty() {
+            visual.push(VisualLine { logical_idx: li, char_start: 0, char_end: 0 });
+            continue;
+        }
+        let mut offset = 0;
+        while offset < chars.len() {
+            let indent = if li == 0 && offset == 0 { 4 } else { 5 };
+            let max_width = (area_width as usize).saturating_sub(indent);
+            if max_width == 0 {
+                let end = chars.len();
+                visual.push(VisualLine { logical_idx: li, char_start: offset, char_end: end });
+                break;
+            }
+            let mut width = 0usize;
+            let mut end = offset;
+            while end < chars.len() {
+                let w = UnicodeWidthStr::width(chars[end].to_string().as_str()).max(1);
+                if width + w > max_width && end > offset {
+                    break;
+                }
+                width += w;
+                end += 1;
+            }
+            visual.push(VisualLine { logical_idx: li, char_start: offset, char_end: end });
+            offset = end;
+        }
+    }
+    visual
+}
+
+fn line_starts_from_logical(logical: &[&str]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(logical.len());
+    let mut acc = 0usize;
+    for (i, seg) in logical.iter().enumerate() {
+        starts.push(acc);
+        acc += seg.chars().count();
+        if i < logical.len() - 1 {
+            acc += 1;
+        }
+    }
+    starts
+}
+
 pub fn render_input(
     frame: &mut Frame,
     area: Rect,
@@ -32,23 +86,21 @@ pub fn render_input(
     });
 
     let logical: Vec<&str> = input.split('\n').collect();
-    let mut line_starts: Vec<usize> = Vec::with_capacity(logical.len());
-    let mut acc = 0usize;
-    for (i, seg) in logical.iter().enumerate() {
-        line_starts.push(acc);
-        acc += seg.chars().count();
-        if i < logical.len() - 1 {
-            acc += 1;
-        }
-    }
-    let cursor_row = line_starts.iter().rposition(|&s| s <= cursor).unwrap_or(0);
+    let line_starts = line_starts_from_logical(&logical);
+    let visual = build_visual_lines(input, area.width);
+
+    let cursor_visual = visual.iter().rposition(|v| {
+        let log_start = line_starts[v.logical_idx];
+        let abs_end = log_start + (v.char_end - v.char_start);
+        cursor >= log_start + v.char_start && cursor <= abs_end
+    }).unwrap_or(0);
 
     let visible_rows = area.height as usize;
-    let total_rows = logical.len();
+    let total_rows = visual.len();
     let top_row = if total_rows <= visible_rows.saturating_sub(top_pad) {
         0
     } else {
-        cursor_row
+        cursor_visual
             .saturating_sub(visible_rows.saturating_sub(1 + top_pad))
             .min(total_rows.saturating_sub(visible_rows.saturating_sub(top_pad)))
     };
@@ -76,24 +128,24 @@ pub fn render_input(
             }
         }
     } else {
-        for ri in 0..top_pad.min(visible_rows) {
+        for _ri in 0..top_pad.min(visible_rows) {
             rendering_lines.push(Line::from(vec![
                 Span::styled(&blank, empty_style),
             ]));
         }
-        let indices: Vec<usize> = line_starts.iter().enumerate()
-            .filter(|&(ri, _)| {
-                if top_pad + ri < top_row {
+        let indices: Vec<usize> = (0..visual.len())
+            .filter(|&vi| {
+                if top_pad + vi < top_row {
                     return false;
                 }
-                top_pad + ri - top_row < visible_rows
+                top_pad + vi - top_row < visible_rows
             })
-            .map(|(ri, _)| ri)
             .collect();
         let max_content = visible_rows.saturating_sub(top_pad);
-        for &row_idx in indices.iter().take(max_content) {
-            let seg = logical[row_idx];
-            let seg_byte_start = char_to_byte_pos(input, line_starts[row_idx]);
+        for &vi in indices.iter().take(max_content) {
+            let vline = &visual[vi];
+            let seg = logical[vline.logical_idx];
+
             let fg = Style::default().fg(theme.fg).bg(theme.input_bg);
             let sel_style = Style::default()
                 .fg(theme.fg)
@@ -101,16 +153,17 @@ pub fn render_input(
                 .add_modifier(Modifier::REVERSED);
 
             let mut spans: Vec<Span> = Vec::new();
-            if row_idx == 0 {
+            if vline.logical_idx == 0 && vline.char_start == 0 {
                 spans.push(Span::styled(" >  ", Style::default().fg(theme.accent).bg(theme.input_bg)));
             } else {
                 spans.push(Span::styled("     ", empty_style));
             }
 
-            let mut chunk_start = 0usize;
-            let seg_bytes = seg.as_bytes();
-            let mut idx = 0usize;
-            while idx < seg_bytes.len() {
+            let seg_byte_start = char_to_byte_pos(input, line_starts[vline.logical_idx]);
+            let mut chunk_start = vline.char_start;
+            let chunk_end = vline.char_end;
+            let mut idx = chunk_start;
+            while idx < chunk_end.min(seg.chars().count()) {
                 let Some(ch) = seg[idx..].chars().next() else { break };
                 let ch_len = ch.len_utf8();
                 let abs_byte = seg_byte_start + idx;
@@ -119,7 +172,7 @@ pub fn render_input(
                     None => false,
                 };
                 let mut j = idx + ch_len;
-                while j < seg_bytes.len() {
+                while j < chunk_end.min(seg.chars().count()) {
                     let next_byte = seg_byte_start + j;
                     let next_in = match sel {
                         Some((s, e)) => next_byte >= s && next_byte < e,
@@ -131,12 +184,14 @@ pub fn render_input(
                     let Some(nch) = seg[j..].chars().next() else { break };
                     j += nch.len_utf8();
                 }
-                let text = &seg[chunk_start..j];
+                let byte_start = char_to_byte_pos(seg, chunk_start);
+                let byte_end = char_to_byte_pos(seg, j);
+                let text = &seg[byte_start..byte_end];
                 spans.push(Span::styled(text, if in_sel { sel_style } else { fg }));
                 chunk_start = j;
                 idx = j;
             }
-            if idx == 0 {
+            if idx == vline.char_start {
                 spans.push(Span::styled("", fg));
             }
             rendering_lines.push(Line::from(spans));
@@ -167,30 +222,39 @@ fn cursor_pos_inner(input: &str, cursor: usize, area: Rect, state: &AppState) ->
     }
     let top_pad = 1;
     let logical: Vec<&str> = input.split('\n').collect();
-    let mut line_starts = Vec::with_capacity(logical.len());
-    let mut acc = 0usize;
-    for (i, seg) in logical.iter().enumerate() {
-        line_starts.push(acc);
-        acc += seg.chars().count();
-        if i < logical.len() - 1 { acc += 1; }
-    }
-    let cursor_row = line_starts.iter().rposition(|&s| s <= cursor).unwrap_or(0);
-    let cursor_col = cursor - line_starts[cursor_row];
+    let line_starts = line_starts_from_logical(&logical);
+    let visual = build_visual_lines(input, area.width);
+
+    let cursor_visual = visual.iter().rposition(|v| {
+        let log_start = line_starts.get(v.logical_idx).copied().unwrap_or(0);
+        let abs_end = log_start + (v.char_end - v.char_start);
+        let abs_start = log_start + (v.char_start - v.char_start);
+        cursor >= abs_start && cursor <= abs_end
+    }).unwrap_or(0);
+    let cursor_logical = visual[cursor_visual].logical_idx;
+    let cursor_visual_in_logical = visual[..=cursor_visual]
+        .iter()
+        .filter(|v| v.logical_idx == cursor_logical)
+        .count()
+        - 1;
+    let cursor_col_in_logical = cursor - line_starts[cursor_logical];
+
     let visible_rows = area.height as usize;
-    let total_rows = logical.len();
+    let total_rows = visual.len();
     let top_row = if total_rows <= visible_rows.saturating_sub(top_pad) {
         0
     } else {
-        cursor_row
+        cursor_visual
             .saturating_sub(visible_rows.saturating_sub(1 + top_pad))
             .min(total_rows.saturating_sub(visible_rows.saturating_sub(top_pad)))
     };
-    let screen_row = top_pad + cursor_row.saturating_sub(top_row);
-    let row_text = logical.get(cursor_row).copied().unwrap_or("");
-    let before_cursor_chars: Vec<char> = row_text.chars().take(cursor_col).collect();
-    let before_cursor_str: String = before_cursor_chars.iter().collect();
-    let indent = if cursor_row == 0 { 4 } else { 5 };
-    let h_offset = u16::try_from(UnicodeWidthStr::width(before_cursor_str.as_str()))
+    let screen_row = top_pad + cursor_visual.saturating_sub(top_row);
+    let indent = if cursor_logical == 0 && cursor_visual_in_logical == 0 { 4 } else { 5 };
+
+    let seg = logical[cursor_logical];
+    let vchar_start = visual[cursor_visual].char_start;
+    let before_cursor_chars: String = seg.chars().skip(vchar_start).take(cursor_col_in_logical - vchar_start).collect();
+    let h_offset = u16::try_from(UnicodeWidthStr::width(before_cursor_chars.as_str()))
         .unwrap_or(u16::MAX)
         .min(area.width.saturating_sub(indent as u16));
     let x = area.x + indent as u16 + h_offset;

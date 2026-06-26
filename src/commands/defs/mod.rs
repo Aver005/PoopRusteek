@@ -1,4 +1,6 @@
 pub mod help;
+pub mod home;
+pub mod cwd;
 pub mod clear;
 pub mod quit;
 pub mod version;
@@ -10,3 +12,5 @@ pub mod session_list;
 pub mod rate;
 pub mod retry;
 pub mod mcp;
+pub mod tools;
+pub mod whitelist;

@@ -7,6 +7,7 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub ui: UiConfig,
     pub agent: AgentConfig,
+    pub mcp: McpConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,17 @@ pub struct AgentConfig {
     pub max_retries: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    pub cache_ttl: u64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self { cache_ttl: 300 }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -70,6 +82,7 @@ impl Default for Config {
                 rate_limit_ms: 0,
                 max_retries: 0,
             },
+            mcp: McpConfig::default(),
         }
     }
 }

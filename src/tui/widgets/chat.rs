@@ -15,10 +15,12 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     for msg in &state.messages {
         match msg.role {
             Role::User => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!(" {} ", msg.visible_content()),
-                    Style::default().fg(theme.fg).bg(theme.user_bg),
-                )]));
+                for line_text in msg.visible_content().lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!(" {} ", line_text),
+                        Style::default().fg(theme.fg).bg(theme.user_bg),
+                    )]));
+                }
             }
             Role::Assistant => {
                 let header = Span::styled(
@@ -45,6 +47,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                         }
                         *md_line = Line::from(styled);
                     }
+                    compact_lines(&mut md_lines);
                     lines.push(Line::from(vec![header]));
                     lines.extend(md_lines);
                 }
@@ -128,6 +131,17 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .wrap(Wrap { trim: false })
         .scroll((top_row as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+fn is_blank(line: &Line) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+fn compact_lines(lines: &mut Vec<Line<'static>>) {
+    // Remove leading blank lines
+    while lines.first().is_some_and(|l| is_blank(l)) {
+        lines.remove(0);
+    }
 }
 
 fn count_wrapped_rows(lines: &[Line], width: usize) -> usize {

@@ -4,10 +4,20 @@ use super::types::*;
 use crate::error::AppResult;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Instant;
+
+struct ServerCache {
+    tools: Vec<MCPTool>,
+    resources: Vec<MCPResource>,
+    tool_entries: Vec<(String, String, String)>,  // (full_name, server_name, tool_name)
+    cached_at: Instant,
+}
 
 pub struct MCPManager {
     servers: HashMap<String, MCPServerEntry>,
     tool_name_map: HashMap<String, (String, String)>,
+    cache: HashMap<String, ServerCache>,
+    cache_ttl: u64,
 }
 
 struct MCPServerEntry {
@@ -24,7 +34,17 @@ impl MCPManager {
         Self {
             servers: HashMap::new(),
             tool_name_map: HashMap::new(),
+            cache: HashMap::new(),
+            cache_ttl: 300,
         }
+    }
+
+    pub fn set_cache_ttl(&mut self, ttl: u64) {
+        self.cache_ttl = ttl;
+    }
+
+    pub fn cache_ttl(&self) -> u64 {
+        self.cache_ttl
     }
 
     pub async fn initialize(&mut self) -> AppResult<()> {
@@ -38,6 +58,21 @@ impl MCPManager {
 
         self.connect_all().await;
         Ok(())
+    }
+
+    pub async fn reload_all(&mut self) {
+        self.cache.clear();
+        self.tool_name_map.clear();
+        let configs = load_mcp_config();
+        let enabled_map = load_own_enabled_map();
+        self.servers.clear();
+
+        for (name, config) in configs {
+            let enabled = enabled_map.get(&name).copied().unwrap_or(true);
+            self.add_server(name, config, enabled).await;
+        }
+
+        self.connect_all().await;
     }
 
     async fn add_server(&mut self, name: String, config: MCPServerConfig, enabled: bool) {
@@ -71,6 +106,15 @@ impl MCPManager {
             }
             MCPServerConfig::Http { url, headers } => {
                 match MCPClient::from_http(&name, url, headers.clone()).await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!("Failed to create MCP client for '{name}': {e}");
+                        None
+                    }
+                }
+            }
+            MCPServerConfig::Sse { url, headers } => {
+                match MCPClient::from_sse(&name, url, headers.clone()).await {
                     Ok(c) => Some(c),
                     Err(e) => {
                         tracing::warn!("Failed to create MCP client for '{name}': {e}");
@@ -122,25 +166,55 @@ impl MCPManager {
             }
         }
 
+        // Check cache
+        if let Some(cache) = self.cache.get(name) {
+            let elapsed = cache.cached_at.elapsed().as_secs();
+            if elapsed < self.cache_ttl {
+                tracing::info!("MCP '{name}' using cache ({elapsed}s old, TTL {})", self.cache_ttl);
+                entry.tools = cache.tools.clone();
+                entry.resources = cache.resources.clone();
+                for (full_name, server_name, tool_name) in &cache.tool_entries {
+                    self.tool_name_map.insert(full_name.clone(), (server_name.clone(), tool_name.clone()));
+                }
+                entry.status = MCPServerStatus::Connected;
+                return;
+            }
+            tracing::info!("MCP '{name}' cache expired ({elapsed}s >= TTL {}s)", self.cache_ttl);
+        }
+
+        // Fetch from server
         match entry.client.list_tools().await {
             Ok(tools) => {
+                let mut tool_entries = Vec::new();
                 for tool in &tools {
                     let full_name = format!("mcp__{}__{}", name, tool.name);
+                    tool_entries.push((full_name.clone(), name.to_string(), tool.name.clone()));
                     self.tool_name_map.insert(full_name, (name.to_string(), tool.name.clone()));
                 }
-                entry.tools = tools;
+                entry.tools = tools.clone();
+
+                let resources = match entry.client.list_resources().await {
+                    Ok(r) => {
+                        tracing::info!("MCP '{name}' fetched {} resources", r.len());
+                        r
+                    }
+                    Err(e) => {
+                        tracing::info!("MCP '{name}' list_resources (optional): {e}");
+                        Vec::new()
+                    }
+                };
+                entry.resources = resources.clone();
+
+                self.cache.insert(name.to_string(), ServerCache {
+                    tools,
+                    resources,
+                    tool_entries,
+                    cached_at: Instant::now(),
+                });
             }
             Err(e) => {
                 tracing::warn!("MCP '{name}' list_tools failed: {e}");
-            }
-        }
-
-        match entry.client.list_resources().await {
-            Ok(resources) => {
-                entry.resources = resources;
-            }
-            Err(e) => {
-                tracing::info!("MCP '{name}' list_resources (optional): {e}");
+                let _ = entry.client.list_resources().await;
             }
         }
 
@@ -220,6 +294,7 @@ impl MCPManager {
             let transport = match &entry.config {
                 MCPServerConfig::Stdio { .. } => "stdio",
                 MCPServerConfig::Http { .. } => "http",
+                MCPServerConfig::Sse { .. } => "sse",
             }.to_string();
             ServerDisplayInfo {
                 name: name.clone(),
@@ -266,6 +341,9 @@ impl MCPManager {
                     MCPServerConfig::Http { url, headers } => {
                         MCPClient::from_http(name, url, headers.clone()).await?
                     }
+                    MCPServerConfig::Sse { url, headers } => {
+                        MCPClient::from_sse(name, url, headers.clone()).await?
+                    }
                 };
                 entry.client = client;
                 entry.status = MCPServerStatus::Pending;
@@ -294,6 +372,9 @@ impl MCPManager {
             }
             MCPServerConfig::Http { url, headers } => {
                 MCPClient::from_http(name, url, headers.clone()).await?
+            }
+            MCPServerConfig::Sse { url, headers } => {
+                MCPClient::from_sse(name, url, headers.clone()).await?
             }
         };
         // remove old tool mappings

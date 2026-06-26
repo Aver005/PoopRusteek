@@ -20,6 +20,12 @@ pub enum MCPServerConfig {
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+    #[serde(rename = "sse")]
+    Sse {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

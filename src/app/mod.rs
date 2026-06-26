@@ -12,6 +12,7 @@ use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use crate::commands::CommandSuggestion;
 use events::{AgentResult, AppEvent, Modal, QuestionRequest, QuestionState, ToolApprovalRequest, View};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -45,6 +46,9 @@ pub struct AppState {
     pub current_session_id: String,
     pub view: View,
     pub mcp_view: McpViewState,
+    pub mcp_server_count: usize,
+    pub mcp_server_connected_count: usize,
+    pub workspace_path: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,7 +94,7 @@ impl App {
             scroll_offset: 0,
             error: None,
             modal: None,
-            approved_tools: std::collections::HashSet::new(),
+            approved_tools: crate::whitelist::load(),
             pending_tool_approval: None,
             pending_question: None,
             animation_tick: 0,
@@ -98,6 +102,11 @@ impl App {
             current_session_id: crate::session::create_session_id(),
             view: View::Chat,
             mcp_view: McpViewState::default(),
+            mcp_server_count: 0,
+            mcp_server_connected_count: 0,
+            workspace_path: std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
         };
 
         Ok(Self {
@@ -163,8 +172,19 @@ impl App {
             }
 
             self.refresh_mcp_view().await;
+            self.update_mcp_stats().await;
             self.render(terminal)?;
         }
+    }
+
+    async fn update_mcp_stats(&mut self) {
+        let mcp = self.mcp.lock().await;
+        let servers = mcp.get_servers_info();
+        self.state.mcp_server_count = servers.len();
+        self.state.mcp_server_connected_count = servers
+            .iter()
+            .filter(|s| s.enabled && s.status == "connected")
+            .count();
     }
 
     async fn refresh_mcp_view(&mut self) {
@@ -411,17 +431,65 @@ impl App {
                     return Ok(false);
                 }
                 Modal::Picker(mut picker) => {
+                    // Ctrl+A: toggle select all filtered items
+                    if matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'))
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        let filtered_count = picker.items.len();
+                        if filtered_count > 0 && picker.persistent_checked.len() >= filtered_count {
+                            picker.persistent_checked.clear();
+                        } else {
+                            picker.persistent_checked = picker.items.iter().map(|item| item.value.clone()).collect();
+                        }
+                        picker.sync_checked();
+                        self.state.modal = Some(Modal::Picker(picker));
+                        return Ok(false);
+                    }
+                    match key.code {
+                        KeyCode::Char(c) if !matches!(c, 'j' | 'k' | ' ') => {
+                            let mut s = picker.search.clone();
+                            s.push(c);
+                            picker.update_search(s);
+                            self.state.modal = Some(Modal::Picker(picker));
+                            return Ok(false);
+                        }
+                        KeyCode::Backspace => {
+                            let mut s = picker.search.clone();
+                            s.pop();
+                            picker.update_search(s);
+                            self.state.modal = Some(Modal::Picker(picker));
+                            return Ok(false);
+                        }
+                        _ => {}
+                    }
+                    let kind = picker.kind.clone();
                     let action = events::handle_picker_key(&mut picker, key.code);
                     match action {
                         events::PickerAction::Selected(indices) => {
-                            if let Some(idx) = indices.first() {
-                                if let Some(item) = picker.items.get(*idx) {
-                                    let id = item.value.clone();
+                            match kind {
+                                events::PickerKind::Whitelist => {
+                                    let selected_names: HashSet<String> = indices
+                                        .iter()
+                                        .filter_map(|&i| picker.items.get(i))
+                                        .map(|item| item.value.clone())
+                                        .collect();
+                                    if let Err(e) = crate::whitelist::save(&selected_names) {
+                                        tracing::warn!("Failed to save whitelist: {e}");
+                                    }
+                                    self.state.approved_tools = selected_names;
                                     self.state.modal = None;
-                                    self.handle_load_session(&id).await?;
+                                }
+                                _ => {
+                                    if let Some(idx) = indices.first() {
+                                        if let Some(item) = picker.items.get(*idx) {
+                                            let id = item.value.clone();
+                                            self.state.modal = None;
+                                            self.handle_load_session(&id).await?;
+                                        }
+                                    }
+                                    self.state.modal = None;
                                 }
                             }
-                            self.state.modal = None;
                         }
                         events::PickerAction::Cancelled => {
                             self.state.modal = None;
@@ -461,7 +529,12 @@ impl App {
                 return Ok(true);
             }
             KeyCode::Esc => {
-                return Ok(true);
+                if self.state.messages.is_empty() && !self.state.is_generating {
+                    return Ok(true);
+                }
+                self.state.messages.clear();
+                self.state.scroll_offset = 0;
+                self.state.is_generating = false;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.messages.clear();
@@ -524,6 +597,34 @@ impl App {
                                     };
                                     self.state.current_session_id =
                                         crate::session::create_session_id();
+                                }
+                                CommandResult::TtlUpdate(ttl) => {
+                                    self.config.mcp.cache_ttl = ttl;
+                                    {
+                                        let mut mcp = self.mcp.lock().await;
+                                        mcp.set_cache_ttl(ttl);
+                                    }
+                                    self.state.messages.push(ChatMessage::system(
+                                        &format!("MCP cache TTL set to {ttl}s"),
+                                    ));
+                                }
+                                CommandResult::ReloadMcp => {
+                                    self.state.messages.push(ChatMessage::system(
+                                        "Reloading all MCP servers...",
+                                    ));
+                                    let mut mcp = self.mcp.lock().await;
+                                    mcp.reload_all().await;
+                                    self.state.mcp_view.servers = mcp.get_servers_info();
+                                    self.state.messages.push(ChatMessage::system(
+                                        "MCP servers reloaded",
+                                    ));
+                                }
+                                CommandResult::ShowTools => {
+                                    let tools_text = self.build_tools_display().await;
+                                    self.state.messages.push(ChatMessage::system(&tools_text));
+                                }
+                                CommandResult::OpenWhitelist => {
+                                    self.open_whitelist_picker().await;
                                 }
                                 CommandResult::Error(err) => {
                                     self.state.messages.push(ChatMessage::system(&err));
@@ -806,10 +907,7 @@ impl App {
     }
 
     async fn build_system_prompt(&self) -> String {
-        let workspace = std::env::current_dir()
-            .ok()
-            .map(|dir| dir.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+        let workspace = &self.state.workspace_path;
         let user = std::env::var("USERNAME")
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "user".to_string());
@@ -1179,7 +1277,8 @@ impl App {
             return;
         }
         let now = session::timestamp_now();
-        if let Err(e) = session::save_session(id, &now, messages, &self.config) {
+        let ws = &self.state.workspace_path;
+        if let Err(e) = session::save_session(id, &now, messages, &self.config, ws) {
             tracing::warn!("Failed to auto-save session: {e}");
         }
     }
@@ -1188,9 +1287,106 @@ impl App {
         crate::tui::render::render(terminal, &self.state, &self.config)
     }
 
+    async fn open_whitelist_picker(&mut self) {
+        use crate::app::events::{PickerItem, PickerMode, PickerKind, PickerState};
+        let mut items: Vec<PickerItem> = Vec::new();
+        let mut checked: Vec<usize> = Vec::new();
+        let whitelist: HashSet<String> = crate::whitelist::load();
+
+        // Built-in tools
+        for def in self.tools.definitions() {
+            let in_list = whitelist.contains(&def.name);
+            items.push(PickerItem::new(
+                format!("{}  {}", if in_list { "\u{2611}" } else { "\u{2610}" }, def.name),
+                def.name.clone(),
+            ));
+            if in_list {
+                checked.push(items.len() - 1);
+            }
+        }
+
+        // MCP tools
+        let mcp = self.mcp.lock().await;
+        for full in mcp.get_all_tools() {
+            let in_list = whitelist.contains(&full.full_name);
+            items.push(PickerItem::new(
+                format!("{}  {}", if in_list { "\u{2611}" } else { "\u{2610}" }, full.full_name),
+                full.full_name.clone(),
+            ));
+            if in_list {
+                checked.push(items.len() - 1);
+            }
+        }
+        drop(mcp);
+
+        if items.is_empty() {
+            self.state.messages.push(crate::provider::ChatMessage::system(
+                "No tools available to whitelist.",
+            ));
+            return;
+        }
+
+        let mut picker = PickerState::new_with_kind(
+            " Tool Whitelist (Space to toggle, Enter to save)",
+            items,
+            PickerMode::Multi,
+            PickerKind::Whitelist,
+        );
+        picker.checked = checked;
+        picker.persistent_checked = whitelist.into_iter().collect();
+        self.state.modal = Some(crate::app::events::Modal::Picker(picker));
+    }
+
+    async fn build_tools_display(&self) -> String {
+        let mut lines = vec!["## Available Tools".to_string()];
+
+        let builtin = self.tools.definitions();
+        if builtin.is_empty() {
+            lines.push("\n### Built-in tools".to_string());
+            lines.push("- none".to_string());
+        } else {
+            lines.push(format!("\n### Built-in tools ({})", builtin.len()));
+            for tool in &builtin {
+                lines.push(format_tool_definition(&tool.name, &tool.description, &tool.parameters));
+            }
+        }
+
+        let mcp = self.mcp.lock().await;
+        let all_mcp = mcp.get_all_tools();
+        if all_mcp.is_empty() {
+            lines.push("\n### MCP tools".to_string());
+            lines.push("- none".to_string());
+        } else {
+            let servers = mcp.get_servers_info();
+            let enabled_count = servers.iter().filter(|s| s.enabled).count();
+            lines.push(format!("\n### MCP tools ({all} total, {enabled} enabled, {conn} connected)",
+                all = all_mcp.len(),
+                enabled = enabled_count,
+                conn = servers.iter().filter(|s| s.enabled && s.status == "connected").count(),
+            ));
+            for full in &all_mcp {
+                let server_name = &full.tool.server_name;
+                let server_info = servers.iter().find(|s| s.name == *server_name);
+                let status = server_info.map(|s| s.status.as_str()).unwrap_or("unknown");
+                lines.push(format!(
+                    "  *Server: `{}` ({status})*",
+                    server_name
+                ));
+                lines.push(format_tool_definition(
+                    &full.full_name,
+                    &full.tool.description,
+                    &full.tool.input_schema,
+                ));
+            }
+        }
+        drop(mcp);
+
+        lines.join("\n\n")
+    }
+
     fn expand_file_mentions(&self, input: &str) -> String {
-        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mentions = crate::cli::file_mentions::extract_mentions(input, &workspace);
+        let workspace = std::path::Path::new(&self.state.workspace_path);
+        let mentions = crate::cli::file_mentions::extract_mentions(input, workspace);
 
         if mentions.is_empty() {
             return input.to_string();

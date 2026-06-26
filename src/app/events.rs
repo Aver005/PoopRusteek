@@ -1,4 +1,5 @@
 use crate::provider::ChatMessage;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
@@ -177,25 +178,85 @@ pub enum PickerMode {
     Multi,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickerKind {
+    Sessions,
+    Whitelist,
+}
+
 #[derive(Debug, Clone)]
 pub struct PickerState {
     pub title: String,
+    pub all_items: Vec<PickerItem>,
     pub items: Vec<PickerItem>,
     pub checked: Vec<usize>,
+    pub persistent_checked: Vec<String>,
     pub cursor: usize,
     pub scroll_offset: usize,
     pub mode: PickerMode,
+    pub kind: PickerKind,
+    pub search: String,
 }
 
 impl PickerState {
     pub fn new(title: impl Into<String>, items: Vec<PickerItem>, mode: PickerMode) -> Self {
+        let all_items = items.clone();
         Self {
             title: title.into(),
+            all_items,
             items,
             checked: Vec::new(),
+            persistent_checked: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             mode,
+            kind: PickerKind::Sessions,
+            search: String::new(),
+        }
+    }
+
+    pub fn new_with_kind(title: impl Into<String>, items: Vec<PickerItem>, mode: PickerMode, kind: PickerKind) -> Self {
+        let all_items = items.clone();
+        Self {
+            title: title.into(),
+            all_items,
+            items,
+            checked: Vec::new(),
+            persistent_checked: Vec::new(),
+            cursor: 0,
+            scroll_offset: 0,
+            mode,
+            kind,
+            search: String::new(),
+        }
+    }
+
+    pub fn sync_checked(&mut self) {
+        let set: HashSet<&str> = self.persistent_checked.iter().map(|s| s.as_str()).collect();
+        self.checked = self.items.iter()
+            .enumerate()
+            .filter(|(_, item)| set.contains(item.value.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    pub fn update_search(&mut self, query: String) {
+        self.search = query;
+        let q = self.search.to_lowercase();
+        if q.is_empty() {
+            self.items = self.all_items.clone();
+        } else {
+            self.items = self.all_items.iter()
+                .filter(|item| item.text.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+        }
+        self.sync_checked();
+        if self.cursor >= self.items.len() {
+            self.cursor = self.items.len().saturating_sub(1);
+        }
+        if self.scroll_offset >= self.items.len() {
+            self.scroll_offset = self.items.len().saturating_sub(1);
         }
     }
 }
@@ -221,14 +282,10 @@ pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCod
                     }
                 }
                 PickerMode::Multi => {
-                    if picker.checked.is_empty() {
-                        PickerAction::None
-                    } else {
-                        let mut sel = picker.checked.clone();
-                        sel.sort();
-                        sel.dedup();
-                        PickerAction::Selected(sel)
-                    }
+                    let mut sel = picker.checked.clone();
+                    sel.sort();
+                    sel.dedup();
+                    PickerAction::Selected(sel)
                 }
             }
         }
@@ -243,11 +300,15 @@ pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCod
                 }
                 PickerMode::Multi => {
                     let pos = picker.cursor;
-                    if let Some(idx) = picker.checked.iter().position(|&i| i == pos) {
-                        picker.checked.remove(idx);
-                    } else {
-                        picker.checked.push(pos);
+                    if let Some(item) = picker.items.get(pos) {
+                        let v = &item.value;
+                        if let Some(p) = picker.persistent_checked.iter().position(|x| x == v) {
+                            picker.persistent_checked.remove(p);
+                        } else {
+                            picker.persistent_checked.push(v.clone());
+                        }
                     }
+                    picker.sync_checked();
                     PickerAction::None
                 }
             }

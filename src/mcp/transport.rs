@@ -1,17 +1,20 @@
 use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use crate::error::AppResult;
 use async_trait::async_trait;
+use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{timeout, Duration};
 use std::collections::HashMap;
 use std::env;
+use std::sync::Mutex;
 
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse>;
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()>;
     async fn close(&mut self) -> AppResult<()>;
+    fn session_id(&self) -> Option<String> { None }
 }
 
 pub struct StdioTransport {
@@ -135,11 +138,13 @@ pub struct HttpTransport {
     client: reqwest::Client,
     url: String,
     headers: HashMap<String, String>,
+    session_id: Mutex<Option<String>>,
 }
 
 impl HttpTransport {
     pub fn new(url: &str, headers: HashMap<String, String>) -> AppResult<Self> {
         let client = reqwest::Client::builder()
+            .cookie_store(true)
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
 
@@ -147,6 +152,7 @@ impl HttpTransport {
             client,
             url: url.to_string(),
             headers,
+            session_id: Mutex::new(None),
         })
     }
 }
@@ -159,21 +165,39 @@ impl Transport for HttpTransport {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
 
+        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
+            req = req.header("MCP-Session-Id", sid);
+        }
+
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
 
         let resp = req.send().await?;
         let status = resp.status();
+
+        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+            *self.session_id.lock().unwrap() = Some(sid.to_string());
+            tracing::debug!("{} acquired session via MCP-Session-Id header", self.url);
+        }
+
         let body = resp.text().await.unwrap_or_default();
-        let response: JsonRpcResponse = serde_json::from_str(&body)
-            .map_err(|e| {
-                let snippet = if body.len() > 200 { format!("{}...", &body[..200]) } else { body.clone() };
-                crate::error::AppError::Mcp(
-                    format!("HTTP MCP decode error (status={status}, url={}): {e} — body: {snippet}", self.url)
-                )
-            })?;
-        Ok(response)
+
+        // Try JSON first
+        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&body) {
+            return Ok(response);
+        }
+
+        // JSON failed — fallback to SSE parsing if body looks like SSE
+        if body.contains("data:") || body.starts_with("event:") {
+            tracing::debug!("HttpTransport: received SSE response, falling back to SSE parse for id={} at {}", request.id, self.url);
+            return SseTransport::parse_sse_fallback(&body, request.id, &self.url, status).await;
+        }
+
+        let snippet = if body.len() > 200 { format!("{}...", &body[..200]) } else { body.clone() };
+        Err(crate::error::AppError::Mcp(
+            format!("HTTP MCP decode error (status={status}, url={}): body: {snippet}", self.url)
+        ))
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
@@ -181,6 +205,10 @@ impl Transport for HttpTransport {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(data.to_vec());
+
+        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
+            req = req.header("MCP-Session-Id", sid);
+        }
 
         for (k, v) in &self.headers {
             req = req.header(k, v);
@@ -192,6 +220,244 @@ impl Transport for HttpTransport {
 
     async fn close(&mut self) -> AppResult<()> {
         Ok(())
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.session_id.lock().unwrap().clone()
+    }
+}
+
+pub struct SseTransport {
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Mutex<Option<String>>,
+}
+
+impl SseTransport {
+    pub fn new(url: &str, headers: HashMap<String, String>) -> AppResult<Self> {
+        let client = reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        Ok(Self {
+            client,
+            url: url.to_string(),
+            headers,
+            session_id: Mutex::new(None),
+        })
+    }
+
+    async fn parse_sse_stream(
+        resp: reqwest::Response,
+        request_id: u64,
+        url: &str,
+        status: reqwest::StatusCode,
+    ) -> AppResult<JsonRpcResponse> {
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            loop {
+                let event_end = match buffer.find("\n\n") {
+                    Some(pos) => pos,
+                    None => break,
+                };
+
+                let event_str = buffer[..event_end].to_string();
+                buffer = buffer[event_end + 2..].to_string();
+
+                let mut data_lines: Vec<String> = Vec::new();
+                for line in event_str.lines() {
+                    if let Some(d) = line.strip_prefix("data: ") {
+                        data_lines.push(d.to_string());
+                    } else if line.trim() == "data:" {
+                        data_lines.push(String::new());
+                    }
+                }
+
+                if data_lines.is_empty() {
+                    continue;
+                }
+
+                let json_str = data_lines.join("\n");
+
+                if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&json_str) {
+                    if response.id == Some(request_id) {
+                        return Ok(response);
+                    }
+                    tracing::debug!(
+                        "SSE skipp no-matching id={:?} (waiting for id={request_id})",
+                        response.id
+                    );
+                } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    if value.get("id").is_none() && value.get("method").is_some() {
+                        tracing::debug!("SSE notification: {:?}", value);
+                    }
+                }
+            }
+        }
+
+        Err(crate::error::AppError::Mcp(
+            format!("SSE stream ended without matching response for id={request_id} (status={status}, url={url})")
+        ))
+    }
+
+    async fn parse_json_body(
+        resp: reqwest::Response,
+        url: &str,
+        status: reqwest::StatusCode,
+    ) -> AppResult<JsonRpcResponse> {
+        let body = resp.text().await.unwrap_or_default();
+        serde_json::from_str(&body).map_err(|e| {
+            let snippet = if body.len() > 200 {
+                format!("{}...", &body[..200])
+            } else {
+                body.clone()
+            };
+            crate::error::AppError::Mcp(
+                format!("HTTP MCP decode error (status={status}, url={url}): {e} — body: {snippet}")
+            )
+        })
+    }
+}
+
+#[async_trait]
+impl Transport for SseTransport {
+    async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse> {
+        let mut req = self.client.post(&self.url)
+            .json(request)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+
+        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
+            req = req.header("MCP-Session-Id", sid);
+        }
+
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+
+        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+            *self.session_id.lock().unwrap() = Some(sid.to_string());
+            tracing::debug!("{} acquired session via MCP-Session-Id header", self.url);
+        }
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet = if body.len() > 200 { format!("{}...", &body[..200]) } else { body };
+            return Err(crate::error::AppError::Mcp(
+                format!("SSE transport error (status={status}, url={}): {snippet}", self.url)
+            ));
+        }
+
+        let content_type = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.contains("text/event-stream") {
+            Self::parse_sse_stream(resp, request.id, &self.url, status).await
+        } else {
+            // Try JSON first; if it fails and body looks like SSE, try SSE parse
+            let body = resp.text().await.unwrap_or_default();
+            let result = serde_json::from_str::<JsonRpcResponse>(&body);
+            match result {
+                Ok(r) => Ok(r),
+                Err(json_err) => {
+                    // Fallback: treat non-JSON body as SSE stream
+                    if body.contains("data:") || body.contains("event:") {
+                        tracing::debug!("SSE transport: non-SSE Content-Type but body looks like SSE, trying SSE parse");
+                        Self::parse_sse_fallback(&body, request.id, &self.url, status).await
+                    } else {
+                        let snippet = if body.len() > 200 { format!("{}...", &body[..200]) } else { body };
+                        Err(crate::error::AppError::Mcp(
+                            format!("SSE transport decode error (status={status}, url={}): {json_err} — body: {snippet}", self.url)
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
+        let mut req = self.client.post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .body(data.to_vec());
+
+        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
+            req = req.header("MCP-Session-Id", sid);
+        }
+
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+
+        req.send().await?;
+        Ok(())
+    }
+
+    async fn close(&mut self) -> AppResult<()> {
+        Ok(())
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.session_id.lock().unwrap().clone()
+    }
+}
+
+impl SseTransport {
+    async fn parse_sse_fallback(
+        body: &str,
+        request_id: u64,
+        url: &str,
+        status: reqwest::StatusCode,
+    ) -> AppResult<JsonRpcResponse> {
+        let mut buffer = body.to_string();
+
+        loop {
+            let event_end = match buffer.find("\n\n") {
+                Some(pos) => pos,
+                None => break,
+            };
+
+            let event_str = buffer[..event_end].to_string();
+            buffer = buffer[event_end + 2..].to_string();
+
+            let mut data_lines: Vec<String> = Vec::new();
+            for line in event_str.lines() {
+                if let Some(d) = line.strip_prefix("data: ") {
+                    data_lines.push(d.to_string());
+                } else if line.trim() == "data:" {
+                    data_lines.push(String::new());
+                }
+            }
+
+            if data_lines.is_empty() {
+                continue;
+            }
+
+            let json_str = data_lines.join("\n");
+
+            if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&json_str) {
+                if response.id == Some(request_id) {
+                    return Ok(response);
+                }
+            }
+        }
+
+        Err(crate::error::AppError::Mcp(
+            format!("SSE fallback: no matching response for id={request_id} (status={status}, url={url})")
+        ))
     }
 }
 
