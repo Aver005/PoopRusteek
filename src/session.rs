@@ -142,3 +142,31 @@ pub fn derive_title(messages: &[ChatMessage]) -> String {
     }
     "Empty conversation".to_string()
 }
+
+pub fn history_path() -> std::path::PathBuf {
+    Config::data_dir().join("history.json")
+}
+
+pub fn load_history() -> Vec<String> {
+    let path = history_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn append_history(input: &str) {
+    let mut history = load_history();
+    if history.last().map(|s| s.as_str()) != Some(input) {
+        history.push(input.to_string());
+    }
+    if history.len() > 500 {
+        history.drain(0..history.len() - 500);
+    }
+    if let Ok(json) = serde_json::to_string(&history) {
+        let _ = std::fs::write(history_path(), json);
+    }
+}

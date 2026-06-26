@@ -57,6 +57,9 @@ pub struct AppState {
     pub session_started_at: String,
     pub show_stats_panel: bool,
     pub last_mcp_stats_update: Option<std::time::Instant>,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub unsent_input: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -119,6 +122,9 @@ impl App {
             last_gen_duration_secs: 0.0,
             session_started_at: chrono::Utc::now().to_rfc3339(),
             last_mcp_stats_update: None,
+            input_history: crate::session::load_history(),
+            history_index: None,
+            unsent_input: String::new(),
         };
 
         if mcp_init_ok {
@@ -653,6 +659,8 @@ impl App {
                         self.state.input_cursor = 0;
                         self.state.input_selection_anchor = None;
                         self.state.autocomplete = AutocompleteState::default();
+                        self.state.history_index = None;
+                        crate::session::append_history(&input);
 
                         if input.starts_with('/') {
                             let result =
@@ -807,6 +815,46 @@ impl App {
                     self.state.input_selection_anchor = Some(self.state.input_cursor);
                 }
                 self.state.input_cursor = self.state.input_buffer.chars().count();
+            }
+            KeyCode::Up if !self.state.is_generating
+                && self.state.input_buffer.chars().take(self.state.input_cursor).filter(|&c| c == '\n').count() == 0 =>
+            {
+                let history = &self.state.input_history;
+                if !history.is_empty() {
+                    let idx = match self.state.history_index {
+                        None => {
+                            self.state.unsent_input = self.state.input_buffer.clone();
+                            Some(history.len() - 1)
+                        }
+                        Some(i) if i > 0 => Some(i - 1),
+                        _ => None,
+                    };
+                    if let Some(i) = idx {
+                        self.state.input_buffer = history[i].clone();
+                        self.state.input_cursor = self.state.input_buffer.chars().count();
+                        self.state.input_selection_anchor = None;
+                        self.state.history_index = Some(i);
+                    }
+                }
+            }
+            KeyCode::Down if !self.state.is_generating
+                && self.state.input_buffer.chars().skip(self.state.input_cursor).filter(|&c| c == '\n').count() == 0 =>
+            {
+                let next = self.state.history_index.map(|i| i + 1);
+                let history_len = self.state.input_history.len();
+                match next {
+                    Some(i) if i < history_len => {
+                        self.state.input_buffer = self.state.input_history[i].clone();
+                        self.state.input_cursor = self.state.input_buffer.chars().count();
+                        self.state.history_index = Some(i);
+                    }
+                    _ => {
+                        self.state.input_buffer = std::mem::take(&mut self.state.unsent_input);
+                        self.state.input_cursor = self.state.input_buffer.chars().count();
+                        self.state.history_index = None;
+                    }
+                }
+                self.state.input_selection_anchor = None;
             }
             KeyCode::Up => {
                 self.state.scroll_offset = self.state.scroll_offset.saturating_add(1);
