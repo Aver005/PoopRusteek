@@ -8,6 +8,7 @@ use crate::mcp::types::McpViewState;
 use crate::prompts::{self, PromptFiles};
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::commands::CommandResult;
+use crate::provider::estimate_tokens;
 use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use crate::commands::CommandSuggestion;
@@ -50,6 +51,11 @@ pub struct AppState {
     pub mcp_server_count: usize,
     pub mcp_server_connected_count: usize,
     pub workspace_path: String,
+    pub generation_start_time: Option<std::time::Instant>,
+    pub last_gen_tokens: u32,
+    pub last_gen_duration_secs: f64,
+    pub session_started_at: String,
+    pub show_stats_panel: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +114,11 @@ impl App {
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
+            generation_start_time: None,
+            last_gen_tokens: 0,
+            last_gen_duration_secs: 0.0,
+            session_started_at: chrono::Utc::now().to_rfc3339(),
+            show_stats_panel: true,
         };
 
         Ok(Self {
@@ -197,6 +208,7 @@ impl App {
             .iter()
             .filter(|s| s.enabled && s.status == "connected")
             .count();
+        self.state.mcp_view.servers = servers;
     }
 
     async fn refresh_mcp_view(&mut self) {
@@ -214,6 +226,7 @@ impl App {
             AppEvent::AgentStarted => {
                 self.state.is_generating = true;
                 self.state.status_message = "Thinking...".to_string();
+                self.state.generation_start_time = Some(std::time::Instant::now());
             }
             AppEvent::BeginAssistantMessage => {
                 let should_push = self
@@ -246,6 +259,7 @@ impl App {
                 self.state.is_generating = false;
                 self.state.status_message = "Ready".to_string();
                 self.agent_task = None;
+                self.record_gen_stats();
                 if self
                     .state
                     .messages
@@ -261,6 +275,7 @@ impl App {
                 self.state.error = Some(err.clone());
                 self.state.status_message = err;
                 self.agent_task = None;
+                self.record_gen_stats();
                 if self
                     .state
                     .messages
@@ -582,6 +597,9 @@ impl App {
                     self.state.messages.clear();
                     self.state.scroll_offset = 0;
                 }
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.show_stats_panel = !self.state.show_stats_panel;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.messages.clear();
@@ -1346,6 +1364,20 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn record_gen_stats(&mut self) {
+        if let Some(start) = self.state.generation_start_time.take() {
+            let elapsed = start.elapsed().as_secs_f64();
+            if let Some(last) = self.state.messages.iter_mut().last() {
+                if last.role == Role::Assistant && !last.content.is_empty() {
+                    let tokens = estimate_tokens(&last.content);
+                    last.total_tokens = Some(tokens);
+                    self.state.last_gen_tokens = tokens;
+                    self.state.last_gen_duration_secs = elapsed;
+                }
+            }
+        }
     }
 
     fn auto_save_session(&self) {

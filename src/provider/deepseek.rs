@@ -927,7 +927,7 @@ impl DeepseekProvider {
                 _ => continue,
             };
             if role == Role::User || role == Role::Assistant {
-                messages.push(ChatMessage { role, content, name: None, tool_call_id: None, display_content: None, tool_error: false });
+                messages.push(ChatMessage { role, content, name: None, tool_call_id: None, display_content: None, tool_error: false, created_at: String::new(), total_tokens: None });
             }
         }
         Ok(messages)

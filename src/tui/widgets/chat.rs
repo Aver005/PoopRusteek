@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::provider::Role;
+use crate::provider::{estimate_tokens, Role};
 use crate::tui::theme::Theme;
 use ratatui::{
     layout::Rect,
@@ -8,6 +8,28 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
     Frame,
 };
+
+fn format_time(rfc3339: &str) -> String {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        dt.format("%H:%M:%S").to_string()
+    } else {
+        rfc3339.chars().take(8).collect()
+    }
+}
+
+fn meta_line(msg: &crate::provider::ChatMessage, theme: &Theme) -> Line<'static> {
+    let time = format_time(&msg.created_at);
+    let tokens = msg.total_tokens.unwrap_or_else(|| estimate_tokens(&msg.content));
+    let meta = if tokens > 0 {
+        format!(" {}  {}t ", time, tokens)
+    } else {
+        format!(" {} ", time)
+    };
+    Line::from(vec![Span::styled(
+        meta,
+        Style::default().fg(theme.text_dim).bg(theme.bg),
+    )])
+}
 
 pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
@@ -21,6 +43,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                         Style::default().fg(theme.fg).bg(theme.user_bg),
                     )]));
                 }
+                lines.push(meta_line(msg, theme));
             }
             Role::Assistant => {
                 let header = Span::styled(
@@ -50,6 +73,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                     compact_lines(&mut md_lines);
                     lines.push(Line::from(vec![header]));
                     lines.extend(md_lines);
+                    lines.push(meta_line(msg, theme));
                 }
             }
             Role::System => {

@@ -55,6 +55,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::quit::QuitCommand));
         self.register(Box::new(defs::version::VersionCommand));
         self.register(Box::new(defs::compact::CompactCommand));
+        self.register(Box::new(defs::last::LastCommand));
         self.register(Box::new(defs::load::LoadCommand));
         self.register(Box::new(defs::session_info::SessionInfoCommand));
         self.register(Box::new(defs::session_list::SessionListCommand));

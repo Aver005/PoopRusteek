@@ -26,6 +26,14 @@ pub struct ChatMessage {
     pub display_content: Option<String>,
     #[serde(skip)]
     pub tool_error: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub total_tokens: Option<u32>,
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 impl ChatMessage {
@@ -37,6 +45,8 @@ impl ChatMessage {
             tool_call_id: None,
             display_content: None,
             tool_error: false,
+            created_at: now_rfc3339(),
+            total_tokens: None,
         }
     }
 
@@ -48,6 +58,8 @@ impl ChatMessage {
             tool_call_id: None,
             display_content: None,
             tool_error: false,
+            created_at: now_rfc3339(),
+            total_tokens: None,
         }
     }
 
@@ -59,6 +71,8 @@ impl ChatMessage {
             tool_call_id: None,
             display_content: None,
             tool_error: false,
+            created_at: now_rfc3339(),
+            total_tokens: None,
         }
     }
 
@@ -70,6 +84,8 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.to_string()),
             display_content: None,
             tool_error: false,
+            created_at: now_rfc3339(),
+            total_tokens: None,
         }
     }
 
@@ -87,12 +103,18 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.to_string()),
             display_content: Some(display.to_string()),
             tool_error: is_error,
+            created_at: now_rfc3339(),
+            total_tokens: None,
         }
     }
 
     pub fn visible_content(&self) -> &str {
         self.display_content.as_deref().unwrap_or(&self.content)
     }
+}
+
+pub fn estimate_tokens(text: &str) -> u32 {
+    (text.chars().count() / 4).max(1) as u32
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +139,7 @@ pub struct CompletionResponse {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,

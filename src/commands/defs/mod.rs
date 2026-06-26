@@ -6,6 +6,7 @@ pub mod quit;
 pub mod version;
 pub mod compact;
 pub mod reset;
+pub mod last;
 pub mod load;
 pub mod session_info;
 pub mod session_list;

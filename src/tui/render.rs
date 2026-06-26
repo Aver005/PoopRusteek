@@ -39,7 +39,33 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
                 .split(area);
 
             render_separator(frame, chunks[1], &theme);
-            widgets::chat::render_chat(frame, chunks[0], state, &theme);
+
+            // Split main content into chat + stats panel
+            let pad_w = 2u16;
+            if state.show_stats_panel {
+                let panel_w = 34u16.min(chunks[0].width / 4);
+                let content_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(pad_w),
+                        Constraint::Min(1),
+                        Constraint::Length(panel_w),
+                    ])
+                    .split(chunks[0]);
+                widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
+                widgets::panel::render_stats_panel(frame, chunks[0], state, config, &theme);
+            } else {
+                let content_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(pad_w),
+                        Constraint::Min(1),
+                        Constraint::Length(pad_w),
+                    ])
+                    .split(chunks[0]);
+                widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
+            }
+
             widgets::input::render_input(frame, chunks[2], state, &theme, false, &cursor_cell);
             render_input_border(frame, chunks[3], &theme);
             render_mini_status(frame, chunks[4], state, config, &theme);
@@ -278,13 +304,13 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         format!(" {} ", state.status_message)
     };
-    let mcp_color = Color::Rgb(255, 140, 0);
-    let mcp_part = if state.mcp_server_count > 0 {
-        format!(" \u{25CF} {}/{} MCP ", state.mcp_server_connected_count, state.mcp_server_count)
+
+    let right = if state.last_gen_duration_secs > 0.0 && state.last_gen_tokens > 0 {
+        let tps = state.last_gen_tokens as f64 / state.last_gen_duration_secs;
+        format!(" {} msgs | {:.1} t/s ", msg_count, tps)
     } else {
-        String::new()
+        format!(" {} msgs ", msg_count)
     };
-    let right = format!("{}{} msgs", mcp_part, msg_count);
 
     let gap = area.width.saturating_sub((left.len() + center.len() + right.len()) as u16).max(1) as usize;
 
@@ -303,12 +329,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
             ),
             Span::styled(
                 right,
-                if state.mcp_server_count > 0 {
-                    Style::default().fg(mcp_color).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text_dim)
-                }
-                .bg(theme.bg),
+                Style::default().fg(theme.text_dim).bg(theme.bg),
             ),
         ])),
         area,
