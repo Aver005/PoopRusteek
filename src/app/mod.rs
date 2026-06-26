@@ -26,6 +26,7 @@ pub struct App {
     pub mcp: Arc<tokio::sync::Mutex<MCPManager>>,
     tools: Arc<ToolRegistry>,
     prompts: PromptFiles,
+    agent_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct AppState {
@@ -119,6 +120,7 @@ impl App {
             mcp,
             tools,
             prompts,
+            agent_task: None,
         })
     }
 
@@ -126,6 +128,13 @@ impl App {
         let mut terminal = crate::tui::init()?;
         let result = self.run_loop(&mut terminal).await;
         crate::tui::restore(&mut terminal)?;
+        // Kill any lingering agent task so it can't keep the runtime alive.
+        if let Some(handle) = self.agent_task.take() {
+            handle.abort();
+        }
+        // Kill all background/PTY processes so spawn_blocking waiters unblock
+        // and the tokio runtime can shut down cleanly.
+        crate::tools::background::shutdown_all().await;
         result
     }
 
@@ -168,6 +177,9 @@ impl App {
                     if self.handle_event(event).await? {
                         return Ok(());
                     }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    return Ok(());
                 }
             }
 
@@ -233,6 +245,7 @@ impl App {
             AppEvent::AgentDone(_result) => {
                 self.state.is_generating = false;
                 self.state.status_message = "Ready".to_string();
+                self.agent_task = None;
                 if self
                     .state
                     .messages
@@ -247,6 +260,7 @@ impl App {
                 self.state.is_generating = false;
                 self.state.error = Some(err.clone());
                 self.state.status_message = err;
+                self.agent_task = None;
                 if self
                     .state
                     .messages
@@ -526,15 +540,48 @@ impl App {
             KeyCode::Char(c)
                 if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
             {
+                if self.state.is_generating {
+                    // Ctrl+C while generating cancels the current turn (like Esc).
+                    if let Some(handle) = self.agent_task.take() {
+                        handle.abort();
+                    }
+                    self.state.is_generating = false;
+                    self.state.status_message = "Cancelled".to_string();
+                    if self
+                        .state
+                        .messages
+                        .last()
+                        .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
+                    {
+                        self.state.messages.pop();
+                    }
+                    return Ok(false);
+                }
                 return Ok(true);
             }
             KeyCode::Esc => {
-                if self.state.messages.is_empty() && !self.state.is_generating {
+                if self.state.is_generating {
+                    // Cancel the current agent turn: abort the spawned task,
+                    // reset is_generating so the user can type a new message.
+                    if let Some(handle) = self.agent_task.take() {
+                        handle.abort();
+                    }
+                    self.state.is_generating = false;
+                    self.state.status_message = "Cancelled".to_string();
+                    if self
+                        .state
+                        .messages
+                        .last()
+                        .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
+                    {
+                        self.state.messages.pop();
+                    }
+                } else if self.state.messages.is_empty() {
                     return Ok(true);
+                } else {
+                    self.state.messages.clear();
+                    self.state.scroll_offset = 0;
                 }
-                self.state.messages.clear();
-                self.state.scroll_offset = 0;
-                self.state.is_generating = false;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.messages.clear();
@@ -996,7 +1043,7 @@ impl App {
 
         let _ = event_tx.send(AppEvent::AgentStarted);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut collected_tool_calls = Vec::new();
 
             for _step in 0..max_steps {
@@ -1021,42 +1068,66 @@ impl App {
 
                 let mut full_response = String::new();
                 let mut streamed_visible = String::new();
-                while let Some(chunk) = rx.recv().await {
-                    if !chunk.content.is_empty() {
-                        full_response.push_str(&chunk.content);
-                        let next_visible = stream_visible_text(&full_response);
-                        if next_visible.starts_with(&streamed_visible) {
-                            let delta = &next_visible[streamed_visible.len()..];
-                            if !delta.is_empty() {
-                                let _ = event_tx.send(AppEvent::AgentChunk(delta.to_string()));
-                            }
-                        } else if !next_visible.is_empty() {
-                            let _ = event_tx.send(AppEvent::AddMessage(ChatMessage::system(
-                                "⚠ Streaming sync issue — agent will continue",
-                            )));
+                // Guard against a hung stream: if no chunk arrives for 120s,
+                // abort so is_generating doesn't stay true forever.
+                let idle_timeout = std::time::Duration::from_secs(120);
+                loop {
+                    match tokio::time::timeout(idle_timeout, rx.recv()).await {
+                        Err(_) => {
+                            let _ = event_tx.send(AppEvent::AgentError(
+                                "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
+                            ));
+                            return;
                         }
-                        streamed_visible = next_visible;
-                    }
-                    if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
-                        break;
+                        Ok(None) => break,
+                        Ok(Some(chunk)) => {
+                            if !chunk.content.is_empty() {
+                                full_response.push_str(&chunk.content);
+                                let next_visible = stream_visible_text(&full_response);
+                                if next_visible.starts_with(&streamed_visible) {
+                                    let delta = &next_visible[streamed_visible.len()..];
+                                    if !delta.is_empty() {
+                                        let _ = event_tx.send(AppEvent::AgentChunk(delta.to_string()));
+                                    }
+                                } else if !next_visible.is_empty() {
+                                    let _ = event_tx.send(AppEvent::AddMessage(ChatMessage::system(
+                                        "⚠ Streaming sync issue — agent will continue",
+                                    )));
+                                }
+                                streamed_visible = next_visible;
+                            }
+                            if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
+                                break;
+                            }
+                        }
                     }
                 }
 
                 let tool_calls = parse_tool_calls(&full_response);
                 let visible_text = strip_tool_calls(&full_response);
 
-                if !visible_text.is_empty() {
-                    messages.push(ChatMessage::assistant(&visible_text));
-                } else {
-                    let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
-                }
-
                 if tool_calls.is_empty() {
+                    if !visible_text.is_empty() {
+                        messages.push(ChatMessage::assistant(&visible_text));
+                    } else {
+                        let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
+                    }
+
                     let _ = event_tx.send(AppEvent::AgentDone(AgentResult {
                         text: visible_text,
                         tool_calls: collected_tool_calls,
                     }));
                     return;
+                }
+
+                // There are tool calls — always push an assistant message (even if
+                // visible text is empty) so tool results are bracketed by assistant
+                // turns. Otherwise consecutive tool messages pile up and the provider's
+                // trailing-tool-batch formatter re-emits all of them as TOOL RESULT
+                // blocks every step, causing the model to retry and the count to grow.
+                messages.push(ChatMessage::assistant(&visible_text));
+                if visible_text.is_empty() {
+                    let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
                 }
 
                 for tool_call in tool_calls.into_iter().take(max_tools_per_step) {
@@ -1180,6 +1251,8 @@ impl App {
             ));
         });
 
+        self.agent_task = Some(handle);
+
         Ok(())
     }
 
@@ -1197,6 +1270,9 @@ impl App {
                 self.state.autocomplete = Default::default();
                 self.state.is_generating = false;
                 self.state.error = None;
+                if let Some(handle) = self.agent_task.take() {
+                    handle.abort();
+                }
 
                 if let Some(provider) = &self.provider {
                     let _ = provider.reset().await;
@@ -1226,6 +1302,9 @@ impl App {
                             self.state.autocomplete = Default::default();
                             self.state.is_generating = false;
                             self.state.error = None;
+                            if let Some(handle) = self.agent_task.take() {
+                                handle.abort();
+                            }
 
                             let _ = provider.reset().await;
 
@@ -1477,7 +1556,7 @@ fn summarize_tool_result(result: &str) -> String {
     const MAX_LEN: usize = 160;
     let compact = result.lines().take(3).collect::<Vec<_>>().join(" ");
     if compact.len() > MAX_LEN {
-        format!("{}...", &compact[..MAX_LEN])
+        crate::util::truncate_with_ellipsis(&compact, MAX_LEN)
     } else if compact.is_empty() {
         "No visible output.".to_string()
     } else {

@@ -114,7 +114,18 @@ impl DeepseekProvider {
         let lower = key.to_ascii_lowercase();
         if lower == "authorization" {
             if value.len() > 24 {
-                return format!("{}...{}", &value[..16], &value[value.len() - 8..]);
+                let head = crate::util::truncate_at_char_boundary(value, 16);
+                let tail_start = value.len().saturating_sub(8);
+                let tail_start = if value.is_char_boundary(tail_start) {
+                    tail_start
+                } else {
+                    let mut i = tail_start;
+                    while i < value.len() && !value.is_char_boundary(i) {
+                        i += 1;
+                    }
+                    i
+                };
+                return format!("{}...{}", head, &value[tail_start..]);
             }
             return "<redacted>".to_string();
         }

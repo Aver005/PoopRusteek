@@ -60,6 +60,9 @@ base64 = "0.22"
 regex = "1"
 wasmtime = "27"
 
+# PTY for interactive CLI tools (arrow-key menus, REPLs)
+portable-pty = "0.9"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

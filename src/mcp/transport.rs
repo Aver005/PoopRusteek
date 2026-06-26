@@ -194,7 +194,7 @@ impl Transport for HttpTransport {
             return SseTransport::parse_sse_fallback(&body, request.id, &self.url, status).await;
         }
 
-        let snippet = if body.len() > 200 { format!("{}...", &body[..200]) } else { body.clone() };
+        let snippet = if body.len() > 200 { crate::util::truncate_with_ellipsis(&body, 200) } else { body.clone() };
         Err(crate::error::AppError::Mcp(
             format!("HTTP MCP decode error (status={status}, url={}): body: {snippet}", self.url)
         ))
@@ -315,7 +315,7 @@ impl SseTransport {
         let body = resp.text().await.unwrap_or_default();
         serde_json::from_str(&body).map_err(|e| {
             let snippet = if body.len() > 200 {
-                format!("{}...", &body[..200])
+                crate::util::truncate_with_ellipsis(&body, 200)
             } else {
                 body.clone()
             };
@@ -352,7 +352,7 @@ impl Transport for SseTransport {
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            let snippet = if body.len() > 200 { format!("{}...", &body[..200]) } else { body };
+            let snippet = if body.len() > 200 { crate::util::truncate_with_ellipsis(&body, 200) } else { body };
             return Err(crate::error::AppError::Mcp(
                 format!("SSE transport error (status={status}, url={}): {snippet}", self.url)
             ));
@@ -378,7 +378,7 @@ impl Transport for SseTransport {
                         tracing::debug!("SSE transport: non-SSE Content-Type but body looks like SSE, trying SSE parse");
                         Self::parse_sse_fallback(&body, request.id, &self.url, status).await
                     } else {
-                        let snippet = if body.len() > 200 { format!("{}...", &body[..200]) } else { body };
+                        let snippet = if body.len() > 200 { crate::util::truncate_with_ellipsis(&body, 200) } else { body };
                         Err(crate::error::AppError::Mcp(
                             format!("SSE transport decode error (status={status}, url={}): {json_err} — body: {snippet}", self.url)
                         ))

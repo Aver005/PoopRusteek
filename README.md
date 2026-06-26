@@ -29,7 +29,8 @@ pooprusteek
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit |
+| `Ctrl+C` | Cancel generation / Quit |
+| `Esc` | Cancel generation / Clear chat / Quit |
 | `Ctrl+L` | Clear chat |
 | `Enter` | Send message |
 | `Arrow keys` | Navigate input / scroll |

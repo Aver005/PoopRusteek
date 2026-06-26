@@ -13,6 +13,7 @@ mod cli;
 mod acp;
 mod prompts;
 mod whitelist;
+mod util;
 
 use std::sync::Arc;
 use color_eyre::Result;
