@@ -56,6 +56,7 @@ pub struct AppState {
     pub last_gen_duration_secs: f64,
     pub session_started_at: String,
     pub show_stats_panel: bool,
+    pub last_mcp_stats_update: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,14 +85,12 @@ impl App {
         };
 
         let mut mcp_manager = MCPManager::new();
-        if let Err(e) = mcp_manager.initialize().await {
-            tracing::warn!("MCP initialization failed: {e}");
-        }
+        let mcp_init_ok = mcp_manager.initialize().await.is_ok();
         let mcp = Arc::new(tokio::sync::Mutex::new(mcp_manager));
         let tools = Arc::new(ToolRegistry::new());
         let prompts = prompts::load_prompt_files()?;
 
-        let state = AppState {
+        let mut state = AppState {
             messages: Vec::new(),
             input_buffer: String::new(),
             input_cursor: 0,
@@ -111,6 +110,7 @@ impl App {
             mcp_view: McpViewState::default(),
             mcp_server_count: 0,
             mcp_server_connected_count: 0,
+            show_stats_panel: true,
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
@@ -118,8 +118,20 @@ impl App {
             last_gen_tokens: 0,
             last_gen_duration_secs: 0.0,
             session_started_at: chrono::Utc::now().to_rfc3339(),
-            show_stats_panel: true,
+            last_mcp_stats_update: None,
         };
+
+        if mcp_init_ok {
+            let mgr = mcp.lock().await;
+            let servers = mgr.get_servers_info();
+            state.mcp_server_count = servers.len();
+            state.mcp_server_connected_count = servers
+                .iter()
+                .filter(|s| s.enabled && s.status == "connected")
+                .count();
+            state.mcp_view.servers = servers;
+            state.last_mcp_stats_update = Some(std::time::Instant::now());
+        }
 
         Ok(Self {
             config,
@@ -201,6 +213,12 @@ impl App {
     }
 
     async fn update_mcp_stats(&mut self) {
+        const MCP_STATS_INTERVAL_SECS: u64 = 2;
+        if let Some(last) = self.state.last_mcp_stats_update {
+            if last.elapsed().as_secs() < MCP_STATS_INTERVAL_SECS {
+                return;
+            }
+        }
         let mcp = self.mcp.lock().await;
         let servers = mcp.get_servers_info();
         self.state.mcp_server_count = servers.len();
@@ -209,6 +227,7 @@ impl App {
             .filter(|s| s.enabled && s.status == "connected")
             .count();
         self.state.mcp_view.servers = servers;
+        self.state.last_mcp_stats_update = Some(std::time::Instant::now());
     }
 
     async fn refresh_mcp_view(&mut self) {
