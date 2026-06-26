@@ -160,10 +160,10 @@ pub fn render_input(
             }
 
             let seg_byte_start = char_to_byte_pos(input, line_starts[vline.logical_idx]);
-            let mut chunk_start = vline.char_start;
-            let chunk_end = vline.char_end;
-            let mut idx = chunk_start;
-            while idx < chunk_end.min(seg.chars().count()) {
+            let byte_chunk_start = char_to_byte_pos(seg, vline.char_start);
+            let byte_chunk_end = char_to_byte_pos(seg, vline.char_end);
+            let mut idx = byte_chunk_start;
+            while idx < byte_chunk_end.min(seg.len()) {
                 let Some(ch) = seg[idx..].chars().next() else { break };
                 let ch_len = ch.len_utf8();
                 let abs_byte = seg_byte_start + idx;
@@ -172,7 +172,7 @@ pub fn render_input(
                     None => false,
                 };
                 let mut j = idx + ch_len;
-                while j < chunk_end.min(seg.chars().count()) {
+                while j < byte_chunk_end.min(seg.len()) {
                     let next_byte = seg_byte_start + j;
                     let next_in = match sel {
                         Some((s, e)) => next_byte >= s && next_byte < e,
@@ -184,14 +184,12 @@ pub fn render_input(
                     let Some(nch) = seg[j..].chars().next() else { break };
                     j += nch.len_utf8();
                 }
-                let byte_start = char_to_byte_pos(seg, chunk_start);
-                let byte_end = char_to_byte_pos(seg, j);
-                let text = &seg[byte_start..byte_end];
+                let byte_end = j;
+                let text = &seg[idx..byte_end];
                 spans.push(Span::styled(text, if in_sel { sel_style } else { fg }));
-                chunk_start = j;
                 idx = j;
             }
-            if idx == vline.char_start {
+            if idx == char_to_byte_pos(seg, vline.char_start) {
                 spans.push(Span::styled("", fg));
             }
             rendering_lines.push(Line::from(spans));
