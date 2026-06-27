@@ -90,10 +90,6 @@ impl CommandRegistry {
         }
     }
 
-    pub fn completions(&self) -> Vec<String> {
-        self.commands.keys().map(|k| format!("/{k}")).collect()
-    }
-
     pub fn suggest(&self, query: &str) -> Vec<CommandSuggestion> {
         let q = query.trim_start_matches('/').to_ascii_lowercase();
         let mut out: Vec<CommandSuggestion> = self

@@ -128,8 +128,6 @@ impl MCPClient {
             uri: r.uri,
             name: r.name,
             description: r.description,
-            mime_type: r.mime_type,
-            server_name: self.server_name.clone(),
         }).collect();
         Ok(resources)
     }
@@ -161,26 +159,6 @@ impl MCPClient {
         })
     }
 
-    pub async fn read_resource(&mut self, uri: &str) -> AppResult<String> {
-        let params = json!({
-            "uri": uri
-        });
-
-        let response = self.call("resources/read", Some(params)).await?;
-        let result = response.result.unwrap_or(json!({}));
-
-        if let Some(contents) = result.get("contents") {
-            if let Some(arr) = contents.as_array() {
-                let texts: Vec<String> = arr.iter()
-                    .filter_map(|c| c.get("text").and_then(|t| t.as_str()).map(String::from))
-                    .collect();
-                return Ok(texts.join("\n"));
-            }
-        }
-
-        Ok(String::new())
-    }
-
     async fn call(&mut self, method: &str, params: Option<Value>) -> AppResult<JsonRpcResponse> {
         self.call_impl(method, params).await
     }
@@ -206,15 +184,6 @@ impl MCPClient {
 
         Ok(response)
     }
-
-    pub async fn close(&mut self) -> AppResult<()> {
-        let mut transport = self.transport.lock().await;
-        transport.close().await
-    }
-
-    pub fn server_name(&self) -> &str {
-        &self.server_name
-    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -232,8 +201,6 @@ struct MCPResourceRaw {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default, rename = "mimeType")]
-    mime_type: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

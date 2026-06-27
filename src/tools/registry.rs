@@ -41,10 +41,6 @@ impl ToolRegistry {
         self.tools.lock().unwrap().values().map(|t| t.definition()).collect()
     }
 
-    pub fn names(&self) -> Vec<String> {
-        self.tools.lock().unwrap().keys().cloned().collect()
-    }
-
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult {
         match self.get(name) {
             Some(tool) => tool.execute(args).await,

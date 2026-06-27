@@ -36,7 +36,7 @@ struct Args {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let _ = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pooprusteek=info")),
@@ -45,7 +45,13 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     debug_log::init(args.debug_log)?;
-    let mut config: Config = config::load().unwrap_or_default();
+    let mut config: Config = match config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: failed to load config, using defaults: {e}");
+            Config::default()
+        }
+    };
 
     if args.acp {
         return run_acp_server(&config);

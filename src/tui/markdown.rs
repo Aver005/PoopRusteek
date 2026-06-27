@@ -157,11 +157,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
-                if in_code_block {
-                    flush_line(&mut lines, &mut current_line);
-                } else {
-                    flush_line(&mut lines, &mut current_line);
-                }
+                flush_line(&mut lines, &mut current_line);
             }
             Event::Rule => {
                 flush_line(&mut lines, &mut current_line);
@@ -251,7 +247,7 @@ fn flush_line(lines: &mut Vec<Line<'static>>, current_line: &mut Vec<Span<'stati
     if current_line.is_empty() {
         lines.push(Line::from(""));
     } else {
-        let line: Line<'static> = Line::from(current_line.drain(..).collect::<Vec<_>>());
+        let line: Line<'static> = Line::from(std::mem::take(current_line));
         lines.push(line);
     }
 }

@@ -54,10 +54,6 @@ pub fn init(enabled: bool) -> AppResult<()> {
     Ok(())
 }
 
-pub fn is_enabled() -> bool {
-    LOGGER.get().and_then(|logger| logger.as_ref()).is_some()
-}
-
 pub fn log(action: &str, message: impl AsRef<str>) {
     if let Some(Some(logger)) = LOGGER.get() {
         logger.write_line(action, message.as_ref());

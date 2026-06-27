@@ -82,21 +82,11 @@ pub enum AppEvent {
     AddMessage(ChatMessage),
 
     // Tool events
-    ToolStarted { name: String, id: String },
-    ToolProgress { id: String, message: String },
-    ToolDone { id: String, result: String },
-    ToolError { id: String, error: String },
+    ToolStarted { name: String },
+    ToolDone { result: String },
+    ToolError { error: String },
     RequestToolApproval(ToolApprovalRequest),
     RequestQuestion(QuestionRequest, QuestionState),
-
-    // UI events
-    SwitchView(View),
-    PushModal(Modal),
-    PopModal,
-    Notification(Notification),
-
-    // App lifecycle
-    Quit,
 }
 
 #[derive(Debug, Clone)]
@@ -154,9 +144,6 @@ impl ToolApprovalRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
     Chat,
-    Sessions,
-    Settings,
-    Help,
     Mcp,
 }
 
@@ -346,18 +333,11 @@ pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCod
 
 #[derive(Debug, Clone)]
 pub enum Modal {
-    Confirm {
-        message: String,
-        on_confirm: String,
-    },
     ToolApproval {
         tool_name: String,
         arguments: String,
         scroll_offset: usize,
         always_allow: bool,
-    },
-    Input {
-        prompt: String,
     },
     Picker(PickerState),
     Question(QuestionState),
@@ -470,19 +450,4 @@ impl QuestionState {
             self.scroll_offset = self.selected + 1 - VISIBLE;
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct Notification {
-    pub kind: NotificationKind,
-    pub message: String,
-    pub timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum NotificationKind {
-    Info,
-    Success,
-    Warning,
-    Error,
 }

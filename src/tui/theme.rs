@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Color;
 
 pub struct Theme {
     pub bg: Color,
@@ -53,38 +53,5 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::default_dark()
-    }
-}
-
-impl Theme {
-    pub fn border_style(&self, focused: bool) -> Style {
-        Style::default().fg(if focused { self.border_focus } else { self.border })
-    }
-
-    pub fn text_style(&self) -> Style {
-        Style::default().fg(self.fg).bg(self.bg)
-    }
-
-    pub fn dim_style(&self) -> Style {
-        Style::default().fg(self.text_dim).bg(self.bg)
-    }
-
-    pub fn accent_style(&self) -> Style {
-        Style::default().fg(self.accent).bg(self.bg)
-    }
-
-    pub fn bold_accent_style(&self) -> Style {
-        Style::default()
-            .fg(self.accent)
-            .bg(self.bg)
-            .add_modifier(Modifier::BOLD)
-    }
-
-    pub fn error_style(&self) -> Style {
-        Style::default().fg(self.error).bg(self.bg)
-    }
-
-    pub fn success_style(&self) -> Style {
-        Style::default().fg(self.success).bg(self.bg)
     }
 }

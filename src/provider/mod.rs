@@ -1,6 +1,5 @@
 pub mod deepseek;
 pub mod pow;
-pub mod types;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -154,7 +153,6 @@ pub trait LLMProvider: Send + Sync {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
     ) -> crate::error::AppResult<()>;
-    fn name(&self) -> &str;
     fn model(&self) -> &str;
     async fn reset(&self) -> crate::error::AppResult<()> {
         Ok(())

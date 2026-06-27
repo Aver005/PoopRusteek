@@ -43,10 +43,6 @@ impl MCPManager {
         self.cache_ttl = ttl;
     }
 
-    pub fn cache_ttl(&self) -> u64 {
-        self.cache_ttl
-    }
-
     pub async fn initialize(&mut self) -> AppResult<()> {
         let configs = load_mcp_config();
         let enabled_map = load_own_enabled_map();
@@ -242,17 +238,6 @@ impl MCPManager {
         entry.client.call_tool(&tool_name, args).await
     }
 
-    pub fn get_dynamic_tool_names(&self) -> Vec<String> {
-        self.tool_name_map.keys().cloned().collect()
-    }
-
-    pub fn get_tool_description(&self, full_name: &str) -> Option<String> {
-        let (server_name, tool_name) = self.tool_name_map.get(full_name)?;
-        let entry = self.servers.get(server_name)?;
-        let tool = entry.tools.iter().find(|t| t.name == *tool_name)?;
-        Some(format!("{}: {}", tool.name, tool.description))
-    }
-
     pub fn get_all_resources(&self) -> Vec<MCPResource> {
         let mut result = Vec::new();
         for entry in self.servers.values() {
@@ -274,19 +259,6 @@ impl MCPManager {
             }
         }
         result
-    }
-
-    pub fn server_status(&self, name: &str) -> Option<&MCPServerStatus> {
-        self.servers.get(name).map(|e| &e.status)
-    }
-
-    pub fn disconnect_all(&mut self) {
-        for entry in self.servers.values_mut() {
-            entry.status = MCPServerStatus::Pending;
-            entry.tools.clear();
-            entry.resources.clear();
-        }
-        self.tool_name_map.clear();
     }
 
     pub fn get_servers_info(&self) -> Vec<ServerDisplayInfo> {
@@ -313,18 +285,6 @@ impl MCPManager {
         }).collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         list
-    }
-
-    pub fn get_server_config(&self, name: &str) -> Option<MCPServerConfig> {
-        self.servers.get(name).map(|e| e.config.clone())
-    }
-
-    pub fn get_server_tools(&self, name: &str) -> Vec<MCPTool> {
-        self.servers.get(name).map(|e| e.tools.clone()).unwrap_or_default()
-    }
-
-    pub fn get_server_resources(&self, name: &str) -> Vec<MCPResource> {
-        self.servers.get(name).map(|e| e.resources.clone()).unwrap_or_default()
     }
 
     pub async fn toggle_server(&mut self, name: &str) -> AppResult<()> {

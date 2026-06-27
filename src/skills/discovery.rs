@@ -183,8 +183,7 @@ fn load_skill_from_file(path: &Path, source: SkillSource, skill_dir: &Path) -> O
 
     let name = frontmatter.name.unwrap_or_else(|| {
         dir_name
-            .replace('-', " ")
-            .replace('_', " ")
+            .replace(['-', '_'], " ")
             .split_whitespace()
             .map(|w| {
                 let mut c = w.chars();

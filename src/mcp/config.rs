@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 struct ClaudeDesktopConfig {
-    #[serde(default)]
-    mcpServers: HashMap<String, ClaudeDesktopServer>,
+    #[serde(default, rename = "mcpServers")]
+    mcp_servers: HashMap<String, ClaudeDesktopServer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16,12 +16,6 @@ struct ClaudeDesktopServer {
     args: Vec<String>,
     #[serde(default)]
     env: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VSCodeMCPConfig {
-    #[serde(default)]
-    servers: HashMap<String, VSCodeMCPServer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +165,7 @@ fn load_claude_desktop_config(configs: &mut HashMap<String, MCPServerConfig>) {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(desktop_config) = serde_json::from_str::<ClaudeDesktopConfig>(&content) {
-                    for (name, server) in desktop_config.mcpServers {
+                    for (name, server) in desktop_config.mcp_servers {
                         let config = MCPServerConfig::Stdio {
                             command: server.command,
                             args: server.args,

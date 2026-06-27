@@ -29,19 +29,13 @@ pub struct SkillDefinition {
     pub enabled: bool,
 }
 
-impl SkillDefinition {
-    pub fn display_name(&self) -> String {
-        format!("{} ({})", self.name, self.source)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillFrontmatter {
     pub name: Option<String>,
     pub description: Option<String>,
 }
 
-pub fn parse_skill_content(path: &std::path::Path, content: &str) -> SkillFrontmatter {
+pub fn parse_skill_content(_path: &std::path::Path, content: &str) -> SkillFrontmatter {
     let content = content.trim();
     if content.starts_with("---") {
         if let Some(end) = content[3..].find("---") {

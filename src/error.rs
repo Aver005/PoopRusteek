@@ -17,14 +17,8 @@ pub enum AppError {
     #[error("Provider error: {0}")]
     Provider(String),
 
-    #[error("Agent error: {0}")]
-    Agent(String),
-
     #[error("MCP error: {0}")]
     Mcp(String),
-
-    #[error("Tool error: {0}")]
-    Tool(String),
 
     #[error("Task join error: {0}")]
     Join(#[from] tokio::task::JoinError),

@@ -64,7 +64,7 @@ fn spawn_command(
                 }
             }
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e),
     }
     .map_err(|e| {
         let msg = format!(
@@ -181,7 +181,9 @@ impl Transport for HttpTransport {
             tracing::debug!("{} acquired session via MCP-Session-Id header", self.url);
         }
 
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.map_err(|e| {
+            crate::error::AppError::Mcp(format!("Failed to read HTTP response body at {}: {e}", self.url))
+        })?;
 
         // Try JSON first
         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&body) {
@@ -262,12 +264,7 @@ impl SseTransport {
             let chunk = chunk?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            loop {
-                let event_end = match buffer.find("\n\n") {
-                    Some(pos) => pos,
-                    None => break,
-                };
-
+            while let Some(event_end) = buffer.find("\n\n") {
                 let event_str = buffer[..event_end].to_string();
                 buffer = buffer[event_end + 2..].to_string();
 
@@ -306,24 +303,6 @@ impl SseTransport {
             format!("SSE stream ended without matching response for id={request_id} (status={status}, url={url})")
         ))
     }
-
-    async fn parse_json_body(
-        resp: reqwest::Response,
-        url: &str,
-        status: reqwest::StatusCode,
-    ) -> AppResult<JsonRpcResponse> {
-        let body = resp.text().await.unwrap_or_default();
-        serde_json::from_str(&body).map_err(|e| {
-            let snippet = if body.len() > 200 {
-                crate::util::truncate_with_ellipsis(&body, 200)
-            } else {
-                body.clone()
-            };
-            crate::error::AppError::Mcp(
-                format!("HTTP MCP decode error (status={status}, url={url}): {e} — body: {snippet}")
-            )
-        })
-    }
 }
 
 #[async_trait]
@@ -351,7 +330,7 @@ impl Transport for SseTransport {
         }
 
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.unwrap_or_else(|_| format!("(failed to read body, status={status})"));
             let snippet = if body.len() > 200 { crate::util::truncate_with_ellipsis(&body, 200) } else { body };
             return Err(crate::error::AppError::Mcp(
                 format!("SSE transport error (status={status}, url={}): {snippet}", self.url)
@@ -368,7 +347,9 @@ impl Transport for SseTransport {
             Self::parse_sse_stream(resp, request.id, &self.url, status).await
         } else {
             // Try JSON first; if it fails and body looks like SSE, try SSE parse
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.map_err(|e| {
+                crate::error::AppError::Mcp(format!("Failed to read SSE response body at {}: {e}", self.url))
+            })?;
             let result = serde_json::from_str::<JsonRpcResponse>(&body);
             match result {
                 Ok(r) => Ok(r),
@@ -424,12 +405,7 @@ impl SseTransport {
     ) -> AppResult<JsonRpcResponse> {
         let mut buffer = body.to_string();
 
-        loop {
-            let event_end = match buffer.find("\n\n") {
-                Some(pos) => pos,
-                None => break,
-            };
-
+        while let Some(event_end) = buffer.find("\n\n") {
             let event_str = buffer[..event_end].to_string();
             buffer = buffer[event_end + 2..].to_string();
 

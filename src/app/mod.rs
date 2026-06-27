@@ -6,14 +6,13 @@ use crate::error::AppResult;
 use crate::mcp::MCPManager;
 use crate::mcp::types::McpViewState;
 use crate::prompts::{self, PromptFiles};
-use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
+use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::commands::CommandResult;
 use crate::provider::estimate_tokens;
 use crate::tools::registry::ToolRegistry;
-use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use crate::commands::CommandSuggestion;
 use crate::skills::{discovery::discover_all_skills, SkillDefinition};
-use events::{AgentResult, AppEvent, Modal, QuestionRequest, QuestionState, ToolApprovalRequest, View};
+use events::{AppEvent, Modal, QuestionRequest, ToolApprovalRequest, View};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -258,7 +257,6 @@ impl App {
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
-            AppEvent::Quit => return Ok(true),
             AppEvent::AgentStarted => {
                 self.state.is_generating = true;
                 self.state.status_message = "Thinking...".to_string();
@@ -325,13 +323,13 @@ impl App {
             AppEvent::AddMessage(message) => {
                 self.state.messages.push(message);
             }
-            AppEvent::ToolStarted { name, id: _ } => {
+            AppEvent::ToolStarted { name } => {
                 self.state.status_message = format!("Running {name}...");
             }
-            AppEvent::ToolDone { id: _, result: _ } => {
+            AppEvent::ToolDone { result: _ } => {
                 self.state.status_message = "Tool finished".to_string();
             }
-            AppEvent::ToolError { id: _, error } => {
+            AppEvent::ToolError { error } => {
                 self.state.status_message = format!("Tool error: {error}");
             }
             AppEvent::RequestToolApproval(request) => {
@@ -356,15 +354,6 @@ impl App {
                 self.state.modal = Some(Modal::Question(state));
                 self.state.is_generating = false;
                 self.state.status_message = "Question pending...".to_string();
-            }
-            AppEvent::PushModal(modal) => {
-                self.state.modal = Some(modal);
-            }
-            AppEvent::PopModal => {
-                self.state.modal = None;
-            }
-            AppEvent::Notification(n) => {
-                self.state.status_message = n.message;
             }
             AppEvent::Tick => {
                 if self.state.is_generating || (self.state.messages.is_empty() && self.state.modal.is_none()) {
@@ -469,27 +458,6 @@ impl App {
                                 scroll_offset: new_offset,
                                 always_allow,
                             });
-                        }
-                        _ => {}
-                    }
-                    return Ok(false);
-                }
-                Modal::Confirm { .. } => {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            self.state.modal = None;
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            self.state.modal = None;
-                        }
-                        _ => {}
-                    }
-                    return Ok(false);
-                }
-                Modal::Input { .. } => {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.state.modal = None;
                         }
                         _ => {}
                     }
@@ -1163,7 +1131,7 @@ impl App {
         };
 
         let event_tx = self.event_tx.clone();
-        let mut messages: Vec<ChatMessage> = self.state.messages.clone();
+        let messages: Vec<ChatMessage> = self.state.messages.clone();
         let system_prompt = self.build_system_prompt().await;
 
         let model = self.config.provider.model.clone();
@@ -1176,213 +1144,19 @@ impl App {
 
         let _ = event_tx.send(AppEvent::AgentStarted);
 
-        let handle = tokio::spawn(async move {
-            let mut collected_tool_calls = Vec::new();
-
-            for _step in 0..max_steps {
-                let _ = event_tx.send(AppEvent::BeginAssistantMessage);
-                let mut request_messages = Vec::with_capacity(messages.len() + 1);
-                request_messages.push(ChatMessage::system(&system_prompt));
-                request_messages.extend(messages.clone());
-
-                let request = CompletionRequest {
-                    messages: request_messages,
-                    model: model.clone(),
-                    temperature,
-                    max_tokens,
-                    stream: true,
-                };
-
-                let (tx, mut rx) = mpsc::unbounded_channel();
-                if let Err(error) = provider.complete_stream(request, tx).await {
-                    let _ = event_tx.send(AppEvent::AgentError(error.to_string()));
-                    return;
-                }
-
-                let mut full_response = String::new();
-                let mut streamed_visible = String::new();
-                // Guard against a hung stream: if no chunk arrives for 120s,
-                // abort so is_generating doesn't stay true forever.
-                let idle_timeout = std::time::Duration::from_secs(120);
-                loop {
-                    match tokio::time::timeout(idle_timeout, rx.recv()).await {
-                        Err(_) => {
-                            let _ = event_tx.send(AppEvent::AgentError(
-                                "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
-                            ));
-                            return;
-                        }
-                        Ok(None) => break,
-                        Ok(Some(chunk)) => {
-                            if !chunk.content.is_empty() {
-                                full_response.push_str(&chunk.content);
-                                let next_visible = stream_visible_text(&full_response);
-                                if next_visible.starts_with(&streamed_visible) {
-                                    let delta = &next_visible[streamed_visible.len()..];
-                                    if !delta.is_empty() {
-                                        let _ = event_tx.send(AppEvent::AgentChunk(delta.to_string()));
-                                    }
-                                } else if !next_visible.is_empty() {
-                                    let _ = event_tx.send(AppEvent::AddMessage(ChatMessage::system(
-                                        "⚠ Streaming sync issue — agent will continue",
-                                    )));
-                                }
-                                streamed_visible = next_visible;
-                            }
-                            if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                let tool_calls = parse_tool_calls(&full_response);
-                let visible_text = strip_tool_calls(&full_response);
-
-                if tool_calls.is_empty() {
-                    if !visible_text.is_empty() {
-                        messages.push(ChatMessage::assistant(&visible_text));
-                    } else {
-                        let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
-                    }
-
-                    let _ = event_tx.send(AppEvent::AgentDone(AgentResult {
-                        text: visible_text,
-                        tool_calls: collected_tool_calls,
-                    }));
-                    return;
-                }
-
-                // There are tool calls — always push an assistant message (even if
-                // visible text is empty) so tool results are bracketed by assistant
-                // turns. Otherwise consecutive tool messages pile up and the provider's
-                // trailing-tool-batch formatter re-emits all of them as TOOL RESULT
-                // blocks every step, causing the model to retry and the count to grow.
-                messages.push(ChatMessage::assistant(&visible_text));
-                if visible_text.is_empty() {
-                    let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
-                }
-
-                for tool_call in tool_calls.into_iter().take(max_tools_per_step) {
-                    let tool_id = uuid::Uuid::new_v4().to_string();
-
-                    let (tool_result, is_error) = if tool_call.name == "question" {
-                        let question_text = tool_call.arguments["question"]
-                            .as_str()
-                            .unwrap_or("(no question)");
-                        let options: Vec<String> = tool_call.arguments["options"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let allow_custom = tool_call.arguments["allow_custom"]
-                            .as_bool()
-                            .unwrap_or(false);
-
-                        let qs = QuestionState::new(
-                            question_text.to_string(),
-                            options,
-                            allow_custom,
-                        );
-                        let request = QuestionRequest::new();
-                        let _ = event_tx
-                            .send(AppEvent::RequestQuestion(request.clone(), qs));
-
-                        let _ = event_tx.send(AppEvent::ToolStarted {
-                            name: tool_call.name.clone(),
-                            id: tool_id.clone(),
-                        });
-
-                        match request.wait().await {
-                            Some(answer) if !answer.is_empty() => {
-                                (format!("User answered: {answer}"), false)
-                            }
-                            _ => {
-                                ("User cancelled the question".to_string(), true)
-                            }
-                        }
-                    } else {
-                        let arguments_preview =
-                            serde_json::to_string_pretty(&tool_call.arguments)
-                                .unwrap_or_else(|_| tool_call.arguments.to_string());
-                        let approval = ToolApprovalRequest::new(
-                            tool_call.name.clone(),
-                            arguments_preview,
-                        );
-                        let _ = event_tx
-                            .send(AppEvent::RequestToolApproval(approval.clone()));
-                        let approved = approval.wait().await;
-
-                        if approved {
-                            let _ = event_tx.send(AppEvent::ToolStarted {
-                                name: tool_call.name.clone(),
-                                id: tool_id.clone(),
-                            });
-                            if tool_call.name.starts_with("mcp__") {
-                                let mut mcp = mcp.lock().await;
-                                match mcp
-                                    .call_tool(
-                                        &tool_call.name,
-                                        tool_call.arguments.clone(),
-                                    )
-                                    .await
-                                {
-                                    Ok(result) => (result.content, result.is_error),
-                                    Err(error) => (error.to_string(), true),
-                                }
-                            } else {
-                                let result = tools
-                                    .execute(
-                                        &tool_call.name,
-                                        tool_call.arguments.clone(),
-                                    )
-                                    .await;
-                                (result.content, result.is_error)
-                            }
-                        } else {
-                            ("Execution denied by user.".to_string(), true)
-                        }
-                    };
-
-                    let preview = summarize_tool_result(&tool_result);
-                    let display = preview.clone();
-
-                    let tool_message = ChatMessage::tool_with_display(
-                        &tool_id,
-                        &tool_call.name,
-                        &tool_result,
-                        &display,
-                        is_error,
-                    );
-                    messages.push(tool_message.clone());
-                    collected_tool_calls.push(events::ToolCallInfo {
-                        name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.clone(),
-                        result: Some(tool_result.clone()),
-                    });
-                    let _ = event_tx.send(AppEvent::AddMessage(tool_message));
-
-                    if is_error {
-                        let _ = event_tx.send(AppEvent::ToolError {
-                            id: tool_id,
-                            error: preview,
-                        });
-                    } else {
-                        let _ = event_tx.send(AppEvent::ToolDone {
-                            id: tool_id,
-                            result: preview,
-                        });
-                    }
-                }
-            }
-
-            let _ = event_tx.send(AppEvent::AgentError(
-                "Reached max agent steps before producing a final answer".to_string(),
-            ));
-        });
+        let handle = tokio::spawn(crate::agent::runner::run_agent_loop(
+            provider,
+            tools,
+            mcp,
+            messages,
+            system_prompt,
+            model,
+            temperature,
+            max_tokens,
+            max_steps,
+            max_tools_per_step,
+            event_tx,
+        ));
 
         self.agent_task = Some(handle);
 
@@ -1778,18 +1552,6 @@ fn insert_newline(state: &mut crate::app::AppState) {
     state.input_buffer.insert(byte_pos, '\n');
     state.input_cursor += 1;
     state.input_selection_anchor = None;
-}
-
-fn summarize_tool_result(result: &str) -> String {
-    const MAX_LEN: usize = 160;
-    let compact = result.lines().take(3).collect::<Vec<_>>().join(" ");
-    if compact.len() > MAX_LEN {
-        crate::util::truncate_with_ellipsis(&compact, MAX_LEN)
-    } else if compact.is_empty() {
-        "No visible output.".to_string()
-    } else {
-        compact
-    }
 }
 
 fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Value) -> String {

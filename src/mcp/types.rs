@@ -38,15 +38,6 @@ pub enum MCPServerStatus {
 }
 
 #[derive(Debug, Clone)]
-pub struct MCPServer {
-    pub name: String,
-    pub config: MCPServerConfig,
-    pub status: MCPServerStatus,
-    pub tools: Vec<MCPTool>,
-    pub resources: Vec<MCPResource>,
-}
-
-#[derive(Debug, Clone)]
 pub struct MCPTool {
     pub name: String,
     pub description: String,
@@ -59,8 +50,6 @@ pub struct MCPResource {
     pub uri: String,
     pub name: String,
     pub description: Option<String>,
-    pub mime_type: Option<String>,
-    pub server_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

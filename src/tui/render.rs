@@ -8,7 +8,7 @@ use crate::tui::widgets;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use std::cell::Cell;
 
@@ -208,7 +208,6 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
     // Sessions table
     if show_sessions {
         let sc = chunks[ci];
-        ci += 1;
         render_sessions_table(frame, sc, &sessions, input_width, theme);
     }
 
@@ -224,7 +223,7 @@ fn render_sessions_table(
     input_width: u16,
     theme: &Theme,
 ) {
-    let count = sessions.len().min(5);
+    let _count = sessions.len().min(5);
     let area = centered_h(area, input_width);
     let header_style = Style::default().fg(theme.text_dim).bg(theme.bg);
     let id_style = Style::default().fg(theme.accent_soft).bg(theme.bg);
@@ -250,7 +249,7 @@ fn render_sessions_table(
         lines.push(Line::from(vec![
             Span::styled(format!("  {id_short}"), id_style),
             Span::styled("  ", Style::default().bg(theme.bg)),
-            Span::styled(format!("{title}"), title_style),
+            Span::styled(title.to_string(), title_style),
             Span::styled("  ", Style::default().bg(theme.bg)),
             Span::styled(date, date_style),
         ]));
@@ -524,7 +523,7 @@ fn render_mcp_details(frame: &mut Frame, area: Rect, mcp: &McpViewState, server_
 fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     match modal {
         Modal::ToolApproval { tool_name, arguments, scroll_offset, always_allow } => {
-            let popup_width = area.width.min(72).max(50);
+            let popup_width = area.width.clamp(50, 72);
             let max_height = area.height.saturating_sub(4);
             let content_height = arguments.lines().count().max(4).min(max_height.saturating_sub(6) as usize);
             let popup_height = (content_height + 8).min(max_height as usize) as u16;
@@ -646,88 +645,14 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                 inner,
             );
         }
-        Modal::Confirm { message, .. } => {
-            let pw = area.width.min(60);
-            let ph = 6u16.min(area.height.saturating_sub(2));
-            let x = (area.width.saturating_sub(pw)) / 2;
-            let y = (area.height.saturating_sub(ph)) / 2;
-            let popup_area = Rect::new(x, y, pw, ph);
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.warning))
-                .title(" Confirm ")
-                .title_style(Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
-                .style(Style::default().bg(theme.bg));
-
-            let lines = vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    format!("  {message}"),
-                    Style::default().fg(theme.fg),
-                )]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  y", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
-                    Span::styled(" = yes  ", Style::default().fg(theme.text_dim)),
-                    Span::styled("n", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
-                    Span::styled(" = no", Style::default().fg(theme.text_dim)),
-                ]),
-            ];
-
-            frame.render_widget(Clear, popup_area);
-            let inner = block.inner(popup_area);
-            frame.render_widget(block, popup_area);
-            frame.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: false }).style(Style::default().bg(theme.bg)),
-                inner,
-            );
-        }
-        Modal::Input { prompt } => {
-            let pw = area.width.min(60);
-            let ph = 6u16.min(area.height.saturating_sub(2));
-            let x = (area.width.saturating_sub(pw)) / 2;
-            let y = (area.height.saturating_sub(ph)) / 2;
-            let popup_area = Rect::new(x, y, pw, ph);
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent))
-                .title(" Input ")
-                .title_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
-                .style(Style::default().bg(theme.bg));
-
-            let lines = vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    format!("  {prompt}"),
-                    Style::default().fg(theme.fg),
-                )]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        "  Press Esc to cancel",
-                        Style::default().fg(theme.text_dim),
-                    ),
-                ]),
-            ];
-
-            frame.render_widget(Clear, popup_area);
-            let inner = block.inner(popup_area);
-            frame.render_widget(block, popup_area);
-            frame.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: false }).style(Style::default().bg(theme.bg)),
-                inner,
-            );
-        }
         Modal::Picker(picker) => render_picker(frame, area, picker, theme),
         Modal::Question(qs) => render_question(frame, area, qs, theme),
     }
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Theme) {
-    let popup_width = area.width.min(80).max(48);
-    let visible = picker.items.len().min(12).max(3);
+    let popup_width = area.width.clamp(48, 80);
+    let visible = picker.items.len().clamp(3, 12);
     let popup_h = (visible + 8) as u16;
     let popup_h = popup_h.min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -857,7 +782,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
 }
 
 fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Theme) {
-    let popup_width = area.width.min(72).max(48);
+    let popup_width = area.width.clamp(48, 72);
     let is_custom_mode = qs.is_custom_mode;
     let is_yes_no = qs.options.is_empty();
 

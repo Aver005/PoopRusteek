@@ -301,7 +301,7 @@ pub async fn spawn_interactive(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
 
-    let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let killer: Box<dyn ChildKiller + Send + Sync> = child.clone_killer();
 
     let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;

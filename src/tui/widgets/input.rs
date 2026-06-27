@@ -226,7 +226,7 @@ fn cursor_pos_inner(input: &str, cursor: usize, area: Rect, state: &AppState) ->
     let cursor_visual = visual.iter().rposition(|v| {
         let log_start = line_starts.get(v.logical_idx).copied().unwrap_or(0);
         let abs_end = log_start + (v.char_end - v.char_start);
-        let abs_start = log_start + (v.char_start - v.char_start);
+        let abs_start = log_start + v.char_start;
         cursor >= abs_start && cursor <= abs_end
     }).unwrap_or(0);
     let cursor_logical = visual[cursor_visual].logical_idx;

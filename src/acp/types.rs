@@ -26,28 +26,15 @@ pub struct AcpError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AcpNotification {
-    pub jsonrpc: String,
-    pub method: String,
-    #[serde(default)]
-    pub params: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub name: String,
     pub version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClientInfo {
-    pub name: String,
-    pub version: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct InitializeResult {
-    pub serverInfo: ServerInfo,
+    #[serde(rename = "serverInfo")]
+    pub server_info: ServerInfo,
     pub capabilities: serde_json::Value,
 }
 

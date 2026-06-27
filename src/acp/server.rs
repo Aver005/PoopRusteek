@@ -50,9 +50,15 @@ impl AcpServer {
             let response = self.handle_request(request);
 
             if let Some(resp) = response {
-                let json = serde_json::to_string(&resp).unwrap_or_default();
-                writeln!(writer, "{json}").ok();
-                writer.flush().ok();
+                match serde_json::to_string(&resp) {
+                    Ok(json) => {
+                        writeln!(writer, "{json}").ok();
+                        writer.flush().ok();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to serialize response: {e}");
+                    }
+                }
             }
         }
 
@@ -63,7 +69,7 @@ impl AcpServer {
         match request.method.as_str() {
             "initialize" => {
                 let result = InitializeResult {
-                    serverInfo: ServerInfo {
+                    server_info: ServerInfo {
                         name: "pooprusteek".to_string(),
                         version: env!("CARGO_PKG_VERSION").to_string(),
                     },

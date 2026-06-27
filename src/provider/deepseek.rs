@@ -19,7 +19,6 @@ const DEEPSEEK_HOST: &str = "chat.deepseek.com";
 const CREATE_POW_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
 const CREATE_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
-const SESSION_LIST_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/list";
 const SESSION_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history";
 const TARGET_PATH: &str = "/api/v0/chat/completion";
 const USER_AGENT: &str =
@@ -850,43 +849,6 @@ impl DeepseekProvider {
         Ok(())
     }
 
-    async fn list_remote_sessions(&self) -> AppResult<Vec<(String, String, i64)>> {
-        let body = json!({"count": 100});
-        let headers = self.auth_headers()?;
-        let response = self
-            .send_json_request(
-                "session.list.request",
-                SESSION_LIST_URL,
-                &headers,
-                &body,
-            )
-            .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error_response(
-                "session.list.request",
-                response,
-                "Session list failed",
-            )
-            .await);
-        }
-        let payload: Value = response.json().await?;
-        let sessions = payload["data"]["biz_data"]["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-
-        let mut result = Vec::new();
-        for s in &sessions {
-            let id = s["id"].as_str().unwrap_or("").to_string();
-            let title = s["title"].as_str().unwrap_or("").to_string();
-            let msg_count = s["message_count"].as_i64().unwrap_or(0);
-            if !id.is_empty() {
-                result.push((id, title, msg_count));
-            }
-        }
-        Ok(result)
-    }
-
     async fn fetch_remote_history(&self, session_id: &str) -> AppResult<Vec<ChatMessage>> {
         let body = json!({
             "session_id": session_id,
@@ -931,17 +893,6 @@ impl DeepseekProvider {
             }
         }
         Ok(messages)
-    }
-
-    fn set_remote_session(&self, session_id: &str, parent_message_id: Option<i64>) -> AppResult<()> {
-        let mut state = self
-            .session_state
-            .lock()
-            .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
-        state.session_id = Some(session_id.to_string());
-        state.parent_message_id = parent_message_id;
-        state.system_sent_for_session = false;
-        Ok(())
     }
 }
 
@@ -1058,10 +1009,6 @@ impl LLMProvider for DeepseekProvider {
 
         self.mark_session_after_success(&session_id, parent_message_id)?;
         Ok(())
-    }
-
-    fn name(&self) -> &str {
-        "deepseek"
     }
 
     fn model(&self) -> &str {
