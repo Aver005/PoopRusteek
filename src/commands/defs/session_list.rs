@@ -36,7 +36,8 @@ impl Command for SessionListCommand {
             .iter()
             .map(|s| {
                 let date = s.updated_at.split('T').next().unwrap_or(&s.updated_at);
-                let text = format!("{} [{}, {} msgs]", s.title, date, s.message_count);
+                let model_tag = if s.model_type.is_empty() { String::new() } else { format!(" [{}]", s.model_type) };
+                let text = format!("{} [{}, {} msgs{}]", s.title, date, s.message_count, model_tag);
                 PickerItem::new(&text, s.id.clone())
             })
             .collect();

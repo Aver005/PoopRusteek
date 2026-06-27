@@ -93,6 +93,17 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
         .filter(|m| m.name.as_deref().is_some_and(|n| matches!(n, "Bash" | "PowerShell" | "ShellInput")))
         .count();
     data_row(&mut lines, "Files", &file_ops.to_string(), theme);
+    let think_total: f64 = state.messages.iter()
+        .filter(|m| m.role == Role::Assistant)
+        .map(|m| m.think_elapsed_secs)
+        .sum();
+    if think_total > 0.0 {
+        data_row(&mut lines, "Think", &format!("{:.1}s", think_total), theme);
+    }
+    let search_count = state.messages.iter().filter(|m| m.search_triggered).count();
+    if search_count > 0 {
+        data_row(&mut lines, "Search", &search_count.to_string(), theme);
+    }
     blank(&mut lines);
 
     // ── MCP Servers ──

@@ -1271,6 +1271,10 @@ impl App {
                 if last.role == Role::Assistant && !last.content.is_empty() {
                     let tokens = estimate_tokens(&last.content);
                     last.total_tokens = Some(tokens);
+                    last.model.clone_from(&self.state.last_model_name);
+                    last.status = self.state.last_message_status.clone();
+                    last.think_elapsed_secs = 0.0;
+                    last.references_count = 0;
                     self.state.last_gen_tokens = tokens;
                     self.state.last_gen_duration_secs = elapsed;
                 }

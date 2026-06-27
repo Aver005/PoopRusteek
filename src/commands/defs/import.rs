@@ -100,6 +100,11 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
                     tool_error: false,
                     created_at,
                     total_tokens: None,
+                    model: String::new(),
+                    status: None,
+                    think_elapsed_secs: 0.0,
+                    references_count: 0,
+                    search_triggered: false,
                 });
                 current_content.clear();
                 current_created_at = None;
@@ -145,6 +150,11 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
             tool_error: false,
             created_at,
             total_tokens: None,
+            model: String::new(),
+            status: None,
+            think_elapsed_secs: 0.0,
+            references_count: 0,
+            search_triggered: false,
         });
     }
 

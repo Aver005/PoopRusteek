@@ -229,6 +229,7 @@ fn render_sessions_table(
     let id_style = Style::default().fg(theme.accent_soft).bg(theme.bg);
     let title_style = Style::default().fg(theme.fg).bg(theme.bg);
     let date_style = Style::default().fg(theme.text_dim).bg(theme.bg);
+    let model_style = Style::default().fg(theme.accent_soft).bg(theme.bg);
     let sep_style = Style::default().fg(theme.border).bg(theme.bg);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -238,7 +239,7 @@ fn render_sessions_table(
         Span::styled(" Recent sessions ", header_style),
     ]));
     lines.push(Line::from(vec![Span::styled(
-        format!("  {} {}  {}", "──".repeat(8), "──".repeat(15), "──".repeat(8)),
+        format!("  {} {} {}  {}", "──".repeat(8), "──".repeat(15), "──".repeat(8), "──".repeat(6)),
         sep_style,
     )]));
 
@@ -246,10 +247,13 @@ fn render_sessions_table(
         let id_short = truncate(&s.id, 16);
         let title = truncate(&s.title, 30);
         let date = format_date(&s.updated_at);
+        let model_tag = if s.model_type.is_empty() { String::new() } else { format!(" [{}]", s.model_type) };
         lines.push(Line::from(vec![
             Span::styled(format!("  {id_short}"), id_style),
             Span::styled("  ", Style::default().bg(theme.bg)),
             Span::styled(title.to_string(), title_style),
+            Span::styled("  ", Style::default().bg(theme.bg)),
+            Span::styled(model_tag, model_style),
             Span::styled("  ", Style::default().bg(theme.bg)),
             Span::styled(date, date_style),
         ]));

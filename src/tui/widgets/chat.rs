@@ -20,11 +20,14 @@ fn format_time(rfc3339: &str) -> String {
 fn meta_line(msg: &crate::provider::ChatMessage, theme: &Theme) -> Line<'static> {
     let time = format_time(&msg.created_at);
     let tokens = msg.total_tokens.unwrap_or_else(|| estimate_tokens(&msg.content));
-    let meta = if tokens > 0 {
-        format!(" {}  {}t ", time, tokens)
-    } else {
-        format!(" {} ", time)
-    };
+    let mut parts = vec![format!(" {}  {}t ", time, tokens)];
+    if msg.think_elapsed_secs > 0.0 {
+        parts.push(format!("think {:.1}s", msg.think_elapsed_secs));
+    }
+    if msg.references_count > 0 {
+        parts.push(format!("\u{1F4CE}{}", msg.references_count));
+    }
+    let meta = parts.join("  ");
     Line::from(vec![Span::styled(
         meta,
         Style::default().fg(theme.text_dim).bg(theme.bg),
@@ -46,11 +49,21 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 lines.push(meta_line(msg, theme));
             }
             Role::Assistant => {
+                let header_color = match msg.status.as_deref() {
+                    Some("ABORTED") => theme.error,
+                    Some("WIP") => theme.warning,
+                    _ => theme.success,
+                };
+                let model_tag = if !msg.model.is_empty() {
+                    format!(" ({})", msg.model)
+                } else {
+                    String::new()
+                };
                 let header = Span::styled(
-                    " pooprusteek ",
+                    format!(" pooprusteek{} ", model_tag),
                     Style::default()
                         .fg(theme.bg)
-                        .bg(theme.success)
+                        .bg(header_color)
                         .add_modifier(Modifier::BOLD),
                 );
                 if msg.content.is_empty() {

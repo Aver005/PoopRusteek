@@ -26,6 +26,7 @@ pub struct SessionSummary {
     pub workspace_root: String,
     pub message_count: usize,
     pub title: String,
+    pub model_type: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tag: Option<String>,
 }
@@ -106,6 +107,7 @@ pub fn list_sessions(_config: &Config) -> AppResult<Vec<SessionSummary>> {
             workspace_root: session.workspace_root,
             message_count: session.messages.len(),
             title,
+            model_type: session.model_type,
             tag: session.tag,
         });
     }
