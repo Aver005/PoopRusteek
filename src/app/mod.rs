@@ -61,6 +61,9 @@ pub struct AppState {
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub unsent_input: String,
+    pub last_model_name: String,
+    pub last_message_status: Option<String>,
+    pub last_think_fragments: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +137,9 @@ impl App {
             input_history: crate::session::load_history(),
             history_index: None,
             unsent_input: String::new(),
+            last_model_name: String::new(),
+            last_message_status: None,
+            last_think_fragments: 0,
         };
 
         if mcp_init_ok {
@@ -292,6 +298,7 @@ impl App {
             AppEvent::AgentDone(_result) => {
                 self.state.is_generating = false;
                 self.state.status_message = "Ready".to_string();
+                self.state.last_message_status = Some("FINISHED".to_string());
                 self.agent_task = None;
                 self.record_gen_stats();
                 if self
@@ -307,7 +314,8 @@ impl App {
             AppEvent::AgentError(err) => {
                 self.state.is_generating = false;
                 self.state.error = Some(err.clone());
-                self.state.status_message = err;
+                self.state.status_message = err.clone();
+                self.state.last_message_status = Some("ABORTED".to_string());
                 self.agent_task = None;
                 self.record_gen_stats();
                 if self

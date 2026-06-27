@@ -290,26 +290,61 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     };
     let model = &config.provider.model;
     let msg_count = state.messages.len();
-    let spinner = match state.animation_tick % 4 {
-        0 => "|",
-        1 => "/",
-        2 => "-",
-        _ => "\\",
+    let total_tokens: u32 = state.messages.iter()
+        .filter(|m| m.role == crate::provider::Role::Assistant)
+        .flat_map(|m| m.total_tokens)
+        .sum();
+
+    let mcp_status = if state.mcp_server_count > 0 {
+        format!(" mcp:{}/{}", state.mcp_server_connected_count, state.mcp_server_count)
+    } else {
+        String::new()
     };
 
-    let left = format!(" {} · {} ", provider_name, model);
+    let model_tag = if !state.last_model_name.is_empty() {
+        format!(" · {}", state.last_model_name)
+    } else {
+        String::new()
+    };
+    let left = format!(" {} · {}{}{} ", provider_name, model, model_tag, mcp_status);
+
+    let status_tag = state.last_message_status.as_deref().unwrap_or("");
+
     let center = if state.is_generating {
-        format!(" {} {} ", spinner, state.status_message)
+        let gen_info = if let Some(start) = state.generation_start_time {
+            let elapsed = start.elapsed().as_secs_f64();
+            let tps = if elapsed > 0.0 && state.last_gen_tokens > 0 {
+                state.last_gen_tokens as f64 / elapsed
+            } else {
+                0.0
+            };
+            format!(" {} {} ", spinner_char(state.animation_tick), state.status_message)
+                + &format!("({} tok, {:.1}s, {:.0} t/s)", state.last_gen_tokens, elapsed, tps)
+        } else {
+            format!(" {} {} ", spinner_char(state.animation_tick), state.status_message)
+        };
+        gen_info
     } else {
-        format!(" {} ", state.status_message)
+        let mut parts = vec![state.status_message.clone()];
+        if !status_tag.is_empty() {
+            parts.push(status_tag.to_string());
+        }
+        if state.last_think_fragments > 0 {
+            parts.push(format!("{} think", state.last_think_fragments));
+        }
+        if state.last_gen_duration_secs > 0.0 && state.last_gen_tokens > 0 {
+            let tps = state.last_gen_tokens as f64 / state.last_gen_duration_secs;
+            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.last_gen_tokens, state.last_gen_duration_secs, tps));
+        }
+        format!(" {} ", parts.join(" · "))
     };
 
-    let right = if state.last_gen_duration_secs > 0.0 && state.last_gen_tokens > 0 {
-        let tps = state.last_gen_tokens as f64 / state.last_gen_duration_secs;
-        format!(" {} msgs | {:.1} t/s ", msg_count, tps)
+    let session_prefix = if state.current_session_id.len() >= 8 {
+        format!(" {} ", &state.current_session_id[..8])
     } else {
-        format!(" {} msgs ", msg_count)
+        format!(" {} ", state.current_session_id)
     };
+    let right = format!(" msgs:{} tot:{} | {} ", msg_count, total_tokens, session_prefix);
 
     let gap = area.width.saturating_sub((left.len() + center.len() + right.len()) as u16).max(1) as usize;
 
@@ -333,6 +368,15 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         ])),
         area,
     );
+}
+
+fn spinner_char(tick: u64) -> &'static str {
+    match tick % 4 {
+        0 => "|",
+        1 => "/",
+        2 => "-",
+        _ => "\\",
+    }
 }
 
 fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
