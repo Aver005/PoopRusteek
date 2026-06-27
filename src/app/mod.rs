@@ -1230,6 +1230,7 @@ impl App {
                                         .to_string(),
                                     model_type: self.config.provider.model.clone(),
                                     messages: self.state.messages.clone(),
+                                    tag: None,
                                 },
                                 &self.config,
                             ) {

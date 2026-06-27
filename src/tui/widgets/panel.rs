@@ -1,6 +1,7 @@
 use crate::app::AppState;
 use crate::config::Config;
 use crate::provider::Role;
+use crate::session;
 use crate::tui::theme::Theme;
 use ratatui::{
     layout::Rect,
@@ -56,6 +57,11 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 
     // ── Session ──
     section_header(&mut lines, "Session", panel_w, theme);
+    if let Ok(s) = session::load_local(&state.current_session_id, config) {
+        if let Some(ref tag) = s.tag {
+            data_row(&mut lines, "Tag", tag, theme);
+        }
+    }
     let started = format_time_short(&state.session_started_at);
     data_row(&mut lines, "Started", &started, theme);
     let latest = state.messages.last().map(|m| format_time_short(&m.created_at)).unwrap_or_default();

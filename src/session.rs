@@ -14,6 +14,8 @@ pub struct Session {
     pub workspace_root: String,
     pub model_type: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +26,8 @@ pub struct SessionSummary {
     pub workspace_root: String,
     pub message_count: usize,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tag: Option<String>,
 }
 
 pub fn create_session_id() -> String {
@@ -53,6 +57,7 @@ pub fn save_session(
         workspace_root: workspace_root.to_string(),
         model_type: config.provider.model.clone(),
         messages: messages.to_vec(),
+        tag: None,
     };
 
     let path = dir.join(format!("{id}.json"));
@@ -101,6 +106,7 @@ pub fn list_sessions(_config: &Config) -> AppResult<Vec<SessionSummary>> {
             workspace_root: session.workspace_root,
             message_count: session.messages.len(),
             title,
+            tag: session.tag,
         });
     }
 

@@ -68,6 +68,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::tools::ToolsCommand));
         self.register(Box::new(defs::whitelist::WhitelistCommand));
         self.register(Box::new(defs::skills::SkillsCommand));
+        self.register(Box::new(defs::export::ExportCommand));
+        self.register(Box::new(defs::import::ImportCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {
