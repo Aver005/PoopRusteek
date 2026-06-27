@@ -1,3 +1,4 @@
+pub mod attach;
 pub mod help;
 pub mod home;
 pub mod cwd;

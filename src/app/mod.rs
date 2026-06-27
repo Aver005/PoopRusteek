@@ -61,6 +61,7 @@ pub struct AppState {
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub unsent_input: String,
+    pub attached_files: Vec<crate::provider::AttachedFile>,
     pub last_model_name: String,
     pub last_message_status: Option<String>,
     pub last_think_fragments: u32,
@@ -72,6 +73,7 @@ pub struct AutocompleteState {
     pub items: Vec<CommandSuggestion>,
     pub selected: usize,
     pub scroll_offset: usize,
+    pub file_mode: bool,
 }
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;
@@ -137,6 +139,7 @@ impl App {
             input_history: crate::session::load_history(),
             history_index: None,
             unsent_input: String::new(),
+            attached_files: Vec::new(),
             last_model_name: String::new(),
             last_message_status: None,
             last_think_fragments: 0,
@@ -740,7 +743,28 @@ impl App {
                                 }
                             }
                         } else {
-                            let expanded = self.expand_file_mentions(&input);
+                            let mut expanded = self.expand_file_mentions(&input);
+                            if !self.state.attached_files.is_empty() {
+                                let attach_header = if expanded.trim().is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\n\n")
+                                };
+                                let attach_section: String = self.state.attached_files
+                                    .iter()
+                                    .filter_map(|f| {
+                                        let content = std::fs::read_to_string(&f.path).ok()?;
+                                        let header = format!("File: {} ({}):", f.display_name, crate::app::format_size(f.size));
+                                        Some(format!("```\n{}\n{}\n```", header, content))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if !attach_section.is_empty() {
+                                    expanded.push_str(&attach_header);
+                                    expanded.push_str(&attach_section);
+                                }
+                                self.state.attached_files.clear();
+                            }
                             self.state.messages.push(ChatMessage::user(&expanded));
                             self.send_to_agent(expanded).await?;
                         }
@@ -987,6 +1011,74 @@ impl App {
 
     fn refresh_autocomplete(&mut self) {
         let buf = self.state.input_buffer.clone();
+
+        // Check for @-triggered file path completion
+        if let Some(at_pos) = buf.rfind('@') {
+            let after_at = &buf[at_pos + 1..];
+            let path_part = after_at.split_whitespace().next().unwrap_or("");
+            if !path_part.is_empty() && !self.state.is_generating && self.state.modal.is_none() {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let search_path = if path_part.contains('/') || path_part.contains('\\') {
+                    std::path::Path::new(path_part).to_path_buf()
+                } else {
+                    cwd.join(path_part)
+                };
+                let parent = search_path.parent().unwrap_or(&cwd);
+                let prefix = search_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                let mut items = Vec::new();
+                if let Ok(read_dir) = std::fs::read_dir(
+                    if path_part.contains('/') || path_part.contains('\\') {
+                        if parent.is_absolute() {
+                            parent.to_path_buf()
+                        } else {
+                            cwd.join(parent)
+                        }
+                    } else {
+                        cwd.clone()
+                    },
+                ) {
+                    for entry in read_dir.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.to_lowercase().starts_with(&prefix) {
+                            let full_path = entry.path();
+                            let display = full_path.to_string_lossy().to_string();
+                            let is_dir = full_path.is_dir();
+                            let suffix = if is_dir { "/" } else { "" };
+                            let desc = if is_dir {
+                                "dir".to_string()
+                            } else {
+                                let meta = full_path.metadata().ok();
+                                let size = meta.map(|m| m.len()).unwrap_or(0);
+                                format_size(size)
+                            };
+                            items.push(CommandSuggestion {
+                                name: format!("{}{}", name, suffix),
+                                description: desc,
+                                usage: display.clone(),
+                            });
+                        }
+                    }
+                }
+                items.sort_by(|a, b| {
+                    let a_dir = a.usage.ends_with('/');
+                    let b_dir = b.usage.ends_with('/');
+                    a_dir.cmp(&b_dir).then(a.name.cmp(&b.name))
+                });
+                self.state.autocomplete.items = items;
+                self.state.autocomplete.visible = !self.state.autocomplete.items.is_empty();
+                self.state.autocomplete.selected = 0;
+                self.state.autocomplete.scroll_offset = 0;
+                self.state.autocomplete.file_mode = true;
+                return;
+            }
+        }
+
+        // Command autocomplete
         let query_main = buf
             .strip_prefix('/')
             .map(|rest| rest.split_whitespace().next().unwrap_or(""))
@@ -1006,6 +1098,7 @@ impl App {
         self.state.autocomplete.visible = !self.state.autocomplete.items.is_empty();
         self.state.autocomplete.selected = 0;
         self.state.autocomplete.scroll_offset = 0;
+        self.state.autocomplete.file_mode = false;
     }
 
     fn clamp_autocomplete_scroll(&mut self) {
@@ -1031,12 +1124,68 @@ impl App {
             .autocomplete
             .selected
             .min(self.state.autocomplete.items.len() - 1);
-        let suggestion = self.state.autocomplete.items[idx].name.clone();
-        let new_buf = format!("/{} ", suggestion);
-        self.state.input_buffer = new_buf;
-        self.state.input_cursor = self.state.input_buffer.chars().count();
-        self.state.input_selection_anchor = None;
-        self.state.autocomplete = AutocompleteState::default();
+        let suggestion = &self.state.autocomplete.items[idx];
+
+        if self.state.autocomplete.file_mode {
+            let path = std::path::Path::new(&suggestion.usage);
+            if path.is_dir() {
+                let at_pos = self.state.input_buffer.rfind('@').unwrap_or(0);
+                let before_at = self.state.input_buffer[..at_pos].to_string();
+                let new_buf = format!("{}@{}/", before_at, suggestion.name.trim_end_matches('/'));
+                self.state.input_buffer = new_buf;
+                self.state.input_cursor = self.state.input_buffer.chars().count();
+                self.state.input_selection_anchor = None;
+                self.state.autocomplete = AutocompleteState::default();
+            } else {
+                let resolved = if path.is_relative() {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    cwd.join(path)
+                } else {
+                    path.to_path_buf()
+                };
+                if resolved.is_file() {
+                    let display_name = resolved
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    let meta = resolved.metadata().ok();
+                    let ext = resolved
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let is_image =
+                        matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg");
+                    self.state
+                        .attached_files
+                        .push(crate::provider::AttachedFile {
+                            display_name,
+                            path: resolved.to_string_lossy().to_string(),
+                            size: meta.map(|m| m.len()).unwrap_or(0),
+                            is_image,
+                        });
+                }
+                let at_pos = self.state.input_buffer.rfind('@').unwrap_or(0);
+                let after_at = &self.state.input_buffer[at_pos + 1..];
+                let path_text = after_at.split_whitespace().next().unwrap_or("");
+                let before = self.state.input_buffer[..at_pos].to_string();
+                let after = self.state.input_buffer[at_pos + 1 + path_text.len()..].to_string();
+                let new_buf = format!("{}{}", before, after);
+                self.state.input_buffer = new_buf;
+                self.state.input_cursor = self.state.input_buffer.chars().count();
+                self.state.input_selection_anchor = None;
+                self.state.autocomplete = AutocompleteState::default();
+                self.state.status_message =
+                    format!("{} files attached", self.state.attached_files.len());
+            }
+        } else {
+            let new_buf = format!("/{} ", suggestion.name);
+            self.state.input_buffer = new_buf;
+            self.state.input_cursor = self.state.input_buffer.chars().count();
+            self.state.input_selection_anchor = None;
+            self.state.autocomplete = AutocompleteState::default();
+        }
     }
 
     fn delete_selection_if_any(&mut self) -> Option<usize> {
@@ -1177,6 +1326,7 @@ impl App {
         match session::load_local(session_id, &self.config) {
             Ok(s) => {
                 self.state.messages = s.messages;
+                self.state.attached_files.clear();
                 self.state.current_session_id = s.id;
                 self.state.scroll_offset = 0;
                 self.state.input_buffer.clear();
@@ -1496,6 +1646,16 @@ impl App {
         }
 
         result
+    }
+}
+
+pub fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 

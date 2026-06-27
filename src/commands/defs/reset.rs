@@ -19,6 +19,7 @@ impl Command for ResetCommand {
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         state.messages.clear();
+        state.attached_files.clear();
         state.scroll_offset = 0;
         state.input_buffer.clear();
         state.input_cursor = 0;

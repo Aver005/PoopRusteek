@@ -27,15 +27,21 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         } else if state.messages.is_empty() && !state.is_generating {
             render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
+            let has_attachments = !state.attached_files.is_empty();
+            let mut constraints = vec![
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ];
+            if has_attachments {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.push(Constraint::Length(4));
+            constraints.push(Constraint::Length(1));
+            constraints.push(Constraint::Length(1));
+
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                    Constraint::Length(4),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                ])
+                .constraints(constraints)
                 .split(area);
 
             render_separator(frame, chunks[1], &theme);
@@ -66,9 +72,17 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
                 widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
             }
 
-            widgets::input::render_input(frame, chunks[2], state, &theme, false, &cursor_cell);
-            render_input_border(frame, chunks[3], &theme);
-            render_mini_status(frame, chunks[4], state, config, &theme);
+            let attach_idx = 2usize;
+            let input_idx = if has_attachments { 3usize } else { 2usize };
+            let border_idx = if has_attachments { 4usize } else { 3usize };
+            let status_idx = if has_attachments { 5usize } else { 4usize };
+
+            if has_attachments {
+                render_attach_bar(frame, chunks[attach_idx], state, &theme);
+            }
+            widgets::input::render_input(frame, chunks[input_idx], state, &theme, false, &cursor_cell);
+            render_input_border(frame, chunks[border_idx], &theme);
+            render_mini_status(frame, chunks[status_idx], state, config, &theme);
 
             if state.autocomplete.visible {
                 render_autocomplete(frame, chunks[2], state, &theme);
@@ -1132,10 +1146,12 @@ fn render_autocomplete(frame: &mut Frame, input_area: Rect, state: &AppState, th
 
     frame.render_widget(Clear, popup_area);
 
+    let is_file = state.autocomplete.file_mode;
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_focus))
-        .title(" Commands ")
+        .title(if is_file { " Files " } else { " Commands " })
         .title_style(
             Style::default()
                 .fg(theme.bg)
@@ -1163,8 +1179,8 @@ fn render_autocomplete(frame: &mut Frame, input_area: Rect, state: &AppState, th
         .map(|(rel, item)| {
             let is_sel = (scroll_off + rel) == state.autocomplete.selected;
             let indicator = if is_sel { "▸ " } else { "  " };
-            let slash = "/";
-            let name_full = format!("{slash}{}", item.name);
+            let prefix = if is_file { "@" } else { "/" };
+            let name_full = format!("{prefix}{}", item.name);
             let padding = max_name_w
                 .saturating_sub(item.name.chars().count())
                 .max(1);
@@ -1203,6 +1219,44 @@ fn render_autocomplete(frame: &mut Frame, input_area: Rect, state: &AppState, th
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.panel)),
         inner,
+    );
+}
+
+fn render_attach_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let files = &state.attached_files;
+    if files.is_empty() {
+        return;
+    }
+    let mut spans: Vec<Span> = vec![Span::styled(
+        " \u{1F4CE} ",
+        Style::default().fg(theme.accent_soft).bg(theme.input_bg),
+    )];
+    let max_w = area.width.saturating_sub(4) as usize;
+    let mut remaining = max_w;
+    for (i, f) in files.iter().enumerate() {
+        let icon = if f.is_image { "\u{1F5BC}" } else { "\u{1F4C4}" };
+        let size_str = crate::app::format_size(f.size);
+        let label = format!(" {} {} {} ", icon, f.display_name, size_str);
+        let sep = if i > 0 { " " } else { "" };
+        let entry = format!("{}{}", sep, label);
+        if entry.chars().count() > remaining {
+            if spans.len() > 1 {
+                spans.push(Span::styled(
+                    " \u{2026}",
+                    Style::default().fg(theme.text_dim).bg(theme.input_bg),
+                ));
+            }
+            break;
+        }
+        remaining = remaining.saturating_sub(entry.chars().count());
+        spans.push(Span::styled(
+            entry,
+            Style::default().fg(theme.fg).bg(theme.input_bg),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.input_bg)),
+        area,
     );
 }
 

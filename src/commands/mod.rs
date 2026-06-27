@@ -48,6 +48,7 @@ impl CommandRegistry {
     }
 
     fn register_defaults(&mut self) {
+        self.register(Box::new(defs::attach::AttachCommand));
         self.register(Box::new(defs::help::HelpCommand));
         self.register(Box::new(defs::home::HomeCommand));
         self.register(Box::new(defs::cwd::CwdCommand { name: "cwd" }));

@@ -148,6 +148,14 @@ impl ChatMessage {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachedFile {
+    pub display_name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_image: bool,
+}
+
 pub fn estimate_tokens(text: &str) -> u32 {
     (text.chars().count() / 4).max(1) as u32
 }
