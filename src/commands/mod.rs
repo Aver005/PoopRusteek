@@ -17,15 +17,23 @@ pub trait Command: Send + Sync {
     fn execute(&self, args: &str, state: &mut AppState, config: &Config) -> CommandResult;
 }
 
+pub enum JobCommandAction {
+    List,
+    Kill(u64),
+    Prune,
+}
+
 pub enum CommandResult {
     Handled,
     NeedsAgent(String),
     LoadSession(String),
     ResetProvider,
+    Quit,
     Error(String),
     TtlUpdate(u64),
     ReloadMcp,
     ShowTools,
+    Jobs(JobCommandAction),
     OpenWhitelist,
     ShowSkills,
     ToggleSkill(String, bool),
@@ -70,7 +78,10 @@ impl CommandRegistry {
         self.register(Box::new(defs::whitelist::WhitelistCommand));
         self.register(Box::new(defs::skills::SkillsCommand));
         self.register(Box::new(defs::export::ExportCommand));
+        self.register(Box::new(defs::goal::GoalCommand));
         self.register(Box::new(defs::import::ImportCommand));
+        self.register(Box::new(defs::ps::PsCommand));
+        self.register(Box::new(defs::jobs::JobsCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {

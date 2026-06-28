@@ -65,6 +65,23 @@ impl QuestionRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalStage {
+    Inactive,
+    WaitForGoal,
+    RunAgent1,
+    RunEvaluator,
+    Done,
+}
+
+#[derive(Debug, Clone)]
+pub struct GoalVerdict {
+    pub success: bool,
+    pub summary: String,
+    pub issues: String,
+    pub feedback: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     // TUI events
@@ -87,6 +104,10 @@ pub enum AppEvent {
     ToolError { error: String },
     RequestToolApproval(ToolApprovalRequest),
     RequestQuestion(QuestionRequest, QuestionState),
+
+    // Goal events
+    GoalEvaluationDone(GoalVerdict),
+    GoalCycleFinished,
 }
 
 #[derive(Debug, Clone)]

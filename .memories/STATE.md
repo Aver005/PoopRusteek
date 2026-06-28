@@ -22,10 +22,10 @@
 
 ## CURRENT FOCUS
 
-1. Multi-theme support (beyond Catppuccin Mocha)
-2. Error recovery & rate limiting
-3. Mouse support in TUI
-4. Copy/paste integration
+1. ~~Multi-theme support~~ (on hold)
+2. GOAL mode — iterative goal-driven agent loop
+3. Error recovery & rate limiting
+4. Mouse support in TUI
 
 ## KNOWN GAPS
 
@@ -35,6 +35,9 @@
 - No streaming progress indicator in agent loop
 - Tool approval dialog blocks event loop
 - No schema validation on MCP tool arguments
+- GOAL evaluator uses non-streaming `complete()` — no visible progress during eval
+- GOAL mode has no manual intervention / edit feedback during cycle
+- No max iteration limit in GOAL cycle (infinite loop risk)
 
 ## RECENT MILESTONES
 
@@ -42,3 +45,4 @@
 |------|-------|
 | 2026-06-24 | Project inception — all core, features, integration built |
 | 2026-06-28 | .memories system created |
+| 2026-06-28 | GOAL mode implemented: `/goal`, evaluator prompt, 3+5 failure swap, system sessions |

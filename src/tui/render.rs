@@ -196,21 +196,34 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
     let info_area = centered_h(chunks[ci], input_width);
     ci += 1;
     let model = format!("{} · {}", provider_label(config), config.provider.model);
+    let mut shortcut_spans = vec![
+        Span::styled(model, Style::default().fg(theme.text_soft).bg(theme.bg)),
+        Span::styled("  ", Style::default().bg(theme.bg)),
+        Span::styled("Enter ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled("send  ", Style::default().fg(theme.text_dim)),
+        Span::styled("/ ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled("commands  ", Style::default().fg(theme.text_dim)),
+        Span::styled("Esc ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled("home  ", Style::default().fg(theme.text_dim)),
+        Span::styled("Ctrl+C ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled("quit", Style::default().fg(theme.text_dim)),
+    ];
+    if state.goal_mode {
+        let goal_label = match state.goal_stage {
+            crate::app::events::GoalStage::Inactive => "[GOAL ON]".to_string(),
+            crate::app::events::GoalStage::WaitForGoal => "[WAITING FOR GOAL]".to_string(),
+            crate::app::events::GoalStage::RunAgent1 => format!("[GOAL iter#{}]", state.goal_iteration),
+            crate::app::events::GoalStage::RunEvaluator => "[EVALUATING]".to_string(),
+            crate::app::events::GoalStage::Done => "[GOAL DONE]".to_string(),
+        };
+        shortcut_spans.push(Span::styled("  ", Style::default().bg(theme.bg)));
+        shortcut_spans.push(Span::styled(
+            goal_label,
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(model, Style::default().fg(theme.text_soft).bg(theme.bg)),
-                Span::styled("  ", Style::default().bg(theme.bg)),
-                Span::styled("Enter ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
-                Span::styled("send  ", Style::default().fg(theme.text_dim)),
-                Span::styled("/ ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
-                Span::styled("commands  ", Style::default().fg(theme.text_dim)),
-                Span::styled("Esc ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
-                Span::styled("home  ", Style::default().fg(theme.text_dim)),
-                Span::styled("Ctrl+C ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
-                Span::styled("quit", Style::default().fg(theme.text_dim)),
-            ]),
-        ])
+        Paragraph::new(vec![Line::from(shortcut_spans)])
         .alignment(Alignment::Center)
         .style(Style::default().bg(theme.bg)),
         info_area,
@@ -318,13 +331,36 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         String::new()
     };
+    let bg_status = if state.running_background_count > 0 {
+        let mut suffix = String::new();
+        if state.running_interactive_count > 0 {
+            suffix.push_str(&format!("/{}i", state.running_interactive_count));
+        }
+        if state.running_persistent_count > 0 {
+            suffix.push_str(&format!("/{}p", state.running_persistent_count));
+        }
+        format!(" bg:{}{}", state.running_background_count, suffix)
+    } else {
+        String::new()
+    };
 
     let model_tag = if !state.last_model_name.is_empty() {
         format!(" · {}", state.last_model_name)
     } else {
         String::new()
     };
-    let left = format!(" {} · {}{}{} ", provider_name, model, model_tag, mcp_status);
+    let goal_tag = if state.goal_mode {
+        format!(" GOAL:{} ", match state.goal_stage {
+            crate::app::events::GoalStage::Inactive => "standby",
+            crate::app::events::GoalStage::WaitForGoal => "need-goal",
+            crate::app::events::GoalStage::RunAgent1 => "build",
+            crate::app::events::GoalStage::RunEvaluator => "eval",
+            crate::app::events::GoalStage::Done => "done",
+        })
+    } else {
+        String::new()
+    };
+    let left = format!(" {}{} · {}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status);
 
     let status_tag = state.last_message_status.as_deref().unwrap_or("");
 
@@ -357,12 +393,24 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         format!(" {} ", parts.join(" · "))
     };
 
-    let session_prefix = if state.current_session_id.len() >= 8 {
-        format!(" {} ", &state.current_session_id[..8])
+    let goal_tag = if state.goal_mode {
+        let stage_str = match state.goal_stage {
+            crate::app::events::GoalStage::Inactive => "ON".to_string(),
+            crate::app::events::GoalStage::WaitForGoal => "NEED-GOAL".to_string(),
+            crate::app::events::GoalStage::RunAgent1 => format!("iter#{}", state.goal_iteration),
+            crate::app::events::GoalStage::RunEvaluator => "EVAL".to_string(),
+            crate::app::events::GoalStage::Done => "DONE".to_string(),
+        };
+        format!(" GOAL:{} ", stage_str)
     } else {
-        format!(" {} ", state.current_session_id)
+        String::new()
     };
-    let right = format!(" msgs:{} tot:{} | {} ", msg_count, total_tokens, session_prefix);
+    let session_prefix = if state.current_session_id.len() >= 8 {
+        format!(" {}", &state.current_session_id[..8])
+    } else {
+        format!(" {}", state.current_session_id)
+    };
+    let right = format!("{} msgs:{} tot:{} | {} ", goal_tag, msg_count, total_tokens, session_prefix);
 
     let gap = area.width.saturating_sub((left.len() + center.len() + right.len()) as u16).max(1) as usize;
 

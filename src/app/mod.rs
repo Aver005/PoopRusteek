@@ -12,10 +12,43 @@ use crate::provider::estimate_tokens;
 use crate::tools::registry::ToolRegistry;
 use crate::commands::CommandSuggestion;
 use crate::skills::{discovery::discover_all_skills, SkillDefinition};
-use events::{AppEvent, Modal, QuestionRequest, ToolApprovalRequest, View};
+use events::{AppEvent, GoalStage, GoalVerdict, Modal, QuestionRequest, ToolApprovalRequest, View};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// PID of the foreground child process (if any), for killing on abort.
+pub static FOREGROUND_CHILD_PID: AtomicU32 = AtomicU32::new(0);
+static TERMINAL_RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub fn request_terminal_restore() {
+    TERMINAL_RESTORE_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn consume_terminal_restore_request() -> bool {
+    TERMINAL_RESTORE_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+pub fn kill_foreground_child() {
+    let pid = FOREGROUND_CHILD_PID.swap(0, Ordering::SeqCst);
+    if pid != 0 {
+        #[cfg(windows)]
+        {
+            // /T kills the entire process tree (child + grandchild processes).
+            let _ = std::process::Command::new("taskkill")
+                .args(&["/F", "/T", "/PID", &pid.to_string()])
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .spawn();
+        }
+    }
+}
 
 pub struct App {
     pub config: Config,
@@ -65,6 +98,23 @@ pub struct AppState {
     pub last_model_name: String,
     pub last_message_status: Option<String>,
     pub last_think_fragments: u32,
+
+    // Goal mode state
+    pub goal_mode: bool,
+    pub goal_stage: GoalStage,
+    pub goal_prompt: String,
+    pub goal_text: String,
+    pub goal_iteration: u32,
+    pub goal_agent1_failures: u32,
+    pub goal_agent2_failures: u32,
+    pub goal_agent1_session_id: String,
+    pub goal_agent2_session_id: String,
+    pub goal_summary: String,
+
+    pub needs_terminal_restore: bool,
+    pub running_background_count: usize,
+    pub running_interactive_count: usize,
+    pub running_persistent_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,6 +193,21 @@ impl App {
             last_model_name: String::new(),
             last_message_status: None,
             last_think_fragments: 0,
+
+            goal_mode: false,
+            goal_stage: GoalStage::Inactive,
+            goal_prompt: String::new(),
+            goal_text: String::new(),
+            goal_iteration: 0,
+            goal_agent1_failures: 0,
+            goal_agent2_failures: 0,
+            goal_agent1_session_id: String::new(),
+            goal_agent2_session_id: String::new(),
+            goal_summary: String::new(),
+            needs_terminal_restore: false,
+            running_background_count: 0,
+            running_interactive_count: 0,
+            running_persistent_count: 0,
         };
 
         if mcp_init_ok {
@@ -175,6 +240,8 @@ impl App {
     pub async fn run(&mut self) -> AppResult<()> {
         let mut terminal = crate::tui::init()?;
         let result = self.run_loop(&mut terminal).await;
+        // Kill any running foreground child before restoring terminal.
+        kill_foreground_child();
         crate::tui::restore(&mut terminal)?;
         // Kill any lingering agent task so it can't keep the runtime alive.
         if let Some(handle) = self.agent_task.take() {
@@ -182,7 +249,7 @@ impl App {
         }
         // Kill all background/PTY processes so spawn_blocking waiters unblock
         // and the tokio runtime can shut down cleanly.
-        crate::tools::background::shutdown_all().await;
+        let _ = crate::tools::background::shutdown_all().await;
         result
     }
 
@@ -227,12 +294,38 @@ impl App {
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
+                    // Kill any running foreground child before restoring terminal.
+                    kill_foreground_child();
+                    let _ = self.shutdown_background_processes().await;
                     return Ok(());
                 }
             }
 
             self.refresh_mcp_view().await;
             self.update_mcp_stats().await;
+            self.update_background_stats().await;
+
+            if consume_terminal_restore_request() {
+                self.state.needs_terminal_restore = true;
+            }
+
+            if self.state.needs_terminal_restore {
+                self.state.needs_terminal_restore = false;
+                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = crossterm::execute!(
+                    terminal.backend_mut(),
+                    crossterm::terminal::LeaveAlternateScreen,
+                );
+                let _ = crossterm::terminal::enable_raw_mode();
+                let _ = crossterm::execute!(
+                    terminal.backend_mut(),
+                    crossterm::terminal::EnterAlternateScreen,
+                    crossterm::cursor::DisableBlinking,
+                    crossterm::cursor::Show,
+                );
+                terminal.clear()?;
+            }
+
             self.render(terminal)?;
         }
     }
@@ -253,6 +346,54 @@ impl App {
             .count();
         self.state.mcp_view.servers = servers;
         self.state.last_mcp_stats_update = Some(std::time::Instant::now());
+    }
+
+    async fn update_background_stats(&mut self) {
+        let _ = crate::tools::background::expire_persistent_idle_processes().await;
+        let _ = crate::tools::background::prune_finished_processes().await;
+        let (total, interactive, persistent) = crate::tools::background::running_process_counts().await;
+        self.state.running_background_count = total;
+        self.state.running_interactive_count = interactive;
+        self.state.running_persistent_count = persistent;
+    }
+
+    async fn shutdown_background_processes(&mut self) -> usize {
+        let killed = crate::tools::background::shutdown_all().await;
+        self.state.running_background_count = 0;
+        self.state.running_interactive_count = 0;
+        self.state.running_persistent_count = 0;
+        killed
+    }
+
+    async fn cleanup_background_before_user_turn(&mut self) -> usize {
+        if self.state.running_background_count == 0 {
+            return 0;
+        }
+        let killed = crate::tools::background::shutdown_nonpersistent().await;
+        self.update_background_stats().await;
+        killed
+    }
+
+    async fn kill_background_job(&mut self, id: u64) -> String {
+        match crate::tools::background::kill_process(id).await {
+            Some(Ok(())) => {
+                let _ = crate::tools::background::remove_process(id).await;
+                self.update_background_stats().await;
+                format!("Stopped job #{id}.")
+            }
+            Some(Err(error)) => format!("Failed to stop job #{id}: {error}"),
+            None => format!("No job with id={id}."),
+        }
+    }
+
+    async fn prune_background_jobs(&mut self) -> String {
+        let (finished, expired) = crate::tools::background::prune_jobs().await;
+        self.update_background_stats().await;
+        if finished == 0 && expired == 0 {
+            "No jobs pruned.".to_string()
+        } else {
+            format!("Pruned jobs: finished={finished}, expired={expired}.")
+        }
     }
 
     async fn refresh_mcp_view(&mut self) {
@@ -313,6 +454,40 @@ impl App {
                     self.state.messages.pop();
                 }
                 self.auto_save_session();
+
+                // --- GOAL cycle check ---
+                if self.state.goal_mode {
+                    match self.state.goal_stage.clone() {
+                        GoalStage::RunAgent1 => {
+                            // Agent 1 finished — get last assistant content for evaluation
+                            let agent_result = self.state.messages
+                                .iter()
+                                .rev()
+                                .find(|m| m.role == Role::Assistant)
+                                .map(|m| m.content.clone())
+                                .unwrap_or_default();
+
+                            if !agent_result.is_empty() {
+                                self.state.status_message = "Evaluating goal...".to_string();
+                                self.state.goal_stage = GoalStage::RunEvaluator;
+                                self.state.messages.push(ChatMessage::system(
+                                    "🔍 Evaluating result against goal..."
+                                ));
+                                self.run_goal_evaluation(agent_result).await;
+                            } else {
+                                self.state.messages.push(ChatMessage::system(
+                                    "⚠ Agent produced no output. Retrying..."
+                                ));
+                                self.retry_agent1().await;
+                            }
+                        }
+                        GoalStage::RunEvaluator => {
+                            // Evaluator finished — parse the verdict
+                            self.handle_goal_verdict().await;
+                        }
+                        _ => {}
+                    }
+                }
             }
             AppEvent::AgentError(err) => {
                 self.state.is_generating = false;
@@ -370,6 +545,12 @@ impl App {
                 if self.state.is_generating || (self.state.messages.is_empty() && self.state.modal.is_none()) {
                     self.state.animation_tick = self.state.animation_tick.wrapping_add(1);
                 }
+            }
+            AppEvent::GoalEvaluationDone(verdict) => {
+                self.handle_goal_verdict_from(verdict).await;
+            }
+            AppEvent::GoalCycleFinished => {
+                self.state.status_message = "Goal achieved!".to_string();
             }
             _ => {}
         }
@@ -595,12 +776,19 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
             {
                 if self.state.is_generating {
-                    // Ctrl+C while generating cancels the current turn (like Esc).
+                    // Kill the running foreground child process first.
+                    kill_foreground_child();
                     if let Some(handle) = self.agent_task.take() {
                         handle.abort();
                     }
+                    let killed = self.shutdown_background_processes().await;
                     self.state.is_generating = false;
-                    self.state.status_message = "Cancelled".to_string();
+                    self.state.status_message = if killed > 0 {
+                        format!("Cancelled; killed {killed} background process(es)")
+                    } else {
+                        "Cancelled".to_string()
+                    };
+                    self.state.needs_terminal_restore = true;
                     if self
                         .state
                         .messages
@@ -611,17 +799,26 @@ impl App {
                     }
                     return Ok(false);
                 }
+                let _ = self.shutdown_background_processes().await;
                 return Ok(true);
             }
             KeyCode::Esc => {
                 if self.state.is_generating {
+                    // Kill the running foreground child process first.
+                    kill_foreground_child();
                     // Cancel the current agent turn: abort the spawned task,
                     // reset is_generating so the user can type a new message.
                     if let Some(handle) = self.agent_task.take() {
                         handle.abort();
                     }
+                    let killed = self.shutdown_background_processes().await;
                     self.state.is_generating = false;
-                    self.state.status_message = "Cancelled".to_string();
+                    self.state.status_message = if killed > 0 {
+                        format!("Cancelled; killed {killed} background process(es)")
+                    } else {
+                        "Cancelled".to_string()
+                    };
+                    self.state.needs_terminal_restore = true;
                     if self
                         .state
                         .messages
@@ -631,6 +828,7 @@ impl App {
                         self.state.messages.pop();
                     }
                 } else if self.state.messages.is_empty() {
+                    let _ = self.shutdown_background_processes().await;
                     return Ok(true);
                 } else {
                     self.state.messages.clear();
@@ -667,26 +865,81 @@ impl App {
                     self.state.input_cursor += 1;
                     self.state.input_selection_anchor = None;
                 } else {
-                    let input = self.state.input_buffer.trim().to_string();
-                    if !input.is_empty() {
-                        self.state.input_buffer.clear();
-                        self.state.input_cursor = 0;
-                        self.state.input_selection_anchor = None;
-                        self.state.autocomplete = AutocompleteState::default();
-                        self.state.history_index = None;
-                        crate::session::append_history(&input);
+                            let input = self.state.input_buffer.trim().to_string();
+                            if !input.is_empty() {
+                                self.state.input_buffer.clear();
+                                self.state.input_cursor = 0;
+                                self.state.input_selection_anchor = None;
+                                self.state.autocomplete = AutocompleteState::default();
+                                self.state.history_index = None;
+                                crate::session::append_history(&input);
 
-                        if input.starts_with('/') {
+                                // --- GOAL mode: intercept non-command input ---
+                                if self.state.goal_mode && !input.starts_with('/') {
+                                    match self.state.goal_stage {
+                                        GoalStage::Inactive => {
+                                            // First input in goal mode = the prompt
+                                            self.state.goal_prompt = input.clone();
+                                            self.state.goal_stage = GoalStage::WaitForGoal;
+                                            self.state.messages.push(ChatMessage::user(&input));
+                                            self.state.messages.push(ChatMessage::system(
+                                                "🎯 Goal mode: now define your GOAL (what must be achieved)",
+                                            ));
+                                            return Ok(false);
+                                        }
+                                        GoalStage::WaitForGoal => {
+                                            // Second input = the goal
+                                            self.state.goal_text = input.clone();
+                                            self.state.goal_stage = GoalStage::RunAgent1;
+                                            self.state.goal_iteration = 1;
+                                            self.state.messages.push(ChatMessage::user(&format!(
+                                                "GOAL: {}", input
+                                            )));
+
+                                            // Build the agent 1 prompt: user's prompt + goal
+                                            let goal_prompt = format!(
+                                                "{}\n\nIMPORTANT - GOAL to achieve: {}",
+                                                self.state.goal_prompt, self.state.goal_text
+                                            );
+                                            self.send_to_agent(goal_prompt).await?;
+                                            return Ok(false);
+                                        }
+                                        GoalStage::RunAgent1 | GoalStage::RunEvaluator => {
+                                            // Block input while goal cycle is active
+                                            self.state.messages.push(ChatMessage::system(
+                                                "Goal cycle in progress. Wait for it to finish or type /goal to cancel.",
+                                            ));
+                                            return Ok(false);
+                                        }
+                                        GoalStage::Done => {
+                                            // After goal is done, regular input resumes
+                                            self.state.goal_mode = false;
+                                            self.state.goal_stage = GoalStage::Inactive;
+                                        }
+                                    }
+                                }
+
+                                if input.starts_with('/') {
                             let result =
                                 self.commands.execute(&input, &mut self.state, &self.config);
                             match result {
                                 CommandResult::Handled => {}
                                 CommandResult::NeedsAgent(msg) => {
+                                    let killed = self.cleanup_background_before_user_turn().await;
+                                    if killed > 0 {
+                                        self.state.messages.push(ChatMessage::system(&format!(
+                                            "Cleaned {killed} ephemeral job(s) before the new turn."
+                                        )));
+                                    }
                                     self.state.messages.push(ChatMessage::user(&input));
                                     self.send_to_agent(msg).await?;
                                 }
                                 CommandResult::LoadSession(id) => {
                                     self.handle_load_session(&id).await?;
+                                }
+                                CommandResult::Quit => {
+                                    let _ = self.shutdown_background_processes().await;
+                                    return Ok(true);
                                 }
                                 CommandResult::ResetProvider => {
                                     if let Ok(config) = crate::config::load() {
@@ -729,6 +982,20 @@ impl App {
                                     let tools_text = self.build_tools_display().await;
                                     self.state.messages.push(ChatMessage::system(&tools_text));
                                 }
+                                CommandResult::Jobs(action) => {
+                                    let jobs_text = match action {
+                                        crate::commands::JobCommandAction::List => {
+                                            self.build_background_processes_display().await
+                                        }
+                                        crate::commands::JobCommandAction::Kill(id) => {
+                                            self.kill_background_job(id).await
+                                        }
+                                        crate::commands::JobCommandAction::Prune => {
+                                            self.prune_background_jobs().await
+                                        }
+                                    };
+                                    self.state.messages.push(ChatMessage::system(&jobs_text));
+                                }
                                 CommandResult::ShowSkills => {
                                     self.open_skill_picker().await;
                                 }
@@ -743,6 +1010,12 @@ impl App {
                                 }
                             }
                         } else {
+                            let killed = self.cleanup_background_before_user_turn().await;
+                            if killed > 0 {
+                                self.state.messages.push(ChatMessage::system(&format!(
+                                    "Cleaned {killed} ephemeral job(s) before the new turn."
+                                )));
+                            }
                             let mut expanded = self.expand_file_mentions(&input);
                             if !self.state.attached_files.is_empty() {
                                 let attach_header = if expanded.trim().is_empty() {
@@ -1320,6 +1593,275 @@ impl App {
         Ok(())
     }
 
+    async fn run_goal_evaluation(&mut self, agent_result: String) {
+        let provider = match &self.provider {
+            Some(p) => Arc::clone(p),
+            None => {
+                self.state.messages.push(ChatMessage::assistant(
+                    "No provider configured for evaluation.",
+                ));
+                return;
+            }
+        };
+
+        let system_prompt = self.prompts
+            .goal_evaluator_prompt
+            .clone();
+
+        let user_msg = format!(
+            "## Goal\n{}\n\n## Completed Work\n{}\n\n## Evaluation",
+            self.state.goal_text, agent_result
+        );
+
+        let eval_messages = vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&user_msg),
+        ];
+
+        let request = crate::provider::CompletionRequest {
+            messages: eval_messages.clone(),
+            model: self.config.provider.model.clone(),
+            temperature: self.config.provider.temperature.min(0.5),
+            max_tokens: self.config.provider.max_tokens,
+            stream: false,
+        };
+
+        match provider.complete(request).await {
+            Ok(response) => {
+                let verdict = self.parse_goal_verdict(&response.content);
+                if verdict.success {
+                    let summary = if verdict.summary.is_empty() {
+                        "Goal achieved!".to_string()
+                    } else {
+                        verdict.summary.clone()
+                    };
+                    self.state.goal_summary = summary.clone();
+                    self.state.goal_stage = GoalStage::Done;
+                    self.state.messages.push(ChatMessage::system(
+                        &format!("✅ Goal achieved!\n\n{}", summary)
+                    ));
+
+                    // Save system session for evaluator
+                    let _ = crate::session::save_session_with_tag(
+                        &self.state.goal_agent2_session_id,
+                        &self.state.session_started_at,
+                        &eval_messages,
+                        &self.config,
+                        &self.state.workspace_path,
+                        Some("__goal_system__".to_string()),
+                    );
+                } else {
+                    self.state.goal_agent2_failures += 1;
+                    let iter = self.state.goal_iteration;
+
+                    // Check if we need to swap agent 2 (after 5 failures)
+                    if self.state.goal_agent2_failures >= 5 {
+                        self.state.goal_agent2_session_id = crate::session::create_session_id();
+                        self.state.goal_agent2_failures = 0;
+                        self.state.messages.push(ChatMessage::system(
+                            "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                        ));
+                    }
+
+                    // Save evaluator session
+                    let _ = crate::session::save_session_with_tag(
+                        &self.state.goal_agent2_session_id,
+                        &self.state.session_started_at,
+                        &eval_messages,
+                        &self.config,
+                        &self.state.workspace_path,
+                        Some("__goal_system__".to_string()),
+                    );
+
+                    let feedback = if verdict.feedback.is_empty() {
+                        "No specific feedback provided. Please re-examine the goal and fix remaining issues.".to_string()
+                    } else {
+                        verdict.feedback.clone()
+                    };
+
+                    self.state.messages.push(ChatMessage::system(
+                        &format!(
+                            "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
+                            iter, verdict.issues, feedback
+                        )
+                    ));
+
+                    // Iteration counter
+                    self.state.goal_iteration += 1;
+
+                    // Check if we need to swap agent 1 (after 3 failures)
+                    if self.state.goal_agent1_failures >= 3 {
+                        self.state.goal_agent1_session_id = crate::session::create_session_id();
+                        self.state.goal_agent1_failures = 0;
+                        self.state.messages.push(ChatMessage::system(
+                            "🔄 Swapping agent to new session after 3 failures."
+                        ));
+                    }
+
+                    self.state.goal_agent1_failures += 1;
+                    self.state.goal_stage = GoalStage::RunAgent1;
+                    self.retry_agent1_with_feedback(&feedback).await;
+                }
+            }
+            Err(e) => {
+                self.state.messages.push(ChatMessage::system(
+                    &format!("⚠ Evaluation failed: {e}. Retrying agent 1...")
+                ));
+                self.state.goal_stage = GoalStage::RunAgent1;
+                self.retry_agent1().await;
+            }
+        }
+    }
+
+    async fn handle_goal_verdict(&mut self) {
+        // Find the evaluator's result from the last assistant message
+        let eval_result = self.state.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        if eval_result.is_empty() {
+            self.state.messages.push(ChatMessage::system(
+                "⚠ Evaluator produced no output. Retrying evaluation..."
+            ));
+            return;
+        }
+
+        // Re-run evaluation via the event-based path
+        let verdict = self.parse_goal_verdict(&eval_result);
+        let event = AppEvent::GoalEvaluationDone(verdict);
+        let _ = self.event_tx.send(event);
+    }
+
+    async fn handle_goal_verdict_from(&mut self, verdict: GoalVerdict) {
+        if verdict.success {
+            let summary = if verdict.summary.is_empty() {
+                "Goal achieved!".to_string()
+            } else {
+                verdict.summary.clone()
+            };
+            self.state.goal_summary = summary.clone();
+            self.state.goal_stage = GoalStage::Done;
+            self.state.messages.push(ChatMessage::system(
+                &format!("✅ Goal achieved!\n\n{}", summary)
+            ));
+        } else {
+            self.state.goal_agent2_failures += 1;
+            let iter = self.state.goal_iteration;
+
+            if self.state.goal_agent2_failures >= 5 {
+                self.state.goal_agent2_session_id = crate::session::create_session_id();
+                self.state.goal_agent2_failures = 0;
+                self.state.messages.push(ChatMessage::system(
+                    "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                ));
+            }
+
+            let feedback = if verdict.feedback.is_empty() {
+                "No specific feedback provided. Please re-examine the goal and fix remaining issues.".to_string()
+            } else {
+                verdict.feedback.clone()
+            };
+
+            self.state.messages.push(ChatMessage::system(
+                &format!(
+                    "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
+                    iter, verdict.issues, feedback
+                )
+            ));
+
+            self.state.goal_iteration += 1;
+
+            if self.state.goal_agent1_failures >= 3 {
+                self.state.goal_agent1_session_id = crate::session::create_session_id();
+                self.state.goal_agent1_failures = 0;
+                self.state.messages.push(ChatMessage::system(
+                    "🔄 Swapping agent to new session after 3 failures."
+                ));
+            }
+
+            self.state.goal_agent1_failures += 1;
+            self.state.goal_stage = GoalStage::RunAgent1;
+            self.retry_agent1_with_feedback(&feedback).await;
+        }
+    }
+
+    async fn retry_agent1(&mut self) {
+        let prompt = format!(
+            "Continue working on the original request.\n\nOriginal prompt: {}\n\nGoal: {}",
+            self.state.goal_prompt, self.state.goal_text
+        );
+        self.state.messages.push(ChatMessage::user(&format!(
+            "[Continuing goal cycle - attempt {}]",
+            self.state.goal_iteration
+        )));
+        self.send_to_agent(prompt).await.unwrap_or_else(|e| {
+            self.state.messages.push(ChatMessage::system(
+                &format!("⚠ Failed to retry agent: {e}")
+            ));
+        });
+    }
+
+    async fn retry_agent1_with_feedback(&mut self, feedback: &str) {
+        let prompt = format!(
+            "The reviewer found issues with the previous attempt. Please fix them.\n\n\
+            Original request: {}\n\nGoal: {}\n\n\
+            Issues to fix:\n{}\n\n\
+            Previous conversation history is above. Focus on fixing the issues.",
+            self.state.goal_prompt, self.state.goal_text, feedback
+        );
+        self.send_to_agent(prompt).await.unwrap_or_else(|e| {
+            self.state.messages.push(ChatMessage::system(
+                &format!("⚠ Failed to retry agent: {e}")
+            ));
+        });
+    }
+
+    fn parse_goal_verdict(&self, text: &str) -> GoalVerdict {
+        let mut success = false;
+        let mut summary = String::new();
+        let mut issues = String::new();
+        let mut feedback = String::new();
+
+        // Look for **Status:** line
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("**Status:**") {
+                success = trimmed.contains("SUCCESS");
+            } else if trimmed.contains("**Summary:**") {
+                summary = trimmed
+                    .splitn(2, "**Summary:**")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            } else if trimmed.contains("**Issues:**") {
+                issues = trimmed
+                    .splitn(2, "**Issues:**")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            } else if trimmed.contains("**Feedback:**") {
+                feedback = trimmed
+                    .splitn(2, "**Feedback:**")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+        }
+
+        // Fallback: if structured fields not found, check for success/failure in general text
+        if summary.is_empty() && text.contains("SUCCESS") {
+            success = true;
+        }
+
+        GoalVerdict { success, summary, issues, feedback }
+    }
+
     async fn handle_load_session(&mut self, session_id: &str) -> AppResult<()> {
         use crate::session;
 
@@ -1628,6 +2170,61 @@ impl App {
         lines.join("\n\n")
     }
 
+    async fn build_background_processes_display(&self) -> String {
+        let snapshots = crate::tools::background::process_snapshots().await;
+        if snapshots.is_empty() {
+            return "## Jobs\n\n- none".to_string();
+        }
+
+        let now = chrono::Utc::now();
+        let running = snapshots
+            .iter()
+            .filter(|proc| matches!(proc.status, crate::tools::background::ProcessStatus::Running))
+            .count();
+        let interactive = snapshots.iter().filter(|proc| proc.interactive).count();
+        let persistent = snapshots.iter().filter(|proc| proc.persistent).count();
+
+        let mut lines = vec![format!(
+            "## Jobs\n\n- total: {}\n- running: {}\n- interactive: {}\n- persistent: {}",
+            snapshots.len(),
+            running,
+            interactive,
+            persistent
+        )];
+
+        for proc in snapshots {
+            let pid = proc
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let kind = if proc.interactive { "interactive" } else { "background" };
+            let persist = if proc.persistent { " persistent" } else { "" };
+            let age = format_duration_secs(now.signed_duration_since(proc.started_at).num_seconds().max(0) as u64);
+            let idle = format_duration_secs(now.signed_duration_since(proc.last_activity_at).num_seconds().max(0) as u64);
+            let ttl = match proc.ttl_secs {
+                Some(0) => " ttl=off".to_string(),
+                Some(ttl) => format!(" ttl={}", format_duration_secs(ttl)),
+                None => String::new(),
+            };
+            let preview: String = proc.command.chars().take(120).collect();
+            lines.push(format!(
+                "- id={} pid={} [{}] {}{} {} age={} idle={}{}: `{}`",
+                proc.id,
+                pid,
+                proc.shell,
+                kind,
+                persist,
+                proc.status.label(),
+                age,
+                idle,
+                ttl,
+                preview
+            ));
+        }
+
+        lines.join("\n")
+    }
+
     fn expand_file_mentions(&self, input: &str) -> String {
         let workspace = std::path::Path::new(&self.state.workspace_path);
         let mentions = crate::cli::file_mentions::extract_mentions(input, workspace);
@@ -1656,6 +2253,15 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+pub fn format_duration_secs(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        3600..=86_399 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
     }
 }
 

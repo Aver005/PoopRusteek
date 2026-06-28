@@ -25,14 +25,19 @@ impl Command for SessionListCommand {
             Err(e) => return CommandResult::Error(format!("Failed to list sessions: {e}")),
         };
 
-        if sessions.is_empty() {
+        // Filter out system sessions (GOAL evaluator sessions)
+        let user_sessions: Vec<_> = sessions.into_iter()
+            .filter(|s| s.tag.as_deref() != Some("__goal_system__"))
+            .collect();
+
+        if user_sessions.is_empty() {
             state.messages.push(crate::provider::ChatMessage::system(
                 "No local sessions found.",
             ));
             return CommandResult::Handled;
         }
 
-        let items: Vec<PickerItem> = sessions
+        let items: Vec<PickerItem> = user_sessions
             .iter()
             .map(|s| {
                 let date = s.updated_at.split('T').next().unwrap_or(&s.updated_at);

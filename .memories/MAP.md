@@ -75,7 +75,8 @@
 | File | Purpose |
 |------|---------|
 | `src/commands/mod.rs` | `Command` trait, `CommandRegistry` |
-| `src/commands/defs/` | 22 command impls (one file each) |
+| `src/commands/defs/` | 23 command impls (one file each) |
+| `src/commands/defs/goal.rs` | `/goal` — toggle GOAL mode |
 
 ## ACP
 

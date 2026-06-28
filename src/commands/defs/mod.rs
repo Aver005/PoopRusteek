@@ -18,4 +18,7 @@ pub mod tools;
 pub mod whitelist;
 pub mod skills;
 pub mod export;
+pub mod goal;
 pub mod import;
+pub mod jobs;
+pub mod ps;

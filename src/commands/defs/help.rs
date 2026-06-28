@@ -23,6 +23,8 @@ Available commands:
   /help       — Show this help
   /clear      — Clear chat history
   /compact    — Compact context (summarize history)
+  /jobs       — List/kill/prune background jobs
+  /ps         — Alias for /jobs
   /reset      — Reset session
   /version    — Show version info
   /quit       — Exit application

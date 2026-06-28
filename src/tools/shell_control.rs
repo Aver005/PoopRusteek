@@ -33,7 +33,7 @@ impl Tool for ShellOutputTool {
 
         match background::read_output(id).await {
             Some((output, status)) => {
-                let mut msg = format!("Background process id={} status: {}\n", id, status.label());
+                let mut msg = format!("Job #{} · {}\n", id, status.label());
                 if output.is_empty() {
                     msg.push_str("(no new output since last read)");
                 } else {
@@ -41,6 +41,9 @@ impl Tool for ShellOutputTool {
                     if !output.ends_with('\n') {
                         msg.push('\n');
                     }
+                }
+                if matches!(status, background::ProcessStatus::Finished(_)) {
+                    let _ = background::remove_process(id).await;
                 }
                 ToolResult::success(&msg)
             }
@@ -85,9 +88,10 @@ impl Tool for ShellKillTool {
                     Some(v) => v,
                     None => (String::new(), background::ProcessStatus::Finished(None)),
                 };
-                let mut msg = format!("Background process id={} terminated. Final status: {}\n", id, status.label());
+                let _ = background::remove_process(id).await;
+                let mut msg = format!("Stopped job #{} · {}\n", id, status.label());
                 if !output.is_empty() {
-                    msg.push_str("Remaining output:\n");
+                    msg.push_str("Final output:\n");
                     msg.push_str(&output);
                     if !output.ends_with('\n') {
                         msg.push('\n');
@@ -117,16 +121,40 @@ impl Tool for ShellListTool {
     }
 
     async fn execute(&self, _args: Value) -> ToolResult {
-        let procs = background::list_processes().await;
+        let _ = background::prune_finished_processes().await;
+        let procs = background::process_snapshots().await;
         if procs.is_empty() {
-            return ToolResult::success("No background processes.");
+            return ToolResult::success("No jobs.");
         }
-        let mut msg = String::from("Background processes:\n");
-        for (id, shell, command, status, interactive) in procs {
-            let preview: String = command.chars().take(80).collect();
-            let kind = if interactive { "interactive" } else { "background" };
+        let now = chrono::Utc::now();
+        let mut msg = String::from("Jobs:\n");
+        for proc in procs {
+            let preview: String = proc.command.chars().take(80).collect();
+            let kind = if proc.interactive { "interactive" } else { "background" };
+            let persist = if proc.persistent { " persistent" } else { "" };
+            let age = crate::app::format_duration_secs(
+                now.signed_duration_since(proc.started_at).num_seconds().max(0) as u64,
+            );
+            let idle = crate::app::format_duration_secs(
+                now.signed_duration_since(proc.last_activity_at).num_seconds().max(0) as u64,
+            );
+            let ttl = match proc.ttl_secs {
+                Some(0) => " ttl=off".to_string(),
+                Some(ttl) => format!(" ttl={}", crate::app::format_duration_secs(ttl)),
+                None => String::new(),
+            };
             msg.push_str(&format!(
-                "- id={id} [{shell}] {kind} {status}: {preview}\n"
+                "- #{} pid={} [{}] {}{} {} age={} idle={}{}: {}\n",
+                proc.id,
+                proc.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "-".to_string()),
+                proc.shell,
+                kind,
+                persist,
+                proc.status.label(),
+                age,
+                idle,
+                ttl,
+                preview
             ));
         }
         ToolResult::success(&msg)
@@ -242,7 +270,7 @@ impl Tool for ShellInputTool {
                     }
                     summary.push_str(&format!("keys=[{}]", names.join(", ")));
                 }
-                ToolResult::success(&format!("Sent input to process id={id}: {summary}. Poll with shell_output to see the result."))
+                ToolResult::success(&format!("Sent input to job #{id}: {summary}. Poll with `shell_output` to see the result."))
             }
             Err(e) => ToolResult::error(&e),
         }

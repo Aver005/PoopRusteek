@@ -46,6 +46,17 @@ pub fn save_session(
     config: &Config,
     workspace_root: &str,
 ) -> AppResult<()> {
+    save_session_with_tag(id, created_at, messages, config, workspace_root, None)
+}
+
+pub fn save_session_with_tag(
+    id: &str,
+    created_at: &str,
+    messages: &[ChatMessage],
+    config: &Config,
+    workspace_root: &str,
+    tag: Option<String>,
+) -> AppResult<()> {
     let dir = Config::sessions_dir();
     std::fs::create_dir_all(&dir)?;
 
@@ -58,7 +69,7 @@ pub fn save_session(
         workspace_root: workspace_root.to_string(),
         model_type: config.provider.model.clone(),
         messages: messages.to_vec(),
-        tag: None,
+        tag,
     };
 
     let path = dir.join(format!("{id}.json"));

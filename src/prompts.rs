@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub struct PromptFiles {
     pub base_prompt: String,
     pub tools_prompt: String,
+    pub goal_evaluator_prompt: String,
 }
 
 pub fn load_prompt_files() -> AppResult<PromptFiles> {
@@ -12,10 +13,14 @@ pub fn load_prompt_files() -> AppResult<PromptFiles> {
         .map_err(|error| AppError::Config(error.to_string()))?;
     let tools_prompt = std::fs::read_to_string(resolve_existing_asset_path("assets/prompts/tools.prompt.md")?)
         .map_err(|error| AppError::Config(error.to_string()))?;
+    let goal_evaluator_prompt = std::fs::read_to_string(
+        resolve_existing_asset_path("assets/prompts/goal-evaluator.prompt.md")?
+    ).map_err(|error| AppError::Config(error.to_string()))?;
 
     Ok(PromptFiles {
         base_prompt,
         tools_prompt,
+        goal_evaluator_prompt,
     })
 }
 

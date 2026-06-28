@@ -39,6 +39,15 @@
 - Tool approval dialog sends `AppEvent::RequestToolApproval`, blocks until user responds
 - Background PTY processes persist across agent steps (use `shell_kill` to clean up)
 
+## GOAL MODE
+
+- `/goal` toggles GOAL mode on/off. State stored in `AppState.goal_mode` + `goal_stage: GoalStage`
+- Flow: user prompt → system asks for GOAL → agent1 works → evaluator (non-streaming, `provider.complete()`) reviews → verdict
+- Evaluator uses `assets/prompts/goal-evaluator.prompt.md` with structured output (`**Status:** SUCCESS/FAILURE`)
+- On FAILURE: feedback sent back to agent1, counter increments. After 3 agent1 failures → new session swapped. After 5 evaluator failures → new evaluator session
+- Evaluator sessions saved with `tag: Some("__goal_system__")` — hidden from `/sessions` picker
+- GOAL mode visible in UI: status bar (`GOAL:stage`), landing page (`[GOAL ON]` / `[iter#N]`)
+
 ## BUILD
 
 - `lto = "fat"`, `codegen-units = 1`, `strip = true` in release profile

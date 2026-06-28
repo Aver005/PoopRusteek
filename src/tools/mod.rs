@@ -38,6 +38,43 @@ impl ToolResult {
     }
 }
 
+pub fn looks_interactive_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "bun create",
+        "npm create",
+        "npx create",
+        "npm init",
+        "pnpm create",
+        "yarn create",
+        "gh auth",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+pub fn looks_persistent_background_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "vite",
+        "next dev",
+        "bun dev",
+        "bun run dev",
+        "npm run dev",
+        "pnpm dev",
+        "pnpm run dev",
+        "yarn dev",
+        "webpack serve",
+        "cargo watch",
+        "cargo leptos watch",
+        "trunk serve",
+        "serve ",
+        "http-server",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
