@@ -22,8 +22,8 @@ pub fn render_status(frame: &mut Frame, area: Rect, state: &AppState, config: &C
         .flat_map(|m| m.total_tokens)
         .sum();
 
-    let mcp_status = if state.mcp_server_count > 0 {
-        format!(" mcp:{}/{}", state.mcp_server_connected_count, state.mcp_server_count)
+    let mcp_status = if state.mcp_status.server_count > 0 {
+        format!(" mcp:{}/{}", state.mcp_status.connected_count, state.mcp_status.server_count)
     } else {
         String::new()
     };

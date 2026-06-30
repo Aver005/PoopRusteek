@@ -23,7 +23,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         );
 
         if state.view == View::Mcp {
-            render_mcp_view(frame, area, &state.mcp_view, &theme);
+            render_mcp_view(frame, area, &state.mcp_status.view, &theme);
         } else if state.messages.is_empty() && !state.is_generating {
             render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
@@ -326,8 +326,8 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         .flat_map(|m| m.total_tokens)
         .sum();
 
-    let mcp_status = if state.mcp_server_count > 0 {
-        format!(" mcp:{}/{}", state.mcp_server_connected_count, state.mcp_server_count)
+    let mcp_status = if state.mcp_status.server_count > 0 {
+        format!(" mcp:{}/{}", state.mcp_status.connected_count, state.mcp_status.server_count)
     } else {
         String::new()
     };

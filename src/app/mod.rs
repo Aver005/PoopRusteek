@@ -1,12 +1,12 @@
 pub mod events;
 mod goal;
 pub mod input;
+pub mod mcp_status;
 
 use crate::commands::CommandRegistry;
 use crate::config::Config;
 use crate::error::AppResult;
 use crate::mcp::MCPManager;
-use crate::mcp::types::McpViewState;
 use crate::prompts::{self, PromptFiles};
 use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::commands::CommandResult;
@@ -81,16 +81,13 @@ pub struct AppState {
     pub autocomplete: AutocompleteState,
     pub current_session_id: String,
     pub view: View,
-    pub mcp_view: McpViewState,
-    pub mcp_server_count: usize,
-    pub mcp_server_connected_count: usize,
+    pub mcp_status: mcp_status::McpStatus,
     pub workspace_path: String,
     pub generation_start_time: Option<std::time::Instant>,
     pub last_gen_tokens: u32,
     pub last_gen_duration_secs: f64,
     pub session_started_at: String,
     pub show_stats_panel: bool,
-    pub last_mcp_stats_update: Option<std::time::Instant>,
     pub attached_files: Vec<crate::provider::AttachedFile>,
     pub last_model_name: String,
     pub last_message_status: Option<String>,
@@ -163,9 +160,7 @@ impl App {
             autocomplete: AutocompleteState::default(),
             current_session_id: crate::session::create_session_id(),
             view: View::Chat,
-            mcp_view: McpViewState::default(),
-            mcp_server_count: 0,
-            mcp_server_connected_count: 0,
+            mcp_status: mcp_status::McpStatus::default(),
             show_stats_panel: true,
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -174,7 +169,6 @@ impl App {
             last_gen_tokens: 0,
             last_gen_duration_secs: 0.0,
             session_started_at: chrono::Utc::now().to_rfc3339(),
-            last_mcp_stats_update: None,
             attached_files: Vec::new(),
             last_model_name: String::new(),
             last_message_status: None,
@@ -190,13 +184,13 @@ impl App {
         if mcp_init_ok {
             let mgr = mcp.lock().await;
             let servers = mgr.get_servers_info();
-            state.mcp_server_count = servers.len();
-            state.mcp_server_connected_count = servers
+            state.mcp_status.server_count = servers.len();
+            state.mcp_status.connected_count = servers
                 .iter()
                 .filter(|s| s.enabled && s.status == "connected")
                 .count();
-            state.mcp_view.servers = servers;
-            state.last_mcp_stats_update = Some(std::time::Instant::now());
+            state.mcp_status.view.servers = servers;
+            state.mcp_status.last_stats_update = Some(std::time::Instant::now());
         }
 
         Ok(Self {
@@ -309,20 +303,20 @@ impl App {
 
     async fn update_mcp_stats(&mut self) {
         const MCP_STATS_INTERVAL_SECS: u64 = 2;
-        if let Some(last) = self.state.last_mcp_stats_update {
+        if let Some(last) = self.state.mcp_status.last_stats_update {
             if last.elapsed().as_secs() < MCP_STATS_INTERVAL_SECS {
                 return;
             }
         }
         let mcp = self.mcp.lock().await;
         let servers = mcp.get_servers_info();
-        self.state.mcp_server_count = servers.len();
-        self.state.mcp_server_connected_count = servers
+        self.state.mcp_status.server_count = servers.len();
+        self.state.mcp_status.connected_count = servers
             .iter()
             .filter(|s| s.enabled && s.status == "connected")
             .count();
-        self.state.mcp_view.servers = servers;
-        self.state.last_mcp_stats_update = Some(std::time::Instant::now());
+        self.state.mcp_status.view.servers = servers;
+        self.state.mcp_status.last_stats_update = Some(std::time::Instant::now());
     }
 
     async fn update_background_stats(&mut self) {
@@ -374,11 +368,11 @@ impl App {
     }
 
     async fn refresh_mcp_view(&mut self) {
-        if self.state.view != View::Mcp || !self.state.mcp_view.servers.is_empty() {
+        if self.state.view != View::Mcp || !self.state.mcp_status.view.servers.is_empty() {
             return;
         }
         let mcp = self.mcp.lock().await;
-        self.state.mcp_view.servers = mcp.get_servers_info();
+        self.state.mcp_status.view.servers = mcp.get_servers_info();
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
@@ -946,7 +940,7 @@ impl App {
                                     ));
                                     let mut mcp = self.mcp.lock().await;
                                     mcp.reload_all().await;
-                                    self.state.mcp_view.servers = mcp.get_servers_info();
+                                    self.state.mcp_status.view.servers = mcp.get_servers_info();
                                     self.state.messages.push(ChatMessage::system(
                                         "MCP servers reloaded",
                                     ));
@@ -1073,87 +1067,87 @@ impl App {
     async fn handle_mcp_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
         use crossterm::event::KeyCode;
 
-        if self.state.mcp_view.servers.is_empty() {
+        if self.state.mcp_status.view.servers.is_empty() {
             let mcp = self.mcp.lock().await;
-            self.state.mcp_view.servers = mcp.get_servers_info();
+            self.state.mcp_status.view.servers = mcp.get_servers_info();
         }
 
-        let details_open = self.state.mcp_view.details_server.is_some();
+        let details_open = self.state.mcp_status.view.details_server.is_some();
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.state.mcp_view.active = false;
-                self.state.mcp_view.details_server = None;
+                self.state.mcp_status.view.active = false;
+                self.state.mcp_status.view.details_server = None;
                 self.state.view = View::Chat;
             }
             KeyCode::Up | KeyCode::Char('k') if !details_open => {
-                self.state.mcp_view.selected = self.state.mcp_view.selected.saturating_sub(1);
+                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.saturating_sub(1);
                 self.clamp_mcp_scroll();
             }
             KeyCode::Down | KeyCode::Char('j') if !details_open => {
-                let max = self.state.mcp_view.servers.len().saturating_sub(1);
-                self.state.mcp_view.selected = self.state.mcp_view.selected.min(max);
-                self.state.mcp_view.selected += 1;
-                self.state.mcp_view.selected = self.state.mcp_view.selected.min(max);
+                let max = self.state.mcp_status.view.servers.len().saturating_sub(1);
+                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.min(max);
+                self.state.mcp_status.view.selected += 1;
+                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.min(max);
                 self.clamp_mcp_scroll();
             }
             KeyCode::Enter => {
                 if details_open {
-                    self.state.mcp_view.details_server = None;
-                } else if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected) {
-                    self.state.mcp_view.details_server = Some(info.name.clone());
-                    self.state.mcp_view.scroll_offset = 0;
+                    self.state.mcp_status.view.details_server = None;
+                } else if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected) {
+                    self.state.mcp_status.view.details_server = Some(info.name.clone());
+                    self.state.mcp_status.view.scroll_offset = 0;
                 }
             }
             KeyCode::Char(' ') if !details_open => {
-                if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected).cloned() {
+                if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
                     let name = info.name.clone();
                     let mut mcp = self.mcp.lock().await;
                     if let Err(e) = mcp.toggle_server(&name).await {
-                        self.state.mcp_view.status_message = format!("Toggle failed: {e}");
+                        self.state.mcp_status.view.status_message = format!("Toggle failed: {e}");
                     } else {
-                        self.state.mcp_view.status_message = format!(
+                        self.state.mcp_status.view.status_message = format!(
                             "{} {}",
                             name,
                             if info.enabled { "disabled" } else { "enabled" },
                         );
                     }
-                    self.state.mcp_view.servers = mcp.get_servers_info();
+                    self.state.mcp_status.view.servers = mcp.get_servers_info();
                 }
             }
             KeyCode::Char('r') if !details_open => {
-                if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected).cloned() {
+                if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
                     let name = info.name.clone();
-                    self.state.mcp_view.status_message = format!("Reconnecting {name}...");
+                    self.state.mcp_status.view.status_message = format!("Reconnecting {name}...");
                     let mut mcp = self.mcp.lock().await;
                     if let Err(e) = mcp.reconnect_server(&name).await {
-                        self.state.mcp_view.status_message = format!("Reconnect failed: {e}");
+                        self.state.mcp_status.view.status_message = format!("Reconnect failed: {e}");
                     } else {
-                        self.state.mcp_view.status_message = format!("{name} reconnected");
+                        self.state.mcp_status.view.status_message = format!("{name} reconnected");
                     }
-                    self.state.mcp_view.servers = mcp.get_servers_info();
+                    self.state.mcp_status.view.servers = mcp.get_servers_info();
                 }
             }
             KeyCode::Char('d') if !details_open => {
-                if let Some(info) = self.state.mcp_view.servers.get(self.state.mcp_view.selected).cloned() {
+                if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
                     let name = info.name.clone();
                     let mut mcp = self.mcp.lock().await;
                     if let Err(e) = mcp.remove_server(&name).await {
-                        self.state.mcp_view.status_message = format!("Remove failed: {e}");
+                        self.state.mcp_status.view.status_message = format!("Remove failed: {e}");
                     } else {
-                        self.state.mcp_view.status_message = format!("{name} removed");
+                        self.state.mcp_status.view.status_message = format!("{name} removed");
                     }
-                    self.state.mcp_view.servers = mcp.get_servers_info();
-                    self.state.mcp_view.selected = self.state.mcp_view.selected.min(
-                        self.state.mcp_view.servers.len().saturating_sub(1),
+                    self.state.mcp_status.view.servers = mcp.get_servers_info();
+                    self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.min(
+                        self.state.mcp_status.view.servers.len().saturating_sub(1),
                     );
                 }
             }
             KeyCode::Up | KeyCode::Char('k') if details_open => {
-                self.state.mcp_view.scroll_offset = self.state.mcp_view.scroll_offset.saturating_sub(1);
+                self.state.mcp_status.view.scroll_offset = self.state.mcp_status.view.scroll_offset.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') if details_open => {
-                self.state.mcp_view.scroll_offset += 1;
+                self.state.mcp_status.view.scroll_offset += 1;
             }
             _ => {}
         }

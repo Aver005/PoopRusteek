@@ -22,7 +22,7 @@ impl Command for McpCommand {
 
         if args.is_empty() {
             state.view = crate::app::events::View::Mcp;
-            state.mcp_view = crate::mcp::types::McpViewState {
+            state.mcp_status.view = crate::mcp::types::McpViewState {
                 active: true,
                 selected: 0,
                 scroll_offset: 0,

@@ -108,7 +108,7 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 
     // ── MCP Servers ──
     section_header(&mut lines, "MCP", panel_w, theme);
-    let enabled_servers: Vec<_> = state.mcp_view.servers.iter().filter(|s| s.enabled).collect();
+    let enabled_servers: Vec<_> = state.mcp_status.view.servers.iter().filter(|s| s.enabled).collect();
     if enabled_servers.is_empty() {
         data_row(&mut lines, "\u{2713}", "none", theme);
     } else {
