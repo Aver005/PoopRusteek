@@ -258,7 +258,7 @@ impl App {
                     if let Some(handle) = self.state.focused_mut().agent_task.take() {
                         handle.abort();
                     }
-                    let killed = self.shutdown_background_processes().await;
+                    let killed = self.state.background.shutdown_all().await;
                     self.state.focused_mut().generation.active = false;
                     self.state.status_message = if killed > 0 {
                         format!("Cancelled; killed {killed} background process(es)")
@@ -277,7 +277,7 @@ impl App {
                     }
                     return Ok(false);
                 }
-                let _ = self.shutdown_background_processes().await;
+                let _ = self.state.background.shutdown_all().await;
                 return Ok(true);
             }
             KeyCode::Esc => {
@@ -289,7 +289,7 @@ impl App {
                     if let Some(handle) = self.state.focused_mut().agent_task.take() {
                         handle.abort();
                     }
-                    let killed = self.shutdown_background_processes().await;
+                    let killed = self.state.background.shutdown_all().await;
                     self.state.focused_mut().generation.active = false;
                     self.state.status_message = if killed > 0 {
                         format!("Cancelled; killed {killed} background process(es)")
@@ -307,7 +307,7 @@ impl App {
                         self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
                     }
                 } else if self.state.focused_mut().messages.is_empty() {
-                    let _ = self.shutdown_background_processes().await;
+                    let _ = self.state.background.shutdown_all().await;
                     return Ok(true);
                 } else {
                     // Esc with no active turn clears the chat; if a goal was mid
@@ -437,7 +437,7 @@ impl App {
                             match result {
                                 CommandResult::Handled => {}
                                 CommandResult::NeedsAgent(msg) => {
-                                    let killed = self.cleanup_background_before_user_turn().await;
+                                    let killed = self.state.background.cleanup_before_user_turn().await;
                                     if killed > 0 {
                                         self.state.focused_mut().messages.push(ChatMessage::system(&format!(
                                             "Cleaned {killed} ephemeral job(s) before the new turn."
@@ -450,7 +450,7 @@ impl App {
                                     self.handle_load_session(&id).await?;
                                 }
                                 CommandResult::Quit => {
-                                    let _ = self.shutdown_background_processes().await;
+                                    let _ = self.state.background.shutdown_all().await;
                                     return Ok(true);
                                 }
                                 CommandResult::ResetProvider => {
@@ -500,10 +500,10 @@ impl App {
                                             self.build_background_processes_display().await
                                         }
                                         crate::commands::JobCommandAction::Kill(id) => {
-                                            self.kill_background_job(id).await
+                                            self.state.background.kill_job(id).await
                                         }
                                         crate::commands::JobCommandAction::Prune => {
-                                            self.prune_background_jobs().await
+                                            self.state.background.prune_jobs().await
                                         }
                                     };
                                     self.state.focused_mut().messages.push(ChatMessage::system(&jobs_text));
@@ -539,7 +539,7 @@ impl App {
                                 }
                             }
                         } else {
-                            let killed = self.cleanup_background_before_user_turn().await;
+                            let killed = self.state.background.cleanup_before_user_turn().await;
                             if killed > 0 {
                                 self.state.focused_mut().messages.push(ChatMessage::system(&format!(
                                     "Cleaned {killed} ephemeral job(s) before the new turn."

@@ -321,15 +321,15 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     let total_tokens = view_model::assistant_token_total(&state.focused().messages);
 
     let mcp_status = view_model::mcp_label(&state.mcp_status);
-    let bg_status = if state.running_background_count > 0 {
+    let bg_status = if state.background.total > 0 {
         let mut suffix = String::new();
-        if state.running_interactive_count > 0 {
-            suffix.push_str(&format!("/{}i", state.running_interactive_count));
+        if state.background.interactive > 0 {
+            suffix.push_str(&format!("/{}i", state.background.interactive));
         }
-        if state.running_persistent_count > 0 {
-            suffix.push_str(&format!("/{}p", state.running_persistent_count));
+        if state.background.persistent > 0 {
+            suffix.push_str(&format!("/{}p", state.background.persistent));
         }
-        format!(" bg:{}{}", state.running_background_count, suffix)
+        format!(" bg:{}{}", state.background.total, suffix)
     } else {
         String::new()
     };

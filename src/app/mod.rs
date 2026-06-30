@@ -1,3 +1,4 @@
+pub mod background_stats;
 pub mod conversation;
 pub mod events;
 pub mod generation;
@@ -113,9 +114,7 @@ pub struct AppState {
     pub goal: goal::GoalState,
 
     pub needs_terminal_restore: bool,
-    pub running_background_count: usize,
-    pub running_interactive_count: usize,
-    pub running_persistent_count: usize,
+    pub background: background_stats::BackgroundCounters,
 }
 
 impl AppState {
@@ -218,9 +217,7 @@ impl App {
 
             goal: goal::GoalState::default(),
             needs_terminal_restore: false,
-            running_background_count: 0,
-            running_interactive_count: 0,
-            running_persistent_count: 0,
+            background: background_stats::BackgroundCounters::default(),
         };
 
         if mcp_init_ok {
@@ -313,14 +310,16 @@ impl App {
                 _ = tokio::signal::ctrl_c() => {
                     // Kill any running foreground child before restoring terminal.
                     kill_foreground_child();
-                    let _ = self.shutdown_background_processes().await;
+                    let _ = self.state.background.shutdown_all().await;
                     return Ok(());
                 }
             }
 
-            self.refresh_mcp_view().await;
-            self.update_mcp_stats().await;
-            self.update_background_stats().await;
+            if self.state.view == View::Mcp {
+                self.state.mcp_status.refresh_view(&self.mcp).await;
+            }
+            self.state.mcp_status.update_stats(&self.mcp).await;
+            self.state.background.refresh().await;
 
             if consume_terminal_restore_request() {
                 self.state.needs_terminal_restore = true;
@@ -345,80 +344,6 @@ impl App {
 
             self.render(terminal)?;
         }
-    }
-
-    async fn update_mcp_stats(&mut self) {
-        const MCP_STATS_INTERVAL_SECS: u64 = 2;
-        if let Some(last) = self.state.mcp_status.last_stats_update {
-            if last.elapsed().as_secs() < MCP_STATS_INTERVAL_SECS {
-                return;
-            }
-        }
-        let mcp = self.mcp.lock().await;
-        let servers = mcp.get_servers_info();
-        self.state.mcp_status.server_count = servers.len();
-        self.state.mcp_status.connected_count = servers
-            .iter()
-            .filter(|s| s.enabled && s.status == "connected")
-            .count();
-        self.state.mcp_status.view.servers = servers;
-        self.state.mcp_status.last_stats_update = Some(std::time::Instant::now());
-    }
-
-    async fn update_background_stats(&mut self) {
-        let _ = crate::tools::background::expire_persistent_idle_processes().await;
-        let _ = crate::tools::background::prune_finished_processes().await;
-        let (total, interactive, persistent) = crate::tools::background::running_process_counts().await;
-        self.state.running_background_count = total;
-        self.state.running_interactive_count = interactive;
-        self.state.running_persistent_count = persistent;
-    }
-
-    async fn shutdown_background_processes(&mut self) -> usize {
-        let killed = crate::tools::background::shutdown_all().await;
-        self.state.running_background_count = 0;
-        self.state.running_interactive_count = 0;
-        self.state.running_persistent_count = 0;
-        killed
-    }
-
-    async fn cleanup_background_before_user_turn(&mut self) -> usize {
-        if self.state.running_background_count == 0 {
-            return 0;
-        }
-        let killed = crate::tools::background::shutdown_nonpersistent().await;
-        self.update_background_stats().await;
-        killed
-    }
-
-    async fn kill_background_job(&mut self, id: u64) -> String {
-        match crate::tools::background::kill_process(id).await {
-            Some(Ok(())) => {
-                let _ = crate::tools::background::remove_process(id).await;
-                self.update_background_stats().await;
-                format!("Stopped job #{id}.")
-            }
-            Some(Err(error)) => format!("Failed to stop job #{id}: {error}"),
-            None => format!("No job with id={id}."),
-        }
-    }
-
-    async fn prune_background_jobs(&mut self) -> String {
-        let (finished, expired) = crate::tools::background::prune_jobs().await;
-        self.update_background_stats().await;
-        if finished == 0 && expired == 0 {
-            "No jobs pruned.".to_string()
-        } else {
-            format!("Pruned jobs: finished={finished}, expired={expired}.")
-        }
-    }
-
-    async fn refresh_mcp_view(&mut self) {
-        if self.state.view != View::Mcp || !self.state.mcp_status.view.servers.is_empty() {
-            return;
-        }
-        let mcp = self.mcp.lock().await;
-        self.state.mcp_status.view.servers = mcp.get_servers_info();
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
