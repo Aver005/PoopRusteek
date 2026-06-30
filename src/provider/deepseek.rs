@@ -1687,19 +1687,15 @@ impl LLMProvider for DeepseekProvider {
     async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
         let (response, session_id) = self.send_request(&request).await?;
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut sse = super::sse::SseLineBuffer::new();
         let mut content = String::new();
         let mut finish_reason = None;
         let mut parent_message_id = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
+            for line in sse.push_bytes(&chunk) {
                 let trimmed = line.trim();
                 if trimmed == "data: [DONE]" {
                     finish_reason = Some("stop".to_string());
@@ -1747,17 +1743,13 @@ impl LLMProvider for DeepseekProvider {
     ) -> AppResult<()> {
         let (response, session_id) = self.send_request(&request).await?;
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut sse = super::sse::SseLineBuffer::new();
         let mut parent_message_id = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
+            for line in sse.push_bytes(&chunk) {
                 let trimmed = line.trim();
                 if trimmed == "data: [DONE]" {
                     debug_log::log("completion.stream.done", "received [DONE]");

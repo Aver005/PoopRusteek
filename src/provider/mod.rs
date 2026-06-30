@@ -1,5 +1,8 @@
 pub mod deepseek;
+#[cfg(test)]
+pub mod fake;
 pub mod pow;
+pub mod sse;
 pub mod types;
 
 use async_trait::async_trait;

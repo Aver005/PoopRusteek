@@ -230,6 +230,63 @@ fn summarize_tool_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::fake::FakeProvider;
+
+    /// The provider seam is substitutable: with a `FakeProvider` the agent loop
+    /// runs to completion — streaming visible text, then `AgentDone` — with no
+    /// network, no proof-of-work, and no DeepSeek token.
+    #[tokio::test]
+    async fn agent_loop_streams_plain_response_then_done() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response("Hello, world!").chunked(3));
+        let tools = Arc::new(ToolRegistry::new());
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            provider,
+            tools,
+            mcp,
+            vec![ChatMessage::user("hi")],
+            "system".to_string(),
+            "fake".to_string(),
+            0.0,
+            128,
+            4,
+            4,
+            event_tx,
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+
+        // First event opens the assistant message.
+        assert!(matches!(events.first(), Some(AppEvent::BeginAssistantMessage)));
+
+        // The streamed deltas reassemble into the full visible response.
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::AgentChunk(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "Hello, world!");
+
+        // The turn ends with AgentDone carrying the final text and no tool calls.
+        let done = events
+            .iter()
+            .find_map(|e| match e {
+                AppEvent::AgentDone(result) => Some(result),
+                _ => None,
+            })
+            .expect("agent loop should finish with AgentDone");
+        assert_eq!(done.text, "Hello, world!");
+        assert!(done.tool_calls.is_empty());
+    }
 
     #[test]
     fn summarize_short_result() {
