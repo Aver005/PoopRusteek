@@ -1,17 +1,34 @@
 # .memories INDEX
-> Agent entry point. Last updated: 2026-06-28T17:12
+> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-06-30
+
+> ⚠️ The app does **NOT** auto-load `.memories/`. An agent only benefits from this folder if it is
+> explicitly told to read `.memories/INDEX.md` first. (Wiring auto-load is an open PLANS item.)
 
 ## 1. READ ORDER
 
+### Core (read top-to-bottom for a full mental model)
 | Step | File | Why |
 |------|------|-----|
-| 1 | `QUICKSTART.md` | 10s orientation — what, where, how |
-| 2 | `STATE.md` | Current snapshot — what's done, broken, cooking |
-| 3 | `MAP.md` | Codebase map — file → purpose → lines |
-| 4 | `BUGS.md` | Known bugs sorted by pain |
-| 5 | `PLANS.md` | Roadmap & active priorities |
-| 6 | `LEARNINGS.md` | Hard-won technical knowledge |
-| 7 | `JOURNAL/` | Recent agent activity log |
+| 1 | `QUICKSTART.md` | 10s orientation — what/where/how |
+| 2 | `STATE.md` | Current snapshot — done / broken / cooking |
+| 3 | `MAP.md` | File → purpose → lines map of the whole tree |
+| 4 | `ARCHITECTURE.md` | Layers, event loop, data flows, GOAL state machine |
+| 5 | `GLOSSARY.md` | Project-specific terms (PoW, ACP, GOAL, jobs…) |
+| 6 | `BUGS.md` | Known defects by severity |
+| 7 | `PLANS.md` | Roadmap & active priorities |
+| 8 | `LEARNINGS.md` | Hard-won gotchas |
+| 9 | `CONVENTIONS.md` | Code style to follow when editing |
+| 10 | `JOURNAL/` | Dated activity log |
+
+### Reference (look up on demand — deep, file:line-cited)
+| File | Covers |
+|------|--------|
+| `reference/COMMANDS.md` | All 25 slash commands + registry |
+| `reference/PROVIDER.md` | DeepSeek API, endpoints, SSE, PoW, auth |
+| `reference/TOOLS.md` | Tool system, agent loop, background PTY |
+| `reference/MCP.md` | MCP clients, transports, 8 config sources |
+| `reference/CONFIG.md` | Config schema, storage paths, sessions |
+| `reference/PROMPTS.md` | Prompt library + skills discovery |
 
 ## 2. KEY SIGNALS
 
@@ -19,16 +36,20 @@
 |--------|---------|
 | `[DONE]` | Implemented and working |
 | `[WIP]` | In progress, partial |
-| `[TODO]` | Not started, planned |
+| `[TODO]` | Planned, not started |
 | `[BUG]` | Known defect |
-| `[IDEA]` | Proposed but not committed |
+| `[IDEA]` | Proposed, not committed |
 | `[?]` | Needs investigation |
 | `→ path:line` | Cross-reference to source |
 
 ## 3. EXTERNAL CONTEXT
 
-- Repo: https://github.com/aver005/poopseek
-- Rewrite target: Rust (from TS)
-- API: DeepSeek web API (reverse-engineered, v0)
-- License: MIT
-- Primary test: `cargo build` — no test suite yet
+- Original repo (TS): https://github.com/aver005/poopseek
+- This project: Rust rewrite (edition 2024, MSRV 1.85), ~15k LOC, License MIT.
+- LLM backend: DeepSeek **web** API (reverse-engineered, v0) — cookie/token auth, requires PoW.
+- Primary verification: `cargo build`. `cargo clippy` not yet clean. Minimal test suite.
+
+## 4. MAINTENANCE RULE
+
+Update the relevant file on every meaningful change and bump its `Last updated`. Add a `JOURNAL/{date}.md`
+entry for notable sessions. Keep claims tied to `→ file:line`. If a fact here contradicts the code, the **code wins** — fix the memory.

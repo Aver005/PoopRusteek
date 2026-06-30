@@ -1,57 +1,70 @@
 # LEARNINGS
-> Hard-won technical knowledge. Gotchas. Patterns.
-> Last updated: 2026-06-28T17:12
+> Hard-won technical knowledge. Gotchas. Patterns. (Deep detail lives in `reference/`.)
+> Last updated: 2026-06-30
 
-## DEEPSEEK API
-
-| Topic | Detail |
-|-------|--------|
-| Auth | DeepSeek web API uses cookie-based session, not API key. Session ID + token from web login. |
-| PoW | Every API call requires SHA-3 proof-of-work. WASM blob solves this. `→ src/provider/pow.rs` |
-| Streaming | SSE events: `ready`, `update_session`, `title`, `close`, `fragment`, `content`, `field`, `batch`, `token` |
-| Endpoints | ~15 reverse-engineered endpoints: chat, sessions, files, search, sharing, user, feedback |
-| Fragility | No documented API — may break without notice. All endpoints reverse-engineered from webapp. |
-
-## RUST PATTERNS
+## DEEPSEEK API  (full detail → `reference/PROVIDER.md`)
 
 | Topic | Detail |
 |-------|--------|
-| Error handling | `AppError` enum with `thiserror`. `AppResult<T>` alias throughout. `→ src/error.rs` |
-| Async | tokio runtime. `LLMProvider` is `#[async_trait]`. |
-| TUI | ratatui with crossterm backend. `App` owns all state, `render()` is called each frame. |
-| Events | `tokio::select!` multiplexes: stdin key events, agent channel, tool channel, tick. |
-| Config | `serde` + `toml` deserialize. Path resolved via `dirs` crate. |
-| MCP | Generic JSON-RPC 2.0 client. No schema validation on tool args (TODO). |
+| Auth | DeepSeek **web** API: cookie/token session + spoofed Android client headers. NOT the public API-key product. |
+| PoW | Every gated call needs a solved SHA-3 challenge in `x-ds-pow-response`. Solved by bundled WASM via `wasmtime`. `→ src/provider/pow.rs` |
+| Prompt shape | Web API takes ONE `prompt` string; history is flattened with `### USER INPUT` / `### TOOL RESULT` / `### LOCAL MEMORY` labels. |
+| `### LOCAL MEMORY` | Just a history-section label — does **NOT** load `.memories/` files. Don't conflate. |
+| SSE | Mixed named (`ready/update_session/title/close`) + unnamed (`o`/`p`/`v` op-path-value) events; ~9 fallback text-extraction paths. |
+| Usage | Token usage never returned by streaming → `usage` is always None; counts are estimated `len/4`. |
+| Fragility | Undocumented, reverse-engineered; client version `1.8.0` hardcoded. May break anytime. |
 
-## MCP GOTCHAS
+## CONFIG / DEFAULTS  (→ `reference/CONFIG.md`)
 
-- Tool names in MCP are prefixed: `mcp__{server_name}__{tool_name}`
-- Stdio transport: spawn child process, write JSON-RPC to stdin, read from stdout
-- HTTP transport: POST to SSE endpoint for init, separate POST for calls
-- Auto-discovery checks 5 config sources; workspace config wins over global
-- Cache TTL for tool lists configured in `config.toml` (default: 60s)
+- **Correct agent defaults**: `max_steps_per_turn = 256`, `max_tools_per_step = 10`, `max_context_messages = 256`. (Older memory wrongly said 25 / 50.)
+- Paths use the `dirs` crate → platform-specific. Config = `{config_dir}/pooprusteek/config.toml`; data (sessions, history, mcp.json) = `{data_dir}/pooprusteek/`.
+- Sessions are JSON; ids are time-sortable (`{rfc3339}-{uuid8}`). History capped at 500.
 
-## AGENT LOOP
+## RUST PATTERNS  (→ `CONVENTIONS.md`)
 
-- Tool calls parsed from raw LLM output (3 formats: XML `<tool_use>`, legacy `[TOOL:name]`, JSON)
-- Agent runs up to `max_steps` (default 25) or `max_tools` (default 50) per conversation
-- Context compaction triggered at ~32K tokens — uses summary prompt
-- Tool approval dialog sends `AppEvent::RequestToolApproval`, blocks until user responds
-- Background PTY processes persist across agent steps (use `shell_kill` to clean up)
+| Topic | Detail |
+|-------|--------|
+| Errors | `AppError` (`thiserror`) + `AppResult<T>` everywhere; `color-eyre` at the top level. |
+| Async | Tokio; `LLMProvider`/`Tool` are `#[async_trait]`. Blocking PTY work on `spawn_blocking`. |
+| Event loop | One `tokio::select!` @120ms over tick / crossterm / internal channel / Ctrl+C. Agent runs in a spawned task. |
+| State | Only the main loop mutates `AppState`; async tasks talk via `AppEvent` + `Notify` handshakes. |
+| Cross-task req/resp | `Arc<Mutex<Option<T>>> + tokio::Notify` (tool approval, questions). |
+| Assets | Resolve via `CARGO_MANIFEST_DIR` → CWD → exe-dir (prompts, PoW WASM). |
 
-## GOAL MODE
+## AGENT LOOP  (→ `reference/TOOLS.md`)
 
-- `/goal` toggles GOAL mode on/off. State stored in `AppState.goal_mode` + `goal_stage: GoalStage`
-- Flow: user prompt → system asks for GOAL → agent1 works → evaluator (non-streaming, `provider.complete()`) reviews → verdict
-- Evaluator uses `assets/prompts/goal-evaluator.prompt.md` with structured output (`**Status:** SUCCESS/FAILURE`)
-- On FAILURE: feedback sent back to agent1, counter increments. After 3 agent1 failures → new session swapped. After 5 evaluator failures → new evaluator session
-- Evaluator sessions saved with `tag: Some("__goal_system__")` — hidden from `/sessions` picker
-- GOAL mode visible in UI: status bar (`GOAL:stage`), landing page (`[GOAL ON]` / `[iter#N]`)
+- Tool calls parsed from raw LLM text — 3 formats: XML `<tool_use>`, legacy `[TOOL:name]`, JSON. No native function-calling.
+- Loop: up to `max_steps` steps, `max_tools_per_step` tools each. 120s idle stream timeout.
+- `question` tool is **special-cased** (opens a modal, no approval); all other tools go through approval.
+- `summarize_tool_result` truncates at 200 bytes on a **char boundary** (emoji-safe; tested).
+- `stream_visible_text` hides partial tool tags during streaming — but over-eagerly cuts at any `<`.
+
+## BACKGROUND / PTY  (→ `reference/TOOLS.md`)
+
+- `tools/background.rs` runs detached (`spawn_background`, piped) or interactive (`spawn_interactive`, real PTY via `portable-pty`).
+- Persistent jobs (dev servers) survive turns; idle TTL default 1800s. Non-persistent killed each user turn; all killed on exit.
+- `shell_input` maps named keys to terminal escape sequences (up/down/enter/esc/ctrl+c…).
+- Windows: foreground processes use `CREATE_NO_WINDOW`/DETACHED to avoid corrupting the TUI; force-kill via `taskkill /F /T`.
+
+## MCP  (→ `reference/MCP.md`)
+
+- Tool names prefixed `mcp__{server}__{tool}`. Protocol version `2024-11-05`.
+- Three transports: stdio (spawn+stdin/stdout, 60s), HTTP (30s, `MCP-Session-Id`, SSE-fallback), SSE.
+- Config auto-discovered from **8 sources** (own → workspace → global → Claude Desktop → VSCode → Claude CLI → Cursor → Opencode), first-found-wins. (Older memory said 5.)
+- Tool lists cached per-server; TTL default 300s, set via `/mcp ttl`.
+- Windows stdio retries `.cmd`/`.bat` so `npx` resolves.
+
+## GOAL MODE  (→ `ARCHITECTURE.md`)
+
+- `/goal` arms it. Flow: prompt → define goal → Agent 1 works → Evaluator (non-streaming) judges → SUCCESS or feedback-retry.
+- Evaluator uses `goal-evaluator.prompt.md`, structured `**Status:** SUCCESS/FAILURE`.
+- Session swap: 3 agent-1 failures → fresh worker session; 5 evaluator failures → fresh evaluator session.
+- Evaluator sessions tagged `__goal_system__` (hidden from `/sessions`). ⚠ No hard iteration cap yet.
+
+## META: THE `.memories` SYSTEM
+
+- This folder is the canonical agent onboarding doc. **The app does not read it** — point agents at `.memories/INDEX.md`.
+- Keep `→ file:line` references; when memory and code disagree, the code wins.
 
 ## BUILD
-
-- `lto = "fat"`, `codegen-units = 1`, `strip = true` in release profile
-- WASM runtime: `wasmtime` crate for PoW solver
-- `portable-pty` for background shell sessions
-- `syntect` with `base16-ocean-dark` theme for syntax highlighting
-- `pulldown-cmark` for markdown parsing
+- `lto="fat"`, `codegen-units=1`, `strip=true` (release). `wasmtime` for PoW, `portable-pty` for shells, `syntect`+`pulldown-cmark` for rendering.
