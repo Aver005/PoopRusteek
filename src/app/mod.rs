@@ -820,11 +820,10 @@ impl App {
                 self.state.scroll_offset = 0;
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.input.selection_anchor = Some(0);
-                self.state.input.cursor = self.state.input.buffer.chars().count();
+                self.state.input.select_all();
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                insert_newline(&mut self.state);
+                self.state.input.insert_newline();
             }
             KeyCode::Enter if !self.state.is_generating => {
                 let buf = &self.state.input.buffer;
@@ -834,13 +833,10 @@ impl App {
                     .is_some_and(|c| c == '\\')
                     && self.state.input.cursor == buf.chars().count();
                 if ends_with_backslash {
+                    // Replace the trailing backslash with a newline (line continuation).
                     self.state.input.buffer.pop();
                     self.state.input.cursor -= 1;
-                    let byte_pos =
-                        char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
-                    self.state.input.buffer.insert(byte_pos, '\n');
-                    self.state.input.cursor += 1;
-                    self.state.input.selection_anchor = None;
+                    self.state.input.insert_newline();
                 } else {
                             let input = self.state.input.buffer.trim().to_string();
                             if !input.is_empty() {
@@ -1022,130 +1018,39 @@ impl App {
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.delete_selection_if_any();
-                let byte_pos = char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
-                self.state.input.buffer.insert(byte_pos, c);
-                self.state.input.cursor += 1;
-                self.state.input.selection_anchor = None;
+                self.state.input.insert_char(c);
             }
             KeyCode::Backspace => {
-                if self.state.input.selection_anchor.is_some() {
-                    self.delete_selection_if_any();
-                } else {
-                    let char_count = self.state.input.buffer.chars().count();
-                    if self.state.input.cursor > 0 && self.state.input.cursor <= char_count {
-                        self.state.input.cursor -= 1;
-                        let byte_pos = char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
-                        if byte_pos < self.state.input.buffer.len() {
-                            self.state.input.buffer.remove(byte_pos);
-                        }
-                    }
-                }
+                self.state.input.backspace();
             }
             KeyCode::Delete => {
-                if self.state.input.selection_anchor.is_some() {
-                    self.delete_selection_if_any();
-                } else {
-                    let char_count = self.state.input.buffer.chars().count();
-                    if self.state.input.cursor < char_count {
-                        let byte_pos =
-                            char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
-                        if byte_pos < self.state.input.buffer.len() {
-                            self.state.input.buffer.remove(byte_pos);
-                        }
-                    }
-                }
+                self.state.input.delete_forward();
             }
             KeyCode::Left => {
                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if !shift {
-                    self.state.input.selection_anchor = None;
-                } else if self.state.input.selection_anchor.is_none() {
-                    self.state.input.selection_anchor = Some(self.state.input.cursor);
-                }
-                let char_count = self.state.input.buffer.chars().count();
-                let clamped = self.state.input.cursor.min(char_count);
-                let new_cursor = if ctrl {
-                    prev_word_start(&self.state.input.buffer, clamped)
-                } else {
-                    clamped.saturating_sub(1)
-                };
-                self.state.input.cursor = new_cursor;
+                self.state.input.move_left(shift, ctrl);
             }
             KeyCode::Right => {
                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if !shift {
-                    self.state.input.selection_anchor = None;
-                } else if self.state.input.selection_anchor.is_none() {
-                    self.state.input.selection_anchor = Some(self.state.input.cursor);
-                }
-                let char_count = self.state.input.buffer.chars().count();
-                let new_cursor = if ctrl {
-                    next_word_end(&self.state.input.buffer, self.state.input.cursor)
-                } else if self.state.input.cursor < char_count {
-                    self.state.input.cursor + 1
-                } else {
-                    self.state.input.cursor
-                };
-                self.state.input.cursor = new_cursor;
+                self.state.input.move_right(shift, ctrl);
             }
             KeyCode::Home => {
-                if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.state.input.selection_anchor = None;
-                } else if self.state.input.selection_anchor.is_none() {
-                    self.state.input.selection_anchor = Some(self.state.input.cursor);
-                }
-                self.state.input.cursor = 0;
+                self.state.input.move_home(key.modifiers.contains(KeyModifiers::SHIFT));
             }
             KeyCode::End => {
-                if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.state.input.selection_anchor = None;
-                } else if self.state.input.selection_anchor.is_none() {
-                    self.state.input.selection_anchor = Some(self.state.input.cursor);
-                }
-                self.state.input.cursor = self.state.input.buffer.chars().count();
+                self.state.input.move_end(key.modifiers.contains(KeyModifiers::SHIFT));
             }
             KeyCode::Up if !self.state.is_generating
                 && self.state.input.buffer.chars().take(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
-                let history = &self.state.input.history;
-                if !history.is_empty() {
-                    let idx = match self.state.input.history_index {
-                        None => {
-                            self.state.input.unsent = self.state.input.buffer.clone();
-                            Some(history.len() - 1)
-                        }
-                        Some(i) if i > 0 => Some(i - 1),
-                        _ => None,
-                    };
-                    if let Some(i) = idx {
-                        self.state.input.buffer = history[i].clone();
-                        self.state.input.cursor = self.state.input.buffer.chars().count();
-                        self.state.input.selection_anchor = None;
-                        self.state.input.history_index = Some(i);
-                    }
-                }
+                self.state.input.history_prev();
             }
             KeyCode::Down if !self.state.is_generating
                 && self.state.input.buffer.chars().skip(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
-                let next = self.state.input.history_index.map(|i| i + 1);
-                let history_len = self.state.input.history.len();
-                match next {
-                    Some(i) if i < history_len => {
-                        self.state.input.buffer = self.state.input.history[i].clone();
-                        self.state.input.cursor = self.state.input.buffer.chars().count();
-                        self.state.input.history_index = Some(i);
-                    }
-                    _ => {
-                        self.state.input.buffer = std::mem::take(&mut self.state.input.unsent);
-                        self.state.input.cursor = self.state.input.buffer.chars().count();
-                        self.state.input.history_index = None;
-                    }
-                }
-                self.state.input.selection_anchor = None;
+                self.state.input.history_next();
             }
             KeyCode::Up => {
                 self.state.scroll_offset = self.state.scroll_offset.saturating_add(1);
@@ -1438,21 +1343,6 @@ impl App {
         }
     }
 
-    fn delete_selection_if_any(&mut self) -> Option<usize> {
-        if let Some(anchor) = self.state.input.selection_anchor.take() {
-            let cursor = self.state.input.cursor;
-            let (start, end) = if anchor <= cursor {
-                (anchor, cursor)
-            } else {
-                (cursor, anchor)
-            };
-            let bs = char_to_byte_pos(&self.state.input.buffer, start);
-            let be = char_to_byte_pos(&self.state.input.buffer, end);
-            self.state.input.buffer.drain(bs..be);
-            self.state.input.cursor = start;
-        }
-        None
-    }
 
     async fn build_system_prompt(&self) -> String {
         let workspace = &self.state.workspace_path;
@@ -2141,74 +2031,6 @@ pub fn format_duration_secs(seconds: u64) -> String {
         3600..=86_399 => format!("{}h", seconds / 3600),
         _ => format!("{}d", seconds / 86_400),
     }
-}
-
-pub fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
-    s.char_indices()
-        .nth(char_pos)
-        .map(|(i, _)| i)
-        .unwrap_or_else(|| s.len())
-}
-
-fn char_is_word(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
-}
-
-fn prev_word_start(s: &str, cursor: usize) -> usize {
-    if cursor == 0 {
-        return 0;
-    }
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = cursor;
-    while i > 0 && chars[i - 1].is_whitespace() {
-        i -= 1;
-    }
-    if i == 0 {
-        return 0;
-    }
-    let word = char_is_word(chars[i - 1]);
-    while i > 0 && char_is_word(chars[i - 1]) == word && !chars[i - 1].is_whitespace() {
-        i -= 1;
-    }
-    i
-}
-
-fn next_word_end(s: &str, cursor: usize) -> usize {
-    let total = s.chars().count();
-    if cursor >= total {
-        return total;
-    }
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = cursor;
-    while i < total && chars[i].is_whitespace() {
-        i += 1;
-    }
-    if i >= total {
-        return total;
-    }
-    let word = char_is_word(chars[i]);
-    while i < total && !chars[i].is_whitespace() && char_is_word(chars[i]) == word {
-        i += 1;
-    }
-    i
-}
-
-fn insert_newline(state: &mut crate::app::AppState) {
-    if let Some(anchor) = state.input.selection_anchor.take() {
-        let (start, end) = if anchor <= state.input.cursor {
-            (anchor, state.input.cursor)
-        } else {
-            (state.input.cursor, anchor)
-        };
-        let bs = char_to_byte_pos(&state.input.buffer, start);
-        let be = char_to_byte_pos(&state.input.buffer, end);
-        state.input.buffer.drain(bs..be);
-        state.input.cursor = start;
-    }
-    let byte_pos = char_to_byte_pos(&state.input.buffer, state.input.cursor);
-    state.input.buffer.insert(byte_pos, '\n');
-    state.input.cursor += 1;
-    state.input.selection_anchor = None;
 }
 
 fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Value) -> String {

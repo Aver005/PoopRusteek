@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::app::char_to_byte_pos;
+use crate::app::input::char_to_byte_pos;
 use crate::tui::theme::Theme;
 use ratatui::{
     layout::Rect,
