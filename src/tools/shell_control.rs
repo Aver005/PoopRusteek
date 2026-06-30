@@ -1,6 +1,14 @@
 use super::*;
 use serde_json::{json, Value};
 
+/// Parse the `id` argument, accepting both JSON integers and floats — LLMs
+/// sometimes emit `12.0` for an integer id.
+fn parse_id(args: &Value) -> Option<u64> {
+    args["id"]
+        .as_u64()
+        .or_else(|| args["id"].as_f64().map(|f| f as u64))
+}
+
 pub struct ShellOutputTool;
 
 #[async_trait]
@@ -23,12 +31,8 @@ impl Tool for ShellOutputTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult {
-        let id = match args["id"].as_u64() {
-            Some(id) => id,
-            None => match args["id"].as_f64() {
-                Some(f) => f as u64,
-                None => return ToolResult::error("Missing or invalid 'id' argument"),
-            },
+        let Some(id) = parse_id(&args) else {
+            return ToolResult::error("Missing or invalid 'id' argument");
         };
 
         match background::read_output(id).await {
@@ -74,12 +78,8 @@ impl Tool for ShellKillTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult {
-        let id = match args["id"].as_u64() {
-            Some(id) => id,
-            None => match args["id"].as_f64() {
-                Some(f) => f as u64,
-                None => return ToolResult::error("Missing or invalid 'id' argument"),
-            },
+        let Some(id) = parse_id(&args) else {
+            return ToolResult::error("Missing or invalid 'id' argument");
         };
 
         match background::kill_process(id).await {
@@ -216,12 +216,8 @@ impl Tool for ShellInputTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult {
-        let id = match args["id"].as_u64() {
-            Some(id) => id,
-            None => match args["id"].as_f64() {
-                Some(f) => f as u64,
-                None => return ToolResult::error("Missing or invalid 'id' argument"),
-            },
+        let Some(id) = parse_id(&args) else {
+            return ToolResult::error("Missing or invalid 'id' argument");
         };
 
         let text = args["text"].as_str().unwrap_or("");
@@ -274,5 +270,41 @@ impl Tool for ShellInputTool {
             }
             Err(e) => ToolResult::error(&e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_id_accepts_int_and_float() {
+        assert_eq!(parse_id(&json!({"id": 5})), Some(5));
+        assert_eq!(parse_id(&json!({"id": 5.0})), Some(5));
+        assert_eq!(parse_id(&json!({"id": 5.9})), Some(5)); // float truncates
+    }
+
+    #[test]
+    fn parse_id_rejects_missing_and_non_numeric() {
+        assert_eq!(parse_id(&json!({})), None);
+        assert_eq!(parse_id(&json!({"id": "5"})), None); // strings not accepted
+        assert_eq!(parse_id(&json!({"id": null})), None);
+    }
+
+    #[test]
+    fn key_sequence_maps_known_keys() {
+        assert_eq!(key_sequence("up"), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_sequence("arrowup"), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_sequence("enter"), Some(b"\r".to_vec()));
+        assert_eq!(key_sequence("tab"), Some(b"\t".to_vec()));
+        assert_eq!(key_sequence("ctrl+c"), Some(b"\x03".to_vec()));
+        assert_eq!(key_sequence("delete"), Some(b"\x1b[3~".to_vec()));
+    }
+
+    #[test]
+    fn key_sequence_unknown_or_wrong_case_is_none() {
+        assert_eq!(key_sequence("f13"), None);
+        assert_eq!(key_sequence("UP"), None); // matching is case-sensitive
+        assert_eq!(key_sequence(""), None);
     }
 }
