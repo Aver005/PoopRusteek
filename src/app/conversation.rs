@@ -71,6 +71,100 @@ impl Conversation {
     }
 }
 
+/// The set of open conversations with one focused. There is no live/parked
+/// split — every conversation, including the focused one, is a full
+/// [`Conversation`] here, so switching focus is just changing an id and an
+/// agent event is routed by looking the conversation up.
+pub struct Conversations {
+    items: Vec<Conversation>,
+    focused: ConversationId,
+}
+
+impl Conversations {
+    /// Create the store seeded with its first (focused) conversation.
+    pub fn new(initial: Conversation) -> Self {
+        let focused = initial.id;
+        Self { items: vec![initial], focused }
+    }
+
+    pub fn focused_id(&self) -> ConversationId {
+        self.focused
+    }
+
+    pub fn focused(&self) -> &Conversation {
+        self.items
+            .iter()
+            .find(|c| c.id == self.focused)
+            .expect("focused conversation always exists")
+    }
+
+    pub fn focused_mut(&mut self) -> &mut Conversation {
+        let focused = self.focused;
+        self.items
+            .iter_mut()
+            .find(|c| c.id == focused)
+            .expect("focused conversation always exists")
+    }
+
+    pub fn get_mut(&mut self, id: ConversationId) -> Option<&mut Conversation> {
+        self.items.iter_mut().find(|c| c.id == id)
+    }
+
+    pub fn contains(&self, id: ConversationId) -> bool {
+        self.items.iter().any(|c| c.id == id)
+    }
+
+    /// Focus an existing conversation (no-op if the id is unknown).
+    pub fn set_focus(&mut self, id: ConversationId) {
+        if self.contains(id) {
+            self.focused = id;
+        }
+    }
+
+    /// Add a conversation and focus it.
+    pub fn open(&mut self, conv: Conversation) {
+        self.focused = conv.id;
+        self.items.push(conv);
+    }
+
+    /// Add a conversation without changing focus (sidechats / sub-agents).
+    pub fn add_background(&mut self, conv: Conversation) {
+        self.items.push(conv);
+    }
+
+    /// Remove a conversation. If it was focused, focus the lowest-id remaining
+    /// one (the store never becomes empty in practice — the main chat stays).
+    pub fn remove(&mut self, id: ConversationId) -> Option<Conversation> {
+        let pos = self.items.iter().position(|c| c.id == id)?;
+        let removed = self.items.remove(pos);
+        if self.focused == id {
+            if let Some(first) = self.items.iter().map(|c| c.id).min_by_key(|c| c.0) {
+                self.focused = first;
+            }
+        }
+        Some(removed)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Conversation> {
+        self.items.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Conversation> {
+        self.items.iter_mut()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Conversation ids in stable (id) order — for cycling focus.
+    pub fn ordered_ids(&self) -> Vec<ConversationId> {
+        let mut ids: Vec<ConversationId> = self.items.iter().map(|c| c.id).collect();
+        ids.sort_by_key(|c| c.0);
+        ids
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

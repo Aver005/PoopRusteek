@@ -37,7 +37,7 @@ fn meta_line(msg: &crate::provider::ChatMessage, theme: &Theme) -> Line<'static>
 pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
 
-    for msg in &state.messages {
+    for msg in &state.focused().messages {
         match msg.role {
             Role::User => {
                 for line_text in msg.visible_content().lines() {

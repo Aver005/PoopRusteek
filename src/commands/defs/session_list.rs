@@ -31,7 +31,7 @@ impl Command for SessionListCommand {
             .collect();
 
         if user_sessions.is_empty() {
-            state.messages.push(crate::provider::ChatMessage::system(
+            state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                 "No local sessions found.",
             ));
             return CommandResult::Handled;

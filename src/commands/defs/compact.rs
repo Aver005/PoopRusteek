@@ -18,25 +18,28 @@ impl Command for CompactCommand {
     }
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        if state.messages.is_empty() {
-            state.messages.push(crate::provider::ChatMessage::system("Nothing to compact."));
+        if state.focused_mut().messages.is_empty() {
+            state.focused_mut().messages.push(crate::provider::ChatMessage::system("Nothing to compact."));
             return CommandResult::Handled;
         }
 
-        let user_msgs: Vec<&str> = state.messages
-            .iter()
-            .filter(|m| m.role == crate::provider::Role::User)
-            .map(|m| m.content.as_str())
-            .collect();
+        let (count, topics) = {
+            let msgs = &state.focused().messages;
+            let topics = msgs
+                .iter()
+                .filter(|m| m.role == crate::provider::Role::User)
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            (msgs.len(), topics)
+        };
 
         let summary = format!(
-            "[Context compacted] Previous conversation had {} messages. User topics: {}",
-            state.messages.len(),
-            user_msgs.join("; ")
+            "[Context compacted] Previous conversation had {count} messages. User topics: {topics}"
         );
 
-        state.messages.clear();
-        state.messages.push(crate::provider::ChatMessage::system(&summary));
+        state.focused_mut().messages.clear();
+        state.push_system(&summary);
         state.scroll_offset = 0;
 
         CommandResult::Handled

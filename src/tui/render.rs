@@ -25,7 +25,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
 
         if state.view == View::Mcp {
             render_mcp_view(frame, area, &state.mcp_status.view, &theme);
-        } else if state.messages.is_empty() && !state.generation.active {
+        } else if state.focused().messages.is_empty() && !state.focused().generation.active {
             render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
             let has_attachments = !state.attached_files.is_empty();
@@ -99,7 +99,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         use crossterm::cursor::MoveTo;
         crossterm::execute!(terminal.backend_mut(), MoveTo(cx, cy))?;
     }
-    if state.modal.is_some() || state.generation.active || state.view == View::Mcp {
+    if state.modal.is_some() || state.focused().generation.active || state.view == View::Mcp {
         terminal.hide_cursor()?;
     } else {
         terminal.show_cursor()?;
@@ -317,8 +317,8 @@ fn centered_h(area: Rect, width: u16) -> Rect {
 fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &Config, theme: &Theme) {
     let provider_name = provider_label(config);
     let model = &config.provider.model;
-    let msg_count = state.messages.len();
-    let total_tokens = view_model::assistant_token_total(&state.messages);
+    let msg_count = state.focused().messages.len();
+    let total_tokens = view_model::assistant_token_total(&state.focused().messages);
 
     let mcp_status = view_model::mcp_label(&state.mcp_status);
     let bg_status = if state.running_background_count > 0 {
@@ -334,23 +334,30 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         String::new()
     };
     let btw_status = {
+        use crate::app::conversation::ConversationKind;
         let running = state
-            .background
+            .conversations
             .iter()
-            .filter(|c| c.kind == crate::app::conversation::ConversationKind::Sidechat && c.is_streaming())
+            .filter(|c| {
+                (c.kind == ConversationKind::Sidechat || c.kind == ConversationKind::SubAgent)
+                    && c.is_streaming()
+            })
             .count();
         if running > 0 {
-            format!(" btw:{running}")
+            format!(" agents:{running}")
         } else {
             String::new()
         }
     };
     let chats_status = {
-        // Switchable parallel chats = focused + background sessions (not sidechats).
-        let sessions = 1 + state
-            .background
+        use crate::app::conversation::ConversationKind;
+        // Switchable parallel chats = main + session conversations (not agents).
+        let sessions = state
+            .conversations
             .iter()
-            .filter(|c| c.kind != crate::app::conversation::ConversationKind::Sidechat)
+            .filter(|c| {
+                c.kind != ConversationKind::Sidechat && c.kind != ConversationKind::SubAgent
+            })
             .count();
         if sessions > 1 {
             format!(" chats:{sessions}")
@@ -359,8 +366,8 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         }
     };
 
-    let model_tag = if !state.generation.last_model.is_empty() {
-        format!(" · {}", state.generation.last_model)
+    let model_tag = if !state.focused().generation.last_model.is_empty() {
+        format!(" · {}", state.focused().generation.last_model)
     } else {
         String::new()
     };
@@ -377,16 +384,16 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     };
     let left = format!(" {}{} · {}{}{}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status, btw_status, chats_status);
 
-    let status_tag = state.generation.last_status.as_deref().unwrap_or("");
+    let status_tag = state.focused().generation.last_status.as_deref().unwrap_or("");
 
-    let center = if state.generation.active {
-        let gen_info = if let Some(start) = state.generation.start_time {
+    let center = if state.focused().generation.active {
+        let gen_info = if let Some(start) = state.focused().generation.start_time {
             let elapsed = start.elapsed().as_secs_f64();
-            let tps = view_model::tokens_per_sec(state.generation.last_tokens, elapsed);
-            format!(" {} {} ", view_model::spinner_char(state.generation.animation_tick), state.status_message)
-                + &format!("({} tok, {:.1}s, {:.0} t/s)", state.generation.last_tokens, elapsed, tps)
+            let tps = view_model::tokens_per_sec(state.focused().generation.last_tokens, elapsed);
+            format!(" {} {} ", view_model::spinner_char(state.focused().generation.animation_tick), state.status_message)
+                + &format!("({} tok, {:.1}s, {:.0} t/s)", state.focused().generation.last_tokens, elapsed, tps)
         } else {
-            format!(" {} {} ", view_model::spinner_char(state.generation.animation_tick), state.status_message)
+            format!(" {} {} ", view_model::spinner_char(state.focused().generation.animation_tick), state.status_message)
         };
         gen_info
     } else {
@@ -394,12 +401,12 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         if !status_tag.is_empty() {
             parts.push(status_tag.to_string());
         }
-        if state.generation.last_think_fragments > 0 {
-            parts.push(format!("{} think", state.generation.last_think_fragments));
+        if state.focused().generation.last_think_fragments > 0 {
+            parts.push(format!("{} think", state.focused().generation.last_think_fragments));
         }
-        let tps = view_model::tokens_per_sec(state.generation.last_tokens, state.generation.last_duration_secs);
+        let tps = view_model::tokens_per_sec(state.focused().generation.last_tokens, state.focused().generation.last_duration_secs);
         if tps > 0.0 {
-            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.generation.last_tokens, state.generation.last_duration_secs, tps));
+            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.focused().generation.last_tokens, state.focused().generation.last_duration_secs, tps));
         }
         format!(" {} ", parts.join(" · "))
     };
@@ -416,7 +423,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         String::new()
     };
-    let session_prefix = format!(" {}", view_model::session_prefix(&state.current_session_id));
+    let session_prefix = format!(" {}", view_model::session_prefix(&state.focused().session_id));
     let right = format!("{} msgs:{} tot:{} | {} ", goal_tag, msg_count, total_tokens, session_prefix);
 
     let gap = area.width.saturating_sub((left.len() + center.len() + right.len()) as u16).max(1) as usize;
@@ -427,7 +434,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
             Span::styled(" ".repeat(gap), Style::default().bg(theme.bg)),
             Span::styled(
                 center,
-                if state.generation.active {
+                if state.focused().generation.active {
                     Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.text_dim)
@@ -1312,7 +1319,7 @@ fn bigger_title(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
     text.chars()
         .enumerate()
         .map(|(index, ch)| {
-            let pulse = ((state.generation.animation_tick as usize / 5) + index) % 6;
+            let pulse = ((state.focused().generation.animation_tick as usize / 5) + index) % 6;
             let color = match pulse {
                 0 | 1 => theme.accent_soft,
                 2 | 3 => theme.accent,

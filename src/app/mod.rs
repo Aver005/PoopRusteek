@@ -77,19 +77,19 @@ pub struct App {
     pub state: AppState,
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
-    provider: Option<Arc<dyn LLMProvider>>,
     commands: CommandRegistry,
     pub mcp: Arc<tokio::sync::Mutex<MCPManager>>,
     tools: Arc<ToolRegistry>,
     prompts: PromptFiles,
     skills: Vec<SkillDefinition>,
-    agent_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct AppState {
-    pub messages: Vec<ChatMessage>,
+    /// All open conversations with one focused. The focused conversation's
+    /// messages / provider / generation / session live inside it — there is no
+    /// separate "live" copy on `App`/`AppState`.
+    pub conversations: conversation::Conversations,
     pub input: input::InputState,
-    pub generation: generation::GenerationState,
     pub status_message: String,
     pub scroll_offset: u32,
     pub error: Option<String>,
@@ -98,11 +98,9 @@ pub struct AppState {
     pub pending_tool_approval: Option<ToolApprovalRequest>,
     pub pending_question: Option<QuestionRequest>,
     pub autocomplete: AutocompleteState,
-    pub current_session_id: String,
     pub view: View,
     pub mcp_status: mcp_status::McpStatus,
     pub workspace_path: String,
-    pub session_started_at: String,
     pub show_stats_panel: bool,
     pub attached_files: Vec<crate::provider::AttachedFile>,
 
@@ -113,15 +111,28 @@ pub struct AppState {
     pub running_background_count: usize,
     pub running_interactive_count: usize,
     pub running_persistent_count: usize,
+}
 
-    /// Identity of the focused conversation (whose live state is the fields
-    /// above). Background conversations are parked in `background`.
-    pub focused_id: conversation::ConversationId,
-    /// Kind of the focused conversation (round-tripped through park/activate).
-    pub focused_kind: conversation::ConversationKind,
-    /// Non-focused conversations (sidechats / sub-agents / parallel sessions)
-    /// that keep streaming on their own tasks.
-    pub background: Vec<conversation::Conversation>,
+impl AppState {
+    /// The focused conversation (whose messages/generation/session are shown).
+    pub fn focused(&self) -> &conversation::Conversation {
+        self.conversations.focused()
+    }
+
+    pub fn focused_mut(&mut self) -> &mut conversation::Conversation {
+        self.conversations.focused_mut()
+    }
+
+    /// Append a message to the focused conversation. Convenience that avoids
+    /// borrow conflicts when the content is derived from `self`.
+    pub fn push_message(&mut self, message: ChatMessage) {
+        self.focused_mut().messages.push(message);
+    }
+
+    /// Append a system message to the focused conversation.
+    pub fn push_system(&mut self, content: &str) {
+        self.focused_mut().messages.push(ChatMessage::system(content));
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,14 +175,27 @@ impl App {
         }
         tools.update_skills(skills.clone());
 
-        let mut state = AppState {
+        let has_provider = provider.is_some();
+        let main_conversation = conversation::Conversation {
+            id: conversation::ConversationId::next(),
+            kind: conversation::ConversationKind::Main,
+            parent: None,
+            title: String::new(),
+            session_id: crate::session::create_session_id(),
+            session_started_at: chrono::Utc::now().to_rfc3339(),
             messages: Vec::new(),
+            provider,
+            generation: generation::GenerationState::default(),
+            agent_task: None,
+        };
+
+        let mut state = AppState {
+            conversations: conversation::Conversations::new(main_conversation),
             input: input::InputState {
                 history: crate::session::load_history(),
                 ..Default::default()
             },
-            generation: generation::GenerationState::default(),
-            status_message: if provider.is_some() { "Ready" } else { "No token configured" }.to_string(),
+            status_message: if has_provider { "Ready" } else { "No token configured" }.to_string(),
             scroll_offset: 0,
             error: None,
             modal: None,
@@ -179,14 +203,12 @@ impl App {
             pending_tool_approval: None,
             pending_question: None,
             autocomplete: AutocompleteState::default(),
-            current_session_id: crate::session::create_session_id(),
             view: View::Chat,
             mcp_status: mcp_status::McpStatus::default(),
             show_stats_panel: true,
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
-            session_started_at: chrono::Utc::now().to_rfc3339(),
             attached_files: Vec::new(),
 
             goal: goal::GoalState::default(),
@@ -194,10 +216,6 @@ impl App {
             running_background_count: 0,
             running_interactive_count: 0,
             running_persistent_count: 0,
-
-            focused_id: conversation::ConversationId::next(),
-            focused_kind: conversation::ConversationKind::Main,
-            background: Vec::new(),
         };
 
         if mcp_init_ok {
@@ -217,13 +235,11 @@ impl App {
             state,
             event_tx,
             event_rx,
-            provider,
             commands: CommandRegistry::new(),
             mcp,
             tools,
             prompts,
             skills,
-            agent_task: None,
         })
     }
 
@@ -233,12 +249,8 @@ impl App {
         // Kill any running foreground child before restoring terminal.
         kill_foreground_child();
         crate::tui::restore(&mut terminal)?;
-        // Kill any lingering agent task so it can't keep the runtime alive.
-        if let Some(handle) = self.agent_task.take() {
-            handle.abort();
-        }
-        // Abort background conversations (sidechats / sub-agents) too.
-        for conv in &mut self.state.background {
+        // Abort every conversation's agent task so none keeps the runtime alive.
+        for conv in self.state.conversations.iter_mut() {
             if let Some(handle) = conv.agent_task.take() {
                 handle.abort();
             }
@@ -404,7 +416,7 @@ impl App {
         // Agent events for a background conversation are applied to its parked
         // record, not the focused chat.
         if let Some(target) = agent_event_target(&event) {
-            if target != self.state.focused_id {
+            if target != self.state.conversations.focused_id() {
                 self.handle_background_event(target, event);
                 return Ok(false);
             }
@@ -412,49 +424,43 @@ impl App {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::AgentStarted(_) => {
-                self.state.generation.begin(std::time::Instant::now());
+                self.state.focused_mut().generation.begin(std::time::Instant::now());
                 self.state.status_message = "Thinking...".to_string();
             }
             AppEvent::BeginAssistantMessage(_) => {
-                let should_push = self
-                    .state
-                    .messages
+                let should_push = self.state.focused_mut().messages
                     .last()
                     .is_none_or(|message| message.role != Role::Assistant || !message.content.is_empty());
                 if should_push {
-                    self.state.messages.push(ChatMessage::assistant(""));
+                    self.state.focused_mut().messages.push(ChatMessage::assistant(""));
                 }
             }
             AppEvent::DiscardEmptyAssistantMessage(_) => {
-                if self
-                    .state
-                    .messages
+                if self.state.focused_mut().messages
                     .last()
                     .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
                 {
-                    self.state.messages.pop();
+                    self.state.focused_mut().messages.pop();
                 }
             }
             AppEvent::AgentChunk(_, chunk) => {
-                if let Some(last) = self.state.messages.last_mut() {
+                if let Some(last) = self.state.focused_mut().messages.last_mut() {
                     if last.role == Role::Assistant {
                         last.content.push_str(&chunk);
                     }
                 }
             }
             AppEvent::AgentDone(_, _result) => {
-                self.state.generation.active = false;
+                self.state.focused_mut().generation.active = false;
                 self.state.status_message = "Ready".to_string();
-                self.state.generation.last_status = Some("FINISHED".to_string());
-                self.agent_task = None;
+                self.state.focused_mut().generation.last_status = Some("FINISHED".to_string());
+                self.state.focused_mut().agent_task = None;
                 self.record_gen_stats();
-                if self
-                    .state
-                    .messages
+                if self.state.focused_mut().messages
                     .last()
                     .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
                 {
-                    self.state.messages.pop();
+                    self.state.focused_mut().messages.pop();
                 }
                 self.auto_save_session();
 
@@ -463,7 +469,7 @@ impl App {
                     match self.state.goal.stage.clone() {
                         GoalStage::RunAgent1 => {
                             // Agent 1 finished — get last assistant content for evaluation
-                            let agent_result = self.state.messages
+                            let agent_result = self.state.focused_mut().messages
                                 .iter()
                                 .rev()
                                 .find(|m| m.role == Role::Assistant)
@@ -473,12 +479,12 @@ impl App {
                             if !agent_result.is_empty() {
                                 self.state.status_message = "Evaluating goal...".to_string();
                                 self.state.goal.stage = GoalStage::RunEvaluator;
-                                self.state.messages.push(ChatMessage::system(
+                                self.state.focused_mut().messages.push(ChatMessage::system(
                                     "🔍 Evaluating result against goal..."
                                 ));
                                 self.run_goal_evaluation(agent_result).await;
                             } else {
-                                self.state.messages.push(ChatMessage::system(
+                                self.state.focused_mut().messages.push(ChatMessage::system(
                                     "⚠ Agent produced no output. Retrying..."
                                 ));
                                 self.retry_agent1().await;
@@ -493,19 +499,17 @@ impl App {
                 }
             }
             AppEvent::AgentError(_, err) => {
-                self.state.generation.active = false;
+                self.state.focused_mut().generation.active = false;
                 self.state.error = Some(err.clone());
                 self.state.status_message = err.clone();
-                self.state.generation.last_status = Some("ABORTED".to_string());
-                self.agent_task = None;
+                self.state.focused_mut().generation.last_status = Some("ABORTED".to_string());
+                self.state.focused_mut().agent_task = None;
                 self.record_gen_stats();
-                if self
-                    .state
-                    .messages
+                if self.state.focused_mut().messages
                     .last()
                     .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
                 {
-                    self.state.messages.pop();
+                    self.state.focused_mut().messages.pop();
                 }
                 self.auto_save_session();
 
@@ -518,7 +522,7 @@ impl App {
                 }
             }
             AppEvent::AddMessage(_, message) => {
-                self.state.messages.push(message);
+                self.state.focused_mut().messages.push(message);
             }
             AppEvent::ToolStarted { name, .. } => {
                 self.state.status_message = format!("Running {name}...");
@@ -532,10 +536,10 @@ impl App {
             AppEvent::RequestToolApproval(request) => {
                 if self.state.approved_tools.contains(&request.tool_name) {
                     request.resolve(true).await;
-                    self.state.generation.active = true;
+                    self.state.focused_mut().generation.active = true;
                     self.state.status_message = format!("Running {} (auto-approved)", request.tool_name);
                 } else {
-                    self.state.generation.active = false;
+                    self.state.focused_mut().generation.active = false;
                     self.state.status_message = format!("Approve tool {}?", request.tool_name);
                     self.state.modal = Some(Modal::ToolApproval {
                         tool_name: request.tool_name.clone(),
@@ -549,12 +553,12 @@ impl App {
             AppEvent::RequestQuestion(request, state) => {
                 self.state.pending_question = Some(request);
                 self.state.modal = Some(Modal::Question(state));
-                self.state.generation.active = false;
+                self.state.focused_mut().generation.active = false;
                 self.state.status_message = "Question pending...".to_string();
             }
             AppEvent::Tick => {
-                if self.state.generation.active || (self.state.messages.is_empty() && self.state.modal.is_none()) {
-                    self.state.generation.animation_tick = self.state.generation.animation_tick.wrapping_add(1);
+                if self.state.focused_mut().generation.active || (self.state.focused_mut().messages.is_empty() && self.state.modal.is_none()) {
+                    self.state.focused_mut().generation.animation_tick = self.state.focused_mut().generation.animation_tick.wrapping_add(1);
                 }
             }
             AppEvent::GoalEvaluationDone(verdict) => {
@@ -646,10 +650,10 @@ impl App {
     }
 
     async fn send_to_agent(&mut self, _input: String) -> AppResult<()> {
-        let provider = match &self.provider {
+        let provider = match &self.state.focused().provider {
             Some(p) => Arc::clone(p),
             None => {
-                self.state.messages.push(ChatMessage::assistant(
+                self.state.focused_mut().messages.push(ChatMessage::assistant(
                     "No provider configured. Set your DeepSeek token in config.",
                 ));
                 return Ok(());
@@ -657,7 +661,7 @@ impl App {
         };
 
         let event_tx = self.event_tx.clone();
-        let messages: Vec<ChatMessage> = self.state.messages.clone();
+        let messages: Vec<ChatMessage> = self.state.focused_mut().messages.clone();
         let system_prompt = self.build_system_prompt().await;
 
         let model = self.config.provider.model.clone();
@@ -667,7 +671,7 @@ impl App {
         let max_tools_per_step = self.config.agent.max_tools_per_step.max(1);
         let tools = Arc::clone(&self.tools);
         let mcp = Arc::clone(&self.mcp);
-        let conversation = self.state.focused_id;
+        let conversation = self.state.conversations.focused_id();
 
         let _ = event_tx.send(AppEvent::AgentStarted(conversation));
 
@@ -687,7 +691,7 @@ impl App {
             event_tx,
         ));
 
-        self.agent_task = Some(handle);
+        self.state.focused_mut().agent_task = Some(handle);
 
         Ok(())
     }
@@ -699,56 +703,57 @@ impl App {
 
         match session::load_local(session_id, &self.config) {
             Ok(s) => {
-                self.state.messages = s.messages;
+                self.state.focused_mut().messages = s.messages;
                 self.state.attached_files.clear();
-                self.state.current_session_id = s.id;
+                self.state.focused_mut().session_id = s.id;
                 self.state.scroll_offset = 0;
                 self.state.input.buffer.clear();
                 self.state.input.cursor = 0;
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = Default::default();
-                self.state.generation.active = false;
+                self.state.focused_mut().generation.active = false;
                 self.state.error = None;
-                if let Some(handle) = self.agent_task.take() {
+                if let Some(handle) = self.state.focused_mut().agent_task.take() {
                     handle.abort();
                 }
 
-                if let Some(provider) = &self.provider {
+                if let Some(provider) = &self.state.focused().provider {
                     let _ = provider.reset().await;
                 }
 
-                let count = self.state.messages.len();
+                let count = self.state.focused_mut().messages.len();
                 self.state.status_message = format!(
                     "Loaded local session {session_id} ({count} messages)"
                 );
             }
             Err(_) => {
-                if let Some(provider) = &self.provider {
+                let remote_provider = self.state.focused().provider.clone();
+                if let Some(provider) = remote_provider {
                     match provider.fetch_remote_session_messages(session_id).await {
                         Ok(messages) => {
                             if messages.is_empty() {
-                                self.state.messages.push(ChatMessage::system(
+                                self.state.focused_mut().messages.push(ChatMessage::system(
                                     &format!("Remote session {session_id} has no messages"),
                                 ));
                                 return Ok(());
                             }
-                            self.state.messages = messages;
-                            self.state.current_session_id = session_id.to_string();
+                            self.state.focused_mut().messages = messages;
+                            self.state.focused_mut().session_id = session_id.to_string();
                             self.state.scroll_offset = 0;
                             self.state.input.buffer.clear();
                             self.state.input.cursor = 0;
                             self.state.input.selection_anchor = None;
                             self.state.autocomplete = Default::default();
-                            self.state.generation.active = false;
+                            self.state.focused_mut().generation.active = false;
                             self.state.error = None;
-                            if let Some(handle) = self.agent_task.take() {
+                            if let Some(handle) = self.state.focused_mut().agent_task.take() {
                                 handle.abort();
                             }
 
                             let _ = provider.reset().await;
 
-                            let count = self.state.messages.len();
-                            let title = session::derive_title(&self.state.messages);
+                            let count = self.state.focused_mut().messages.len();
+                            let title = session::derive_title(&self.state.focused_mut().messages);
                             let now = session::timestamp_now();
                             if let Err(e) = session::save_local(
                                 &session::Session {
@@ -761,7 +766,7 @@ impl App {
                                         .to_string_lossy()
                                         .to_string(),
                                     model_type: self.config.provider.model.clone(),
-                                    messages: self.state.messages.clone(),
+                                    messages: self.state.focused_mut().messages.clone(),
                                     tag: None,
                                 },
                                 &self.config,
@@ -773,13 +778,13 @@ impl App {
                             );
                         }
                         Err(e) => {
-                            self.state.messages.push(ChatMessage::system(
+                            self.state.focused_mut().messages.push(ChatMessage::system(
                                 &format!("Session {session_id} not found locally and remote fetch failed: {e}"),
                             ));
                         }
                     }
                 } else {
-                    self.state.messages.push(ChatMessage::system(
+                    self.state.focused_mut().messages.push(ChatMessage::system(
                         &format!("Session {session_id} not found locally"),
                     ));
                 }
@@ -789,26 +794,30 @@ impl App {
     }
 
     fn record_gen_stats(&mut self) {
-        if let Some(elapsed) = self.state.generation.take_elapsed() {
-            if let Some(last) = self.state.messages.iter_mut().last() {
-                if last.role == Role::Assistant && !last.content.is_empty() {
-                    let tokens = estimate_tokens(&last.content);
-                    last.total_tokens = Some(tokens);
-                    last.model.clone_from(&self.state.generation.last_model);
-                    last.status = self.state.generation.last_status.clone();
-                    last.think_elapsed_secs = 0.0;
-                    last.references_count = 0;
-                    self.state.generation.last_tokens = tokens;
-                    self.state.generation.last_duration_secs = elapsed;
-                }
+        let conv = self.state.focused_mut();
+        let Some(elapsed) = conv.generation.take_elapsed() else {
+            return;
+        };
+        let last_model = conv.generation.last_model.clone();
+        let last_status = conv.generation.last_status.clone();
+        if let Some(last) = conv.messages.iter_mut().last() {
+            if last.role == Role::Assistant && !last.content.is_empty() {
+                let tokens = estimate_tokens(&last.content);
+                last.total_tokens = Some(tokens);
+                last.model = last_model;
+                last.status = last_status;
+                last.think_elapsed_secs = 0.0;
+                last.references_count = 0;
+                conv.generation.last_tokens = tokens;
+                conv.generation.last_duration_secs = elapsed;
             }
         }
     }
 
     fn auto_save_session(&self) {
         use crate::session;
-        let id = &self.state.current_session_id;
-        let messages = &self.state.messages;
+        let id = &self.state.focused().session_id;
+        let messages = &self.state.focused().messages;
         if messages.is_empty() {
             return;
         }
@@ -856,7 +865,7 @@ impl App {
         drop(mcp);
 
         if items.is_empty() {
-            self.state.messages.push(crate::provider::ChatMessage::system(
+            self.state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                 "No tools available to whitelist.",
             ));
             return;
@@ -895,7 +904,7 @@ impl App {
         }
 
         if items.is_empty() {
-            self.state.messages.push(crate::provider::ChatMessage::system(
+            self.state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                 "No skills found. Install skills with `npx skills add <owner/repo>` or create SKILL.md files in `.skills/` directory.",
             ));
             return;
@@ -946,9 +955,9 @@ impl App {
             } else {
                 format!("Skill '{name}' disabled.")
             };
-            self.state.messages.push(crate::provider::ChatMessage::system(&msg));
+            self.state.focused_mut().messages.push(crate::provider::ChatMessage::system(&msg));
         } else if enable {
-            self.state.messages.push(crate::provider::ChatMessage::system(
+            self.state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                 &format!("Skill '{name}' not found. Use /skills list to see available skills."),
             ));
         }

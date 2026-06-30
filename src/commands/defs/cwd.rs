@@ -62,7 +62,7 @@ impl Command for CwdCommand {
                 let cwd = std::env::current_dir()
                     .map(|p| strip_verbatim(&p.to_string_lossy()))
                     .unwrap_or_else(|_| absolute.to_string_lossy().to_string());
-                state.messages.push(crate::provider::ChatMessage::system(
+                state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                     &format!("Changed directory to {cwd}"),
                 ));
                 state.workspace_path = cwd.clone();

@@ -41,7 +41,7 @@ Keyboard shortcuts:
   Shift+Left/Right — Select by char
   Ctrl+A         — Select all";
 
-        state.messages.push(crate::provider::ChatMessage::system(help_text));
+        state.focused_mut().messages.push(crate::provider::ChatMessage::system(help_text));
         CommandResult::Handled
     }
 }

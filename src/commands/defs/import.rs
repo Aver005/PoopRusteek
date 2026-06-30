@@ -60,19 +60,19 @@ impl Command for ImportCommand {
             return CommandResult::Error(format!("Failed to save imported session: {e}"));
         }
 
-        state.messages = messages;
-        state.current_session_id = session_id.clone();
+        state.focused_mut().messages = messages;
+        state.focused_mut().session_id = session_id.clone();
         state.scroll_offset = 0;
         state.input.buffer.clear();
         state.input.cursor = 0;
         state.input.selection_anchor = None;
-        state.generation.active = false;
+        state.focused_mut().generation.active = false;
         state.error = None;
 
         state.status_message = format!(
             "Imported session {} ({} messages, tagged Imported)",
             &session_id[..session_id.len().min(17)],
-            state.messages.len(),
+            state.focused_mut().messages.len(),
         );
 
         CommandResult::Handled

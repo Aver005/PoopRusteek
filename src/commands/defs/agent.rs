@@ -23,7 +23,7 @@ impl Command for AgentCommand {
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         let prompt = args.trim();
         if prompt.is_empty() {
-            state.messages.push(crate::provider::ChatMessage::system(
+            state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                 "Usage: /agent <task>",
             ));
             return CommandResult::Handled;

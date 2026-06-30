@@ -37,13 +37,13 @@ impl Command for AttachCommand {
             };
 
             if !resolved.exists() {
-                let _ = state.messages.push(crate::provider::ChatMessage::system(
+                let _ = state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                     &format!("File not found: {raw_path}"),
                 ));
                 continue;
             }
             if !resolved.is_file() {
-                let _ = state.messages.push(crate::provider::ChatMessage::system(
+                let _ = state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                     &format!("Not a file: {raw_path}"),
                 ));
                 continue;
@@ -52,7 +52,7 @@ impl Command for AttachCommand {
             let metadata = match resolved.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = state.messages.push(crate::provider::ChatMessage::system(
+                    let _ = state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                         &format!("Cannot read {raw_path}: {e}"),
                     ));
                     continue;

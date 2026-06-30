@@ -46,7 +46,7 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
     // ── Model ──
     section_header(&mut lines, "Model", panel_w, theme);
     data_row(&mut lines, "Model", &config.provider.model, theme);
-    let sid = &state.current_session_id;
+    let sid = &state.focused().session_id;
     let short_sid = if sid.len() > 17 {
         format!("{}..", &sid[..17])
     } else {
@@ -57,16 +57,16 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 
     // ── Session ──
     section_header(&mut lines, "Session", panel_w, theme);
-    if let Ok(s) = session::load_local(&state.current_session_id, config) {
+    if let Ok(s) = session::load_local(&state.focused().session_id, config) {
         if let Some(ref tag) = s.tag {
             data_row(&mut lines, "Tag", tag, theme);
         }
     }
-    let started = format_time_short(&state.session_started_at);
+    let started = format_time_short(&state.focused().session_started_at);
     data_row(&mut lines, "Started", &started, theme);
-    let latest = state.messages.last().map(|m| format_time_short(&m.created_at)).unwrap_or_default();
+    let latest = state.focused().messages.last().map(|m| format_time_short(&m.created_at)).unwrap_or_default();
     data_row(&mut lines, "Latest", &latest, theme);
-    data_row(&mut lines, "Messages", &state.messages.len().to_string(), theme);
+    data_row(&mut lines, "Messages", &state.focused().messages.len().to_string(), theme);
     blank(&mut lines);
 
     // ── Tokens ──
@@ -75,13 +75,13 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
     data_row(&mut lines, "Input", &format_num(input_tok), theme);
     data_row(&mut lines, "Output", &format_num(output_tok), theme);
     let tps = crate::tui::view_model::tokens_per_sec(
-        state.generation.last_tokens,
-        state.generation.last_duration_secs,
+        state.focused().generation.last_tokens,
+        state.focused().generation.last_duration_secs,
     );
     let speed = if tps > 0.0 {
         format!("{:.1} t/s", tps)
-    } else if state.generation.active {
-        spinner(state.generation.animation_tick)
+    } else if state.focused().generation.active {
+        spinner(state.focused().generation.animation_tick)
     } else {
         "\u{2014}".to_string()
     };
@@ -90,21 +90,21 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 
     // ── Activity ──
     section_header(&mut lines, "Activity", panel_w, theme);
-    let tool_calls = state.messages.iter().filter(|m| m.role == Role::Tool).count();
+    let tool_calls = state.focused().messages.iter().filter(|m| m.role == Role::Tool).count();
     data_row(&mut lines, "Tools", &tool_calls.to_string(), theme);
-    let file_ops = state.messages.iter()
+    let file_ops = state.focused().messages.iter()
         .filter(|m| m.role == Role::Tool)
         .filter(|m| m.name.as_deref().is_some_and(|n| matches!(n, "Bash" | "PowerShell" | "ShellInput")))
         .count();
     data_row(&mut lines, "Files", &file_ops.to_string(), theme);
-    let think_total: f64 = state.messages.iter()
+    let think_total: f64 = state.focused().messages.iter()
         .filter(|m| m.role == Role::Assistant)
         .map(|m| m.think_elapsed_secs)
         .sum();
     if think_total > 0.0 {
         data_row(&mut lines, "Think", &format!("{:.1}s", think_total), theme);
     }
-    let search_count = state.messages.iter().filter(|m| m.search_triggered).count();
+    let search_count = state.focused().messages.iter().filter(|m| m.search_triggered).count();
     if search_count > 0 {
         data_row(&mut lines, "Search", &search_count.to_string(), theme);
     }
@@ -173,7 +173,7 @@ fn format_time_short(rfc3339: &str) -> String {
 fn compute_totals(state: &AppState) -> (u64, u64) {
     let mut input = 0u64;
     let mut output = 0u64;
-    for msg in &state.messages {
+    for msg in &state.focused().messages {
         match msg.role {
             Role::User => {
                 input += crate::provider::estimate_tokens(&msg.content) as u64;

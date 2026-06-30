@@ -1,6 +1,7 @@
 //! Multi-conversation management: `/btw` sidechats, sub-agents, and parallel
-//! session switching. These are `App` methods, split out of the large
-//! `app/mod.rs`. Pure relocation — behavior is unchanged.
+//! session switching. With the unified [`Conversations`](conversation::Conversations)
+//! store there is no live/parked split — switching focus is just a focus change,
+//! and every conversation (focused or not) is a full record.
 
 use super::{conversation, generation, App};
 use crate::app::events::AppEvent;
@@ -29,10 +30,10 @@ impl App {
         title: String,
         prompt: String,
     ) -> AppResult<()> {
-        let provider = match &self.provider {
+        let provider = match self.state.focused().provider.as_ref() {
             Some(p) => p.fork(),
             None => {
-                self.state.messages.push(ChatMessage::system(
+                self.state.focused_mut().messages.push(ChatMessage::system(
                     "No provider configured. Set your DeepSeek token in config.",
                 ));
                 return Ok(());
@@ -70,7 +71,7 @@ impl App {
             event_tx,
         ));
 
-        self.state.background.push(conversation::Conversation {
+        self.state.conversations.add_background(conversation::Conversation {
             id,
             kind,
             parent: Some(parent),
@@ -87,7 +88,7 @@ impl App {
 
     /// `/btw` — one-shot side-question whose answer flushes into the chat.
     pub(crate) async fn spawn_sidechat(&mut self, question: String) -> AppResult<()> {
-        let parent = self.state.focused_id;
+        let parent = self.state.conversations.focused_id();
         self.spawn_background_agent(
             conversation::ConversationKind::Sidechat,
             parent,
@@ -95,7 +96,10 @@ impl App {
             question.clone(),
         )
         .await?;
-        self.state.messages.push(ChatMessage::system(&format!("◈ btw started — {question}")));
+        self.state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::system(&format!("◈ btw started — {question}")));
         Ok(())
     }
 
@@ -114,28 +118,35 @@ impl App {
             prompt,
         )
         .await?;
-        self.state.messages.push(ChatMessage::system(&format!("🤖 sub-agent started — {label}")));
+        self.state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::system(&format!("🤖 sub-agent started — {label}")));
         Ok(())
     }
 
     /// Stop a running background conversation (sidechat / sub-agent) by id.
     pub(crate) fn stop_background(&mut self, target: conversation::ConversationId) {
-        if let Some(pos) = self.state.background.iter().position(|c| c.id == target) {
-            let mut conv = self.state.background.remove(pos);
+        if let Some(mut conv) = self.state.conversations.remove(target) {
             if let Some(handle) = conv.agent_task.take() {
                 handle.abort();
             }
-            self.state.messages.push(ChatMessage::system(&format!(
-                "⏹ Stopped: {}",
-                if conv.title.is_empty() { "(background agent)" } else { &conv.title }
-            )));
+            let title = if conv.title.is_empty() { "(background agent)".to_string() } else { conv.title };
+            self.state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::system(&format!("⏹ Stopped: {title}")));
         }
     }
 
-    /// Apply an agent event that targets a background conversation (not the
-    /// focused one). Streaming events mutate the parked conversation; terminal
-    /// events finalize it (sidechats flush their answer into the chat).
-    pub(crate) fn handle_background_event(&mut self, target: conversation::ConversationId, event: AppEvent) {
+    /// Apply an agent event that targets a non-focused conversation. Streaming
+    /// events mutate that conversation; terminal events finalize sidechats /
+    /// sub-agents (which flush their result) while parked sessions just stop.
+    pub(crate) fn handle_background_event(
+        &mut self,
+        target: conversation::ConversationId,
+        event: AppEvent,
+    ) {
         enum Finish {
             None,
             Done,
@@ -143,7 +154,7 @@ impl App {
         }
         let mut finish = Finish::None;
 
-        if let Some(conv) = self.state.background.iter_mut().find(|c| c.id == target) {
+        if let Some(conv) = self.state.conversations.get_mut(target) {
             match event {
                 AppEvent::AgentStarted(_) => {
                     conv.generation.begin(std::time::Instant::now());
@@ -177,8 +188,6 @@ impl App {
                 AppEvent::AgentDone(_, _) => {
                     conv.generation.active = false;
                     conv.agent_task = None;
-                    // Sidechats and sub-agents flush their result and disappear;
-                    // a parked session just stops and waits to be switched to.
                     if conv.kind != conversation::ConversationKind::Session {
                         finish = Finish::Done;
                     }
@@ -190,7 +199,6 @@ impl App {
                         finish = Finish::Error(err);
                     }
                 }
-                // Tool status from background turns is not surfaced live.
                 _ => {}
             }
         }
@@ -202,13 +210,16 @@ impl App {
         }
     }
 
-    /// Remove a finished background conversation (sidechat or sub-agent) and
-    /// flush its result (answer or error) into the focused chat.
-    pub(crate) fn finish_background(&mut self, target: conversation::ConversationId, error: Option<String>) {
-        let Some(pos) = self.state.background.iter().position(|c| c.id == target) else {
+    /// Remove a finished sidechat / sub-agent and flush its result (answer or
+    /// error) into the chat that spawned it (or the focused chat).
+    pub(crate) fn finish_background(
+        &mut self,
+        target: conversation::ConversationId,
+        error: Option<String>,
+    ) {
+        let Some(conv) = self.state.conversations.remove(target) else {
             return;
         };
-        let conv = self.state.background.remove(pos);
         let label = match conv.kind {
             conversation::ConversationKind::SubAgent => "🤖 sub-agent",
             _ => "◈ btw",
@@ -229,17 +240,12 @@ impl App {
 
         // Deliver into the chat that spawned it; if the user has switched away,
         // drop the result there and just notify the focused chat.
+        let focused_id = self.state.conversations.focused_id();
         if let Some(pid) = conv.parent {
-            if pid != self.state.focused_id {
-                let delivered = match self.state.background.iter_mut().find(|c| c.id == pid) {
-                    Some(pconv) => {
-                        pconv.messages.push(ChatMessage::system(&block));
-                        true
-                    }
-                    None => false,
-                };
-                if delivered {
-                    self.state.messages.push(ChatMessage::system(&format!(
+            if pid != focused_id {
+                if let Some(pconv) = self.state.conversations.get_mut(pid) {
+                    pconv.messages.push(ChatMessage::system(&block));
+                    self.state.focused_mut().messages.push(ChatMessage::system(&format!(
                         "{label} finished in another chat — {}",
                         conv.title
                     )));
@@ -248,43 +254,8 @@ impl App {
             }
         }
 
-        self.state.messages.push(ChatMessage::system(&block));
+        self.state.focused_mut().messages.push(ChatMessage::system(&block));
         self.auto_save_session();
-    }
-
-    /// Pack the focused conversation's live state into a parked record.
-    pub(crate) fn park_focused(&mut self) -> conversation::Conversation {
-        conversation::Conversation {
-            id: self.state.focused_id,
-            kind: self.state.focused_kind,
-            parent: None,
-            title: conversation_title(&self.state.messages),
-            session_id: std::mem::take(&mut self.state.current_session_id),
-            session_started_at: std::mem::take(&mut self.state.session_started_at),
-            messages: std::mem::take(&mut self.state.messages),
-            provider: self.provider.take(),
-            generation: std::mem::take(&mut self.state.generation),
-            agent_task: self.agent_task.take(),
-        }
-    }
-
-    /// Make a parked conversation the focused/live one (it keeps its running
-    /// task — switching never drops a stream).
-    pub(crate) fn activate(&mut self, conv: conversation::Conversation) {
-        self.state.focused_id = conv.id;
-        self.state.focused_kind = conv.kind;
-        self.state.current_session_id = conv.session_id;
-        self.state.session_started_at = conv.session_started_at;
-        self.state.messages = conv.messages;
-        self.provider = conv.provider;
-        self.state.generation = conv.generation;
-        self.agent_task = conv.agent_task;
-        self.state.scroll_offset = 0;
-        self.state.status_message = if self.state.generation.active {
-            "Thinking...".to_string()
-        } else {
-            "Ready".to_string()
-        };
     }
 
     /// Open a fresh parallel session and focus it; the current one keeps
@@ -293,84 +264,75 @@ impl App {
         if self.state.modal.is_some() {
             return;
         }
-        let new_provider = self.provider.as_ref().map(|p| p.fork());
-        let parked = self.park_focused();
-        self.state.background.push(parked);
-
-        self.state.focused_id = conversation::ConversationId::next();
-        self.state.focused_kind = conversation::ConversationKind::Session;
-        self.state.current_session_id = crate::session::create_session_id();
-        self.state.session_started_at = chrono::Utc::now().to_rfc3339();
-        self.state.messages = Vec::new();
-        self.provider = new_provider;
-        self.state.generation = generation::GenerationState::default();
-        self.agent_task = None;
+        let provider = self.state.focused().provider.as_ref().map(|p| p.fork());
+        let has_provider = provider.is_some();
+        self.state.conversations.open(conversation::Conversation {
+            id: conversation::ConversationId::next(),
+            kind: conversation::ConversationKind::Session,
+            parent: None,
+            title: String::new(),
+            session_id: crate::session::create_session_id(),
+            session_started_at: chrono::Utc::now().to_rfc3339(),
+            messages: Vec::new(),
+            provider,
+            generation: generation::GenerationState::default(),
+            agent_task: None,
+        });
         self.state.scroll_offset = 0;
-        self.state.status_message = if self.provider.is_some() {
-            "Ready".to_string()
-        } else {
-            "No provider".to_string()
-        };
-        self.state.messages.push(ChatMessage::system(
+        self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();
+        self.state.focused_mut().messages.push(ChatMessage::system(
             "New chat opened. /chats or Tab to switch between chats.",
         ));
     }
 
-    /// Switch focus to a background conversation by id, parking the current one.
+    /// Switch focus to another conversation (its stream keeps running).
     pub(crate) fn switch_to(&mut self, target: conversation::ConversationId) {
-        if target == self.state.focused_id || self.state.modal.is_some() {
+        if target == self.state.conversations.focused_id()
+            || self.state.modal.is_some()
+            || !self.state.conversations.contains(target)
+        {
             return;
         }
-        let Some(pos) = self.state.background.iter().position(|c| c.id == target) else {
-            return;
+        self.state.conversations.set_focus(target);
+        self.state.scroll_offset = 0;
+        self.state.status_message = if self.state.focused().generation.active {
+            "Thinking...".to_string()
+        } else {
+            "Ready".to_string()
         };
-        let parked = self.park_focused();
-        let incoming = self.state.background.remove(pos);
-        self.state.background.push(parked);
-        self.activate(incoming);
     }
 
     /// Cycle focus to the next (`+1`) / previous (`-1`) conversation by id order.
     pub(crate) fn cycle_focus(&mut self, dir: i64) {
-        if self.state.modal.is_some() || self.state.background.is_empty() {
+        if self.state.modal.is_some() || self.state.conversations.len() <= 1 {
             return;
         }
-        let mut ids: Vec<conversation::ConversationId> =
-            self.state.background.iter().map(|c| c.id).collect();
-        ids.push(self.state.focused_id);
-        ids.sort_by_key(|c| c.0);
-        let cur = ids
-            .iter()
-            .position(|&i| i == self.state.focused_id)
-            .unwrap_or(0);
+        let ids = self.state.conversations.ordered_ids();
+        let focused = self.state.conversations.focused_id();
+        let cur = ids.iter().position(|&i| i == focused).unwrap_or(0);
         let len = ids.len() as i64;
         let next = ids[(((cur as i64 + dir) % len + len) % len) as usize];
         self.switch_to(next);
     }
 
-    /// Open the `/chats` picker listing the focused conversation + background
-    /// ones, with a streaming marker; selecting one switches focus.
+    /// Open the `/chats` picker listing parallel sessions (not sidechats /
+    /// sub-agents); selecting one switches focus.
     pub(crate) async fn open_chats_picker(&mut self) {
         use crate::app::events::{Modal, PickerItem, PickerKind, PickerMode, PickerState};
 
+        let focused = self.state.conversations.focused_id();
         let mut items: Vec<(conversation::ConversationId, PickerItem)> = Vec::new();
-        let focused_label = format!(
-            "● {}{}",
-            conversation_title(&self.state.messages),
-            if self.state.generation.active { "  [streaming]" } else { "" }
-        );
-        items.push((
-            self.state.focused_id,
-            PickerItem::new(focused_label, self.state.focused_id.0.to_string()),
-        ));
-        for conv in &self.state.background {
+        for conv in self.state.conversations.iter() {
             // Sidechats / sub-agents live in `/agents`, not the chat switcher.
-            if conv.kind != conversation::ConversationKind::Session {
+            if conv.kind == conversation::ConversationKind::Sidechat
+                || conv.kind == conversation::ConversationKind::SubAgent
+            {
                 continue;
             }
+            let marker = if conv.id == focused { "● " } else { "  " };
             let label = format!(
-                "  {}{}",
-                if conv.title.is_empty() { "(chat)".to_string() } else { conv.title.clone() },
+                "{marker}{}{}",
+                conversation_title(&conv.messages),
                 if conv.is_streaming() { "  [streaming]" } else { "" }
             );
             items.push((conv.id, PickerItem::new(label, conv.id.0.to_string())));
@@ -393,9 +355,12 @@ impl App {
 
         let items: Vec<PickerItem> = self
             .state
-            .background
+            .conversations
             .iter()
-            .filter(|c| c.kind != conversation::ConversationKind::Session)
+            .filter(|c| {
+                c.kind == conversation::ConversationKind::SubAgent
+                    || c.kind == conversation::ConversationKind::Sidechat
+            })
             .map(|c| {
                 let tag = match c.kind {
                     conversation::ConversationKind::SubAgent => "🤖",
@@ -411,7 +376,10 @@ impl App {
             .collect();
 
         if items.is_empty() {
-            self.state.messages.push(ChatMessage::system("No background agents running."));
+            self.state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::system("No background agents running."));
             return;
         }
 

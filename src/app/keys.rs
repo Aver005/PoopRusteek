@@ -49,7 +49,7 @@ impl App {
                     self.clamp_autocomplete_scroll();
                     return Ok(false);
                 }
-                KeyCode::Enter if !self.state.generation.active => {
+                KeyCode::Enter if !self.state.focused_mut().generation.active => {
                     self.accept_autocomplete();
                     return Ok(false);
                 }
@@ -69,7 +69,7 @@ impl App {
                                 request.resolve(true).await;
                             }
                             self.state.modal = None;
-                            self.state.generation.active = true;
+                            self.state.focused_mut().generation.active = true;
                             self.state.status_message = format!("Running {}", tool_name);
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -77,7 +77,7 @@ impl App {
                                 request.resolve(false).await;
                             }
                             self.state.modal = None;
-                            self.state.generation.active = true;
+                            self.state.focused_mut().generation.active = true;
                             self.state.status_message = format!("Denied {}", tool_name);
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -233,7 +233,7 @@ impl App {
                             request.resolve(answer).await;
                         }
                         self.state.modal = None;
-                        self.state.generation.active = true;
+                        self.state.focused_mut().generation.active = true;
                         self.state.status_message = "Answer received".to_string();
                     } else {
                         self.state.modal = Some(Modal::Question(qs));
@@ -252,27 +252,25 @@ impl App {
             KeyCode::Char(c)
                 if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
             {
-                if self.state.generation.active {
+                if self.state.focused_mut().generation.active {
                     // Kill the running foreground child process first.
                     kill_foreground_child();
-                    if let Some(handle) = self.agent_task.take() {
+                    if let Some(handle) = self.state.focused_mut().agent_task.take() {
                         handle.abort();
                     }
                     let killed = self.shutdown_background_processes().await;
-                    self.state.generation.active = false;
+                    self.state.focused_mut().generation.active = false;
                     self.state.status_message = if killed > 0 {
                         format!("Cancelled; killed {killed} background process(es)")
                     } else {
                         "Cancelled".to_string()
                     };
                     self.state.needs_terminal_restore = true;
-                    if self
-                        .state
-                        .messages
+                    if self.state.focused_mut().messages
                         .last()
                         .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
                     {
-                        self.state.messages.pop();
+                        self.state.focused_mut().messages.pop();
                     }
                     if self.state.goal.is_running() {
                         self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
@@ -283,34 +281,32 @@ impl App {
                 return Ok(true);
             }
             KeyCode::Esc => {
-                if self.state.generation.active {
+                if self.state.focused_mut().generation.active {
                     // Kill the running foreground child process first.
                     kill_foreground_child();
                     // Cancel the current agent turn: abort the spawned task,
                     // reset is_generating so the user can type a new message.
-                    if let Some(handle) = self.agent_task.take() {
+                    if let Some(handle) = self.state.focused_mut().agent_task.take() {
                         handle.abort();
                     }
                     let killed = self.shutdown_background_processes().await;
-                    self.state.generation.active = false;
+                    self.state.focused_mut().generation.active = false;
                     self.state.status_message = if killed > 0 {
                         format!("Cancelled; killed {killed} background process(es)")
                     } else {
                         "Cancelled".to_string()
                     };
                     self.state.needs_terminal_restore = true;
-                    if self
-                        .state
-                        .messages
+                    if self.state.focused_mut().messages
                         .last()
                         .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
                     {
-                        self.state.messages.pop();
+                        self.state.focused_mut().messages.pop();
                     }
                     if self.state.goal.is_running() {
                         self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
                     }
-                } else if self.state.messages.is_empty() {
+                } else if self.state.focused_mut().messages.is_empty() {
                     let _ = self.shutdown_background_processes().await;
                     return Ok(true);
                 } else {
@@ -319,7 +315,7 @@ impl App {
                     if self.state.goal.mode {
                         self.state.goal.deactivate();
                     }
-                    self.state.messages.clear();
+                    self.state.focused_mut().messages.clear();
                     self.state.scroll_offset = 0;
                 }
             }
@@ -333,7 +329,7 @@ impl App {
                 self.state.show_stats_panel = !self.state.show_stats_panel;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.messages.clear();
+                self.state.focused_mut().messages.clear();
                 self.state.scroll_offset = 0;
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -342,7 +338,7 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.input.insert_newline();
             }
-            KeyCode::Enter if !self.state.generation.active => {
+            KeyCode::Enter if !self.state.focused_mut().generation.active => {
                 let buf = &self.state.input.buffer;
                 let ends_with_backslash = buf
                     .chars()
@@ -366,7 +362,7 @@ impl App {
                                 } else {
                                     "goal"
                                 };
-                                self.state.messages.push(ChatMessage::system(&format!(
+                                self.state.focused_mut().messages.push(ChatMessage::system(&format!(
                                     "Your {what} is empty — type something before pressing Enter."
                                 )));
                                 self.state.input.buffer.clear();
@@ -387,8 +383,8 @@ impl App {
                                             // First input in goal mode = the prompt
                                             self.state.goal.prompt = input.clone();
                                             self.state.goal.stage = GoalStage::WaitForGoal;
-                                            self.state.messages.push(ChatMessage::user(&input));
-                                            self.state.messages.push(ChatMessage::system(
+                                            self.state.focused_mut().messages.push(ChatMessage::user(&input));
+                                            self.state.focused_mut().messages.push(ChatMessage::system(
                                                 "🎯 Goal mode: now define your GOAL (what must be achieved)",
                                             ));
                                             return Ok(false);
@@ -396,13 +392,13 @@ impl App {
                                         GoalStage::WaitForGoal => {
                                             // Second input = the goal
                                             self.state.goal.text = input.clone();
-                                            self.state.messages.push(ChatMessage::user(&format!(
+                                            self.state.focused_mut().messages.push(ChatMessage::user(&format!(
                                                 "GOAL: {}", input
                                             )));
 
                                             // Without a provider the worker can't run; advancing
                                             // the stage would wedge the cycle, so bail cleanly.
-                                            if self.provider.is_none() {
+                                            if self.state.focused().provider.is_none() {
                                                 self.cancel_goal_cycle(
                                                     "No provider configured — cannot run the goal. Set your DeepSeek token, then /goal to retry.",
                                                 );
@@ -422,7 +418,7 @@ impl App {
                                         }
                                         GoalStage::RunAgent1 | GoalStage::RunEvaluator => {
                                             // Block input while goal cycle is active
-                                            self.state.messages.push(ChatMessage::system(
+                                            self.state.focused_mut().messages.push(ChatMessage::system(
                                                 "Goal cycle in progress. Wait for it to finish or type /goal to cancel.",
                                             ));
                                             return Ok(false);
@@ -443,11 +439,11 @@ impl App {
                                 CommandResult::NeedsAgent(msg) => {
                                     let killed = self.cleanup_background_before_user_turn().await;
                                     if killed > 0 {
-                                        self.state.messages.push(ChatMessage::system(&format!(
+                                        self.state.focused_mut().messages.push(ChatMessage::system(&format!(
                                             "Cleaned {killed} ephemeral job(s) before the new turn."
                                         )));
                                     }
-                                    self.state.messages.push(ChatMessage::user(&input));
+                                    self.state.focused_mut().messages.push(ChatMessage::user(&input));
                                     self.send_to_agent(msg).await?;
                                 }
                                 CommandResult::LoadSession(id) => {
@@ -461,7 +457,7 @@ impl App {
                                     if let Ok(config) = crate::config::load() {
                                         self.config = config;
                                     }
-                                    self.provider = if self.config.provider.token.is_empty() {
+                                    self.state.focused_mut().provider = if self.config.provider.token.is_empty() {
                                         None
                                     } else {
                                         crate::provider::deepseek::DeepseekProvider::new(
@@ -470,7 +466,7 @@ impl App {
                                             self.config.agent.max_retries,
                                         ).ok().map(|ds| Arc::new(ds) as Arc<dyn LLMProvider>)
                                     };
-                                    self.state.current_session_id =
+                                    self.state.focused_mut().session_id =
                                         crate::session::create_session_id();
                                 }
                                 CommandResult::TtlUpdate(ttl) => {
@@ -479,24 +475,24 @@ impl App {
                                         let mut mcp = self.mcp.lock().await;
                                         mcp.set_cache_ttl(ttl);
                                     }
-                                    self.state.messages.push(ChatMessage::system(
+                                    self.state.focused_mut().messages.push(ChatMessage::system(
                                         &format!("MCP cache TTL set to {ttl}s"),
                                     ));
                                 }
                                 CommandResult::ReloadMcp => {
-                                    self.state.messages.push(ChatMessage::system(
+                                    self.state.focused_mut().messages.push(ChatMessage::system(
                                         "Reloading all MCP servers...",
                                     ));
                                     let mut mcp = self.mcp.lock().await;
                                     mcp.reload_all().await;
                                     self.state.mcp_status.view.servers = mcp.get_servers_info();
-                                    self.state.messages.push(ChatMessage::system(
+                                    self.state.focused_mut().messages.push(ChatMessage::system(
                                         "MCP servers reloaded",
                                     ));
                                 }
                                 CommandResult::ShowTools => {
                                     let tools_text = self.build_tools_display().await;
-                                    self.state.messages.push(ChatMessage::system(&tools_text));
+                                    self.state.focused_mut().messages.push(ChatMessage::system(&tools_text));
                                 }
                                 CommandResult::Jobs(action) => {
                                     let jobs_text = match action {
@@ -510,7 +506,7 @@ impl App {
                                             self.prune_background_jobs().await
                                         }
                                     };
-                                    self.state.messages.push(ChatMessage::system(&jobs_text));
+                                    self.state.focused_mut().messages.push(ChatMessage::system(&jobs_text));
                                 }
                                 CommandResult::ShowSkills => {
                                     self.open_skill_picker().await;
@@ -531,7 +527,7 @@ impl App {
                                     self.open_chats_picker().await;
                                 }
                                 CommandResult::SpawnAgent(prompt) => {
-                                    let parent = self.state.focused_id;
+                                    let parent = self.state.conversations.focused_id();
                                     let label: String = prompt.chars().take(40).collect();
                                     self.spawn_sub_agent(parent, label, prompt).await?;
                                 }
@@ -539,13 +535,13 @@ impl App {
                                     self.open_agents_picker().await;
                                 }
                                 CommandResult::Error(err) => {
-                                    self.state.messages.push(ChatMessage::system(&err));
+                                    self.state.focused_mut().messages.push(ChatMessage::system(&err));
                                 }
                             }
                         } else {
                             let killed = self.cleanup_background_before_user_turn().await;
                             if killed > 0 {
-                                self.state.messages.push(ChatMessage::system(&format!(
+                                self.state.focused_mut().messages.push(ChatMessage::system(&format!(
                                     "Cleaned {killed} ephemeral job(s) before the new turn."
                                 )));
                             }
@@ -571,7 +567,7 @@ impl App {
                                 }
                                 self.state.attached_files.clear();
                             }
-                            self.state.messages.push(ChatMessage::user(&expanded));
+                            self.state.focused_mut().messages.push(ChatMessage::user(&expanded));
                             self.send_to_agent(expanded).await?;
                         }
                     }
@@ -602,12 +598,12 @@ impl App {
             KeyCode::End => {
                 self.state.input.move_end(key.modifiers.contains(KeyModifiers::SHIFT));
             }
-            KeyCode::Up if !self.state.generation.active
+            KeyCode::Up if !self.state.focused_mut().generation.active
                 && self.state.input.buffer.chars().take(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
                 self.state.input.history_prev();
             }
-            KeyCode::Down if !self.state.generation.active
+            KeyCode::Down if !self.state.focused_mut().generation.active
                 && self.state.input.buffer.chars().skip(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
                 self.state.input.history_next();
@@ -731,7 +727,7 @@ impl App {
         if let Some(at_pos) = buf.rfind('@') {
             let after_at = &buf[at_pos + 1..];
             let path_part = after_at.split_whitespace().next().unwrap_or("");
-            if !path_part.is_empty() && !self.state.generation.active && self.state.modal.is_none() {
+            if !path_part.is_empty() && !self.state.focused_mut().generation.active && self.state.modal.is_none() {
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let search_path = if path_part.contains('/') || path_part.contains('\\') {
                     std::path::Path::new(path_part).to_path_buf()
@@ -799,7 +795,7 @@ impl App {
             .map(|rest| rest.split_whitespace().next().unwrap_or(""))
             .unwrap_or("");
         let active = buf.starts_with('/')
-            && !self.state.generation.active
+            && !self.state.focused_mut().generation.active
             && self.state.modal.is_none()
             && !buf[1..].contains(char::is_whitespace);
         if !active {

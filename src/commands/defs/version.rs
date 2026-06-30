@@ -22,7 +22,7 @@ impl Command for VersionCommand {
         let info = format!(
             "Pooprusteek v{version}\nRust TUI coding agent powered by DeepSeek"
         );
-        state.messages.push(crate::provider::ChatMessage::system(&info));
+        state.focused_mut().messages.push(crate::provider::ChatMessage::system(&info));
         CommandResult::Handled
     }
 }

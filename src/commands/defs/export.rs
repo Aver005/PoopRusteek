@@ -19,14 +19,14 @@ impl Command for ExportCommand {
     }
 
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        if state.messages.is_empty() {
+        if state.focused_mut().messages.is_empty() {
             return CommandResult::Error("No messages to export".to_string());
         }
 
         let path = if args.trim().is_empty() {
             let exports_dir = Config::data_dir().join("exports");
             std::fs::create_dir_all(&exports_dir).unwrap_or_default();
-            exports_dir.join(format!("{}.md", state.current_session_id))
+            exports_dir.join(format!("{}.md", state.focused().session_id))
         } else {
             let custom = std::path::PathBuf::from(args.trim());
             if let Some(parent) = custom.parent() {
@@ -37,12 +37,12 @@ impl Command for ExportCommand {
 
         let mut md = String::new();
         md.push_str("# Pooprusteek Chat Export\n\n");
-        md.push_str(&format!("- **Session:** {}\n", state.current_session_id));
+        md.push_str(&format!("- **Session:** {}\n", state.focused().session_id));
         md.push_str(&format!("- **Exported:** {}\n", chrono::Utc::now().to_rfc3339()));
-        md.push_str(&format!("- **Messages:** {}\n", state.messages.len()));
+        md.push_str(&format!("- **Messages:** {}\n", state.focused_mut().messages.len()));
         md.push_str("\n---\n\n");
 
-        for msg in &state.messages {
+        for msg in &state.focused_mut().messages {
             let role_label = match msg.role {
                 Role::System => "system",
                 Role::User => "user",
@@ -65,10 +65,9 @@ impl Command for ExportCommand {
 
         match std::fs::write(&path, md) {
             Ok(_) => {
-                let display = path.display();
-                state.messages.push(crate::provider::ChatMessage::system(
-                    &format!("Exported {} messages to {}", state.messages.len(), display),
-                ));
+                let display = path.display().to_string();
+                let count = state.focused().messages.len();
+                state.push_system(&format!("Exported {count} messages to {display}"));
                 CommandResult::Handled
             }
             Err(e) => CommandResult::Error(format!("Failed to export: {e}")),

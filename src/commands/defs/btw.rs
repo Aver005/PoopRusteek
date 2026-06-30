@@ -23,7 +23,7 @@ impl Command for BtwCommand {
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         let question = args.trim();
         if question.is_empty() {
-            state.messages.push(crate::provider::ChatMessage::system(
+            state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                 "Usage: /btw <question>",
             ));
             return CommandResult::Handled;

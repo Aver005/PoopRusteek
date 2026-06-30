@@ -19,28 +19,31 @@ impl Command for SessionInfoCommand {
     }
 
     fn execute(&self, _args: &str, state: &mut AppState, config: &Config) -> CommandResult {
-        let id = &state.current_session_id;
-        let count = state.messages.len();
-        let model = &config.provider.model;
+        use crate::provider::Role;
+
+        let conv = state.focused();
+        let id = conv.session_id.clone();
+        let count = conv.messages.len();
+        let model = config.provider.model.clone();
 
         let title = if count > 0 {
-            session::derive_title(&state.messages)
+            session::derive_title(&conv.messages)
         } else {
             "Empty conversation".to_string()
         };
 
         let msg_stats = if count > 0 {
-            let user_msgs = state.messages.iter().filter(|m| m.role == crate::provider::Role::User).count();
-            let asst_msgs = state.messages.iter().filter(|m| m.role == crate::provider::Role::Assistant).count();
-            let tool_msgs = state.messages.iter().filter(|m| m.role == crate::provider::Role::Tool).count();
-            let finished = state.messages.iter().filter(|m| m.status.as_deref() == Some("FINISHED")).count();
-            let aborted = state.messages.iter().filter(|m| m.status.as_deref() == Some("ABORTED")).count();
-            let think_total: f64 = state.messages.iter()
-                .filter(|m| m.role == crate::provider::Role::Assistant)
+            let user_msgs = conv.messages.iter().filter(|m| m.role == Role::User).count();
+            let asst_msgs = conv.messages.iter().filter(|m| m.role == Role::Assistant).count();
+            let tool_msgs = conv.messages.iter().filter(|m| m.role == Role::Tool).count();
+            let finished = conv.messages.iter().filter(|m| m.status.as_deref() == Some("FINISHED")).count();
+            let aborted = conv.messages.iter().filter(|m| m.status.as_deref() == Some("ABORTED")).count();
+            let think_total: f64 = conv.messages.iter()
+                .filter(|m| m.role == Role::Assistant)
                 .map(|m| m.think_elapsed_secs)
                 .sum();
-            let total_tokens: u32 = state.messages.iter()
-                .filter(|m| m.role == crate::provider::Role::Assistant)
+            let total_tokens: u32 = conv.messages.iter()
+                .filter(|m| m.role == Role::Assistant)
                 .flat_map(|m| m.total_tokens)
                 .sum();
             format!(
@@ -49,15 +52,15 @@ Status: {finished} finished, {aborted} aborted
 Tokens: {total_tokens} total
 Think: {think_total:.1}s total
 Session model: {}",
-                state.generation.last_model
+                conv.generation.last_model
             )
         } else {
             "Empty conversation".to_string()
         };
 
-        state.messages.push(crate::provider::ChatMessage::system(&format!(
+        state.push_system(&format!(
             "---\nSession: {id}\nTitle: {title}\nModel: {model}\nType: local\n{msg_stats}\n---"
-        )));
+        ));
         CommandResult::Handled
     }
 }

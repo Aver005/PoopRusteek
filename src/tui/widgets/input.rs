@@ -215,7 +215,7 @@ pub fn render_input(
 }
 
 fn cursor_pos_inner(input: &str, cursor: usize, area: Rect, state: &AppState) -> Option<(u16, u16)> {
-    if state.generation.active || state.modal.is_some() {
+    if state.focused().generation.active || state.modal.is_some() {
         return None;
     }
     let top_pad = 1;
