@@ -111,6 +111,13 @@ pub enum AppEvent {
     // Goal events
     GoalEvaluationDone(GoalVerdict),
     GoalCycleFinished,
+
+    /// A model `task` tool call asked for a detached sub-agent.
+    SpawnSubAgent {
+        parent: ConversationId,
+        label: String,
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +202,7 @@ pub enum PickerKind {
     Whitelist,
     Skills,
     Chats,
+    Agents,
 }
 
 #[derive(Debug, Clone)]

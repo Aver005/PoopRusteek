@@ -155,6 +155,53 @@ pub async fn run_agent_loop(
                     }
                 }
                 }
+            } else if tool_call.name == "task" {
+                // Only the foreground (interactive) loop may spawn sub-agents;
+                // sidechats / sub-agents (auto_approve) cannot — depth limit 1.
+                if auto_approve {
+                    ("Nested sub-agents are not allowed.".to_string(), true)
+                } else {
+                    let prompt = tool_call.arguments["prompt"].as_str().unwrap_or("").trim().to_string();
+                    let label = tool_call.arguments["description"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("sub-agent task")
+                        .to_string();
+                    let background = tool_call.arguments["background"].as_bool().unwrap_or(false);
+                    if prompt.is_empty() {
+                        ("The 'task' tool requires a non-empty 'prompt'.".to_string(), true)
+                    } else if background {
+                        let _ = event_tx.send(AppEvent::SpawnSubAgent {
+                            parent: conversation,
+                            label: label.clone(),
+                            prompt,
+                        });
+                        (format!("Started background sub-agent: {label}"), false)
+                    } else {
+                        let _ = event_tx.send(AppEvent::ToolStarted {
+                            conversation,
+                            name: "task".to_string(),
+                        });
+                        let sub_provider = provider.fork();
+                        match crate::agent::sub_agent::run_sub_agent(
+                            sub_provider,
+                            Arc::clone(&tools),
+                            Arc::clone(&mcp),
+                            system_prompt.clone(),
+                            prompt,
+                            model.clone(),
+                            temperature,
+                            max_tokens,
+                            max_steps.min(8),
+                            max_tools_per_step,
+                        )
+                        .await
+                        {
+                            Ok(text) => (text, false),
+                            Err(e) => (format!("Sub-agent failed: {e}"), true),
+                        }
+                    }
+                }
             } else {
                 let approved = if auto_approve {
                     true

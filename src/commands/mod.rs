@@ -43,6 +43,10 @@ pub enum CommandResult {
     NewChat,
     /// `/chats` — open the chat switcher picker.
     OpenChats,
+    /// `/agent <prompt>` — launch a background sub-agent.
+    SpawnAgent(String),
+    /// `/agents` — open the running-agents picker (to stop them).
+    OpenAgents,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +95,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::btw::BtwCommand));
         self.register(Box::new(defs::chats::NewChatCommand));
         self.register(Box::new(defs::chats::ChatsCommand));
+        self.register(Box::new(defs::agent::AgentCommand));
+        self.register(Box::new(defs::agent::AgentsCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {

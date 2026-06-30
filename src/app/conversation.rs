@@ -34,8 +34,6 @@ impl std::fmt::Display for ConversationId {
 
 /// What kind of conversation this is — drives titling, lifecycle, and how it is
 /// surfaced in the UI.
-// Only `Sidechat` is constructed in Phase 2; the rest arrive in Phase 3/4.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
     /// The primary chat the user starts in.
@@ -54,6 +52,9 @@ pub enum ConversationKind {
 pub struct Conversation {
     pub id: ConversationId,
     pub kind: ConversationKind,
+    /// For sub-agents/sidechats: the conversation that spawned it (where to
+    /// notify / deliver the result). `None` for top-level chats.
+    pub parent: Option<ConversationId>,
     pub title: String,
     pub session_id: String,
     pub session_started_at: String,

@@ -1,6 +1,7 @@
 pub mod registry;
 pub mod shell;
 pub mod question;
+pub mod task;
 pub mod background;
 pub mod shell_control;
 pub mod skill;

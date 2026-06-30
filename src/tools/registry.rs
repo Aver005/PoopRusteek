@@ -22,6 +22,7 @@ impl ToolRegistry {
         self.register(Arc::new(shell::ShellTool::bash()));
         self.register(Arc::new(shell::ShellTool::powershell()));
         self.register(Arc::new(question::QuestionTool));
+        self.register(Arc::new(task::TaskTool));
         self.register(Arc::new(shell_control::ShellOutputTool));
         self.register(Arc::new(shell_control::ShellKillTool));
         self.register(Arc::new(shell_control::ShellListTool));

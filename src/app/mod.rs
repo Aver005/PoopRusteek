@@ -572,6 +572,9 @@ impl App {
             AppEvent::GoalCycleFinished => {
                 self.state.status_message = "Goal achieved!".to_string();
             }
+            AppEvent::SpawnSubAgent { parent, label, prompt } => {
+                self.spawn_sub_agent(parent, label, prompt).await?;
+            }
             _ => {}
         }
         Ok(false)
@@ -757,6 +760,17 @@ impl App {
                                     self.state.modal = None;
                                     if let Some(target) = target {
                                         self.switch_to(target);
+                                    }
+                                }
+                                events::PickerKind::Agents => {
+                                    let target = indices
+                                        .first()
+                                        .and_then(|&i| picker.items.get(i))
+                                        .and_then(|item| item.value.parse::<u64>().ok())
+                                        .map(conversation::ConversationId);
+                                    self.state.modal = None;
+                                    if let Some(target) = target {
+                                        self.stop_background(target);
                                     }
                                 }
                                 _ => {
@@ -1083,6 +1097,14 @@ impl App {
                                 }
                                 CommandResult::OpenChats => {
                                     self.open_chats_picker().await;
+                                }
+                                CommandResult::SpawnAgent(prompt) => {
+                                    let parent = self.state.focused_id;
+                                    let label: String = prompt.chars().take(40).collect();
+                                    self.spawn_sub_agent(parent, label, prompt).await?;
+                                }
+                                CommandResult::OpenAgents => {
+                                    self.open_agents_picker().await;
                                 }
                                 CommandResult::Error(err) => {
                                     self.state.messages.push(ChatMessage::system(&err));
@@ -1572,7 +1594,16 @@ impl App {
     /// Spawn a one-shot `/btw` sidechat: an isolated background conversation
     /// (its own forked session, auto-approved tools) whose answer is appended
     /// to the chat when it finishes. Streams independently of the main turn.
-    async fn spawn_sidechat(&mut self, question: String) -> AppResult<()> {
+    /// Spawn an isolated background agent (sidechat or sub-agent): a forked
+    /// session that streams on its own task with auto-approved tools and
+    /// reports back to `parent` when done.
+    async fn spawn_background_agent(
+        &mut self,
+        kind: conversation::ConversationKind,
+        parent: conversation::ConversationId,
+        title: String,
+        prompt: String,
+    ) -> AppResult<()> {
         let provider = match &self.provider {
             Some(p) => p.fork(),
             None => {
@@ -1584,13 +1615,12 @@ impl App {
         };
 
         let id = conversation::ConversationId::next();
-        let sidechat_messages = vec![ChatMessage::user(&question)];
+        let messages = vec![ChatMessage::user(&prompt)];
         let system_prompt = self.build_system_prompt().await;
         let model = self.config.provider.model.clone();
         let temperature = self.config.provider.temperature;
         let max_tokens = self.config.provider.max_tokens;
-        // Keep sidechats lightweight.
-        let max_steps = self.config.agent.max_steps_per_turn.clamp(1, 6);
+        let max_steps = self.config.agent.max_steps_per_turn.clamp(1, 8);
         let max_tools_per_step = self.config.agent.max_tools_per_step.max(1);
         let tools = Arc::clone(&self.tools);
         let mcp = Arc::clone(&self.mcp);
@@ -1604,7 +1634,7 @@ impl App {
             Arc::clone(&provider),
             tools,
             mcp,
-            sidechat_messages.clone(),
+            messages.clone(),
             system_prompt,
             model,
             temperature,
@@ -1617,20 +1647,64 @@ impl App {
 
         self.state.background.push(conversation::Conversation {
             id,
-            kind: conversation::ConversationKind::Sidechat,
-            title: question.clone(),
+            kind,
+            parent: Some(parent),
+            title,
             session_id: crate::session::create_session_id(),
             session_started_at: chrono::Utc::now().to_rfc3339(),
-            messages: sidechat_messages,
+            messages,
             provider: Some(provider),
             generation,
             agent_task: Some(handle),
         });
-
-        self.state.messages.push(ChatMessage::system(&format!(
-            "◈ btw started — {question}"
-        )));
         Ok(())
+    }
+
+    /// `/btw` — one-shot side-question whose answer flushes into the chat.
+    async fn spawn_sidechat(&mut self, question: String) -> AppResult<()> {
+        let parent = self.state.focused_id;
+        self.spawn_background_agent(
+            conversation::ConversationKind::Sidechat,
+            parent,
+            question.clone(),
+            question.clone(),
+        )
+        .await?;
+        self.state.messages.push(ChatMessage::system(&format!("◈ btw started — {question}")));
+        Ok(())
+    }
+
+    /// Spawn a tracked background sub-agent (from the model's `task` tool or
+    /// `/agent`). Its result is delivered into the spawning chat when done.
+    async fn spawn_sub_agent(
+        &mut self,
+        parent: conversation::ConversationId,
+        label: String,
+        prompt: String,
+    ) -> AppResult<()> {
+        self.spawn_background_agent(
+            conversation::ConversationKind::SubAgent,
+            parent,
+            label.clone(),
+            prompt,
+        )
+        .await?;
+        self.state.messages.push(ChatMessage::system(&format!("🤖 sub-agent started — {label}")));
+        Ok(())
+    }
+
+    /// Stop a running background conversation (sidechat / sub-agent) by id.
+    fn stop_background(&mut self, target: conversation::ConversationId) {
+        if let Some(pos) = self.state.background.iter().position(|c| c.id == target) {
+            let mut conv = self.state.background.remove(pos);
+            if let Some(handle) = conv.agent_task.take() {
+                handle.abort();
+            }
+            self.state.messages.push(ChatMessage::system(&format!(
+                "⏹ Stopped: {}",
+                if conv.title.is_empty() { "(background agent)" } else { &conv.title }
+            )));
+        }
     }
 
     /// Apply an agent event that targets a background conversation (not the
@@ -1678,16 +1752,16 @@ impl App {
                 AppEvent::AgentDone(_, _) => {
                     conv.generation.active = false;
                     conv.agent_task = None;
-                    // A sidechat flushes its answer and disappears; a parked
-                    // session just stops streaming and waits to be switched to.
-                    if conv.kind == conversation::ConversationKind::Sidechat {
+                    // Sidechats and sub-agents flush their result and disappear;
+                    // a parked session just stops and waits to be switched to.
+                    if conv.kind != conversation::ConversationKind::Session {
                         finish = Finish::Done;
                     }
                 }
                 AppEvent::AgentError(_, err) => {
                     conv.generation.active = false;
                     conv.agent_task = None;
-                    if conv.kind == conversation::ConversationKind::Sidechat {
+                    if conv.kind != conversation::ConversationKind::Session {
                         finish = Finish::Error(err);
                     }
                 }
@@ -1697,21 +1771,25 @@ impl App {
         }
 
         match finish {
-            Finish::Done => self.finish_sidechat(target, None),
-            Finish::Error(err) => self.finish_sidechat(target, Some(err)),
+            Finish::Done => self.finish_background(target, None),
+            Finish::Error(err) => self.finish_background(target, Some(err)),
             Finish::None => {}
         }
     }
 
-    /// Remove a finished background conversation and flush its result (answer or
-    /// error) into the focused chat as a `◈ btw` block.
-    fn finish_sidechat(&mut self, target: conversation::ConversationId, error: Option<String>) {
+    /// Remove a finished background conversation (sidechat or sub-agent) and
+    /// flush its result (answer or error) into the focused chat.
+    fn finish_background(&mut self, target: conversation::ConversationId, error: Option<String>) {
         let Some(pos) = self.state.background.iter().position(|c| c.id == target) else {
             return;
         };
         let conv = self.state.background.remove(pos);
+        let label = match conv.kind {
+            conversation::ConversationKind::SubAgent => "🤖 sub-agent",
+            _ => "◈ btw",
+        };
         let block = if let Some(err) = error {
-            format!("◈ btw — {}\n\n⚠ {err}", conv.title)
+            format!("{label} — {}\n\n⚠ {err}", conv.title)
         } else {
             let answer = conv
                 .messages
@@ -1721,8 +1799,30 @@ impl App {
                 .map(|m| m.content.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "(no answer)".to_string());
-            format!("◈ btw — {}\n\n{answer}", conv.title)
+            format!("{label} — {}\n\n{answer}", conv.title)
         };
+
+        // Deliver into the chat that spawned it; if the user has switched away,
+        // drop the result there and just notify the focused chat.
+        if let Some(pid) = conv.parent {
+            if pid != self.state.focused_id {
+                let delivered = match self.state.background.iter_mut().find(|c| c.id == pid) {
+                    Some(pconv) => {
+                        pconv.messages.push(ChatMessage::system(&block));
+                        true
+                    }
+                    None => false,
+                };
+                if delivered {
+                    self.state.messages.push(ChatMessage::system(&format!(
+                        "{label} finished in another chat — {}",
+                        conv.title
+                    )));
+                    return;
+                }
+            }
+        }
+
         self.state.messages.push(ChatMessage::system(&block));
         self.auto_save_session();
     }
@@ -1732,6 +1832,7 @@ impl App {
         conversation::Conversation {
             id: self.state.focused_id,
             kind: self.state.focused_kind,
+            parent: None,
             title: conversation_title(&self.state.messages),
             session_id: std::mem::take(&mut self.state.current_session_id),
             session_started_at: std::mem::take(&mut self.state.session_started_at),
@@ -1838,6 +1939,10 @@ impl App {
             PickerItem::new(focused_label, self.state.focused_id.0.to_string()),
         ));
         for conv in &self.state.background {
+            // Sidechats / sub-agents live in `/agents`, not the chat switcher.
+            if conv.kind != conversation::ConversationKind::Session {
+                continue;
+            }
             let label = format!(
                 "  {}{}",
                 if conv.title.is_empty() { "(chat)".to_string() } else { conv.title.clone() },
@@ -1852,6 +1957,44 @@ impl App {
             items.into_iter().map(|(_, item)| item).collect(),
             PickerMode::Single,
             PickerKind::Chats,
+        );
+        self.state.modal = Some(Modal::Picker(picker));
+    }
+
+    /// Open the `/agents` picker listing running background sub-agents and
+    /// sidechats; selecting one stops it.
+    async fn open_agents_picker(&mut self) {
+        use crate::app::events::{Modal, PickerItem, PickerKind, PickerMode, PickerState};
+
+        let items: Vec<PickerItem> = self
+            .state
+            .background
+            .iter()
+            .filter(|c| c.kind != conversation::ConversationKind::Session)
+            .map(|c| {
+                let tag = match c.kind {
+                    conversation::ConversationKind::SubAgent => "🤖",
+                    _ => "◈",
+                };
+                let label = format!(
+                    "{tag} {}{}",
+                    if c.title.is_empty() { "(agent)".to_string() } else { c.title.clone() },
+                    if c.is_streaming() { "  [running]" } else { "  [done]" }
+                );
+                PickerItem::new(label, c.id.0.to_string())
+            })
+            .collect();
+
+        if items.is_empty() {
+            self.state.messages.push(ChatMessage::system("No background agents running."));
+            return;
+        }
+
+        let picker = PickerState::new_with_kind(
+            "Agents — Enter to stop",
+            items,
+            PickerMode::Single,
+            PickerKind::Agents,
         );
         self.state.modal = Some(Modal::Picker(picker));
     }
