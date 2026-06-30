@@ -208,11 +208,11 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
         Span::styled("Ctrl+C ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
         Span::styled("quit", Style::default().fg(theme.text_dim)),
     ];
-    if state.goal_mode {
-        let goal_label = match state.goal_stage {
+    if state.goal.mode {
+        let goal_label = match state.goal.stage {
             crate::app::events::GoalStage::Inactive => "[GOAL ON]".to_string(),
             crate::app::events::GoalStage::WaitForGoal => "[WAITING FOR GOAL]".to_string(),
-            crate::app::events::GoalStage::RunAgent1 => format!("[GOAL iter#{}]", state.goal_iteration),
+            crate::app::events::GoalStage::RunAgent1 => format!("[GOAL iter#{}]", state.goal.iteration),
             crate::app::events::GoalStage::RunEvaluator => "[EVALUATING]".to_string(),
             crate::app::events::GoalStage::Done => "[GOAL DONE]".to_string(),
         };
@@ -349,8 +349,8 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         String::new()
     };
-    let goal_tag = if state.goal_mode {
-        format!(" GOAL:{} ", match state.goal_stage {
+    let goal_tag = if state.goal.mode {
+        format!(" GOAL:{} ", match state.goal.stage {
             crate::app::events::GoalStage::Inactive => "standby",
             crate::app::events::GoalStage::WaitForGoal => "need-goal",
             crate::app::events::GoalStage::RunAgent1 => "build",
@@ -393,11 +393,11 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         format!(" {} ", parts.join(" · "))
     };
 
-    let goal_tag = if state.goal_mode {
-        let stage_str = match state.goal_stage {
+    let goal_tag = if state.goal.mode {
+        let stage_str = match state.goal.stage {
             crate::app::events::GoalStage::Inactive => "ON".to_string(),
             crate::app::events::GoalStage::WaitForGoal => "NEED-GOAL".to_string(),
-            crate::app::events::GoalStage::RunAgent1 => format!("iter#{}", state.goal_iteration),
+            crate::app::events::GoalStage::RunAgent1 => format!("iter#{}", state.goal.iteration),
             crate::app::events::GoalStage::RunEvaluator => "EVAL".to_string(),
             crate::app::events::GoalStage::Done => "DONE".to_string(),
         };

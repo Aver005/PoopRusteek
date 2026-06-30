@@ -65,8 +65,9 @@ impl QuestionRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum GoalStage {
+    #[default]
     Inactive,
     WaitForGoal,
     RunAgent1,

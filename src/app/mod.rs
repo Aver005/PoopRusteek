@@ -1,4 +1,5 @@
 pub mod events;
+mod goal;
 
 use crate::commands::CommandRegistry;
 use crate::config::Config;
@@ -100,16 +101,7 @@ pub struct AppState {
     pub last_think_fragments: u32,
 
     // Goal mode state
-    pub goal_mode: bool,
-    pub goal_stage: GoalStage,
-    pub goal_prompt: String,
-    pub goal_text: String,
-    pub goal_iteration: u32,
-    pub goal_agent1_failures: u32,
-    pub goal_agent2_failures: u32,
-    pub goal_agent1_session_id: String,
-    pub goal_agent2_session_id: String,
-    pub goal_summary: String,
+    pub goal: goal::GoalState,
 
     pub needs_terminal_restore: bool,
     pub running_background_count: usize,
@@ -194,16 +186,7 @@ impl App {
             last_message_status: None,
             last_think_fragments: 0,
 
-            goal_mode: false,
-            goal_stage: GoalStage::Inactive,
-            goal_prompt: String::new(),
-            goal_text: String::new(),
-            goal_iteration: 0,
-            goal_agent1_failures: 0,
-            goal_agent2_failures: 0,
-            goal_agent1_session_id: String::new(),
-            goal_agent2_session_id: String::new(),
-            goal_summary: String::new(),
+            goal: goal::GoalState::default(),
             needs_terminal_restore: false,
             running_background_count: 0,
             running_interactive_count: 0,
@@ -456,8 +439,8 @@ impl App {
                 self.auto_save_session();
 
                 // --- GOAL cycle check ---
-                if self.state.goal_mode {
-                    match self.state.goal_stage.clone() {
+                if self.state.goal.mode {
+                    match self.state.goal.stage.clone() {
                         GoalStage::RunAgent1 => {
                             // Agent 1 finished — get last assistant content for evaluation
                             let agent_result = self.state.messages
@@ -469,7 +452,7 @@ impl App {
 
                             if !agent_result.is_empty() {
                                 self.state.status_message = "Evaluating goal...".to_string();
-                                self.state.goal_stage = GoalStage::RunEvaluator;
+                                self.state.goal.stage = GoalStage::RunEvaluator;
                                 self.state.messages.push(ChatMessage::system(
                                     "🔍 Evaluating result against goal..."
                                 ));
@@ -875,12 +858,12 @@ impl App {
                                 crate::session::append_history(&input);
 
                                 // --- GOAL mode: intercept non-command input ---
-                                if self.state.goal_mode && !input.starts_with('/') {
-                                    match self.state.goal_stage {
+                                if self.state.goal.mode && !input.starts_with('/') {
+                                    match self.state.goal.stage {
                                         GoalStage::Inactive => {
                                             // First input in goal mode = the prompt
-                                            self.state.goal_prompt = input.clone();
-                                            self.state.goal_stage = GoalStage::WaitForGoal;
+                                            self.state.goal.prompt = input.clone();
+                                            self.state.goal.stage = GoalStage::WaitForGoal;
                                             self.state.messages.push(ChatMessage::user(&input));
                                             self.state.messages.push(ChatMessage::system(
                                                 "🎯 Goal mode: now define your GOAL (what must be achieved)",
@@ -889,19 +872,19 @@ impl App {
                                         }
                                         GoalStage::WaitForGoal => {
                                             // Second input = the goal
-                                            self.state.goal_text = input.clone();
-                                            self.state.goal_stage = GoalStage::RunAgent1;
-                                            self.state.goal_iteration = 1;
+                                            self.state.goal.text = input.clone();
+                                            self.state.goal.stage = GoalStage::RunAgent1;
+                                            self.state.goal.iteration = 1;
                                             self.state.messages.push(ChatMessage::user(&format!(
                                                 "GOAL: {}", input
                                             )));
 
                                             // Build the agent 1 prompt: user's prompt + goal
-                                            let goal_prompt = format!(
+                                            let agent1_prompt = format!(
                                                 "{}\n\nIMPORTANT - GOAL to achieve: {}",
-                                                self.state.goal_prompt, self.state.goal_text
+                                                self.state.goal.prompt, self.state.goal.text
                                             );
-                                            self.send_to_agent(goal_prompt).await?;
+                                            self.send_to_agent(agent1_prompt).await?;
                                             return Ok(false);
                                         }
                                         GoalStage::RunAgent1 | GoalStage::RunEvaluator => {
@@ -913,8 +896,8 @@ impl App {
                                         }
                                         GoalStage::Done => {
                                             // After goal is done, regular input resumes
-                                            self.state.goal_mode = false;
-                                            self.state.goal_stage = GoalStage::Inactive;
+                                            self.state.goal.mode = false;
+                                            self.state.goal.stage = GoalStage::Inactive;
                                         }
                                     }
                                 }
@@ -1610,7 +1593,7 @@ impl App {
 
         let user_msg = format!(
             "## Goal\n{}\n\n## Completed Work\n{}\n\n## Evaluation",
-            self.state.goal_text, agent_result
+            self.state.goal.text, agent_result
         );
 
         let eval_messages = vec![
@@ -1628,22 +1611,22 @@ impl App {
 
         match provider.complete(request).await {
             Ok(response) => {
-                let verdict = self.parse_goal_verdict(&response.content);
+                let verdict = goal::parse_goal_verdict(&response.content);
                 if verdict.success {
                     let summary = if verdict.summary.is_empty() {
                         "Goal achieved!".to_string()
                     } else {
                         verdict.summary.clone()
                     };
-                    self.state.goal_summary = summary.clone();
-                    self.state.goal_stage = GoalStage::Done;
+                    self.state.goal.summary = summary.clone();
+                    self.state.goal.stage = GoalStage::Done;
                     self.state.messages.push(ChatMessage::system(
                         &format!("✅ Goal achieved!\n\n{}", summary)
                     ));
 
                     // Save system session for evaluator
                     let _ = crate::session::save_session_with_tag(
-                        &self.state.goal_agent2_session_id,
+                        &self.state.goal.agent2_session_id,
                         &self.state.session_started_at,
                         &eval_messages,
                         &self.config,
@@ -1651,13 +1634,13 @@ impl App {
                         Some("__goal_system__".to_string()),
                     );
                 } else {
-                    self.state.goal_agent2_failures += 1;
-                    let iter = self.state.goal_iteration;
+                    self.state.goal.agent2_failures += 1;
+                    let iter = self.state.goal.iteration;
 
                     // Check if we need to swap agent 2 (after 5 failures)
-                    if self.state.goal_agent2_failures >= 5 {
-                        self.state.goal_agent2_session_id = crate::session::create_session_id();
-                        self.state.goal_agent2_failures = 0;
+                    if self.state.goal.agent2_failures >= 5 {
+                        self.state.goal.agent2_session_id = crate::session::create_session_id();
+                        self.state.goal.agent2_failures = 0;
                         self.state.messages.push(ChatMessage::system(
                             "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
                         ));
@@ -1665,7 +1648,7 @@ impl App {
 
                     // Save evaluator session
                     let _ = crate::session::save_session_with_tag(
-                        &self.state.goal_agent2_session_id,
+                        &self.state.goal.agent2_session_id,
                         &self.state.session_started_at,
                         &eval_messages,
                         &self.config,
@@ -1687,19 +1670,19 @@ impl App {
                     ));
 
                     // Iteration counter
-                    self.state.goal_iteration += 1;
+                    self.state.goal.iteration += 1;
 
                     // Check if we need to swap agent 1 (after 3 failures)
-                    if self.state.goal_agent1_failures >= 3 {
-                        self.state.goal_agent1_session_id = crate::session::create_session_id();
-                        self.state.goal_agent1_failures = 0;
+                    if self.state.goal.agent1_failures >= 3 {
+                        self.state.goal.agent1_session_id = crate::session::create_session_id();
+                        self.state.goal.agent1_failures = 0;
                         self.state.messages.push(ChatMessage::system(
                             "🔄 Swapping agent to new session after 3 failures."
                         ));
                     }
 
-                    self.state.goal_agent1_failures += 1;
-                    self.state.goal_stage = GoalStage::RunAgent1;
+                    self.state.goal.agent1_failures += 1;
+                    self.state.goal.stage = GoalStage::RunAgent1;
                     self.retry_agent1_with_feedback(&feedback).await;
                 }
             }
@@ -1707,7 +1690,7 @@ impl App {
                 self.state.messages.push(ChatMessage::system(
                     &format!("⚠ Evaluation failed: {e}. Retrying agent 1...")
                 ));
-                self.state.goal_stage = GoalStage::RunAgent1;
+                self.state.goal.stage = GoalStage::RunAgent1;
                 self.retry_agent1().await;
             }
         }
@@ -1730,7 +1713,7 @@ impl App {
         }
 
         // Re-run evaluation via the event-based path
-        let verdict = self.parse_goal_verdict(&eval_result);
+        let verdict = goal::parse_goal_verdict(&eval_result);
         let event = AppEvent::GoalEvaluationDone(verdict);
         let _ = self.event_tx.send(event);
     }
@@ -1742,18 +1725,18 @@ impl App {
             } else {
                 verdict.summary.clone()
             };
-            self.state.goal_summary = summary.clone();
-            self.state.goal_stage = GoalStage::Done;
+            self.state.goal.summary = summary.clone();
+            self.state.goal.stage = GoalStage::Done;
             self.state.messages.push(ChatMessage::system(
                 &format!("✅ Goal achieved!\n\n{}", summary)
             ));
         } else {
-            self.state.goal_agent2_failures += 1;
-            let iter = self.state.goal_iteration;
+            self.state.goal.agent2_failures += 1;
+            let iter = self.state.goal.iteration;
 
-            if self.state.goal_agent2_failures >= 5 {
-                self.state.goal_agent2_session_id = crate::session::create_session_id();
-                self.state.goal_agent2_failures = 0;
+            if self.state.goal.agent2_failures >= 5 {
+                self.state.goal.agent2_session_id = crate::session::create_session_id();
+                self.state.goal.agent2_failures = 0;
                 self.state.messages.push(ChatMessage::system(
                     "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
                 ));
@@ -1772,18 +1755,18 @@ impl App {
                 )
             ));
 
-            self.state.goal_iteration += 1;
+            self.state.goal.iteration += 1;
 
-            if self.state.goal_agent1_failures >= 3 {
-                self.state.goal_agent1_session_id = crate::session::create_session_id();
-                self.state.goal_agent1_failures = 0;
+            if self.state.goal.agent1_failures >= 3 {
+                self.state.goal.agent1_session_id = crate::session::create_session_id();
+                self.state.goal.agent1_failures = 0;
                 self.state.messages.push(ChatMessage::system(
                     "🔄 Swapping agent to new session after 3 failures."
                 ));
             }
 
-            self.state.goal_agent1_failures += 1;
-            self.state.goal_stage = GoalStage::RunAgent1;
+            self.state.goal.agent1_failures += 1;
+            self.state.goal.stage = GoalStage::RunAgent1;
             self.retry_agent1_with_feedback(&feedback).await;
         }
     }
@@ -1791,11 +1774,11 @@ impl App {
     async fn retry_agent1(&mut self) {
         let prompt = format!(
             "Continue working on the original request.\n\nOriginal prompt: {}\n\nGoal: {}",
-            self.state.goal_prompt, self.state.goal_text
+            self.state.goal.prompt, self.state.goal.text
         );
         self.state.messages.push(ChatMessage::user(&format!(
             "[Continuing goal cycle - attempt {}]",
-            self.state.goal_iteration
+            self.state.goal.iteration
         )));
         self.send_to_agent(prompt).await.unwrap_or_else(|e| {
             self.state.messages.push(ChatMessage::system(
@@ -1810,56 +1793,13 @@ impl App {
             Original request: {}\n\nGoal: {}\n\n\
             Issues to fix:\n{}\n\n\
             Previous conversation history is above. Focus on fixing the issues.",
-            self.state.goal_prompt, self.state.goal_text, feedback
+            self.state.goal.prompt, self.state.goal.text, feedback
         );
         self.send_to_agent(prompt).await.unwrap_or_else(|e| {
             self.state.messages.push(ChatMessage::system(
                 &format!("⚠ Failed to retry agent: {e}")
             ));
         });
-    }
-
-    fn parse_goal_verdict(&self, text: &str) -> GoalVerdict {
-        let mut success = false;
-        let mut summary = String::new();
-        let mut issues = String::new();
-        let mut feedback = String::new();
-
-        // Look for **Status:** line
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.contains("**Status:**") {
-                success = trimmed.contains("SUCCESS");
-            } else if trimmed.contains("**Summary:**") {
-                summary = trimmed
-                    .splitn(2, "**Summary:**")
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            } else if trimmed.contains("**Issues:**") {
-                issues = trimmed
-                    .splitn(2, "**Issues:**")
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            } else if trimmed.contains("**Feedback:**") {
-                feedback = trimmed
-                    .splitn(2, "**Feedback:**")
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            }
-        }
-
-        // Fallback: if structured fields not found, check for success/failure in general text
-        if summary.is_empty() && text.contains("SUCCESS") {
-            success = true;
-        }
-
-        GoalVerdict { success, summary, issues, feedback }
     }
 
     async fn handle_load_session(&mut self, session_id: &str) -> AppResult<()> {
