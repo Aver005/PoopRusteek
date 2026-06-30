@@ -19,8 +19,8 @@ impl ToolRegistry {
     }
 
     fn register_default_tools(&self) {
-        self.register(Arc::new(bash::BashTool));
-        self.register(Arc::new(powershell::PowerShellTool));
+        self.register(Arc::new(shell::ShellTool::bash()));
+        self.register(Arc::new(shell::ShellTool::powershell()));
         self.register(Arc::new(question::QuestionTool));
         self.register(Arc::new(shell_control::ShellOutputTool));
         self.register(Arc::new(shell_control::ShellKillTool));

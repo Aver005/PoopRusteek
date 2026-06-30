@@ -1,6 +1,5 @@
 pub mod registry;
-pub mod bash;
-pub mod powershell;
+pub mod shell;
 pub mod question;
 pub mod background;
 pub mod shell_control;
