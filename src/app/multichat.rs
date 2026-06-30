@@ -42,7 +42,14 @@ impl App {
 
         let id = conversation::ConversationId::next();
         let messages = vec![ChatMessage::user(&prompt)];
-        let system_prompt = self.build_system_prompt().await;
+        let system_prompt = super::system_prompt::build(
+            &self.prompts,
+            &self.skills,
+            &self.tools,
+            &self.mcp,
+            &self.state.workspace_path,
+        )
+        .await;
 
         let mut generation = generation::GenerationState::default();
         generation.begin(std::time::Instant::now());

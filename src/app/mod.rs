@@ -7,6 +7,7 @@ mod keys;
 pub mod mcp_status;
 mod multichat;
 mod runtime;
+mod system_prompt;
 
 use crate::commands::CommandRegistry;
 use crate::config::Config;
@@ -583,80 +584,6 @@ impl App {
         Ok(false)
     }
 
-
-
-    async fn build_system_prompt(&self) -> String {
-        let workspace = &self.state.workspace_path;
-        let user = std::env::var("USERNAME")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "user".to_string());
-        let os = std::env::consts::OS.to_string();
-
-        let builtin_tools = self.tools.definitions();
-        let builtin_section = if builtin_tools.is_empty() {
-            "- none".to_string()
-        } else {
-            builtin_tools
-                .iter()
-                .map(|tool| format_tool_definition(&tool.name, &tool.description, &tool.parameters))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-
-        let mcp = self.mcp.lock().await;
-        let all_mcp_tools = mcp.get_all_tools();
-        let all_mcp_resources = mcp.get_all_resources();
-        let mcp_tool_section = if all_mcp_tools.is_empty() {
-            "- none".to_string()
-        } else {
-            all_mcp_tools
-                .iter()
-                .map(|full| {
-                    format_tool_definition(
-                        &full.full_name,
-                        &full.tool.description,
-                        &full.tool.input_schema,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-        let mcp_resource_section = if all_mcp_resources.is_empty() {
-            String::new()
-        } else {
-            let mut lines = vec!["\n\n### Available MCP resources:".to_string()];
-            for r in &all_mcp_resources {
-                let desc = r.description.as_deref().unwrap_or("");
-                let name = if r.name.is_empty() { &r.uri } else { &r.name };
-                lines.push(format!("- `{}`: {} ({})", name, desc, r.uri));
-            }
-            lines.join("\n")
-        };
-        let mcp_section = format!("{mcp_tool_section}{mcp_resource_section}");
-        drop(mcp);
-
-        let base_prompt = self
-            .prompts
-            .base_prompt
-            .replace("{{user}}", &user)
-            .replace("{{folder}}", &workspace)
-            .replace("{{os}}", &os);
-        let tools_prompt = self
-            .prompts
-            .tools_prompt
-            .replace("{{builtin_tools}}", &builtin_section)
-            .replace("{{mcp_tools}}", &mcp_section);
-
-        let skills_section = crate::skills::discovery::load_enabled_skills_content(&self.skills);
-
-        format!(
-            "{}\n\n{}{}",
-            base_prompt.trim(),
-            tools_prompt.trim(),
-            skills_section
-        )
-    }
-
     async fn send_to_agent(&mut self, _input: String) -> AppResult<()> {
         let provider = match &self.state.focused().provider {
             Some(p) => Arc::clone(p),
@@ -670,7 +597,14 @@ impl App {
 
         let conversation = self.state.conversations.focused_id();
         let messages: Vec<ChatMessage> = self.state.focused().messages.clone();
-        let system_prompt = self.build_system_prompt().await;
+        let system_prompt = system_prompt::build(
+            &self.prompts,
+            &self.skills,
+            &self.tools,
+            &self.mcp,
+            &self.state.workspace_path,
+        )
+        .await;
 
         let spec = runtime::TurnSpec {
             conversation,
