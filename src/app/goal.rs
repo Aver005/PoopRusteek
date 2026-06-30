@@ -7,6 +7,10 @@
 
 use super::events::{GoalStage, GoalVerdict};
 
+/// Stop the worker/evaluator loop after this many attempts so a goal that can
+/// never be satisfied (or a flaky evaluator) doesn't retry forever.
+pub(crate) const MAX_GOAL_ITERATIONS: u32 = 10;
+
 /// All state for goal mode, grouped out of the `AppState` god-object.
 ///
 /// Goal mode drives a two-agent loop: `agent1` (the worker) attempts the goal,
@@ -35,6 +39,8 @@ pub struct GoalState {
 pub(crate) enum GoalOutcome {
     /// Goal met. Display this summary.
     Succeeded { summary: String },
+    /// Hit the attempt cap without success — stop and tell the user.
+    GaveUp { iteration: u32 },
     /// Goal not met. Retry agent 1 with this feedback.
     Retry {
         /// Attempt number to display (the pre-increment iteration).
@@ -76,6 +82,12 @@ impl GoalState {
             self.agent2_failures = 0;
         }
 
+        // Stop retrying once we've made enough attempts.
+        if iteration >= MAX_GOAL_ITERATIONS {
+            self.stage = GoalStage::Done;
+            return GoalOutcome::GaveUp { iteration };
+        }
+
         let feedback = if verdict.feedback.is_empty() {
             "No specific feedback provided. Please re-examine the goal and fix remaining issues."
                 .to_string()
@@ -101,6 +113,31 @@ impl GoalState {
             swapped_agent1,
             swapped_agent2,
         }
+    }
+
+    /// Is a worker/evaluator turn supposed to be in flight right now? When this
+    /// is true but no agent is actually running (e.g. after an abort or a
+    /// missing provider), the pipeline is wedged — callers use this to detect
+    /// and recover from that.
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.stage, GoalStage::RunAgent1 | GoalStage::RunEvaluator)
+    }
+
+    /// Enter goal mode fresh: clear all per-run state and start two new agent
+    /// sessions. Stage stays `Inactive` until the user supplies a prompt.
+    pub(crate) fn activate(&mut self) {
+        *self = GoalState {
+            mode: true,
+            agent1_session_id: crate::session::create_session_id(),
+            agent2_session_id: crate::session::create_session_id(),
+            ..GoalState::default()
+        };
+    }
+
+    /// Leave goal mode and clear all per-run state. Safe to call at any time —
+    /// it always lands in a non-wedged, fully-reset state.
+    pub(crate) fn deactivate(&mut self) {
+        *self = GoalState::default();
     }
 }
 
@@ -264,5 +301,68 @@ mod tests {
             GoalOutcome::Retry { swapped_agent1, .. } => assert!(swapped_agent1),
             _ => panic!("expected Retry"),
         }
+    }
+
+    #[test]
+    fn gives_up_at_iteration_cap() {
+        let mut g = GoalState { iteration: MAX_GOAL_ITERATIONS, ..Default::default() };
+        match g.apply_verdict(verdict(false, "", "", "")) {
+            GoalOutcome::GaveUp { iteration } => assert_eq!(iteration, MAX_GOAL_ITERATIONS),
+            _ => panic!("expected GaveUp at the cap"),
+        }
+        // Stage must not be left "running", or the pipeline would wedge.
+        assert!(!g.is_running());
+    }
+
+    #[test]
+    fn keeps_retrying_just_below_cap() {
+        let mut g = GoalState { iteration: MAX_GOAL_ITERATIONS - 1, ..Default::default() };
+        assert!(matches!(g.apply_verdict(verdict(false, "", "", "")), GoalOutcome::Retry { .. }));
+    }
+
+    #[test]
+    fn is_running_only_during_agent_stages() {
+        let stages = [
+            (GoalStage::Inactive, false),
+            (GoalStage::WaitForGoal, false),
+            (GoalStage::RunAgent1, true),
+            (GoalStage::RunEvaluator, true),
+            (GoalStage::Done, false),
+        ];
+        for (stage, expected) in stages {
+            let g = GoalState { stage, ..Default::default() };
+            assert_eq!(g.is_running(), expected);
+        }
+    }
+
+    #[test]
+    fn activate_starts_fresh_with_sessions() {
+        let mut g = GoalState {
+            iteration: 7,
+            summary: "old".to_string(),
+            ..Default::default()
+        };
+        g.activate();
+        assert!(g.mode);
+        assert_eq!(g.stage, GoalStage::Inactive);
+        assert_eq!(g.iteration, 0);
+        assert!(g.summary.is_empty());
+        assert!(!g.agent1_session_id.is_empty() && !g.agent2_session_id.is_empty());
+    }
+
+    #[test]
+    fn deactivate_resets_everything() {
+        let mut g = GoalState {
+            mode: true,
+            stage: GoalStage::RunAgent1,
+            iteration: 5,
+            prompt: "p".to_string(),
+            ..Default::default()
+        };
+        g.deactivate();
+        assert!(!g.mode);
+        assert!(!g.is_running());
+        assert_eq!(g.iteration, 0);
+        assert!(g.prompt.is_empty());
     }
 }

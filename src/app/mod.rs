@@ -462,6 +462,14 @@ impl App {
                     self.state.messages.pop();
                 }
                 self.auto_save_session();
+
+                // An error mid-cycle would otherwise leave goal mode stuck in a
+                // "running" stage with nothing actually running.
+                if self.state.goal.is_running() {
+                    self.cancel_goal_cycle(&format!(
+                        "⚠ Goal cycle stopped after an error: {err}. Use /goal to retry."
+                    ));
+                }
             }
             AppEvent::AddMessage(message) => {
                 self.state.messages.push(message);
@@ -754,6 +762,9 @@ impl App {
                     {
                         self.state.messages.pop();
                     }
+                    if self.state.goal.is_running() {
+                        self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
+                    }
                     return Ok(false);
                 }
                 let _ = self.shutdown_background_processes().await;
@@ -784,10 +795,18 @@ impl App {
                     {
                         self.state.messages.pop();
                     }
+                    if self.state.goal.is_running() {
+                        self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
+                    }
                 } else if self.state.messages.is_empty() {
                     let _ = self.shutdown_background_processes().await;
                     return Ok(true);
                 } else {
+                    // Esc with no active turn clears the chat; if a goal was mid
+                    // setup, clear that too so we don't orphan its state.
+                    if self.state.goal.mode {
+                        self.state.goal.deactivate();
+                    }
                     self.state.messages.clear();
                     self.state.scroll_offset = 0;
                 }
@@ -819,6 +838,22 @@ impl App {
                     self.state.input.insert_newline();
                 } else {
                             let input = self.state.input.buffer.trim().to_string();
+                            // Empty submission while defining a goal: nudge instead of silently ignoring it.
+                            if input.is_empty()
+                                && self.state.goal.mode
+                                && matches!(self.state.goal.stage, GoalStage::Inactive | GoalStage::WaitForGoal)
+                            {
+                                let what = if matches!(self.state.goal.stage, GoalStage::Inactive) {
+                                    "prompt"
+                                } else {
+                                    "goal"
+                                };
+                                self.state.messages.push(ChatMessage::system(&format!(
+                                    "Your {what} is empty — type something before pressing Enter."
+                                )));
+                                self.state.input.buffer.clear();
+                                self.state.input.cursor = 0;
+                            }
                             if !input.is_empty() {
                                 self.state.input.buffer.clear();
                                 self.state.input.cursor = 0;
@@ -843,11 +878,21 @@ impl App {
                                         GoalStage::WaitForGoal => {
                                             // Second input = the goal
                                             self.state.goal.text = input.clone();
-                                            self.state.goal.stage = GoalStage::RunAgent1;
-                                            self.state.goal.iteration = 1;
                                             self.state.messages.push(ChatMessage::user(&format!(
                                                 "GOAL: {}", input
                                             )));
+
+                                            // Without a provider the worker can't run; advancing
+                                            // the stage would wedge the cycle, so bail cleanly.
+                                            if self.provider.is_none() {
+                                                self.cancel_goal_cycle(
+                                                    "No provider configured — cannot run the goal. Set your DeepSeek token, then /goal to retry.",
+                                                );
+                                                return Ok(false);
+                                            }
+
+                                            self.state.goal.stage = GoalStage::RunAgent1;
+                                            self.state.goal.iteration = 1;
 
                                             // Build the agent 1 prompt: user's prompt + goal
                                             let agent1_prompt = format!(
@@ -1440,13 +1485,24 @@ impl App {
         Ok(())
     }
 
+    /// Abort any in-flight goal cycle and leave goal mode fully reset, so the
+    /// user is never stuck behind a "cycle in progress" that isn't running.
+    /// No-op when goal mode is off.
+    fn cancel_goal_cycle(&mut self, reason: &str) {
+        if !self.state.goal.mode {
+            return;
+        }
+        self.state.messages.push(ChatMessage::system(reason));
+        self.state.goal.deactivate();
+    }
+
     async fn run_goal_evaluation(&mut self, agent_result: String) {
         let provider = match &self.provider {
             Some(p) => Arc::clone(p),
             None => {
-                self.state.messages.push(ChatMessage::assistant(
-                    "No provider configured for evaluation.",
-                ));
+                self.cancel_goal_cycle(
+                    "No provider configured for evaluation — goal cancelled. Set your token, then /goal to retry.",
+                );
                 return;
             }
         };
@@ -1493,6 +1549,12 @@ impl App {
                             &format!("✅ Goal achieved!\n\n{}", summary)
                         ));
                         save_eval_session(self);
+                    }
+                    goal::GoalOutcome::GaveUp { iteration } => {
+                        save_eval_session(self);
+                        self.cancel_goal_cycle(&format!(
+                            "🛑 Goal not achieved after {iteration} attempts — stopping. Use /goal to try a different approach."
+                        ));
                     }
                     goal::GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
                         if swapped_agent2 {
@@ -1555,6 +1617,11 @@ impl App {
             goal::GoalOutcome::Succeeded { summary } => {
                 self.state.messages.push(ChatMessage::system(
                     &format!("✅ Goal achieved!\n\n{}", summary)
+                ));
+            }
+            goal::GoalOutcome::GaveUp { iteration } => {
+                self.cancel_goal_cycle(&format!(
+                    "🛑 Goal not achieved after {iteration} attempts — stopping. Use /goal to try a different approach."
                 ));
             }
             goal::GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
