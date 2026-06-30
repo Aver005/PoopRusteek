@@ -73,14 +73,14 @@ pub fn render_input(
     is_landing: bool,
     cursor_out: &Cell<Option<(u16, u16)>>,
 ) {
-    let input = &state.input_buffer;
-    let cursor = state.input_cursor.min(input.chars().count());
+    let input = &state.input.buffer;
+    let cursor = state.input.cursor.min(input.chars().count());
     let top_pad = 1;
 
     let sep_style = Style::default().fg(theme.accent).bg(theme.input_bg);
     let empty_style = Style::default().bg(theme.input_bg);
 
-    let sel: Option<(usize, usize)> = state.input_selection_anchor.map(|anchor| {
+    let sel: Option<(usize, usize)> = state.input.selection_anchor.map(|anchor| {
         let (start, end) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
         (char_to_byte_pos(input, start), char_to_byte_pos(input, end))
     });
@@ -263,7 +263,7 @@ fn cursor_pos_inner(input: &str, cursor: usize, area: Rect, state: &AppState) ->
 
 #[allow(dead_code)]
 pub fn cursor_pos(state: &AppState, area: Rect) -> Option<(u16, u16)> {
-    let input = &state.input_buffer;
-    let cursor = state.input_cursor.min(input.chars().count());
+    let input = &state.input.buffer;
+    let cursor = state.input.cursor.min(input.chars().count());
     cursor_pos_inner(input, cursor, area, state)
 }

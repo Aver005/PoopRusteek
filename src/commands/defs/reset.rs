@@ -21,9 +21,9 @@ impl Command for ResetCommand {
         state.messages.clear();
         state.attached_files.clear();
         state.scroll_offset = 0;
-        state.input_buffer.clear();
-        state.input_cursor = 0;
-        state.input_selection_anchor = None;
+        state.input.buffer.clear();
+        state.input.cursor = 0;
+        state.input.selection_anchor = None;
         state.autocomplete = Default::default();
         state.is_generating = false;
         state.status_message = "Ready".to_string();

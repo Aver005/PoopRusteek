@@ -1,5 +1,6 @@
 pub mod events;
 mod goal;
+pub mod input;
 
 use crate::commands::CommandRegistry;
 use crate::config::Config;
@@ -67,9 +68,7 @@ pub struct App {
 
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
-    pub input_buffer: String,
-    pub input_cursor: usize,
-    pub input_selection_anchor: Option<usize>,
+    pub input: input::InputState,
     pub is_generating: bool,
     pub status_message: String,
     pub scroll_offset: u32,
@@ -92,9 +91,6 @@ pub struct AppState {
     pub session_started_at: String,
     pub show_stats_panel: bool,
     pub last_mcp_stats_update: Option<std::time::Instant>,
-    pub input_history: Vec<String>,
-    pub history_index: Option<usize>,
-    pub unsent_input: String,
     pub attached_files: Vec<crate::provider::AttachedFile>,
     pub last_model_name: String,
     pub last_message_status: Option<String>,
@@ -151,9 +147,10 @@ impl App {
 
         let mut state = AppState {
             messages: Vec::new(),
-            input_buffer: String::new(),
-            input_cursor: 0,
-            input_selection_anchor: None,
+            input: input::InputState {
+                history: crate::session::load_history(),
+                ..Default::default()
+            },
             is_generating: false,
             status_message: if provider.is_some() { "Ready" } else { "No token configured" }.to_string(),
             scroll_offset: 0,
@@ -178,9 +175,6 @@ impl App {
             last_gen_duration_secs: 0.0,
             session_started_at: chrono::Utc::now().to_rfc3339(),
             last_mcp_stats_update: None,
-            input_history: crate::session::load_history(),
-            history_index: None,
-            unsent_input: String::new(),
             attached_files: Vec::new(),
             last_model_name: String::new(),
             last_message_status: None,
@@ -826,35 +820,35 @@ impl App {
                 self.state.scroll_offset = 0;
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.input_selection_anchor = Some(0);
-                self.state.input_cursor = self.state.input_buffer.chars().count();
+                self.state.input.selection_anchor = Some(0);
+                self.state.input.cursor = self.state.input.buffer.chars().count();
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 insert_newline(&mut self.state);
             }
             KeyCode::Enter if !self.state.is_generating => {
-                let buf = &self.state.input_buffer;
+                let buf = &self.state.input.buffer;
                 let ends_with_backslash = buf
                     .chars()
                     .last()
                     .is_some_and(|c| c == '\\')
-                    && self.state.input_cursor == buf.chars().count();
+                    && self.state.input.cursor == buf.chars().count();
                 if ends_with_backslash {
-                    self.state.input_buffer.pop();
-                    self.state.input_cursor -= 1;
+                    self.state.input.buffer.pop();
+                    self.state.input.cursor -= 1;
                     let byte_pos =
-                        char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
-                    self.state.input_buffer.insert(byte_pos, '\n');
-                    self.state.input_cursor += 1;
-                    self.state.input_selection_anchor = None;
+                        char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
+                    self.state.input.buffer.insert(byte_pos, '\n');
+                    self.state.input.cursor += 1;
+                    self.state.input.selection_anchor = None;
                 } else {
-                            let input = self.state.input_buffer.trim().to_string();
+                            let input = self.state.input.buffer.trim().to_string();
                             if !input.is_empty() {
-                                self.state.input_buffer.clear();
-                                self.state.input_cursor = 0;
-                                self.state.input_selection_anchor = None;
+                                self.state.input.buffer.clear();
+                                self.state.input.cursor = 0;
+                                self.state.input.selection_anchor = None;
                                 self.state.autocomplete = AutocompleteState::default();
-                                self.state.history_index = None;
+                                self.state.input.history_index = None;
                                 crate::session::append_history(&input);
 
                                 // --- GOAL mode: intercept non-command input ---
@@ -1029,35 +1023,35 @@ impl App {
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.delete_selection_if_any();
-                let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
-                self.state.input_buffer.insert(byte_pos, c);
-                self.state.input_cursor += 1;
-                self.state.input_selection_anchor = None;
+                let byte_pos = char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
+                self.state.input.buffer.insert(byte_pos, c);
+                self.state.input.cursor += 1;
+                self.state.input.selection_anchor = None;
             }
             KeyCode::Backspace => {
-                if self.state.input_selection_anchor.is_some() {
+                if self.state.input.selection_anchor.is_some() {
                     self.delete_selection_if_any();
                 } else {
-                    let char_count = self.state.input_buffer.chars().count();
-                    if self.state.input_cursor > 0 && self.state.input_cursor <= char_count {
-                        self.state.input_cursor -= 1;
-                        let byte_pos = char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
-                        if byte_pos < self.state.input_buffer.len() {
-                            self.state.input_buffer.remove(byte_pos);
+                    let char_count = self.state.input.buffer.chars().count();
+                    if self.state.input.cursor > 0 && self.state.input.cursor <= char_count {
+                        self.state.input.cursor -= 1;
+                        let byte_pos = char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
+                        if byte_pos < self.state.input.buffer.len() {
+                            self.state.input.buffer.remove(byte_pos);
                         }
                     }
                 }
             }
             KeyCode::Delete => {
-                if self.state.input_selection_anchor.is_some() {
+                if self.state.input.selection_anchor.is_some() {
                     self.delete_selection_if_any();
                 } else {
-                    let char_count = self.state.input_buffer.chars().count();
-                    if self.state.input_cursor < char_count {
+                    let char_count = self.state.input.buffer.chars().count();
+                    if self.state.input.cursor < char_count {
                         let byte_pos =
-                            char_to_byte_pos(&self.state.input_buffer, self.state.input_cursor);
-                        if byte_pos < self.state.input_buffer.len() {
-                            self.state.input_buffer.remove(byte_pos);
+                            char_to_byte_pos(&self.state.input.buffer, self.state.input.cursor);
+                        if byte_pos < self.state.input.buffer.len() {
+                            self.state.input.buffer.remove(byte_pos);
                         }
                     }
                 }
@@ -1066,92 +1060,92 @@ impl App {
                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 if !shift {
-                    self.state.input_selection_anchor = None;
-                } else if self.state.input_selection_anchor.is_none() {
-                    self.state.input_selection_anchor = Some(self.state.input_cursor);
+                    self.state.input.selection_anchor = None;
+                } else if self.state.input.selection_anchor.is_none() {
+                    self.state.input.selection_anchor = Some(self.state.input.cursor);
                 }
-                let char_count = self.state.input_buffer.chars().count();
-                let clamped = self.state.input_cursor.min(char_count);
+                let char_count = self.state.input.buffer.chars().count();
+                let clamped = self.state.input.cursor.min(char_count);
                 let new_cursor = if ctrl {
-                    prev_word_start(&self.state.input_buffer, clamped)
+                    prev_word_start(&self.state.input.buffer, clamped)
                 } else {
                     clamped.saturating_sub(1)
                 };
-                self.state.input_cursor = new_cursor;
+                self.state.input.cursor = new_cursor;
             }
             KeyCode::Right => {
                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 if !shift {
-                    self.state.input_selection_anchor = None;
-                } else if self.state.input_selection_anchor.is_none() {
-                    self.state.input_selection_anchor = Some(self.state.input_cursor);
+                    self.state.input.selection_anchor = None;
+                } else if self.state.input.selection_anchor.is_none() {
+                    self.state.input.selection_anchor = Some(self.state.input.cursor);
                 }
-                let char_count = self.state.input_buffer.chars().count();
+                let char_count = self.state.input.buffer.chars().count();
                 let new_cursor = if ctrl {
-                    next_word_end(&self.state.input_buffer, self.state.input_cursor)
-                } else if self.state.input_cursor < char_count {
-                    self.state.input_cursor + 1
+                    next_word_end(&self.state.input.buffer, self.state.input.cursor)
+                } else if self.state.input.cursor < char_count {
+                    self.state.input.cursor + 1
                 } else {
-                    self.state.input_cursor
+                    self.state.input.cursor
                 };
-                self.state.input_cursor = new_cursor;
+                self.state.input.cursor = new_cursor;
             }
             KeyCode::Home => {
                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.state.input_selection_anchor = None;
-                } else if self.state.input_selection_anchor.is_none() {
-                    self.state.input_selection_anchor = Some(self.state.input_cursor);
+                    self.state.input.selection_anchor = None;
+                } else if self.state.input.selection_anchor.is_none() {
+                    self.state.input.selection_anchor = Some(self.state.input.cursor);
                 }
-                self.state.input_cursor = 0;
+                self.state.input.cursor = 0;
             }
             KeyCode::End => {
                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.state.input_selection_anchor = None;
-                } else if self.state.input_selection_anchor.is_none() {
-                    self.state.input_selection_anchor = Some(self.state.input_cursor);
+                    self.state.input.selection_anchor = None;
+                } else if self.state.input.selection_anchor.is_none() {
+                    self.state.input.selection_anchor = Some(self.state.input.cursor);
                 }
-                self.state.input_cursor = self.state.input_buffer.chars().count();
+                self.state.input.cursor = self.state.input.buffer.chars().count();
             }
             KeyCode::Up if !self.state.is_generating
-                && self.state.input_buffer.chars().take(self.state.input_cursor).filter(|&c| c == '\n').count() == 0 =>
+                && self.state.input.buffer.chars().take(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
-                let history = &self.state.input_history;
+                let history = &self.state.input.history;
                 if !history.is_empty() {
-                    let idx = match self.state.history_index {
+                    let idx = match self.state.input.history_index {
                         None => {
-                            self.state.unsent_input = self.state.input_buffer.clone();
+                            self.state.input.unsent = self.state.input.buffer.clone();
                             Some(history.len() - 1)
                         }
                         Some(i) if i > 0 => Some(i - 1),
                         _ => None,
                     };
                     if let Some(i) = idx {
-                        self.state.input_buffer = history[i].clone();
-                        self.state.input_cursor = self.state.input_buffer.chars().count();
-                        self.state.input_selection_anchor = None;
-                        self.state.history_index = Some(i);
+                        self.state.input.buffer = history[i].clone();
+                        self.state.input.cursor = self.state.input.buffer.chars().count();
+                        self.state.input.selection_anchor = None;
+                        self.state.input.history_index = Some(i);
                     }
                 }
             }
             KeyCode::Down if !self.state.is_generating
-                && self.state.input_buffer.chars().skip(self.state.input_cursor).filter(|&c| c == '\n').count() == 0 =>
+                && self.state.input.buffer.chars().skip(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
-                let next = self.state.history_index.map(|i| i + 1);
-                let history_len = self.state.input_history.len();
+                let next = self.state.input.history_index.map(|i| i + 1);
+                let history_len = self.state.input.history.len();
                 match next {
                     Some(i) if i < history_len => {
-                        self.state.input_buffer = self.state.input_history[i].clone();
-                        self.state.input_cursor = self.state.input_buffer.chars().count();
-                        self.state.history_index = Some(i);
+                        self.state.input.buffer = self.state.input.history[i].clone();
+                        self.state.input.cursor = self.state.input.buffer.chars().count();
+                        self.state.input.history_index = Some(i);
                     }
                     _ => {
-                        self.state.input_buffer = std::mem::take(&mut self.state.unsent_input);
-                        self.state.input_cursor = self.state.input_buffer.chars().count();
-                        self.state.history_index = None;
+                        self.state.input.buffer = std::mem::take(&mut self.state.input.unsent);
+                        self.state.input.cursor = self.state.input.buffer.chars().count();
+                        self.state.input.history_index = None;
                     }
                 }
-                self.state.input_selection_anchor = None;
+                self.state.input.selection_anchor = None;
             }
             KeyCode::Up => {
                 self.state.scroll_offset = self.state.scroll_offset.saturating_add(1);
@@ -1266,7 +1260,7 @@ impl App {
     }
 
     fn refresh_autocomplete(&mut self) {
-        let buf = self.state.input_buffer.clone();
+        let buf = self.state.input.buffer.clone();
 
         // Check for @-triggered file path completion
         if let Some(at_pos) = buf.rfind('@') {
@@ -1385,12 +1379,12 @@ impl App {
         if self.state.autocomplete.file_mode {
             let path = std::path::Path::new(&suggestion.usage);
             if path.is_dir() {
-                let at_pos = self.state.input_buffer.rfind('@').unwrap_or(0);
-                let before_at = self.state.input_buffer[..at_pos].to_string();
+                let at_pos = self.state.input.buffer.rfind('@').unwrap_or(0);
+                let before_at = self.state.input.buffer[..at_pos].to_string();
                 let new_buf = format!("{}@{}/", before_at, suggestion.name.trim_end_matches('/'));
-                self.state.input_buffer = new_buf;
-                self.state.input_cursor = self.state.input_buffer.chars().count();
-                self.state.input_selection_anchor = None;
+                self.state.input.buffer = new_buf;
+                self.state.input.cursor = self.state.input.buffer.chars().count();
+                self.state.input.selection_anchor = None;
                 self.state.autocomplete = AutocompleteState::default();
             } else {
                 let resolved = if path.is_relative() {
@@ -1422,40 +1416,40 @@ impl App {
                             is_image,
                         });
                 }
-                let at_pos = self.state.input_buffer.rfind('@').unwrap_or(0);
-                let after_at = &self.state.input_buffer[at_pos + 1..];
+                let at_pos = self.state.input.buffer.rfind('@').unwrap_or(0);
+                let after_at = &self.state.input.buffer[at_pos + 1..];
                 let path_text = after_at.split_whitespace().next().unwrap_or("");
-                let before = self.state.input_buffer[..at_pos].to_string();
-                let after = self.state.input_buffer[at_pos + 1 + path_text.len()..].to_string();
+                let before = self.state.input.buffer[..at_pos].to_string();
+                let after = self.state.input.buffer[at_pos + 1 + path_text.len()..].to_string();
                 let new_buf = format!("{}{}", before, after);
-                self.state.input_buffer = new_buf;
-                self.state.input_cursor = self.state.input_buffer.chars().count();
-                self.state.input_selection_anchor = None;
+                self.state.input.buffer = new_buf;
+                self.state.input.cursor = self.state.input.buffer.chars().count();
+                self.state.input.selection_anchor = None;
                 self.state.autocomplete = AutocompleteState::default();
                 self.state.status_message =
                     format!("{} files attached", self.state.attached_files.len());
             }
         } else {
             let new_buf = format!("/{} ", suggestion.name);
-            self.state.input_buffer = new_buf;
-            self.state.input_cursor = self.state.input_buffer.chars().count();
-            self.state.input_selection_anchor = None;
+            self.state.input.buffer = new_buf;
+            self.state.input.cursor = self.state.input.buffer.chars().count();
+            self.state.input.selection_anchor = None;
             self.state.autocomplete = AutocompleteState::default();
         }
     }
 
     fn delete_selection_if_any(&mut self) -> Option<usize> {
-        if let Some(anchor) = self.state.input_selection_anchor.take() {
-            let cursor = self.state.input_cursor;
+        if let Some(anchor) = self.state.input.selection_anchor.take() {
+            let cursor = self.state.input.cursor;
             let (start, end) = if anchor <= cursor {
                 (anchor, cursor)
             } else {
                 (cursor, anchor)
             };
-            let bs = char_to_byte_pos(&self.state.input_buffer, start);
-            let be = char_to_byte_pos(&self.state.input_buffer, end);
-            self.state.input_buffer.drain(bs..be);
-            self.state.input_cursor = start;
+            let bs = char_to_byte_pos(&self.state.input.buffer, start);
+            let be = char_to_byte_pos(&self.state.input.buffer, end);
+            self.state.input.buffer.drain(bs..be);
+            self.state.input.cursor = start;
         }
         None
     }
@@ -1755,9 +1749,9 @@ impl App {
                 self.state.attached_files.clear();
                 self.state.current_session_id = s.id;
                 self.state.scroll_offset = 0;
-                self.state.input_buffer.clear();
-                self.state.input_cursor = 0;
-                self.state.input_selection_anchor = None;
+                self.state.input.buffer.clear();
+                self.state.input.cursor = 0;
+                self.state.input.selection_anchor = None;
                 self.state.autocomplete = Default::default();
                 self.state.is_generating = false;
                 self.state.error = None;
@@ -1787,9 +1781,9 @@ impl App {
                             self.state.messages = messages;
                             self.state.current_session_id = session_id.to_string();
                             self.state.scroll_offset = 0;
-                            self.state.input_buffer.clear();
-                            self.state.input_cursor = 0;
-                            self.state.input_selection_anchor = None;
+                            self.state.input.buffer.clear();
+                            self.state.input.cursor = 0;
+                            self.state.input.selection_anchor = None;
                             self.state.autocomplete = Default::default();
                             self.state.is_generating = false;
                             self.state.error = None;
@@ -2200,21 +2194,21 @@ fn next_word_end(s: &str, cursor: usize) -> usize {
 }
 
 fn insert_newline(state: &mut crate::app::AppState) {
-    if let Some(anchor) = state.input_selection_anchor.take() {
-        let (start, end) = if anchor <= state.input_cursor {
-            (anchor, state.input_cursor)
+    if let Some(anchor) = state.input.selection_anchor.take() {
+        let (start, end) = if anchor <= state.input.cursor {
+            (anchor, state.input.cursor)
         } else {
-            (state.input_cursor, anchor)
+            (state.input.cursor, anchor)
         };
-        let bs = char_to_byte_pos(&state.input_buffer, start);
-        let be = char_to_byte_pos(&state.input_buffer, end);
-        state.input_buffer.drain(bs..be);
-        state.input_cursor = start;
+        let bs = char_to_byte_pos(&state.input.buffer, start);
+        let be = char_to_byte_pos(&state.input.buffer, end);
+        state.input.buffer.drain(bs..be);
+        state.input.cursor = start;
     }
-    let byte_pos = char_to_byte_pos(&state.input_buffer, state.input_cursor);
-    state.input_buffer.insert(byte_pos, '\n');
-    state.input_cursor += 1;
-    state.input_selection_anchor = None;
+    let byte_pos = char_to_byte_pos(&state.input.buffer, state.input.cursor);
+    state.input.buffer.insert(byte_pos, '\n');
+    state.input.cursor += 1;
+    state.input.selection_anchor = None;
 }
 
 fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Value) -> String {

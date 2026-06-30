@@ -63,9 +63,9 @@ impl Command for ImportCommand {
         state.messages = messages;
         state.current_session_id = session_id.clone();
         state.scroll_offset = 0;
-        state.input_buffer.clear();
-        state.input_cursor = 0;
-        state.input_selection_anchor = None;
+        state.input.buffer.clear();
+        state.input.cursor = 0;
+        state.input.selection_anchor = None;
         state.is_generating = false;
         state.error = None;
 
