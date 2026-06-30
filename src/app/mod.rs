@@ -1612,78 +1612,46 @@ impl App {
         match provider.complete(request).await {
             Ok(response) => {
                 let verdict = goal::parse_goal_verdict(&response.content);
-                if verdict.success {
-                    let summary = if verdict.summary.is_empty() {
-                        "Goal achieved!".to_string()
-                    } else {
-                        verdict.summary.clone()
-                    };
-                    self.state.goal.summary = summary.clone();
-                    self.state.goal.stage = GoalStage::Done;
-                    self.state.messages.push(ChatMessage::system(
-                        &format!("✅ Goal achieved!\n\n{}", summary)
-                    ));
-
-                    // Save system session for evaluator
+                let save_eval_session = |this: &Self| {
                     let _ = crate::session::save_session_with_tag(
-                        &self.state.goal.agent2_session_id,
-                        &self.state.session_started_at,
+                        &this.state.goal.agent2_session_id,
+                        &this.state.session_started_at,
                         &eval_messages,
-                        &self.config,
-                        &self.state.workspace_path,
+                        &this.config,
+                        &this.state.workspace_path,
                         Some("__goal_system__".to_string()),
                     );
-                } else {
-                    self.state.goal.agent2_failures += 1;
-                    let iter = self.state.goal.iteration;
+                };
 
-                    // Check if we need to swap agent 2 (after 5 failures)
-                    if self.state.goal.agent2_failures >= 5 {
-                        self.state.goal.agent2_session_id = crate::session::create_session_id();
-                        self.state.goal.agent2_failures = 0;
+                match self.state.goal.apply_verdict(verdict) {
+                    goal::GoalOutcome::Succeeded { summary } => {
                         self.state.messages.push(ChatMessage::system(
-                            "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                            &format!("✅ Goal achieved!\n\n{}", summary)
                         ));
+                        save_eval_session(self);
                     }
+                    goal::GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
+                        if swapped_agent2 {
+                            self.state.messages.push(ChatMessage::system(
+                                "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                            ));
+                        }
+                        // Save under the (possibly swapped) evaluator session id.
+                        save_eval_session(self);
 
-                    // Save evaluator session
-                    let _ = crate::session::save_session_with_tag(
-                        &self.state.goal.agent2_session_id,
-                        &self.state.session_started_at,
-                        &eval_messages,
-                        &self.config,
-                        &self.state.workspace_path,
-                        Some("__goal_system__".to_string()),
-                    );
-
-                    let feedback = if verdict.feedback.is_empty() {
-                        "No specific feedback provided. Please re-examine the goal and fix remaining issues.".to_string()
-                    } else {
-                        verdict.feedback.clone()
-                    };
-
-                    self.state.messages.push(ChatMessage::system(
-                        &format!(
-                            "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
-                            iter, verdict.issues, feedback
-                        )
-                    ));
-
-                    // Iteration counter
-                    self.state.goal.iteration += 1;
-
-                    // Check if we need to swap agent 1 (after 3 failures)
-                    if self.state.goal.agent1_failures >= 3 {
-                        self.state.goal.agent1_session_id = crate::session::create_session_id();
-                        self.state.goal.agent1_failures = 0;
                         self.state.messages.push(ChatMessage::system(
-                            "🔄 Swapping agent to new session after 3 failures."
+                            &format!(
+                                "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
+                                iteration, issues, feedback
+                            )
                         ));
+                        if swapped_agent1 {
+                            self.state.messages.push(ChatMessage::system(
+                                "🔄 Swapping agent to new session after 3 failures."
+                            ));
+                        }
+                        self.retry_agent1_with_feedback(&feedback).await;
                     }
-
-                    self.state.goal.agent1_failures += 1;
-                    self.state.goal.stage = GoalStage::RunAgent1;
-                    self.retry_agent1_with_feedback(&feedback).await;
                 }
             }
             Err(e) => {
@@ -1719,55 +1687,31 @@ impl App {
     }
 
     async fn handle_goal_verdict_from(&mut self, verdict: GoalVerdict) {
-        if verdict.success {
-            let summary = if verdict.summary.is_empty() {
-                "Goal achieved!".to_string()
-            } else {
-                verdict.summary.clone()
-            };
-            self.state.goal.summary = summary.clone();
-            self.state.goal.stage = GoalStage::Done;
-            self.state.messages.push(ChatMessage::system(
-                &format!("✅ Goal achieved!\n\n{}", summary)
-            ));
-        } else {
-            self.state.goal.agent2_failures += 1;
-            let iter = self.state.goal.iteration;
-
-            if self.state.goal.agent2_failures >= 5 {
-                self.state.goal.agent2_session_id = crate::session::create_session_id();
-                self.state.goal.agent2_failures = 0;
+        match self.state.goal.apply_verdict(verdict) {
+            goal::GoalOutcome::Succeeded { summary } => {
                 self.state.messages.push(ChatMessage::system(
-                    "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                    &format!("✅ Goal achieved!\n\n{}", summary)
                 ));
             }
-
-            let feedback = if verdict.feedback.is_empty() {
-                "No specific feedback provided. Please re-examine the goal and fix remaining issues.".to_string()
-            } else {
-                verdict.feedback.clone()
-            };
-
-            self.state.messages.push(ChatMessage::system(
-                &format!(
-                    "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
-                    iter, verdict.issues, feedback
-                )
-            ));
-
-            self.state.goal.iteration += 1;
-
-            if self.state.goal.agent1_failures >= 3 {
-                self.state.goal.agent1_session_id = crate::session::create_session_id();
-                self.state.goal.agent1_failures = 0;
+            goal::GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
+                if swapped_agent2 {
+                    self.state.messages.push(ChatMessage::system(
+                        "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                    ));
+                }
                 self.state.messages.push(ChatMessage::system(
-                    "🔄 Swapping agent to new session after 3 failures."
+                    &format!(
+                        "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
+                        iteration, issues, feedback
+                    )
                 ));
+                if swapped_agent1 {
+                    self.state.messages.push(ChatMessage::system(
+                        "🔄 Swapping agent to new session after 3 failures."
+                    ));
+                }
+                self.retry_agent1_with_feedback(&feedback).await;
             }
-
-            self.state.goal.agent1_failures += 1;
-            self.state.goal.stage = GoalStage::RunAgent1;
-            self.retry_agent1_with_feedback(&feedback).await;
         }
     }
 

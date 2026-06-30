@@ -27,6 +27,83 @@ pub struct GoalState {
     pub summary: String,
 }
 
+/// What the imperative shell must surface after a verdict is applied.
+///
+/// `apply_verdict` performs all the goal *state* changes (counters, stage,
+/// session swaps); the caller is left to do the I/O — pushing chat messages,
+/// saving sessions, kicking off the retry.
+pub(crate) enum GoalOutcome {
+    /// Goal met. Display this summary.
+    Succeeded { summary: String },
+    /// Goal not met. Retry agent 1 with this feedback.
+    Retry {
+        /// Attempt number to display (the pre-increment iteration).
+        iteration: u32,
+        issues: String,
+        feedback: String,
+        /// A fresh agent-1 (worker) session was started this round.
+        swapped_agent1: bool,
+        /// A fresh agent-2 (evaluator) session was started this round.
+        swapped_agent2: bool,
+    },
+}
+
+impl GoalState {
+    /// Apply an evaluator verdict: advance failure counters, swap a stale
+    /// agent's session (worker after 3 failures, evaluator after 5), bump the
+    /// iteration, and set the next stage. Returns what the shell should do.
+    ///
+    /// This is the goal loop's decision core, shared by the inline and
+    /// event-driven verdict paths so the rules live in exactly one place.
+    pub(crate) fn apply_verdict(&mut self, verdict: GoalVerdict) -> GoalOutcome {
+        if verdict.success {
+            let summary = if verdict.summary.is_empty() {
+                "Goal achieved!".to_string()
+            } else {
+                verdict.summary
+            };
+            self.summary = summary.clone();
+            self.stage = GoalStage::Done;
+            return GoalOutcome::Succeeded { summary };
+        }
+
+        // Evaluator (agent 2): increment first, then swap if it keeps failing.
+        self.agent2_failures += 1;
+        let iteration = self.iteration;
+        let swapped_agent2 = self.agent2_failures >= 5;
+        if swapped_agent2 {
+            self.agent2_session_id = crate::session::create_session_id();
+            self.agent2_failures = 0;
+        }
+
+        let feedback = if verdict.feedback.is_empty() {
+            "No specific feedback provided. Please re-examine the goal and fix remaining issues."
+                .to_string()
+        } else {
+            verdict.feedback
+        };
+
+        self.iteration += 1;
+
+        // Worker (agent 1): swap before counting this round's failure.
+        let swapped_agent1 = self.agent1_failures >= 3;
+        if swapped_agent1 {
+            self.agent1_session_id = crate::session::create_session_id();
+            self.agent1_failures = 0;
+        }
+        self.agent1_failures += 1;
+        self.stage = GoalStage::RunAgent1;
+
+        GoalOutcome::Retry {
+            iteration,
+            issues: verdict.issues,
+            feedback,
+            swapped_agent1,
+            swapped_agent2,
+        }
+    }
+}
+
 /// Parse an evaluator reply into a structured [`GoalVerdict`].
 ///
 /// The evaluator is asked to emit `**Status:**`, `**Summary:**`, `**Issues:**`
@@ -101,5 +178,91 @@ mod tests {
         let v = parse_goal_verdict("**Status:** FAILURE\n**Summary:** partial — SUCCESS not reached");
         assert!(!v.success);
         assert_eq!(v.summary, "partial — SUCCESS not reached");
+    }
+
+    fn verdict(success: bool, summary: &str, issues: &str, feedback: &str) -> GoalVerdict {
+        GoalVerdict {
+            success,
+            summary: summary.to_string(),
+            issues: issues.to_string(),
+            feedback: feedback.to_string(),
+        }
+    }
+
+    #[test]
+    fn apply_success_sets_done_and_summary() {
+        let mut g = GoalState::default();
+        let outcome = g.apply_verdict(verdict(true, "shipped it", "", ""));
+        assert_eq!(g.stage, GoalStage::Done);
+        assert_eq!(g.summary, "shipped it");
+        match outcome {
+            GoalOutcome::Succeeded { summary } => assert_eq!(summary, "shipped it"),
+            _ => panic!("expected Succeeded"),
+        }
+    }
+
+    #[test]
+    fn apply_success_empty_summary_defaults() {
+        let mut g = GoalState::default();
+        let outcome = g.apply_verdict(verdict(true, "", "", ""));
+        match outcome {
+            GoalOutcome::Succeeded { summary } => assert_eq!(summary, "Goal achieved!"),
+            _ => panic!("expected Succeeded"),
+        }
+    }
+
+    #[test]
+    fn apply_failure_advances_iteration_and_counters() {
+        let mut g = GoalState::default();
+        let outcome = g.apply_verdict(verdict(false, "", "tests red", "fix tests"));
+        assert_eq!(g.stage, GoalStage::RunAgent1);
+        assert_eq!(g.iteration, 1);
+        assert_eq!(g.agent1_failures, 1);
+        assert_eq!(g.agent2_failures, 1);
+        match outcome {
+            GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
+                assert_eq!(iteration, 0); // pre-increment attempt number
+                assert_eq!(issues, "tests red");
+                assert_eq!(feedback, "fix tests");
+                assert!(!swapped_agent1 && !swapped_agent2);
+            }
+            _ => panic!("expected Retry"),
+        }
+    }
+
+    #[test]
+    fn apply_failure_empty_feedback_defaults() {
+        let mut g = GoalState::default();
+        let outcome = g.apply_verdict(verdict(false, "", "", ""));
+        match outcome {
+            GoalOutcome::Retry { feedback, .. } => assert!(feedback.starts_with("No specific feedback")),
+            _ => panic!("expected Retry"),
+        }
+    }
+
+    #[test]
+    fn evaluator_swaps_after_fifth_failure() {
+        let mut g = GoalState { agent2_failures: 4, ..Default::default() };
+        let outcome = g.apply_verdict(verdict(false, "", "", ""));
+        // 4 + 1 == 5 → swap and reset the evaluator session.
+        assert_eq!(g.agent2_failures, 0);
+        assert!(!g.agent2_session_id.is_empty());
+        match outcome {
+            GoalOutcome::Retry { swapped_agent2, .. } => assert!(swapped_agent2),
+            _ => panic!("expected Retry"),
+        }
+    }
+
+    #[test]
+    fn worker_swaps_when_already_at_three_failures() {
+        let mut g = GoalState { agent1_failures: 3, ..Default::default() };
+        let outcome = g.apply_verdict(verdict(false, "", "", ""));
+        // Check is before increment: swap, reset to 0, then count this round → 1.
+        assert_eq!(g.agent1_failures, 1);
+        assert!(!g.agent1_session_id.is_empty());
+        match outcome {
+            GoalOutcome::Retry { swapped_agent1, .. } => assert!(swapped_agent1),
+            _ => panic!("expected Retry"),
+        }
     }
 }
