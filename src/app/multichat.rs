@@ -43,33 +43,22 @@ impl App {
         let id = conversation::ConversationId::next();
         let messages = vec![ChatMessage::user(&prompt)];
         let system_prompt = self.build_system_prompt().await;
-        let model = self.config.provider.model.clone();
-        let temperature = self.config.provider.temperature;
-        let max_tokens = self.config.provider.max_tokens;
-        let max_steps = self.config.agent.max_steps_per_turn.clamp(1, 8);
-        let max_tools_per_step = self.config.agent.max_tools_per_step.max(1);
-        let tools = Arc::clone(&self.tools);
-        let mcp = Arc::clone(&self.mcp);
-        let event_tx = self.event_tx.clone();
 
         let mut generation = generation::GenerationState::default();
         generation.begin(std::time::Instant::now());
 
-        let handle = tokio::spawn(crate::agent::runner::run_agent_loop(
-            id,
-            Arc::clone(&provider),
-            tools,
-            mcp,
-            messages.clone(),
+        let handle = self.runtime.spawn(super::runtime::TurnSpec {
+            conversation: id,
+            provider: Arc::clone(&provider),
+            messages: messages.clone(),
             system_prompt,
-            model,
-            temperature,
-            max_tokens,
-            max_steps,
-            max_tools_per_step,
-            true, // background: auto-approve, never block on a modal
-            event_tx,
-        ));
+            model: self.config.provider.model.clone(),
+            temperature: self.config.provider.temperature,
+            max_tokens: self.config.provider.max_tokens,
+            max_steps: self.config.agent.max_steps_per_turn.clamp(1, 8),
+            max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
+            auto_approve: true, // background: auto-approve, never block on a modal
+        });
 
         self.state.conversations.add_background(conversation::Conversation {
             id,

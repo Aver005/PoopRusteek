@@ -6,6 +6,7 @@ pub mod input;
 mod keys;
 pub mod mcp_status;
 mod multichat;
+mod runtime;
 
 use crate::commands::CommandRegistry;
 use crate::config::Config;
@@ -82,6 +83,9 @@ pub struct App {
     tools: Arc<ToolRegistry>,
     prompts: PromptFiles,
     skills: Vec<SkillDefinition>,
+    /// Launches agent turns (owns the tool registry / MCP / event channel for
+    /// execution). The single place the agent loop is spawned.
+    runtime: runtime::AgentRuntime,
 }
 
 pub struct AppState {
@@ -230,6 +234,9 @@ impl App {
             state.mcp_status.last_stats_update = Some(std::time::Instant::now());
         }
 
+        let runtime =
+            runtime::AgentRuntime::new(Arc::clone(&tools), Arc::clone(&mcp), event_tx.clone());
+
         Ok(Self {
             config,
             state,
@@ -240,6 +247,7 @@ impl App {
             tools,
             prompts,
             skills,
+            runtime,
         })
     }
 
@@ -660,37 +668,25 @@ impl App {
             }
         };
 
-        let event_tx = self.event_tx.clone();
-        let messages: Vec<ChatMessage> = self.state.focused_mut().messages.clone();
+        let conversation = self.state.conversations.focused_id();
+        let messages: Vec<ChatMessage> = self.state.focused().messages.clone();
         let system_prompt = self.build_system_prompt().await;
 
-        let model = self.config.provider.model.clone();
-        let temperature = self.config.provider.temperature;
-        let max_tokens = self.config.provider.max_tokens;
-        let max_steps = self.config.agent.max_steps_per_turn.max(1);
-        let max_tools_per_step = self.config.agent.max_tools_per_step.max(1);
-        let tools = Arc::clone(&self.tools);
-        let mcp = Arc::clone(&self.mcp);
-        let conversation = self.state.conversations.focused_id();
-
-        let _ = event_tx.send(AppEvent::AgentStarted(conversation));
-
-        let handle = tokio::spawn(crate::agent::runner::run_agent_loop(
+        let spec = runtime::TurnSpec {
             conversation,
             provider,
-            tools,
-            mcp,
             messages,
             system_prompt,
-            model,
-            temperature,
-            max_tokens,
-            max_steps,
-            max_tools_per_step,
-            false, // focused turn: interactive approval
-            event_tx,
-        ));
+            model: self.config.provider.model.clone(),
+            temperature: self.config.provider.temperature,
+            max_tokens: self.config.provider.max_tokens,
+            max_steps: self.config.agent.max_steps_per_turn.max(1),
+            max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
+            auto_approve: false, // focused turn: interactive approval
+        };
 
+        let _ = self.event_tx.send(AppEvent::AgentStarted(conversation));
+        let handle = self.runtime.spawn(spec);
         self.state.focused_mut().agent_task = Some(handle);
 
         Ok(())
