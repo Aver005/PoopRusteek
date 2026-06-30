@@ -37,6 +37,8 @@ pub enum CommandResult {
     OpenWhitelist,
     ShowSkills,
     ToggleSkill(String, bool),
+    /// `/btw <question>` — run a one-shot side-answer in the background.
+    Sidechat(String),
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::import::ImportCommand));
         self.register(Box::new(defs::ps::PsCommand));
         self.register(Box::new(defs::jobs::JobsCommand));
+        self.register(Box::new(defs::btw::BtwCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {

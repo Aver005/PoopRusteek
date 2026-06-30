@@ -1,3 +1,4 @@
+use crate::app::conversation::ConversationId;
 use crate::provider::ChatMessage;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -90,19 +91,20 @@ pub enum AppEvent {
     Resize(u16, u16),
     Tick,
 
-    // Agent events
-    AgentStarted,
-    AgentChunk(String),
-    AgentDone(AgentResult),
-    AgentError(String),
-    BeginAssistantMessage,
-    DiscardEmptyAssistantMessage,
-    AddMessage(ChatMessage),
+    // Agent events — each carries the conversation it belongs to so background
+    // (sidechat / sub-agent) turns stream into the right place.
+    AgentStarted(ConversationId),
+    AgentChunk(ConversationId, String),
+    AgentDone(ConversationId, AgentResult),
+    AgentError(ConversationId, String),
+    BeginAssistantMessage(ConversationId),
+    DiscardEmptyAssistantMessage(ConversationId),
+    AddMessage(ConversationId, ChatMessage),
 
     // Tool events
-    ToolStarted { name: String },
-    ToolDone { result: String },
-    ToolError { error: String },
+    ToolStarted { conversation: ConversationId, name: String },
+    ToolDone { conversation: ConversationId, result: String },
+    ToolError { conversation: ConversationId, error: String },
     RequestToolApproval(ToolApprovalRequest),
     RequestQuestion(QuestionRequest, QuestionState),
 

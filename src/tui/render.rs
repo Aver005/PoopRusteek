@@ -333,6 +333,14 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         String::new()
     };
+    let btw_status = {
+        let running = state.background.iter().filter(|c| c.is_streaming()).count();
+        if running > 0 {
+            format!(" btw:{running}")
+        } else {
+            String::new()
+        }
+    };
 
     let model_tag = if !state.generation.last_model.is_empty() {
         format!(" · {}", state.generation.last_model)
@@ -350,7 +358,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         String::new()
     };
-    let left = format!(" {}{} · {}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status);
+    let left = format!(" {}{} · {}{}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status, btw_status);
 
     let status_tag = state.generation.last_status.as_deref().unwrap_or("");
 

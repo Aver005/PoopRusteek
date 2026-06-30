@@ -54,6 +54,23 @@ pub fn kill_foreground_child() {
     }
 }
 
+/// The conversation an agent event targets, if it is a per-conversation event.
+fn agent_event_target(event: &AppEvent) -> Option<conversation::ConversationId> {
+    match event {
+        AppEvent::AgentStarted(id)
+        | AppEvent::AgentChunk(id, _)
+        | AppEvent::AgentDone(id, _)
+        | AppEvent::AgentError(id, _)
+        | AppEvent::BeginAssistantMessage(id)
+        | AppEvent::DiscardEmptyAssistantMessage(id)
+        | AppEvent::AddMessage(id, _) => Some(*id),
+        AppEvent::ToolStarted { conversation, .. }
+        | AppEvent::ToolDone { conversation, .. }
+        | AppEvent::ToolError { conversation, .. } => Some(*conversation),
+        _ => None,
+    }
+}
+
 pub struct App {
     pub config: Config,
     pub state: AppState,
@@ -95,6 +112,13 @@ pub struct AppState {
     pub running_background_count: usize,
     pub running_interactive_count: usize,
     pub running_persistent_count: usize,
+
+    /// Identity of the focused conversation (whose live state is the fields
+    /// above). Background conversations are parked in `background`.
+    pub focused_id: conversation::ConversationId,
+    /// Non-focused conversations (sidechats / sub-agents / parallel sessions)
+    /// that keep streaming on their own tasks.
+    pub background: Vec<conversation::Conversation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,6 +191,9 @@ impl App {
             running_background_count: 0,
             running_interactive_count: 0,
             running_persistent_count: 0,
+
+            focused_id: conversation::ConversationId::next(),
+            background: Vec::new(),
         };
 
         if mcp_init_ok {
@@ -205,6 +232,12 @@ impl App {
         // Kill any lingering agent task so it can't keep the runtime alive.
         if let Some(handle) = self.agent_task.take() {
             handle.abort();
+        }
+        // Abort background conversations (sidechats / sub-agents) too.
+        for conv in &mut self.state.background {
+            if let Some(handle) = conv.agent_task.take() {
+                handle.abort();
+            }
         }
         // Kill all background/PTY processes so spawn_blocking waiters unblock
         // and the tokio runtime can shut down cleanly.
@@ -364,13 +397,21 @@ impl App {
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
+        // Agent events for a background conversation are applied to its parked
+        // record, not the focused chat.
+        if let Some(target) = agent_event_target(&event) {
+            if target != self.state.focused_id {
+                self.handle_background_event(target, event);
+                return Ok(false);
+            }
+        }
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
-            AppEvent::AgentStarted => {
+            AppEvent::AgentStarted(_) => {
                 self.state.generation.begin(std::time::Instant::now());
                 self.state.status_message = "Thinking...".to_string();
             }
-            AppEvent::BeginAssistantMessage => {
+            AppEvent::BeginAssistantMessage(_) => {
                 let should_push = self
                     .state
                     .messages
@@ -380,7 +421,7 @@ impl App {
                     self.state.messages.push(ChatMessage::assistant(""));
                 }
             }
-            AppEvent::DiscardEmptyAssistantMessage => {
+            AppEvent::DiscardEmptyAssistantMessage(_) => {
                 if self
                     .state
                     .messages
@@ -390,14 +431,14 @@ impl App {
                     self.state.messages.pop();
                 }
             }
-            AppEvent::AgentChunk(chunk) => {
+            AppEvent::AgentChunk(_, chunk) => {
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == Role::Assistant {
                         last.content.push_str(&chunk);
                     }
                 }
             }
-            AppEvent::AgentDone(_result) => {
+            AppEvent::AgentDone(_, _result) => {
                 self.state.generation.active = false;
                 self.state.status_message = "Ready".to_string();
                 self.state.generation.last_status = Some("FINISHED".to_string());
@@ -447,7 +488,7 @@ impl App {
                     }
                 }
             }
-            AppEvent::AgentError(err) => {
+            AppEvent::AgentError(_, err) => {
                 self.state.generation.active = false;
                 self.state.error = Some(err.clone());
                 self.state.status_message = err.clone();
@@ -472,16 +513,16 @@ impl App {
                     ));
                 }
             }
-            AppEvent::AddMessage(message) => {
+            AppEvent::AddMessage(_, message) => {
                 self.state.messages.push(message);
             }
-            AppEvent::ToolStarted { name } => {
+            AppEvent::ToolStarted { name, .. } => {
                 self.state.status_message = format!("Running {name}...");
             }
-            AppEvent::ToolDone { result: _ } => {
+            AppEvent::ToolDone { result: _, .. } => {
                 self.state.status_message = "Tool finished".to_string();
             }
-            AppEvent::ToolError { error } => {
+            AppEvent::ToolError { error, .. } => {
                 self.state.status_message = format!("Tool error: {error}");
             }
             AppEvent::RequestToolApproval(request) => {
@@ -1004,6 +1045,9 @@ impl App {
                                 CommandResult::OpenWhitelist => {
                                     self.open_whitelist_picker().await;
                                 }
+                                CommandResult::Sidechat(question) => {
+                                    self.spawn_sidechat(question).await?;
+                                }
                                 CommandResult::Error(err) => {
                                     self.state.messages.push(ChatMessage::system(&err));
                                 }
@@ -1464,10 +1508,12 @@ impl App {
         let max_tools_per_step = self.config.agent.max_tools_per_step.max(1);
         let tools = Arc::clone(&self.tools);
         let mcp = Arc::clone(&self.mcp);
+        let conversation = self.state.focused_id;
 
-        let _ = event_tx.send(AppEvent::AgentStarted);
+        let _ = event_tx.send(AppEvent::AgentStarted(conversation));
 
         let handle = tokio::spawn(crate::agent::runner::run_agent_loop(
+            conversation,
             provider,
             tools,
             mcp,
@@ -1478,12 +1524,165 @@ impl App {
             max_tokens,
             max_steps,
             max_tools_per_step,
+            false, // focused turn: interactive approval
             event_tx,
         ));
 
         self.agent_task = Some(handle);
 
         Ok(())
+    }
+
+    /// Spawn a one-shot `/btw` sidechat: an isolated background conversation
+    /// (its own forked session, auto-approved tools) whose answer is appended
+    /// to the chat when it finishes. Streams independently of the main turn.
+    async fn spawn_sidechat(&mut self, question: String) -> AppResult<()> {
+        let provider = match &self.provider {
+            Some(p) => p.fork(),
+            None => {
+                self.state.messages.push(ChatMessage::system(
+                    "No provider configured. Set your DeepSeek token in config.",
+                ));
+                return Ok(());
+            }
+        };
+
+        let id = conversation::ConversationId::next();
+        let sidechat_messages = vec![ChatMessage::user(&question)];
+        let system_prompt = self.build_system_prompt().await;
+        let model = self.config.provider.model.clone();
+        let temperature = self.config.provider.temperature;
+        let max_tokens = self.config.provider.max_tokens;
+        // Keep sidechats lightweight.
+        let max_steps = self.config.agent.max_steps_per_turn.clamp(1, 6);
+        let max_tools_per_step = self.config.agent.max_tools_per_step.max(1);
+        let tools = Arc::clone(&self.tools);
+        let mcp = Arc::clone(&self.mcp);
+        let event_tx = self.event_tx.clone();
+
+        let mut generation = generation::GenerationState::default();
+        generation.begin(std::time::Instant::now());
+
+        let handle = tokio::spawn(crate::agent::runner::run_agent_loop(
+            id,
+            Arc::clone(&provider),
+            tools,
+            mcp,
+            sidechat_messages.clone(),
+            system_prompt,
+            model,
+            temperature,
+            max_tokens,
+            max_steps,
+            max_tools_per_step,
+            true, // background: auto-approve, never block on a modal
+            event_tx,
+        ));
+
+        self.state.background.push(conversation::Conversation {
+            id,
+            kind: conversation::ConversationKind::Sidechat,
+            title: question.clone(),
+            session_id: crate::session::create_session_id(),
+            session_started_at: chrono::Utc::now().to_rfc3339(),
+            messages: sidechat_messages,
+            provider: Some(provider),
+            generation,
+            agent_task: Some(handle),
+        });
+
+        self.state.messages.push(ChatMessage::system(&format!(
+            "◈ btw started — {question}"
+        )));
+        Ok(())
+    }
+
+    /// Apply an agent event that targets a background conversation (not the
+    /// focused one). Streaming events mutate the parked conversation; terminal
+    /// events finalize it (sidechats flush their answer into the chat).
+    fn handle_background_event(&mut self, target: conversation::ConversationId, event: AppEvent) {
+        enum Finish {
+            None,
+            Done,
+            Error(String),
+        }
+        let mut finish = Finish::None;
+
+        if let Some(conv) = self.state.background.iter_mut().find(|c| c.id == target) {
+            match event {
+                AppEvent::AgentStarted(_) => {
+                    conv.generation.begin(std::time::Instant::now());
+                }
+                AppEvent::BeginAssistantMessage(_) => {
+                    let needs_push = conv
+                        .messages
+                        .last()
+                        .is_none_or(|m| m.role != Role::Assistant || !m.content.is_empty());
+                    if needs_push {
+                        conv.messages.push(ChatMessage::assistant(""));
+                    }
+                }
+                AppEvent::AgentChunk(_, chunk) => {
+                    if let Some(last) = conv.messages.last_mut() {
+                        if last.role == Role::Assistant {
+                            last.content.push_str(&chunk);
+                        }
+                    }
+                }
+                AppEvent::AddMessage(_, message) => conv.messages.push(message),
+                AppEvent::DiscardEmptyAssistantMessage(_) => {
+                    if conv
+                        .messages
+                        .last()
+                        .is_some_and(|m| m.role == Role::Assistant && m.content.is_empty())
+                    {
+                        conv.messages.pop();
+                    }
+                }
+                AppEvent::AgentDone(_, _) => {
+                    conv.generation.active = false;
+                    conv.agent_task = None;
+                    finish = Finish::Done;
+                }
+                AppEvent::AgentError(_, err) => {
+                    conv.generation.active = false;
+                    conv.agent_task = None;
+                    finish = Finish::Error(err);
+                }
+                // Tool status from background turns is not surfaced live.
+                _ => {}
+            }
+        }
+
+        match finish {
+            Finish::Done => self.finish_sidechat(target, None),
+            Finish::Error(err) => self.finish_sidechat(target, Some(err)),
+            Finish::None => {}
+        }
+    }
+
+    /// Remove a finished background conversation and flush its result (answer or
+    /// error) into the focused chat as a `◈ btw` block.
+    fn finish_sidechat(&mut self, target: conversation::ConversationId, error: Option<String>) {
+        let Some(pos) = self.state.background.iter().position(|c| c.id == target) else {
+            return;
+        };
+        let conv = self.state.background.remove(pos);
+        let block = if let Some(err) = error {
+            format!("◈ btw — {}\n\n⚠ {err}", conv.title)
+        } else {
+            let answer = conv
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Assistant)
+                .map(|m| m.content.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(no answer)".to_string());
+            format!("◈ btw — {}\n\n{answer}", conv.title)
+        };
+        self.state.messages.push(ChatMessage::system(&block));
+        self.auto_save_session();
     }
 
     /// Abort any in-flight goal cycle and leave goal mode fully reset, so the

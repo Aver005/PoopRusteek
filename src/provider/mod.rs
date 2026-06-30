@@ -208,8 +208,6 @@ pub trait LLMProvider: Send + Sync {
     /// `parent_message_id`/`session_id`. Each parallel conversation and
     /// sub-agent gets its own fork so concurrent turns never collide on
     /// session state.
-    // Phase 0 scaffolding: first callers arrive in Phase 1+.
-    #[allow(dead_code)]
     fn fork(&self) -> std::sync::Arc<dyn LLMProvider>;
     async fn reset(&self) -> crate::error::AppResult<()> {
         Ok(())

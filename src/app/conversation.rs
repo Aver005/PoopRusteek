@@ -3,14 +3,15 @@
 //! A conversation is one independent chat thread — the main chat, a `/btw`
 //! sidechat, a parallel session, or a sub-agent. Each will own its messages,
 //! a forked provider/session, generation status, and agent task (Phase 1).
-//! For now this module provides the identity and kind so the rest of the code
-//! can start routing agent events by conversation.
-//!
-// Phase 0 scaffolding: these are consumed starting in Phase 1 (the Conversation
-// abstraction). The allow is narrowed/removed there.
-#![allow(dead_code)]
+//! A conversation is one independent chat thread; the *focused* one's live
+//! state stays on `App`/`AppState`, while non-focused (background) ones are
+//! parked here as [`Conversation`] records that keep streaming on their own
+//! tasks.
 
+use super::generation::GenerationState;
+use crate::provider::{ChatMessage, LLMProvider};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Stable, process-unique id for a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,6 +34,8 @@ impl std::fmt::Display for ConversationId {
 
 /// What kind of conversation this is — drives titling, lifecycle, and how it is
 /// surfaced in the UI.
+// Only `Sidechat` is constructed in Phase 2; the rest arrive in Phase 3/4.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
     /// The primary chat the user starts in.
@@ -43,6 +46,34 @@ pub enum ConversationKind {
     Sidechat,
     /// An isolated sub-agent run (Phase 4).
     SubAgent,
+}
+
+/// A parked (non-focused) conversation: it owns its own messages, forked
+/// provider/session, generation status, and agent task, so it keeps streaming
+/// independently while the user looks at something else.
+pub struct Conversation {
+    pub id: ConversationId,
+    // `kind`, `session_id`, `session_started_at`, and `provider` are written now
+    // but only read once switching/persistence land in Phase 3.
+    #[allow(dead_code)]
+    pub kind: ConversationKind,
+    pub title: String,
+    #[allow(dead_code)]
+    pub session_id: String,
+    #[allow(dead_code)]
+    pub session_started_at: String,
+    pub messages: Vec<ChatMessage>,
+    #[allow(dead_code)]
+    pub provider: Option<Arc<dyn LLMProvider>>,
+    pub generation: GenerationState,
+    pub agent_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Conversation {
+    /// Is this conversation's agent turn currently in flight?
+    pub fn is_streaming(&self) -> bool {
+        self.generation.active
+    }
 }
 
 #[cfg(test)]

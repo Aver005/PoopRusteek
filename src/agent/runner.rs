@@ -1,3 +1,4 @@
+use crate::app::conversation::ConversationId;
 use crate::app::events::{AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider};
@@ -6,7 +7,14 @@ use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_too
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Drive one agent turn for `conversation`. Every event it emits is tagged with
+/// that id so the app routes it to the right conversation (focused or
+/// background). When `auto_approve` is set (background sidechats / sub-agents,
+/// where no user is watching) tool calls run without an approval prompt and
+/// `question` calls are declined instead of blocking.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_loop(
+    conversation: ConversationId,
     provider: Arc<dyn LLMProvider>,
     tools: Arc<ToolRegistry>,
     mcp: Arc<tokio::sync::Mutex<MCPManager>>,
@@ -17,13 +25,14 @@ pub async fn run_agent_loop(
     max_tokens: u32,
     max_steps: usize,
     max_tools_per_step: usize,
+    auto_approve: bool,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let mut collected_tool_calls = Vec::new();
     let mut messages = messages;
 
     for _step in 0..max_steps {
-        let _ = event_tx.send(AppEvent::BeginAssistantMessage);
+        let _ = event_tx.send(AppEvent::BeginAssistantMessage(conversation));
         let mut request_messages = Vec::with_capacity(messages.len() + 1);
         request_messages.push(ChatMessage::system(&system_prompt));
         request_messages.extend(messages.clone());
@@ -38,7 +47,7 @@ pub async fn run_agent_loop(
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         if let Err(error) = provider.complete_stream(request, tx).await {
-            let _ = event_tx.send(AppEvent::AgentError(error.to_string()));
+            let _ = event_tx.send(AppEvent::AgentError(conversation, error.to_string()));
             return;
         }
 
@@ -49,6 +58,7 @@ pub async fn run_agent_loop(
             match tokio::time::timeout(idle_timeout, rx.recv()).await {
                 Err(_) => {
                     let _ = event_tx.send(AppEvent::AgentError(
+                        conversation,
                         "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
                     ));
                     return;
@@ -61,10 +71,10 @@ pub async fn run_agent_loop(
                         if next_visible.starts_with(&streamed_visible) {
                             let delta = &next_visible[streamed_visible.len()..];
                             if !delta.is_empty() {
-                                let _ = event_tx.send(AppEvent::AgentChunk(delta.to_string()));
+                                let _ = event_tx.send(AppEvent::AgentChunk(conversation, delta.to_string()));
                             }
                         } else if !next_visible.is_empty() {
-                            let _ = event_tx.send(AppEvent::AddMessage(ChatMessage::system(
+                            let _ = event_tx.send(AppEvent::AddMessage(conversation, ChatMessage::system(
                                 "⚠ Streaming sync issue — agent will continue",
                             )));
                         }
@@ -84,10 +94,10 @@ pub async fn run_agent_loop(
             if !visible_text.is_empty() {
                 messages.push(ChatMessage::assistant(&visible_text));
             } else {
-                let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
+                let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage(conversation));
             }
 
-            let _ = event_tx.send(AppEvent::AgentDone(AgentResult {
+            let _ = event_tx.send(AppEvent::AgentDone(conversation, AgentResult {
                 text: visible_text,
                 tool_calls: collected_tool_calls,
             }));
@@ -96,13 +106,17 @@ pub async fn run_agent_loop(
 
         messages.push(ChatMessage::assistant(&visible_text));
         if visible_text.is_empty() {
-            let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage);
+            let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage(conversation));
         }
 
         for tool_call in tool_calls.into_iter().take(max_tools_per_step) {
             let tool_id = uuid::Uuid::new_v4().to_string();
 
             let (tool_result, is_error) = if tool_call.name == "question" {
+                // Background turns (auto_approve) have no user to answer.
+                if auto_approve {
+                    ("Cannot ask the user from a background agent.".to_string(), true)
+                } else {
                 let question_text = tool_call.arguments["question"]
                     .as_str()
                     .unwrap_or("(no question)");
@@ -128,6 +142,7 @@ pub async fn run_agent_loop(
                     .send(AppEvent::RequestQuestion(request.clone(), qs));
 
                 let _ = event_tx.send(AppEvent::ToolStarted {
+                    conversation,
                     name: tool_call.name.clone(),
                 });
 
@@ -139,20 +154,26 @@ pub async fn run_agent_loop(
                         ("User cancelled the question".to_string(), true)
                     }
                 }
+                }
             } else {
-                let arguments_preview =
-                    serde_json::to_string_pretty(&tool_call.arguments)
-                        .unwrap_or_else(|_| tool_call.arguments.to_string());
-                let approval = ToolApprovalRequest::new(
-                    tool_call.name.clone(),
-                    arguments_preview,
-                );
-                let _ = event_tx
-                    .send(AppEvent::RequestToolApproval(approval.clone()));
-                let approved = approval.wait().await;
+                let approved = if auto_approve {
+                    true
+                } else {
+                    let arguments_preview =
+                        serde_json::to_string_pretty(&tool_call.arguments)
+                            .unwrap_or_else(|_| tool_call.arguments.to_string());
+                    let approval = ToolApprovalRequest::new(
+                        tool_call.name.clone(),
+                        arguments_preview,
+                    );
+                    let _ = event_tx
+                        .send(AppEvent::RequestToolApproval(approval.clone()));
+                    approval.wait().await
+                };
 
                 if approved {
                     let _ = event_tx.send(AppEvent::ToolStarted {
+                        conversation,
                         name: tool_call.name.clone(),
                     });
                     if tool_call.name.starts_with("mcp__") {
@@ -197,14 +218,16 @@ pub async fn run_agent_loop(
                 arguments: tool_call.arguments.clone(),
                 result: Some(tool_result.clone()),
             });
-            let _ = event_tx.send(AppEvent::AddMessage(tool_message));
+            let _ = event_tx.send(AppEvent::AddMessage(conversation, tool_message));
 
             if is_error {
                 let _ = event_tx.send(AppEvent::ToolError {
+                    conversation,
                     error: preview,
                 });
             } else {
                 let _ = event_tx.send(AppEvent::ToolDone {
+                    conversation,
                     result: preview,
                 });
             }
@@ -212,6 +235,7 @@ pub async fn run_agent_loop(
     }
 
     let _ = event_tx.send(AppEvent::AgentError(
+        conversation,
         "Reached max agent steps before producing a final answer".to_string(),
     ));
 }
@@ -242,8 +266,10 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new());
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
 
         run_agent_loop(
+            cid,
             provider,
             tools,
             mcp,
@@ -254,6 +280,7 @@ mod tests {
             128,
             4,
             4,
+            false,
             event_tx,
         )
         .await;
@@ -263,14 +290,14 @@ mod tests {
             events.push(ev);
         }
 
-        // First event opens the assistant message.
-        assert!(matches!(events.first(), Some(AppEvent::BeginAssistantMessage)));
+        // First event opens the assistant message, tagged with our conversation.
+        assert!(matches!(events.first(), Some(AppEvent::BeginAssistantMessage(id)) if *id == cid));
 
         // The streamed deltas reassemble into the full visible response.
         let streamed: String = events
             .iter()
             .filter_map(|e| match e {
-                AppEvent::AgentChunk(s) => Some(s.as_str()),
+                AppEvent::AgentChunk(_, s) => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -280,7 +307,7 @@ mod tests {
         let done = events
             .iter()
             .find_map(|e| match e {
-                AppEvent::AgentDone(result) => Some(result),
+                AppEvent::AgentDone(_, result) => Some(result),
                 _ => None,
             })
             .expect("agent loop should finish with AgentDone");
