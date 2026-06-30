@@ -1,6 +1,6 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-06-30
+> Last updated: 2026-06-30 (added /btw, /new, /chats, /agent, /agents)
 
 ## HOW COMMANDS WORK
 
@@ -13,7 +13,7 @@
 ### `CommandResult` variants (`src/commands/mod.rs:26`)
 `Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)`
 
-## FULL COMMAND LIST (25 commands, +2 aliases)
+## FULL COMMAND LIST (30 commands, +2 `/cwd` aliases)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -41,8 +41,16 @@
 | `/whitelist` | — | — | Open tool auto-approval whitelist manager | `defs/whitelist.rs` |
 | `/rate` | — | `<ms>` | Set min delay between API requests (0 = off) → `config.agent.rate_limit_ms` | `defs/rate.rs` |
 | `/retry` | — | `<N\|on\|off\|-1>` | Set max retries on API failure → `config.agent.max_retries` (-1/on = infinite, 0/off = none) | `defs/retry.rs` |
+| `/btw` | — | `<question>` | One-shot side-question answered in the background (ephemeral `Sidechat` conversation, forked provider) — doesn't disturb the main turn | `defs/btw.rs` |
+| `/new` | — | — | Open a new parallel chat (`Session` conversation, forked provider, fresh session) and switch to it | `defs/chats.rs` (`NewChatCommand`) |
+| `/chats` | — | — | Picker to switch between parallel chats (Tab/Ctrl also cycles focus) | `defs/chats.rs` (`ChatsCommand`) |
+| `/agent` | — | `<task>` | Launch a background sub-agent for a task | `defs/agent.rs` (`AgentCommand`) |
+| `/agents` | — | — | List and stop running background sub-agents (picker) | `defs/agent.rs` (`AgentsCommand`) |
 
 ## NOTES & GOTCHAS
+
+- `/btw`, `/new`+`/chats`, `/agent`+`/agents` arrived with the multi-chat wave (commits `438e60d`, `6c04774`, `38ce06f`). They rely on the `Conversation`/`Conversations` model and `LLMProvider::fork()` — see `ARCHITECTURE.md`.
+- The model can also spawn a sub-agent itself via the `task` tool (special-cased in `run_agent_loop`), independent of `/agent`.
 
 - `/jobs` and `/ps` were added in commit `e801dbe` (2026-06-28) alongside GOAL mode.
 - `/goal`'s `name()` returns `"/goal"` (with leading slash) — minor inconsistency vs. other commands; harmless because dispatch strips the slash.

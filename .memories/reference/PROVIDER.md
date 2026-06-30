@@ -1,6 +1,6 @@
 # REFERENCE: DeepSeek Provider
 > The LLM backend. Reverse-engineered DeepSeek **web** API (chat.deepseek.com), not the public API key product.
-> Source: `src/provider/`. Last updated: 2026-06-30
+> Source: `src/provider/`. Last updated: 2026-06-30 (added fork() + session-fork fix)
 
 ## LLMProvider TRAIT (`src/provider/mod.rs:192`)
 
@@ -11,8 +11,9 @@
 | `model` | `() -> &str` | Model id string |
 | `reset` | `async () -> AppResult<()>` | Reset session state (default no-op; DeepSeek impl clears `SessionState`) |
 | `fetch_remote_session_messages` | `async (session_id) -> AppResult<Vec<ChatMessage>>` | Pull a remote DeepSeek session (default: error) |
+| `fork` | `() -> Arc<dyn LLMProvider>` (:211) | Fresh-session sibling sharing config/token. DeepSeek rebuilds via `fork_session()` (:144) with a new `SessionState`; `FakeProvider` returns a new instance. Tested for session independence (`deepseek.rs:1773`). |
 
-Only `DeepseekProvider` implements it today. `provider` is `Option<Arc<dyn LLMProvider>>` in `App` — `None` when token is empty.
+`DeepseekProvider` is the only real impl; `FakeProvider` (`provider/fake.rs`, `#[cfg(test)]`) is the test double. `provider` is `Option<Arc<dyn LLMProvider>>` and lives **per `Conversation`** (each gets its own via `fork()`) — `None` when token is empty.
 
 ## CORE TYPES (`src/provider/mod.rs`)
 
@@ -30,6 +31,7 @@ Only `DeepseekProvider` implements it today. `provider` is `Option<Arc<dyn LLMPr
 - **Base URL**: `https://chat.deepseek.com/api/v0` (:20).
 - **Auth**: cookie/token session (NOT an API key). `auth_headers()` (:144) sets `Authorization: Bearer {token}` + spoofed Android client headers (`x-client-platform: android`, `x-client-version: 1.8.0`, `x-client-locale: zh_CN`, a Chrome/YaBrowser UA).
 - **`SessionState`** (:84) — `session_id?, parent_message_id?, system_sent_for_session`. Held in a `Mutex`. Tracks DeepSeek-side conversation continuity; system prompt sent once per session.
+  - ⚠ **Session-fork hazard (fixed)**: the DeepSeek session is a tree keyed by `parent_message_id`; a stale id silently forks onto an *invisible* branch — messages show in the TUI but never reach the web view/model context. Interrupted/errored streams used to desync it. Fix (`183712e`): persist `parent_message_id` incrementally + flush-on-error. Per-conversation `fork()` isolation prevents cross-conversation desync structurally.
 
 ### Reverse-engineered endpoints (~30, declared :19–75)
 - **Chat**: `chat/create_pow_challenge`, `chat/completion` (SSE), `chat/history`, `chat/history_messages`, `chat/edit_message`†, `chat/regenerate`†, `chat/continue`, `chat/stop_stream`, `chat/resume_stream`, `chat/message_feedback`.

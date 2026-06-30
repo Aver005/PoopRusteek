@@ -1,6 +1,6 @@
 # MAP
 > Codebase map — file → purpose. Navigation aid. (~15k LOC)
-> Last updated: 2026-06-30
+> Last updated: 2026-06-30 (post conversation-unification + controllers refactor)
 
 ## ENTRY / ROOT
 | File | Purpose | Lines |
@@ -11,26 +11,40 @@
 | `src/session.rs` | `Session`, save/load/list, tags, history file | 191 |
 | `src/debug_log.rs` | Optional `.dev/debug.log` logger | 68 |
 
-## APP LAYER (Application)
+## APP LAYER (Application) — decomposed from the old ~2.4k god-file into cohesive modules
 | File | Purpose | Lines |
 |------|---------|-------|
-| `src/app/mod.rs` | **God-file**: App+AppState, event loop, key handling, autocomplete, MCP view, sessions, GOAL mode, helpers | ~2382 |
-| `src/app/events.rs` | `AppEvent`, `Modal`, `PickerState`, `QuestionState`, `GoalStage`, `GoalVerdict`, `ToolApprovalRequest` | 474 |
+| `src/app/mod.rs` | Coordinator: `App` + `AppState`, event loop, `handle_event`, `send_to_agent`, autocomplete/session helpers. No longer a god-file. | 925 |
+| `src/app/conversation.rs` | `ConversationId`, `ConversationKind` (Main/Session/Sidechat/SubAgent), `Conversation` (owns messages/provider/generation/agent_task), `Conversations` store (`focused()/focused_mut()/open()/add_background()/remove()/iter()`…) | 154 |
+| `src/app/runtime.rs` | `AgentRuntime` controller — owns `tools`/`mcp`/`event_tx`; `spawn(TurnSpec)` is the one place agent turns launch | 63 |
+| `src/app/system_prompt.rs` | `build(prompts, skills, tools, mcp, workspace)` — system-prompt assembly with explicit narrow deps (was god-method on `&self`) | 79 |
+| `src/app/background_stats.rs` | `BackgroundCounters` (total/interactive/persistent) + refresh/shutdown/kill/prune methods (data clump lifted off `AppState`) | 69 |
+| `src/app/mcp_status.rs` | `McpStatus` (UI view + cached counts) + `update_stats(&mcp)`/`refresh_view(&mcp)` poll methods | 50 |
+| `src/app/generation.rs` | `GenerationState` — per-turn streaming/animation/stats status | 63 |
+| `src/app/input.rs` | `InputState` + autocomplete state and input-editing logic | 353 |
+| `src/app/goal.rs` | `GoalState`, `GoalOutcome`, pure `apply_verdict`, `parse_goal_verdict` + goal `impl App` methods | 512 |
+| `src/app/keys.rs` | `handle_key`/`handle_mcp_key`/autocomplete key handling | 878 |
+| `src/app/multichat.rs` | `spawn_background_agent`/`spawn_sidechat`/`spawn_sub_agent`/`stop_background`/`handle_background_event`/`new_conversation`/`switch_to`/`cycle_focus`/pickers | 364 |
+| `src/app/events.rs` | `AppEvent` (agent variants tagged with `ConversationId`; `SpawnSubAgent`), `Modal`, `PickerState`, `QuestionState`, `GoalStage`, `GoalVerdict`, `ToolApprovalRequest` | 452 |
 | `src/config/mod.rs` | `Config` schema (provider/ui/agent/mcp/skills), paths, load/save | 134 |
 
 ## PROVIDER (Domain)
 | File | Purpose | Lines |
 |------|---------|-------|
-| `src/provider/mod.rs` | `LLMProvider` trait, `ChatMessage`, `Role`, request/response types | 213 |
-| `src/provider/deepseek.rs` | DeepSeek web client: auth, ~30 endpoints, session state, prompt build, SSE, retry | ~1819 |
+| `src/provider/mod.rs` | `LLMProvider` trait (incl. `fork() -> Arc<dyn LLMProvider>`), `ChatMessage`, `Role`, request/response types | 205 |
+| `src/provider/deepseek.rs` | DeepSeek web client: auth, ~30 endpoints, session state, prompt build, SSE, retry; `fork_session()` (fresh session) + `fork()` impl + incremental `parent_message_id` persist/flush-on-error | ~1819 |
+| `src/provider/fake.rs` | `FakeProvider` test double (impls `fork()`) — `#[cfg(test)]` | 80 |
+| `src/provider/prompt.rs` | Prompt/history assembly for the web API (extracted from deepseek.rs) | — |
+| `src/provider/sse.rs` | Shared SSE line buffering | — |
 | `src/provider/pow.rs` | SHA-3 PoW solver via `wasmtime` | 245 |
 | `src/provider/types.rs` | API/SSE response types, `ParsedSSEEvent` | 637 |
 
 ## AGENT (Domain)
 | File | Purpose | Lines |
 |------|---------|-------|
-| `src/agent/runner.rs` | `run_agent_loop` — multi-step LLM↔tool conversation, streaming, approval, summarize | 272 |
-| `src/agent/tool_parser.rs` | Parse/strip tool calls (XML / `[TOOL:]` / JSON), stream-visible text | 195 |
+| `src/agent/runner.rs` | `run_agent_loop` — multi-step LLM↔tool loop, streaming, approval, summarize; all events tagged with `ConversationId`; `task` tool special-cased (fg: fork+`run_sub_agent`; bg: emit `SpawnSubAgent`) | 370 |
+| `src/agent/sub_agent.rs` | `run_sub_agent` — headless isolated agent run (own forked provider, auto-approval), returns final text | 114 |
+| `src/agent/tool_parser.rs` | Parse/strip tool calls (XML / `[TOOL:]` / JSON), stream-visible text | 170 |
 
 ## TOOLS (Domain)
 | File | Purpose | Lines |
@@ -70,7 +84,7 @@
 | File | Purpose |
 |------|---------|
 | `src/commands/mod.rs` | `Command` trait, `CommandRegistry`, `CommandResult` |
-| `src/commands/defs/*.rs` | 25 commands (one per file) — see `reference/COMMANDS.md` |
+| `src/commands/defs/*.rs` | 28 commands (one per file) — incl. `/btw`, `/new`+`/chats`, `/agent`+`/agents` — see `reference/COMMANDS.md` |
 
 ## OTHER
 | File | Purpose |
@@ -90,4 +104,6 @@
 - Agent ↔ Tools: `runner.rs` → `ToolRegistry::execute()` / `MCPManager::call_tool()`
 - App ↔ MCP: `app/mod.rs` owns `Arc<Mutex<MCPManager>>`
 - App ↔ TUI: `app/mod.rs` → `render.rs` each frame
-- App ↔ Agent: spawned task ↔ main loop via `AppEvent` channels + `Notify` handshakes
+- App ↔ Agent: every turn launches via `AgentRuntime::spawn(TurnSpec)` (`app/runtime.rs`); spawned task ↔ main loop via `AppEvent` channels (tagged with `ConversationId`) + `Notify` handshakes
+- Conversations: `App.state.conversations: Conversations` (`app/conversation.rs`) — one focused, others background; `agent_event_target()` routes non-focused agent events to `handle_background_event` (`app/multichat.rs`)
+- Each `Conversation` owns its **own forked provider** (`LLMProvider::fork()`) → isolated DeepSeek session, no `parent_message_id` cross-talk

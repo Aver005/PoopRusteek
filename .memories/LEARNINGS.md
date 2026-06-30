@@ -1,6 +1,20 @@
 # LEARNINGS
 > Hard-won technical knowledge. Gotchas. Patterns. (Deep detail lives in `reference/`.)
-> Last updated: 2026-06-30
+> Last updated: 2026-06-30 (added refactor + conversation/fork learnings)
+
+## ARCHITECTURE & REFACTORING  (→ `ARCHITECTURE.md`)
+
+- **Organizational ≠ architectural.** Splitting a god-file into more files is not a clean refactor by itself. The wins here came from (a) grouping data clumps into cohesive structs and (b) extracting **controllers** that own *dependencies* and expose narrow APIs — so methods stop taking `&mut self` (all of `App`) just to touch three fields.
+- **Refactor in tiny verified increments.** One cluster at a time; `cargo build` + `cargo test` green after each step. Compiler-driven migration: after removing/renaming a field, let errors enumerate the call sites. Use anchored per-file `sed`/`perl` (read-only files → `focused()`, `&mut` files → `focused_mut()`); watch for multi-line expressions a line-based sed misses (`perl -0777`).
+- **Borrow-conflict patterns when narrowing.** Disjoint fields of `self` *can* be borrowed together in one expression (`self.state.mcp_status.refresh_view(&self.mcp)` — `state` mut + `mcp` shared). For sequential conflicts, bind reads into locals first, then mutate; or add `push_message`/`push_system` helpers on the sub-state to avoid holding a borrow across a push.
+- **`Arc` + deref coercion** lets a narrow fn signature (`&ToolRegistry`, `&Mutex<MCPManager>`) accept `&self.tools` / `&self.mcp` (which are `&Arc<…>`) without explicit deref.
+- **Functional core / imperative shell**: `goal::apply_verdict` is a pure function (testable, no I/O); the `impl App` goal methods are the thin shell around it.
+
+## CONVERSATIONS & PROVIDER FORK  (→ `ARCHITECTURE.md`, `reference/PROVIDER.md`)
+
+- **`parent_message_id` desync = "evaporating messages".** DeepSeek's web session is a tree keyed by `parent_message_id`; a stale id silently forks onto an *invisible* branch — the UI shows the message but the web view (and the model's context) never sees it. An interrupted/errored stream was the trigger. Fix: incrementally persist `parent_message_id` and flush-on-error (`deepseek.rs`, commit `183712e`).
+- **Structural prevention**: give each `Conversation` its own forked provider (fresh `SessionState`). Concurrent turns then can't collide on shared `session_state`. `fork()` is the cornerstone that makes parallel sessions / sidechats / sub-agents safe.
+- **Event tagging is mandatory for concurrency**: agent events carry a `ConversationId`; `handle_event` routes non-focused ones to `handle_background_event`. Without the tag, a background turn's chunks would append to whatever's focused.
 
 ## DEEPSEEK API  (full detail → `reference/PROVIDER.md`)
 

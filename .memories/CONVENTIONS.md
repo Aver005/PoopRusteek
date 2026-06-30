@@ -1,6 +1,6 @@
 # CONVENTIONS
 > Code style & patterns to follow when contributing. Match the surrounding code.
-> Last updated: 2026-06-30
+> Last updated: 2026-06-30 (added decomposition/controller + conversation patterns)
 
 ## LANGUAGE & EDITION
 - Rust **edition 2024**, MSRV **1.85**. Use modern idioms (`let-else`, `LazyLock`, `floor_char_boundary`, etc.).
@@ -20,6 +20,14 @@
 - Only the main loop mutates `AppState`. Async tasks communicate via `AppEvent`s, not shared mutable state.
 - Shared services are `Arc<Mutex<…>>` (`MCPManager`) or `Arc<…>` (`ToolRegistry`, provider).
 - Global singletons (background registry, foreground-PID slot) use `OnceLock`/atomics.
+- **Per-conversation state** lives in a `Conversation` (`app/conversation.rs`), never globally on `AppState`. Reach the active one via `state.focused()/focused_mut()`; touch others only through the `Conversations` store API. Each conversation has its **own forked provider** (`LLMProvider::fork()`).
+- **Agent events must carry a `ConversationId`** so background turns stream into the right buffer; route non-focused events through `handle_background_event`.
+- **Launch every agent turn via `AgentRuntime::spawn(TurnSpec)`** — don't call `run_agent_loop` directly. Set `auto_approve:true` for background turns (sidechats/sub-agents).
+
+## MODULE / DECOMPOSITION PATTERN (how the god-object was tamed — keep it this way)
+- Prefer **cohesive sub-state structs** over loose fields on `AppState`: group fields that are always read/written together into a module struct (`GenerationState`, `InputState`, `McpStatus`, `BackgroundCounters`, `GoalState`) and move their behavior onto the struct.
+- Prefer **controllers** that own *dependencies* with a narrow API over methods that take `&mut self` (all of `App`) just to touch a few fields/deps: `AgentRuntime` (turn launching), `system_prompt::build(...)` (explicit deps), `BackgroundCounters` (registry sync). New cross-cutting behavior should follow this shape, not grow `mod.rs`.
+- `impl App` may still be split across files (`keys.rs`, `multichat.rs`, `goal.rs`) — that's organizational; the *architectural* win is narrow deps + cohesive state.
 
 ## NAMING
 - Error binding spelled out: `|error|` / `|e|` both appear; prefer `error` in new code (dominant style).
@@ -32,9 +40,10 @@
 - Keep render pure: `render()` reads `&AppState`, never mutates.
 
 ## TESTS
-- Sparse today. Where they exist (`agent/runner.rs`, `agent/tool_parser.rs`), they're `#[cfg(test)] mod tests` in-file.
-- Edge cases worth testing: multibyte/emoji boundaries, partial tool-tag streaming, all 3 tool-call formats.
-- **Verification baseline = `cargo build`.** `cargo clippy` not yet clean (run it before large changes).
+- **84 tests** today (`cargo test --bin pooprusteek`), all in-file `#[cfg(test)] mod tests` — provider `fork` isolation (`deepseek.rs`), goal `apply_verdict` (pure core), conversation ids, tool-parser, runner, etc.
+- Edge cases worth testing: multibyte/emoji boundaries, partial tool-tag streaming, all 3 tool-call formats, fork session independence.
+- Favor a **pure functional core** (like `goal::apply_verdict`) so logic is testable without a live `App`.
+- **Verification baseline = `cargo build` + `cargo test --bin pooprusteek`.** `cargo clippy` not yet clean (run it before large changes).
 
 ## ASSETS
 - Anything loaded at runtime (prompts, the PoW WASM) resolves via `CARGO_MANIFEST_DIR` → CWD → exe-dir. Add new assets under `assets/` and follow that resolution pattern.
@@ -48,4 +57,5 @@
 - `opt-level=3, lto="fat", codegen-units=1, strip=true`. Release builds are slow but small/fast.
 
 ## COMMIT STYLE (observed in git log)
-- Conventional-ish prefixes: `feat:`, `fix:`, `imp:`, `refactor:`. Occasional emoji (🔥 for deletions). Keep messages imperative and scoped.
+- Conventional commits with a **scope + gitmoji**: `refactor(app): 🧹 …`, `feat(provider, app): ✨ …`, `fix(deepseek): 🐛 …`, `refactor(background): ♻️ …`, `docs(comparison): 📝 …`, `refactor(tui): 🚚 …`, `feat(app): 🎯 …`. Keep messages imperative and scoped.
+- **Commits are the user's job** — the agent leaves changes uncommitted in the working tree for the user to review and commit. Don't run `git commit`/`push`.

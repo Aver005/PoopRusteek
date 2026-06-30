@@ -16,28 +16,36 @@ Rust rewrite of the TypeScript **Poopseek**. ~15k LOC, edition 2024, MSRV 1.85.
 | Path | Role | Size |
 |------|------|------|
 | `src/main.rs` | Entry, CLI flags (`--acp`, `--debug_log`) | 85 |
-| `src/app/mod.rs` | **God-file**: App+AppState, event loop, key handling, GOAL mode | ~2382 |
-| `src/app/events.rs` | `AppEvent`, `Modal`, `GoalStage`, `QuestionState` | 474 |
-| `src/provider/deepseek.rs` | DeepSeek web API client (biggest after app) | ~1819 |
+| `src/app/mod.rs` | Coordinator: App+AppState, event loop, `handle_event`, `send_to_agent` (no longer a god-file) | 925 |
+| `src/app/conversation.rs` | `Conversation` + `Conversations` store (multi-chat core) | 154 |
+| `src/app/multichat.rs` | sub-agents / sidechat / parallel-session spawning + focus | 364 |
+| `src/app/runtime.rs` | `AgentRuntime` — the one place agent turns launch (`spawn(TurnSpec)`) | 63 |
+| `src/app/keys.rs` | key handling | 878 |
+| `src/app/goal.rs` | GOAL state machine + pure `apply_verdict` | 512 |
+| `src/app/events.rs` | `AppEvent` (id-tagged), `Modal`, `GoalStage`, `QuestionState` | 452 |
+| `src/provider/deepseek.rs` | DeepSeek web API client; `fork_session()`/`fork()` | ~1819 |
 | `src/provider/pow.rs` | SHA-3 PoW solver via `wasmtime` | 245 |
-| `src/agent/runner.rs` | Agent loop (LLM ↔ tools, streaming) | 272 |
-| `src/agent/tool_parser.rs` | Parse tool calls (XML / `[TOOL:]` / JSON) | 195 |
+| `src/agent/runner.rs` | Agent loop (LLM ↔ tools, streaming, `task` tool) | 370 |
+| `src/agent/sub_agent.rs` | Headless isolated sub-agent runner | 114 |
 | `src/tools/background.rs` | Background + interactive PTY processes | 744 |
 | `src/tui/render.rs` | All views (landing/chat/MCP/modals/status) | ~1336 |
 | `src/mcp/` | MCP clients, transports, discovery | — |
-| `src/commands/defs/` | 25 slash commands (one file each) | — |
+| `src/commands/defs/` | 28 slash commands (one file each) | — |
 | `src/config/mod.rs` | Config schema + storage paths | 134 |
 | `assets/prompts/` | System prompts + built-in skills | — |
 
 ## KEY ARCHITECTURE
 
 ```
-main ─ App (single tokio::select! loop @120ms)
-        ├─ run_agent_loop (spawned task; LLM ↔ tools via channels)
+main ─ App (single tokio::select! loop @120ms; thin coordinator)
+        ├─ AppState
+        │    └─ Conversations (focused + background; each owns msgs + forked provider + task)
+        ├─ AgentRuntime.spawn(TurnSpec) ─ run_agent_loop (spawned task; events tagged by ConversationId)
+        │    └─ task tool ⇒ run_sub_agent (fg) | SpawnSubAgent (bg)
         ├─ ToolRegistry  (bash, powershell, question, shell_*, skill, mcp__*)
         ├─ MCPManager    (external tool servers; stdio/http/sse)
-        ├─ DeepseekProvider (PoW + SSE streaming)
-        └─ TUI render (reads &AppState; never mutates)
+        ├─ DeepseekProvider (PoW + SSE streaming; fork() → isolated session per conversation)
+        └─ TUI render (reads &AppState, focused conversation only; never mutates)
 ```
 
 ## CRITICAL NOTES

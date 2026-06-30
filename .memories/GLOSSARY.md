@@ -1,11 +1,21 @@
 # GLOSSARY
-> Project-specific terms a fresh agent will hit. Last updated: 2026-06-30
+> Project-specific terms a fresh agent will hit. Last updated: 2026-06-30 (added conversation/sub-agent/controller terms)
 
 | Term | Meaning |
 |------|---------|
 | **Pooprusteek / Пупра́стик** | This project: a Rust TUI coding agent powered by DeepSeek's web API. Rust rewrite of **Poopseek** (TS). |
 | **Poopseek** | The original TypeScript project this is forked/rewritten from. Repo: github.com/aver005/poopseek. |
-| **Provider** | An `LLMProvider` impl. Only `DeepseekProvider` exists. |
+| **Provider** | An `LLMProvider` impl. Only `DeepseekProvider` is real; `FakeProvider` is a `#[cfg(test)]` double. |
+| **Conversation** | One independent chat thread (`app/conversation.rs`): owns its messages, **its own forked provider/session**, generation status, and agent task. Kinds: `Main`, `Session`, `Sidechat`, `SubAgent`. |
+| **Conversations** | The store of all open conversations + a `focused` id. No live/parked split — every conversation is a full record; switching focus is just changing an id. |
+| **Focused conversation** | The one currently rendered and targeted by input/abort. `state.focused()/focused_mut()`. Others are **background** — they keep streaming into their own buffers. |
+| **`fork()`** | `LLMProvider::fork()` — returns a fresh-session sibling provider sharing config/token. Gives each conversation an isolated DeepSeek session (no `parent_message_id` cross-talk). poopseek's `provider.clone()` analog. |
+| **Sidechat (`/btw`)** | A one-shot background side-answer in its own ephemeral `Sidechat` conversation; streams in without disturbing the main turn. |
+| **Sub-agent** | An isolated agent run (`SubAgent` conversation) spawned by the model (`task` tool) or user (`/agent`); foreground returns only its conclusion into the turn, `background:true` detaches + notifies. `/agents` lists/stops. |
+| **`task` tool** | Model-driven sub-agent spawn; special-cased in `run_agent_loop` (like `question`), not a normal `Tool`. |
+| **AgentRuntime / TurnSpec** | The controller (`app/runtime.rs`) that owns `tools`/`mcp`/`event_tx` and is the single launch point for every agent turn; `TurnSpec` describes one turn. |
+| **Controller** | A type that owns its *dependencies* and exposes a narrow API (`AgentRuntime`, `system_prompt::build`, `BackgroundCounters`), so behavior stops reaching into all of `App`. |
+| **`auto_approve`** | `TurnSpec` flag: background turns (sidechats/sub-agents) auto-approve tools so they never block on a modal nobody's watching; the focused user turn does not. |
 | **DeepSeek web API** | The *unofficial* chat.deepseek.com endpoints (cookie/token auth), NOT the public API-key product. Reverse-engineered, no SLA. |
 | **PoW** | Proof-of-Work. DeepSeek requires a solved SHA-3 challenge (`x-ds-pow-response` header) on gated calls. Solved by a bundled WASM blob via `wasmtime`. |
 | **Agent loop** | `run_agent_loop` in `agent/runner.rs` — the multi-step LLM↔tool conversation driver. |

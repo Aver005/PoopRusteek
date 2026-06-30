@@ -62,8 +62,9 @@ for step in 0..max_steps:                       # default max_steps_per_turn = 2
   if no tool_calls: push assistant msg, AgentDone, return
   push assistant(visible)
   for call in tool_calls.take(max_tools_per_step):   # default 10
-      if name == "question": RequestQuestion → wait()      # no approval
-      else: RequestToolApproval → wait()
+      if name == "question": RequestQuestion → wait()      # no approval, opens modal
+      elif name == "task":   fork provider + run_sub_agent (fg) | emit SpawnSubAgent (bg)   # special-cased like question
+      else: RequestToolApproval → wait()      # auto-approved when TurnSpec.auto_approve (background turns)
           if approved:
               mcp__* → mcp.call_tool()
               else   → tools.execute()
@@ -72,7 +73,9 @@ for step in 0..max_steps:                       # default max_steps_per_turn = 2
 # loop exhausted → AgentError("Reached max agent steps…")
 ```
 
-- Runs in a spawned `tokio` task (`app.agent_task`); `Esc` aborts it.
+- Launched via `AgentRuntime::spawn(TurnSpec)` (`app/runtime.rs`); the handle lives on the owning `Conversation` (`state.focused().agent_task`). `Esc` aborts the focused conversation's task.
+- All emitted `AppEvent`s are tagged with the turn's `ConversationId` so background turns stream into the right buffer.
+- The `task` tool (sub-agents) is special-cased here, not a `Tool` impl; the headless runner is `agent/sub_agent.rs::run_sub_agent`.
 - `summarize_tool_result` (:219) truncates at `floor_char_boundary(200)` — UTF-8/emoji safe (tested).
 
 ## TOOL-CALL PARSING (`agent/tool_parser.rs`)
@@ -88,7 +91,7 @@ Three formats parsed from raw LLM text (DeepSeek web API has NO native function-
 
 ## SKILLS as tools
 
-`skill` tool can `list`/`load` skills at runtime. Skills discovered from many dirs (see `MCP.md`/`CONFIG.md` siblings and `skills/discovery.rs`); enabled ones are injected into the system prompt by `App::build_system_prompt`.
+`skill` tool can `list`/`load` skills at runtime. Skills discovered from many dirs (see `MCP.md`/`CONFIG.md` siblings and `skills/discovery.rs`); enabled ones are injected into the system prompt by `app::system_prompt::build(...)` (`app/system_prompt.rs`).
 
 ## SAFETY MODEL
 

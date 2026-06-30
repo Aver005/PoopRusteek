@@ -1,5 +1,5 @@
 # .memories INDEX
-> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-06-30
+> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-06-30 (post conversation-unification, sub-agents, sidechat, controllers refactor)
 
 > ⚠️ The app does **NOT** auto-load `.memories/`. An agent only benefits from this folder if it is
 > explicitly told to read `.memories/INDEX.md` first. (Wiring auto-load is an open PLANS item.)
@@ -23,7 +23,7 @@
 ### Reference (look up on demand — deep, file:line-cited)
 | File | Covers |
 |------|--------|
-| `reference/COMMANDS.md` | All 25 slash commands + registry |
+| `reference/COMMANDS.md` | All 30 slash commands + registry (incl. `/btw`, `/new`, `/chats`, `/agent`, `/agents`) |
 | `reference/PROVIDER.md` | DeepSeek API, endpoints, SSE, PoW, auth |
 | `reference/TOOLS.md` | Tool system, agent loop, background PTY |
 | `reference/MCP.md` | MCP clients, transports, 8 config sources |
