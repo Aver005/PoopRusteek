@@ -74,10 +74,10 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
     let (input_tok, output_tok) = compute_totals(state);
     data_row(&mut lines, "Input", &format_num(input_tok), theme);
     data_row(&mut lines, "Output", &format_num(output_tok), theme);
-    let speed = if state.last_gen_duration_secs > 0.0 && state.last_gen_tokens > 0 {
-        format!("{:.1} t/s", state.last_gen_tokens as f64 / state.last_gen_duration_secs)
-    } else if state.is_generating {
-        spinner(state.animation_tick)
+    let speed = if state.generation.last_duration_secs > 0.0 && state.generation.last_tokens > 0 {
+        format!("{:.1} t/s", state.generation.last_tokens as f64 / state.generation.last_duration_secs)
+    } else if state.generation.active {
+        spinner(state.generation.animation_tick)
     } else {
         "\u{2014}".to_string()
     };

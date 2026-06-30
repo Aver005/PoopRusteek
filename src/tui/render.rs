@@ -24,7 +24,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
 
         if state.view == View::Mcp {
             render_mcp_view(frame, area, &state.mcp_status.view, &theme);
-        } else if state.messages.is_empty() && !state.is_generating {
+        } else if state.messages.is_empty() && !state.generation.active {
             render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
             let has_attachments = !state.attached_files.is_empty();
@@ -98,7 +98,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         use crossterm::cursor::MoveTo;
         crossterm::execute!(terminal.backend_mut(), MoveTo(cx, cy))?;
     }
-    if state.modal.is_some() || state.is_generating || state.view == View::Mcp {
+    if state.modal.is_some() || state.generation.active || state.view == View::Mcp {
         terminal.hide_cursor()?;
     } else {
         terminal.show_cursor()?;
@@ -344,8 +344,8 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         String::new()
     };
 
-    let model_tag = if !state.last_model_name.is_empty() {
-        format!(" · {}", state.last_model_name)
+    let model_tag = if !state.generation.last_model.is_empty() {
+        format!(" · {}", state.generation.last_model)
     } else {
         String::new()
     };
@@ -362,20 +362,20 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     };
     let left = format!(" {}{} · {}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status);
 
-    let status_tag = state.last_message_status.as_deref().unwrap_or("");
+    let status_tag = state.generation.last_status.as_deref().unwrap_or("");
 
-    let center = if state.is_generating {
-        let gen_info = if let Some(start) = state.generation_start_time {
+    let center = if state.generation.active {
+        let gen_info = if let Some(start) = state.generation.start_time {
             let elapsed = start.elapsed().as_secs_f64();
-            let tps = if elapsed > 0.0 && state.last_gen_tokens > 0 {
-                state.last_gen_tokens as f64 / elapsed
+            let tps = if elapsed > 0.0 && state.generation.last_tokens > 0 {
+                state.generation.last_tokens as f64 / elapsed
             } else {
                 0.0
             };
-            format!(" {} {} ", spinner_char(state.animation_tick), state.status_message)
-                + &format!("({} tok, {:.1}s, {:.0} t/s)", state.last_gen_tokens, elapsed, tps)
+            format!(" {} {} ", spinner_char(state.generation.animation_tick), state.status_message)
+                + &format!("({} tok, {:.1}s, {:.0} t/s)", state.generation.last_tokens, elapsed, tps)
         } else {
-            format!(" {} {} ", spinner_char(state.animation_tick), state.status_message)
+            format!(" {} {} ", spinner_char(state.generation.animation_tick), state.status_message)
         };
         gen_info
     } else {
@@ -383,12 +383,12 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         if !status_tag.is_empty() {
             parts.push(status_tag.to_string());
         }
-        if state.last_think_fragments > 0 {
-            parts.push(format!("{} think", state.last_think_fragments));
+        if state.generation.last_think_fragments > 0 {
+            parts.push(format!("{} think", state.generation.last_think_fragments));
         }
-        if state.last_gen_duration_secs > 0.0 && state.last_gen_tokens > 0 {
-            let tps = state.last_gen_tokens as f64 / state.last_gen_duration_secs;
-            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.last_gen_tokens, state.last_gen_duration_secs, tps));
+        if state.generation.last_duration_secs > 0.0 && state.generation.last_tokens > 0 {
+            let tps = state.generation.last_tokens as f64 / state.generation.last_duration_secs;
+            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.generation.last_tokens, state.generation.last_duration_secs, tps));
         }
         format!(" {} ", parts.join(" · "))
     };
@@ -420,7 +420,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
             Span::styled(" ".repeat(gap), Style::default().bg(theme.bg)),
             Span::styled(
                 center,
-                if state.is_generating {
+                if state.generation.active {
                     Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.text_dim)
@@ -1313,7 +1313,7 @@ fn bigger_title(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
     text.chars()
         .enumerate()
         .map(|(index, ch)| {
-            let pulse = ((state.animation_tick as usize / 5) + index) % 6;
+            let pulse = ((state.generation.animation_tick as usize / 5) + index) % 6;
             let color = match pulse {
                 0 | 1 => theme.accent_soft,
                 2 | 3 => theme.accent,

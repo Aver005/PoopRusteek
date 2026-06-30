@@ -25,7 +25,7 @@ impl Command for ResetCommand {
         state.input.cursor = 0;
         state.input.selection_anchor = None;
         state.autocomplete = Default::default();
-        state.is_generating = false;
+        state.generation.active = false;
         state.status_message = "Ready".to_string();
         state.error = None;
 

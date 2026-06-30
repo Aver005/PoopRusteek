@@ -28,26 +28,26 @@ pub fn render_status(frame: &mut Frame, area: Rect, state: &AppState, config: &C
         String::new()
     };
 
-    let model_tag = if !state.last_model_name.is_empty() {
-        format!(" · {}", state.last_model_name)
+    let model_tag = if !state.generation.last_model.is_empty() {
+        format!(" · {}", state.generation.last_model)
     } else {
         String::new()
     };
     let left = format!(" {} · {}{}{} ", provider_name, model, model_tag, mcp_status);
 
-    let status_tag = state.last_message_status.as_deref().unwrap_or("");
+    let status_tag = state.generation.last_status.as_deref().unwrap_or("");
 
-    let center = if state.is_generating {
-        let gen_info = if let Some(start) = state.generation_start_time {
+    let center = if state.generation.active {
+        let gen_info = if let Some(start) = state.generation.start_time {
             let elapsed = start.elapsed().as_secs_f64();
-            let tps = if elapsed > 0.0 && state.last_gen_tokens > 0 {
-                state.last_gen_tokens as f64 / elapsed
+            let tps = if elapsed > 0.0 && state.generation.last_tokens > 0 {
+                state.generation.last_tokens as f64 / elapsed
             } else {
                 0.0
             };
-            format!(" {} {} ({} tok, {:.1}s, {:.0} t/s)", spinner_char(state.animation_tick), state.status_message, state.last_gen_tokens, elapsed, tps)
+            format!(" {} {} ({} tok, {:.1}s, {:.0} t/s)", spinner_char(state.generation.animation_tick), state.status_message, state.generation.last_tokens, elapsed, tps)
         } else {
-            format!(" {} {}", spinner_char(state.animation_tick), state.status_message)
+            format!(" {} {}", spinner_char(state.generation.animation_tick), state.status_message)
         };
         gen_info
     } else {
@@ -55,12 +55,12 @@ pub fn render_status(frame: &mut Frame, area: Rect, state: &AppState, config: &C
         if !status_tag.is_empty() {
             parts.push(status_tag.to_string());
         }
-        if state.last_think_fragments > 0 {
-            parts.push(format!("{} think", state.last_think_fragments));
+        if state.generation.last_think_fragments > 0 {
+            parts.push(format!("{} think", state.generation.last_think_fragments));
         }
-        if state.last_gen_duration_secs > 0.0 && state.last_gen_tokens > 0 {
-            let tps = state.last_gen_tokens as f64 / state.last_gen_duration_secs;
-            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.last_gen_tokens, state.last_gen_duration_secs, tps));
+        if state.generation.last_duration_secs > 0.0 && state.generation.last_tokens > 0 {
+            let tps = state.generation.last_tokens as f64 / state.generation.last_duration_secs;
+            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.generation.last_tokens, state.generation.last_duration_secs, tps));
         }
         format!(" {} ", parts.join(" · "))
     };
@@ -72,7 +72,7 @@ pub fn render_status(frame: &mut Frame, area: Rect, state: &AppState, config: &C
     };
     let right = format!(" msgs:{} tot:{} | {} ", msg_count, total_tokens, session_prefix);
 
-    let status_style = if state.is_generating {
+    let status_style = if state.generation.active {
         Style::default()
             .fg(theme.warning)
             .bg(theme.status_bg)

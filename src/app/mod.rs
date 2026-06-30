@@ -1,4 +1,5 @@
 pub mod events;
+pub mod generation;
 mod goal;
 pub mod input;
 pub mod mcp_status;
@@ -69,7 +70,7 @@ pub struct App {
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub input: input::InputState,
-    pub is_generating: bool,
+    pub generation: generation::GenerationState,
     pub status_message: String,
     pub scroll_offset: u32,
     pub error: Option<String>,
@@ -77,21 +78,14 @@ pub struct AppState {
     pub approved_tools: std::collections::HashSet<String>,
     pub pending_tool_approval: Option<ToolApprovalRequest>,
     pub pending_question: Option<QuestionRequest>,
-    pub animation_tick: u64,
     pub autocomplete: AutocompleteState,
     pub current_session_id: String,
     pub view: View,
     pub mcp_status: mcp_status::McpStatus,
     pub workspace_path: String,
-    pub generation_start_time: Option<std::time::Instant>,
-    pub last_gen_tokens: u32,
-    pub last_gen_duration_secs: f64,
     pub session_started_at: String,
     pub show_stats_panel: bool,
     pub attached_files: Vec<crate::provider::AttachedFile>,
-    pub last_model_name: String,
-    pub last_message_status: Option<String>,
-    pub last_think_fragments: u32,
 
     // Goal mode state
     pub goal: goal::GoalState,
@@ -148,7 +142,7 @@ impl App {
                 history: crate::session::load_history(),
                 ..Default::default()
             },
-            is_generating: false,
+            generation: generation::GenerationState::default(),
             status_message: if provider.is_some() { "Ready" } else { "No token configured" }.to_string(),
             scroll_offset: 0,
             error: None,
@@ -156,7 +150,6 @@ impl App {
             approved_tools: crate::whitelist::load(),
             pending_tool_approval: None,
             pending_question: None,
-            animation_tick: 0,
             autocomplete: AutocompleteState::default(),
             current_session_id: crate::session::create_session_id(),
             view: View::Chat,
@@ -165,14 +158,8 @@ impl App {
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
-            generation_start_time: None,
-            last_gen_tokens: 0,
-            last_gen_duration_secs: 0.0,
             session_started_at: chrono::Utc::now().to_rfc3339(),
             attached_files: Vec::new(),
-            last_model_name: String::new(),
-            last_message_status: None,
-            last_think_fragments: 0,
 
             goal: goal::GoalState::default(),
             needs_terminal_restore: false,
@@ -379,9 +366,8 @@ impl App {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::AgentStarted => {
-                self.state.is_generating = true;
+                self.state.generation.begin(std::time::Instant::now());
                 self.state.status_message = "Thinking...".to_string();
-                self.state.generation_start_time = Some(std::time::Instant::now());
             }
             AppEvent::BeginAssistantMessage => {
                 let should_push = self
@@ -411,9 +397,9 @@ impl App {
                 }
             }
             AppEvent::AgentDone(_result) => {
-                self.state.is_generating = false;
+                self.state.generation.active = false;
                 self.state.status_message = "Ready".to_string();
-                self.state.last_message_status = Some("FINISHED".to_string());
+                self.state.generation.last_status = Some("FINISHED".to_string());
                 self.agent_task = None;
                 self.record_gen_stats();
                 if self
@@ -461,10 +447,10 @@ impl App {
                 }
             }
             AppEvent::AgentError(err) => {
-                self.state.is_generating = false;
+                self.state.generation.active = false;
                 self.state.error = Some(err.clone());
                 self.state.status_message = err.clone();
-                self.state.last_message_status = Some("ABORTED".to_string());
+                self.state.generation.last_status = Some("ABORTED".to_string());
                 self.agent_task = None;
                 self.record_gen_stats();
                 if self
@@ -492,10 +478,10 @@ impl App {
             AppEvent::RequestToolApproval(request) => {
                 if self.state.approved_tools.contains(&request.tool_name) {
                     request.resolve(true).await;
-                    self.state.is_generating = true;
+                    self.state.generation.active = true;
                     self.state.status_message = format!("Running {} (auto-approved)", request.tool_name);
                 } else {
-                    self.state.is_generating = false;
+                    self.state.generation.active = false;
                     self.state.status_message = format!("Approve tool {}?", request.tool_name);
                     self.state.modal = Some(Modal::ToolApproval {
                         tool_name: request.tool_name.clone(),
@@ -509,12 +495,12 @@ impl App {
             AppEvent::RequestQuestion(request, state) => {
                 self.state.pending_question = Some(request);
                 self.state.modal = Some(Modal::Question(state));
-                self.state.is_generating = false;
+                self.state.generation.active = false;
                 self.state.status_message = "Question pending...".to_string();
             }
             AppEvent::Tick => {
-                if self.state.is_generating || (self.state.messages.is_empty() && self.state.modal.is_none()) {
-                    self.state.animation_tick = self.state.animation_tick.wrapping_add(1);
+                if self.state.generation.active || (self.state.messages.is_empty() && self.state.modal.is_none()) {
+                    self.state.generation.animation_tick = self.state.generation.animation_tick.wrapping_add(1);
                 }
             }
             AppEvent::GoalEvaluationDone(verdict) => {
@@ -565,7 +551,7 @@ impl App {
                     self.clamp_autocomplete_scroll();
                     return Ok(false);
                 }
-                KeyCode::Enter if !self.state.is_generating => {
+                KeyCode::Enter if !self.state.generation.active => {
                     self.accept_autocomplete();
                     return Ok(false);
                 }
@@ -585,7 +571,7 @@ impl App {
                                 request.resolve(true).await;
                             }
                             self.state.modal = None;
-                            self.state.is_generating = true;
+                            self.state.generation.active = true;
                             self.state.status_message = format!("Running {}", tool_name);
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -593,7 +579,7 @@ impl App {
                                 request.resolve(false).await;
                             }
                             self.state.modal = None;
-                            self.state.is_generating = true;
+                            self.state.generation.active = true;
                             self.state.status_message = format!("Denied {}", tool_name);
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -727,7 +713,7 @@ impl App {
                             request.resolve(answer).await;
                         }
                         self.state.modal = None;
-                        self.state.is_generating = true;
+                        self.state.generation.active = true;
                         self.state.status_message = "Answer received".to_string();
                     } else {
                         self.state.modal = Some(Modal::Question(qs));
@@ -746,14 +732,14 @@ impl App {
             KeyCode::Char(c)
                 if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
             {
-                if self.state.is_generating {
+                if self.state.generation.active {
                     // Kill the running foreground child process first.
                     kill_foreground_child();
                     if let Some(handle) = self.agent_task.take() {
                         handle.abort();
                     }
                     let killed = self.shutdown_background_processes().await;
-                    self.state.is_generating = false;
+                    self.state.generation.active = false;
                     self.state.status_message = if killed > 0 {
                         format!("Cancelled; killed {killed} background process(es)")
                     } else {
@@ -774,7 +760,7 @@ impl App {
                 return Ok(true);
             }
             KeyCode::Esc => {
-                if self.state.is_generating {
+                if self.state.generation.active {
                     // Kill the running foreground child process first.
                     kill_foreground_child();
                     // Cancel the current agent turn: abort the spawned task,
@@ -783,7 +769,7 @@ impl App {
                         handle.abort();
                     }
                     let killed = self.shutdown_background_processes().await;
-                    self.state.is_generating = false;
+                    self.state.generation.active = false;
                     self.state.status_message = if killed > 0 {
                         format!("Cancelled; killed {killed} background process(es)")
                     } else {
@@ -819,7 +805,7 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.input.insert_newline();
             }
-            KeyCode::Enter if !self.state.is_generating => {
+            KeyCode::Enter if !self.state.generation.active => {
                 let buf = &self.state.input.buffer;
                 let ends_with_backslash = buf
                     .chars()
@@ -1036,12 +1022,12 @@ impl App {
             KeyCode::End => {
                 self.state.input.move_end(key.modifiers.contains(KeyModifiers::SHIFT));
             }
-            KeyCode::Up if !self.state.is_generating
+            KeyCode::Up if !self.state.generation.active
                 && self.state.input.buffer.chars().take(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
                 self.state.input.history_prev();
             }
-            KeyCode::Down if !self.state.is_generating
+            KeyCode::Down if !self.state.generation.active
                 && self.state.input.buffer.chars().skip(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
             {
                 self.state.input.history_next();
@@ -1165,7 +1151,7 @@ impl App {
         if let Some(at_pos) = buf.rfind('@') {
             let after_at = &buf[at_pos + 1..];
             let path_part = after_at.split_whitespace().next().unwrap_or("");
-            if !path_part.is_empty() && !self.state.is_generating && self.state.modal.is_none() {
+            if !path_part.is_empty() && !self.state.generation.active && self.state.modal.is_none() {
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let search_path = if path_part.contains('/') || path_part.contains('\\') {
                     std::path::Path::new(path_part).to_path_buf()
@@ -1233,7 +1219,7 @@ impl App {
             .map(|rest| rest.split_whitespace().next().unwrap_or(""))
             .unwrap_or("");
         let active = buf.starts_with('/')
-            && !self.state.is_generating
+            && !self.state.generation.active
             && self.state.modal.is_none()
             && !buf[1..].contains(char::is_whitespace);
         if !active {
@@ -1637,7 +1623,7 @@ impl App {
                 self.state.input.cursor = 0;
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = Default::default();
-                self.state.is_generating = false;
+                self.state.generation.active = false;
                 self.state.error = None;
                 if let Some(handle) = self.agent_task.take() {
                     handle.abort();
@@ -1669,7 +1655,7 @@ impl App {
                             self.state.input.cursor = 0;
                             self.state.input.selection_anchor = None;
                             self.state.autocomplete = Default::default();
-                            self.state.is_generating = false;
+                            self.state.generation.active = false;
                             self.state.error = None;
                             if let Some(handle) = self.agent_task.take() {
                                 handle.abort();
@@ -1719,18 +1705,17 @@ impl App {
     }
 
     fn record_gen_stats(&mut self) {
-        if let Some(start) = self.state.generation_start_time.take() {
-            let elapsed = start.elapsed().as_secs_f64();
+        if let Some(elapsed) = self.state.generation.take_elapsed() {
             if let Some(last) = self.state.messages.iter_mut().last() {
                 if last.role == Role::Assistant && !last.content.is_empty() {
                     let tokens = estimate_tokens(&last.content);
                     last.total_tokens = Some(tokens);
-                    last.model.clone_from(&self.state.last_model_name);
-                    last.status = self.state.last_message_status.clone();
+                    last.model.clone_from(&self.state.generation.last_model);
+                    last.status = self.state.generation.last_status.clone();
                     last.think_elapsed_secs = 0.0;
                     last.references_count = 0;
-                    self.state.last_gen_tokens = tokens;
-                    self.state.last_gen_duration_secs = elapsed;
+                    self.state.generation.last_tokens = tokens;
+                    self.state.generation.last_duration_secs = elapsed;
                 }
             }
         }

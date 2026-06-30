@@ -49,7 +49,7 @@ Status: {finished} finished, {aborted} aborted
 Tokens: {total_tokens} total
 Think: {think_total:.1}s total
 Session model: {}",
-                state.last_model_name
+                state.generation.last_model
             )
         } else {
             "Empty conversation".to_string()
