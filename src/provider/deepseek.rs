@@ -1569,7 +1569,15 @@ impl LLMProvider for DeepseekProvider {
         let mut parent_message_id = None;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    // Persist the thread id before bailing so an interrupted
+                    // collection doesn't fork the conversation on the next turn.
+                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    return Err(error.into());
+                }
+            };
 
             for line in sse.push_bytes(&chunk) {
                 let trimmed = line.trim();
@@ -1599,6 +1607,8 @@ impl LLMProvider for DeepseekProvider {
                             "completion.collect.parent",
                             format!("parent_message_id={:?}", parent_message_id),
                         );
+                        // Persist immediately so a cut stream keeps the thread id.
+                        let _ = self.mark_session_after_success(&session_id, parent_message_id);
                     }
                 }
             }
@@ -1623,7 +1633,16 @@ impl LLMProvider for DeepseekProvider {
         let mut parent_message_id = None;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    // The server already advanced this session's message tree;
+                    // persist the id we have so the next message threads onto it
+                    // instead of forking onto an invisible branch.
+                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    return Err(error.into());
+                }
+            };
 
             for line in sse.push_bytes(&chunk) {
                 let trimmed = line.trim();
@@ -1645,6 +1664,9 @@ impl LLMProvider for DeepseekProvider {
                             "completion.stream.parent",
                             format!("parent_message_id={:?}", parent_message_id),
                         );
+                        // Persist immediately — if the stream is cut after this,
+                        // the thread id is already saved.
+                        let _ = self.mark_session_after_success(&session_id, parent_message_id);
                     }
 
                     if let Some(text) = text_chunk {
@@ -1683,5 +1705,59 @@ impl LLMProvider for DeepseekProvider {
         session_id: &str,
     ) -> AppResult<Vec<ChatMessage>> {
         self.fetch_remote_history(session_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ProviderConfig, ProviderKind};
+
+    fn provider() -> DeepseekProvider {
+        // Builds a reqwest client only — no network, no token needed.
+        let config = ProviderConfig {
+            kind: ProviderKind::Deepseek,
+            token: String::new(),
+            model: "deepseek-chat".to_string(),
+            base_url: None,
+            temperature: 0.0,
+            max_tokens: 128,
+        };
+        DeepseekProvider::new(&config, 0, 0).expect("client builds")
+    }
+
+    #[test]
+    fn parent_id_persists_once_recorded_and_survives_empty_marks() {
+        let p = provider();
+        p.session_state.lock().unwrap().session_id = Some("sess-1".to_string());
+
+        // A message id seen mid-stream is recorded immediately.
+        p.mark_session_after_success("sess-1", Some(42)).unwrap();
+        {
+            let s = p.session_state.lock().unwrap();
+            assert_eq!(s.parent_message_id, Some(42));
+            assert!(s.system_sent_for_session);
+        }
+
+        // A later mark with no new id (clean end, or interrupted stream) must
+        // NOT clobber the recorded thread id — this is exactly what keeps an
+        // abnormally-ended turn from forking the conversation onto a branch the
+        // web UI never shows.
+        p.mark_session_after_success("sess-1", None).unwrap();
+        assert_eq!(p.session_state.lock().unwrap().parent_message_id, Some(42));
+    }
+
+    #[test]
+    fn mark_ignores_a_stale_session_id() {
+        let p = provider();
+        {
+            let mut s = p.session_state.lock().unwrap();
+            s.session_id = Some("current".to_string());
+            s.parent_message_id = Some(7);
+        }
+        // A late event referring to a previous/reset session must not rewrite
+        // the current session's thread id.
+        p.mark_session_after_success("old-session", Some(999)).unwrap();
+        assert_eq!(p.session_state.lock().unwrap().parent_message_id, Some(7));
     }
 }
