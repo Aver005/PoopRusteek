@@ -5,7 +5,10 @@
 //! today, but the *pure* pieces — parsing the evaluator's verdict out of its
 //! free-text reply — belong here where they can be tested in isolation.
 
-use super::events::{GoalStage, GoalVerdict};
+use super::events::{AppEvent, GoalStage, GoalVerdict};
+use super::App;
+use crate::provider::{ChatMessage, Role};
+use std::sync::Arc;
 
 /// Stop the worker/evaluator loop after this many attempts so a goal that can
 /// never be satisfied (or a flaky evaluator) doesn't retry forever.
@@ -364,5 +367,199 @@ mod tests {
         assert!(!g.is_running());
         assert_eq!(g.iteration, 0);
         assert!(g.prompt.is_empty());
+    }
+}
+
+impl App {
+    /// Abort any in-flight goal cycle and leave goal mode fully reset, so the
+    /// user is never stuck behind a "cycle in progress" that isn't running.
+    /// No-op when goal mode is off.
+    pub(crate) fn cancel_goal_cycle(&mut self, reason: &str) {
+        if !self.state.goal.mode {
+            return;
+        }
+        self.state.messages.push(ChatMessage::system(reason));
+        self.state.goal.deactivate();
+    }
+
+    pub(crate) async fn run_goal_evaluation(&mut self, agent_result: String) {
+        let provider = match &self.provider {
+            Some(p) => Arc::clone(p),
+            None => {
+                self.cancel_goal_cycle(
+                    "No provider configured for evaluation — goal cancelled. Set your token, then /goal to retry.",
+                );
+                return;
+            }
+        };
+
+        let system_prompt = self.prompts
+            .goal_evaluator_prompt
+            .clone();
+
+        let user_msg = format!(
+            "## Goal\n{}\n\n## Completed Work\n{}\n\n## Evaluation",
+            self.state.goal.text, agent_result
+        );
+
+        let eval_messages = vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&user_msg),
+        ];
+
+        let request = crate::provider::CompletionRequest {
+            messages: eval_messages.clone(),
+            model: self.config.provider.model.clone(),
+            temperature: self.config.provider.temperature.min(0.5),
+            max_tokens: self.config.provider.max_tokens,
+            stream: false,
+        };
+
+        match provider.complete(request).await {
+            Ok(response) => {
+                let verdict = parse_goal_verdict(&response.content);
+                let save_eval_session = |this: &Self| {
+                    let _ = crate::session::save_session_with_tag(
+                        &this.state.goal.agent2_session_id,
+                        &this.state.session_started_at,
+                        &eval_messages,
+                        &this.config,
+                        &this.state.workspace_path,
+                        Some("__goal_system__".to_string()),
+                    );
+                };
+
+                match self.state.goal.apply_verdict(verdict) {
+                    GoalOutcome::Succeeded { summary } => {
+                        self.state.messages.push(ChatMessage::system(
+                            &format!("✅ Goal achieved!\n\n{}", summary)
+                        ));
+                        save_eval_session(self);
+                    }
+                    GoalOutcome::GaveUp { iteration } => {
+                        save_eval_session(self);
+                        self.cancel_goal_cycle(&format!(
+                            "🛑 Goal not achieved after {iteration} attempts — stopping. Use /goal to try a different approach."
+                        ));
+                    }
+                    GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
+                        if swapped_agent2 {
+                            self.state.messages.push(ChatMessage::system(
+                                "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                            ));
+                        }
+                        // Save under the (possibly swapped) evaluator session id.
+                        save_eval_session(self);
+
+                        self.state.messages.push(ChatMessage::system(
+                            &format!(
+                                "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
+                                iteration, issues, feedback
+                            )
+                        ));
+                        if swapped_agent1 {
+                            self.state.messages.push(ChatMessage::system(
+                                "🔄 Swapping agent to new session after 3 failures."
+                            ));
+                        }
+                        self.retry_agent1_with_feedback(&feedback).await;
+                    }
+                }
+            }
+            Err(e) => {
+                self.state.messages.push(ChatMessage::system(
+                    &format!("⚠ Evaluation failed: {e}. Retrying agent 1...")
+                ));
+                self.state.goal.stage = GoalStage::RunAgent1;
+                self.retry_agent1().await;
+            }
+        }
+    }
+
+    pub(crate) async fn handle_goal_verdict(&mut self) {
+        // Find the evaluator's result from the last assistant message
+        let eval_result = self.state.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        if eval_result.is_empty() {
+            self.state.messages.push(ChatMessage::system(
+                "⚠ Evaluator produced no output. Retrying evaluation..."
+            ));
+            return;
+        }
+
+        // Re-run evaluation via the event-based path
+        let verdict = parse_goal_verdict(&eval_result);
+        let event = AppEvent::GoalEvaluationDone(verdict);
+        let _ = self.event_tx.send(event);
+    }
+
+    pub(crate) async fn handle_goal_verdict_from(&mut self, verdict: GoalVerdict) {
+        match self.state.goal.apply_verdict(verdict) {
+            GoalOutcome::Succeeded { summary } => {
+                self.state.messages.push(ChatMessage::system(
+                    &format!("✅ Goal achieved!\n\n{}", summary)
+                ));
+            }
+            GoalOutcome::GaveUp { iteration } => {
+                self.cancel_goal_cycle(&format!(
+                    "🛑 Goal not achieved after {iteration} attempts — stopping. Use /goal to try a different approach."
+                ));
+            }
+            GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
+                if swapped_agent2 {
+                    self.state.messages.push(ChatMessage::system(
+                        "🔄 Swapping evaluator (agent 2) to new session after 5 failures."
+                    ));
+                }
+                self.state.messages.push(ChatMessage::system(
+                    &format!(
+                        "❌ Goal not achieved (attempt {}).\nIssues: {}\nFeedback: {}",
+                        iteration, issues, feedback
+                    )
+                ));
+                if swapped_agent1 {
+                    self.state.messages.push(ChatMessage::system(
+                        "🔄 Swapping agent to new session after 3 failures."
+                    ));
+                }
+                self.retry_agent1_with_feedback(&feedback).await;
+            }
+        }
+    }
+
+    pub(crate) async fn retry_agent1(&mut self) {
+        let prompt = format!(
+            "Continue working on the original request.\n\nOriginal prompt: {}\n\nGoal: {}",
+            self.state.goal.prompt, self.state.goal.text
+        );
+        self.state.messages.push(ChatMessage::user(&format!(
+            "[Continuing goal cycle - attempt {}]",
+            self.state.goal.iteration
+        )));
+        self.send_to_agent(prompt).await.unwrap_or_else(|e| {
+            self.state.messages.push(ChatMessage::system(
+                &format!("⚠ Failed to retry agent: {e}")
+            ));
+        });
+    }
+
+    pub(crate) async fn retry_agent1_with_feedback(&mut self, feedback: &str) {
+        let prompt = format!(
+            "The reviewer found issues with the previous attempt. Please fix them.\n\n\
+            Original request: {}\n\nGoal: {}\n\n\
+            Issues to fix:\n{}\n\n\
+            Previous conversation history is above. Focus on fixing the issues.",
+            self.state.goal.prompt, self.state.goal.text, feedback
+        );
+        self.send_to_agent(prompt).await.unwrap_or_else(|e| {
+            self.state.messages.push(ChatMessage::system(
+                &format!("⚠ Failed to retry agent: {e}")
+            ));
+        });
     }
 }
