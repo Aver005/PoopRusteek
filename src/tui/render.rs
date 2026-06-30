@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::mcp::types::McpViewState;
 use crate::tui::TuiTerminal;
 use crate::tui::theme::Theme;
+use crate::tui::view_model;
 use crate::tui::widgets;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -314,23 +315,12 @@ fn centered_h(area: Rect, width: u16) -> Rect {
 }
 
 fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &Config, theme: &Theme) {
-    let provider_name = match config.provider.kind {
-        crate::config::ProviderKind::Deepseek => "DeepSeek",
-        crate::config::ProviderKind::Openai => "OpenAI",
-        crate::config::ProviderKind::Custom => "Custom",
-    };
+    let provider_name = provider_label(config);
     let model = &config.provider.model;
     let msg_count = state.messages.len();
-    let total_tokens: u32 = state.messages.iter()
-        .filter(|m| m.role == crate::provider::Role::Assistant)
-        .flat_map(|m| m.total_tokens)
-        .sum();
+    let total_tokens = view_model::assistant_token_total(&state.messages);
 
-    let mcp_status = if state.mcp_status.server_count > 0 {
-        format!(" mcp:{}/{}", state.mcp_status.connected_count, state.mcp_status.server_count)
-    } else {
-        String::new()
-    };
+    let mcp_status = view_model::mcp_label(&state.mcp_status);
     let bg_status = if state.running_background_count > 0 {
         let mut suffix = String::new();
         if state.running_interactive_count > 0 {
@@ -367,15 +357,11 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     let center = if state.generation.active {
         let gen_info = if let Some(start) = state.generation.start_time {
             let elapsed = start.elapsed().as_secs_f64();
-            let tps = if elapsed > 0.0 && state.generation.last_tokens > 0 {
-                state.generation.last_tokens as f64 / elapsed
-            } else {
-                0.0
-            };
-            format!(" {} {} ", spinner_char(state.generation.animation_tick), state.status_message)
+            let tps = view_model::tokens_per_sec(state.generation.last_tokens, elapsed);
+            format!(" {} {} ", view_model::spinner_char(state.generation.animation_tick), state.status_message)
                 + &format!("({} tok, {:.1}s, {:.0} t/s)", state.generation.last_tokens, elapsed, tps)
         } else {
-            format!(" {} {} ", spinner_char(state.generation.animation_tick), state.status_message)
+            format!(" {} {} ", view_model::spinner_char(state.generation.animation_tick), state.status_message)
         };
         gen_info
     } else {
@@ -386,8 +372,8 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         if state.generation.last_think_fragments > 0 {
             parts.push(format!("{} think", state.generation.last_think_fragments));
         }
-        if state.generation.last_duration_secs > 0.0 && state.generation.last_tokens > 0 {
-            let tps = state.generation.last_tokens as f64 / state.generation.last_duration_secs;
+        let tps = view_model::tokens_per_sec(state.generation.last_tokens, state.generation.last_duration_secs);
+        if tps > 0.0 {
             parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.generation.last_tokens, state.generation.last_duration_secs, tps));
         }
         format!(" {} ", parts.join(" · "))
@@ -405,11 +391,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         String::new()
     };
-    let session_prefix = if state.current_session_id.len() >= 8 {
-        format!(" {}", &state.current_session_id[..8])
-    } else {
-        format!(" {}", state.current_session_id)
-    };
+    let session_prefix = format!(" {}", view_model::session_prefix(&state.current_session_id));
     let right = format!("{} msgs:{} tot:{} | {} ", goal_tag, msg_count, total_tokens, session_prefix);
 
     let gap = area.width.saturating_sub((left.len() + center.len() + right.len()) as u16).max(1) as usize;
@@ -436,14 +418,6 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     );
 }
 
-fn spinner_char(tick: u64) -> &'static str {
-    match tick % 4 {
-        0 => "|",
-        1 => "/",
-        2 => "-",
-        _ => "\\",
-    }
-}
 
 fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
     let chunks = Layout::default()
