@@ -1,6 +1,7 @@
 pub mod deepseek;
 #[cfg(test)]
 pub mod fake;
+pub mod prompt;
 pub mod pow;
 pub mod sse;
 pub mod types;

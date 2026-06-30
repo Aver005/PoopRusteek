@@ -6,13 +6,12 @@ use crate::debug_log;
 use crate::error::{AppError, AppResult};
 use async_trait::async_trait;
 use futures::StreamExt;
-use regex::Regex;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client, Response,
 };
 use serde_json::{json, Value};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -76,9 +75,6 @@ const EXPORT_ALL_URL: &str = "https://chat.deepseek.com/api/v0/export_all";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
 
-static LONG_CODE_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```.{300,}?```").expect("hardcoded regex is valid")
-});
 
 #[derive(Debug, Default)]
 struct SessionState {
@@ -421,133 +417,13 @@ impl DeepseekProvider {
         })
     }
 
-    fn split_system_prompt(messages: &[ChatMessage]) -> (String, Vec<ChatMessage>) {
-        let mut system_prompt = String::new();
-        let mut non_system = Vec::new();
-        let mut captured_system = false;
-
-        for message in messages {
-            if !captured_system && message.role == Role::System {
-                system_prompt = message.content.clone();
-                captured_system = true;
-            } else {
-                non_system.push(message.clone());
-            }
-        }
-
-        (system_prompt, non_system)
-    }
-
-    fn strip_long_code_blocks(text: &str) -> String {
-        LONG_CODE_BLOCK_RE.replace_all(text, "[...]").into_owned()
-    }
-
-    fn format_history_message(message: &ChatMessage) -> String {
-        if message.role == Role::Assistant {
-            let stripped = Self::strip_long_code_blocks(message.content.trim());
-            return format!("[ASSISTANT]\n{stripped}");
-        }
-
-        let role = match message.role {
-            Role::System => "SYSTEM",
-            Role::User => "USER",
-            Role::Assistant => "ASSISTANT",
-            Role::Tool => "TOOL",
-        };
-        format!("[{role}]\n{}", message.content)
-    }
-
-    fn build_prompt(
-        messages: &[ChatMessage],
-        system_prompt: &str,
-        system_sent_for_session: bool,
-    ) -> String {
-        let Some(last_message) = messages.last() else {
-            return system_prompt.trim().to_string();
-        };
-
-        if !system_sent_for_session {
-            let mut parts = Vec::new();
-
-            if !system_prompt.trim().is_empty() {
-                parts.push(system_prompt.trim().to_string());
-            }
-
-            if messages.len() > 1 {
-                let history = messages[..messages.len() - 1]
-                    .iter()
-                    .map(Self::format_history_message)
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                parts.push(String::new());
-                parts.push("### LOCAL MEMORY".to_string());
-                parts.push(history);
-            }
-
-            if last_message.role == Role::Tool {
-                parts.push(String::new());
-                parts.push(format!(
-                    "### TOOL RESULT: {}",
-                    last_message.name.as_deref().unwrap_or("unknown")
-                ));
-                parts.push(last_message.content.clone());
-            } else if !last_message.content.is_empty() {
-                parts.push(String::new());
-                parts.push("### USER INPUT".to_string());
-                parts.push(last_message.content.clone());
-            }
-
-            return parts.join("\n");
-        }
-
-        if last_message.role == Role::Tool {
-            let mut tool_batch = Vec::new();
-            for message in messages.iter().rev() {
-                if message.role != Role::Tool {
-                    break;
-                }
-                tool_batch.push(message);
-            }
-            tool_batch.reverse();
-
-            return tool_batch
-                .into_iter()
-                .map(|message| {
-                    format!(
-                        "### TOOL RESULT: {}\n{}",
-                        message.name.as_deref().unwrap_or("unknown"),
-                        message.content
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-        }
-
-        if last_message.content.is_empty() {
-            return last_message.content.clone();
-        }
-
-        format!("### USER INPUT\n{}", last_message.content)
-    }
-
-    fn resolve_model_type(model: &str, parent_message_id: Option<i64>) -> Option<&'static str> {
-        let lower = model.to_ascii_lowercase();
-        if lower.contains("reasoner") || lower.contains("expert") {
-            Some("expert")
-        } else if parent_message_id.is_none() {
-            Some("default")
-        } else {
-            None
-        }
-    }
-
     fn build_body(
         &self,
         request: &CompletionRequest,
         prompt: String,
         session: &SessionSnapshot,
     ) -> Value {
-        let model_type = Self::resolve_model_type(&request.model, session.parent_message_id);
+        let model_type = prompt::resolve_model_type(&request.model, session.parent_message_id);
         let thinking_enabled = matches!(model_type, Some("expert"));
 
         json!({
@@ -566,7 +442,7 @@ impl DeepseekProvider {
     }
 
     async fn send_request(&self, request: &CompletionRequest) -> AppResult<(Response, String)> {
-        let (system_prompt, non_system_messages) = Self::split_system_prompt(&request.messages);
+        let (system_prompt, non_system_messages) = prompt::split_system_prompt(&request.messages);
         let should_reset = {
             let state = self
                 .session_state
@@ -576,7 +452,7 @@ impl DeepseekProvider {
         };
 
         let session = self.ensure_session(should_reset).await?;
-        let prompt = Self::build_prompt(
+        let prompt = prompt::build_prompt(
             &non_system_messages,
             &system_prompt,
             session.system_sent_for_session,
