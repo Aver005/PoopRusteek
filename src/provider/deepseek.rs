@@ -11,7 +11,7 @@ use reqwest::{
     Client, Response,
 };
 use serde_json::{json, Value};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -135,6 +135,24 @@ impl DeepseekProvider {
         );
 
         Ok(provider)
+    }
+
+    /// Concrete fork: shares the reqwest client (connection pool is internally
+    /// Arc'd) and all config, but starts from a clean session so the fork
+    /// threads its own conversation. Kept concrete (not just the trait method)
+    /// so tests can inspect the resulting session state.
+    fn fork_session(&self) -> DeepseekProvider {
+        DeepseekProvider {
+            client: self.client.clone(),
+            token: self.token.clone(),
+            model: self.model.clone(),
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            session_state: Mutex::new(SessionState::default()),
+            rate_limit_ms: self.rate_limit_ms,
+            max_retries: self.max_retries,
+            last_request: Mutex::new(Instant::now()),
+        }
     }
 
     fn auth_headers(&self) -> AppResult<HeaderMap> {
@@ -1691,6 +1709,10 @@ impl LLMProvider for DeepseekProvider {
         &self.model
     }
 
+    fn fork(&self) -> Arc<dyn LLMProvider> {
+        Arc::new(self.fork_session())
+    }
+
     async fn reset(&self) -> AppResult<()> {
         let mut state = self
             .session_state
@@ -1745,6 +1767,29 @@ mod tests {
         // web UI never shows.
         p.mark_session_after_success("sess-1", None).unwrap();
         assert_eq!(p.session_state.lock().unwrap().parent_message_id, Some(42));
+    }
+
+    #[test]
+    fn fork_has_independent_session_state() {
+        let parent = provider();
+        parent.session_state.lock().unwrap().session_id = Some("parent-sess".to_string());
+        parent.mark_session_after_success("parent-sess", Some(42)).unwrap();
+
+        // The fork must NOT inherit the parent's session/thread id — otherwise
+        // two parallel conversations would corrupt each other's message tree.
+        let forked = parent.fork_session();
+        {
+            let s = forked.session_state.lock().unwrap();
+            assert_eq!(s.session_id, None);
+            assert_eq!(s.parent_message_id, None);
+            assert!(!s.system_sent_for_session);
+        }
+        // And mutating the fork must not touch the parent.
+        forked.session_state.lock().unwrap().session_id = Some("fork-sess".to_string());
+        assert_eq!(
+            parent.session_state.lock().unwrap().session_id.as_deref(),
+            Some("parent-sess")
+        );
     }
 
     #[test]

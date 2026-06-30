@@ -82,4 +82,9 @@ impl LLMProvider for FakeProvider {
     fn model(&self) -> &str {
         &self.model
     }
+
+    fn fork(&self) -> std::sync::Arc<dyn LLMProvider> {
+        // A fork starts empty — tests script it independently of the parent.
+        std::sync::Arc::new(FakeProvider::with_responses(Vec::new()))
+    }
 }

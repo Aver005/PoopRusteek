@@ -1,3 +1,4 @@
+pub mod conversation;
 pub mod events;
 pub mod generation;
 mod goal;
