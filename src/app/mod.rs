@@ -54,6 +54,16 @@ pub fn kill_foreground_child() {
     }
 }
 
+/// A short display title for a conversation, from its first user message.
+fn conversation_title(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .map(|m| m.content.chars().take(40).collect::<String>().replace('\n', " "))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "(empty chat)".to_string())
+}
+
 /// The conversation an agent event targets, if it is a per-conversation event.
 fn agent_event_target(event: &AppEvent) -> Option<conversation::ConversationId> {
     match event {
@@ -116,6 +126,8 @@ pub struct AppState {
     /// Identity of the focused conversation (whose live state is the fields
     /// above). Background conversations are parked in `background`.
     pub focused_id: conversation::ConversationId,
+    /// Kind of the focused conversation (round-tripped through park/activate).
+    pub focused_kind: conversation::ConversationKind,
     /// Non-focused conversations (sidechats / sub-agents / parallel sessions)
     /// that keep streaming on their own tasks.
     pub background: Vec<conversation::Conversation>,
@@ -193,6 +205,7 @@ impl App {
             running_persistent_count: 0,
 
             focused_id: conversation::ConversationId::next(),
+            focused_kind: conversation::ConversationKind::Main,
             background: Vec::new(),
         };
 
@@ -735,6 +748,17 @@ impl App {
                                     self.tools.update_skills(self.skills.clone());
                                     self.state.modal = None;
                                 }
+                                events::PickerKind::Chats => {
+                                    let target = indices
+                                        .first()
+                                        .and_then(|&i| picker.items.get(i))
+                                        .and_then(|item| item.value.parse::<u64>().ok())
+                                        .map(conversation::ConversationId);
+                                    self.state.modal = None;
+                                    if let Some(target) = target {
+                                        self.switch_to(target);
+                                    }
+                                }
                                 _ => {
                                     if let Some(idx) = indices.first() {
                                         if let Some(item) = picker.items.get(*idx) {
@@ -852,6 +876,12 @@ impl App {
                     self.state.messages.clear();
                     self.state.scroll_offset = 0;
                 }
+            }
+            KeyCode::Tab => {
+                self.cycle_focus(1);
+            }
+            KeyCode::BackTab => {
+                self.cycle_focus(-1);
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.show_stats_panel = !self.state.show_stats_panel;
@@ -1047,6 +1077,12 @@ impl App {
                                 }
                                 CommandResult::Sidechat(question) => {
                                     self.spawn_sidechat(question).await?;
+                                }
+                                CommandResult::NewChat => {
+                                    self.new_conversation();
+                                }
+                                CommandResult::OpenChats => {
+                                    self.open_chats_picker().await;
                                 }
                                 CommandResult::Error(err) => {
                                     self.state.messages.push(ChatMessage::system(&err));
@@ -1642,12 +1678,18 @@ impl App {
                 AppEvent::AgentDone(_, _) => {
                     conv.generation.active = false;
                     conv.agent_task = None;
-                    finish = Finish::Done;
+                    // A sidechat flushes its answer and disappears; a parked
+                    // session just stops streaming and waits to be switched to.
+                    if conv.kind == conversation::ConversationKind::Sidechat {
+                        finish = Finish::Done;
+                    }
                 }
                 AppEvent::AgentError(_, err) => {
                     conv.generation.active = false;
                     conv.agent_task = None;
-                    finish = Finish::Error(err);
+                    if conv.kind == conversation::ConversationKind::Sidechat {
+                        finish = Finish::Error(err);
+                    }
                 }
                 // Tool status from background turns is not surfaced live.
                 _ => {}
@@ -1683,6 +1725,135 @@ impl App {
         };
         self.state.messages.push(ChatMessage::system(&block));
         self.auto_save_session();
+    }
+
+    /// Pack the focused conversation's live state into a parked record.
+    fn park_focused(&mut self) -> conversation::Conversation {
+        conversation::Conversation {
+            id: self.state.focused_id,
+            kind: self.state.focused_kind,
+            title: conversation_title(&self.state.messages),
+            session_id: std::mem::take(&mut self.state.current_session_id),
+            session_started_at: std::mem::take(&mut self.state.session_started_at),
+            messages: std::mem::take(&mut self.state.messages),
+            provider: self.provider.take(),
+            generation: std::mem::take(&mut self.state.generation),
+            agent_task: self.agent_task.take(),
+        }
+    }
+
+    /// Make a parked conversation the focused/live one (it keeps its running
+    /// task — switching never drops a stream).
+    fn activate(&mut self, conv: conversation::Conversation) {
+        self.state.focused_id = conv.id;
+        self.state.focused_kind = conv.kind;
+        self.state.current_session_id = conv.session_id;
+        self.state.session_started_at = conv.session_started_at;
+        self.state.messages = conv.messages;
+        self.provider = conv.provider;
+        self.state.generation = conv.generation;
+        self.agent_task = conv.agent_task;
+        self.state.scroll_offset = 0;
+        self.state.status_message = if self.state.generation.active {
+            "Thinking...".to_string()
+        } else {
+            "Ready".to_string()
+        };
+    }
+
+    /// Open a fresh parallel session and focus it; the current one keeps
+    /// running in the background.
+    fn new_conversation(&mut self) {
+        if self.state.modal.is_some() {
+            return;
+        }
+        let new_provider = self.provider.as_ref().map(|p| p.fork());
+        let parked = self.park_focused();
+        self.state.background.push(parked);
+
+        self.state.focused_id = conversation::ConversationId::next();
+        self.state.focused_kind = conversation::ConversationKind::Session;
+        self.state.current_session_id = crate::session::create_session_id();
+        self.state.session_started_at = chrono::Utc::now().to_rfc3339();
+        self.state.messages = Vec::new();
+        self.provider = new_provider;
+        self.state.generation = generation::GenerationState::default();
+        self.agent_task = None;
+        self.state.scroll_offset = 0;
+        self.state.status_message = if self.provider.is_some() {
+            "Ready".to_string()
+        } else {
+            "No provider".to_string()
+        };
+        self.state.messages.push(ChatMessage::system(
+            "New chat opened. /chats or Tab to switch between chats.",
+        ));
+    }
+
+    /// Switch focus to a background conversation by id, parking the current one.
+    fn switch_to(&mut self, target: conversation::ConversationId) {
+        if target == self.state.focused_id || self.state.modal.is_some() {
+            return;
+        }
+        let Some(pos) = self.state.background.iter().position(|c| c.id == target) else {
+            return;
+        };
+        let parked = self.park_focused();
+        let incoming = self.state.background.remove(pos);
+        self.state.background.push(parked);
+        self.activate(incoming);
+    }
+
+    /// Cycle focus to the next (`+1`) / previous (`-1`) conversation by id order.
+    fn cycle_focus(&mut self, dir: i64) {
+        if self.state.modal.is_some() || self.state.background.is_empty() {
+            return;
+        }
+        let mut ids: Vec<conversation::ConversationId> =
+            self.state.background.iter().map(|c| c.id).collect();
+        ids.push(self.state.focused_id);
+        ids.sort_by_key(|c| c.0);
+        let cur = ids
+            .iter()
+            .position(|&i| i == self.state.focused_id)
+            .unwrap_or(0);
+        let len = ids.len() as i64;
+        let next = ids[(((cur as i64 + dir) % len + len) % len) as usize];
+        self.switch_to(next);
+    }
+
+    /// Open the `/chats` picker listing the focused conversation + background
+    /// ones, with a streaming marker; selecting one switches focus.
+    async fn open_chats_picker(&mut self) {
+        use crate::app::events::{Modal, PickerItem, PickerKind, PickerMode, PickerState};
+
+        let mut items: Vec<(conversation::ConversationId, PickerItem)> = Vec::new();
+        let focused_label = format!(
+            "● {}{}",
+            conversation_title(&self.state.messages),
+            if self.state.generation.active { "  [streaming]" } else { "" }
+        );
+        items.push((
+            self.state.focused_id,
+            PickerItem::new(focused_label, self.state.focused_id.0.to_string()),
+        ));
+        for conv in &self.state.background {
+            let label = format!(
+                "  {}{}",
+                if conv.title.is_empty() { "(chat)".to_string() } else { conv.title.clone() },
+                if conv.is_streaming() { "  [streaming]" } else { "" }
+            );
+            items.push((conv.id, PickerItem::new(label, conv.id.0.to_string())));
+        }
+        items.sort_by_key(|(id, _)| id.0);
+
+        let picker = PickerState::new_with_kind(
+            "Chats — Enter to switch",
+            items.into_iter().map(|(_, item)| item).collect(),
+            PickerMode::Single,
+            PickerKind::Chats,
+        );
+        self.state.modal = Some(Modal::Picker(picker));
     }
 
     /// Abort any in-flight goal cycle and leave goal mode fully reset, so the

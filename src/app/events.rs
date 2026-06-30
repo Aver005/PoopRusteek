@@ -194,6 +194,7 @@ pub enum PickerKind {
     Sessions,
     Whitelist,
     Skills,
+    Chats,
 }
 
 #[derive(Debug, Clone)]

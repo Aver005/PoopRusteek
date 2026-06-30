@@ -39,6 +39,10 @@ pub enum CommandResult {
     ToggleSkill(String, bool),
     /// `/btw <question>` — run a one-shot side-answer in the background.
     Sidechat(String),
+    /// `/new` — open a fresh parallel chat and focus it.
+    NewChat,
+    /// `/chats` — open the chat switcher picker.
+    OpenChats,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +89,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::ps::PsCommand));
         self.register(Box::new(defs::jobs::JobsCommand));
         self.register(Box::new(defs::btw::BtwCommand));
+        self.register(Box::new(defs::chats::NewChatCommand));
+        self.register(Box::new(defs::chats::ChatsCommand));
     }
 
     pub fn register(&mut self, cmd: Box<dyn Command>) {

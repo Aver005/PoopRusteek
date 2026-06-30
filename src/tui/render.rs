@@ -334,9 +334,26 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
         String::new()
     };
     let btw_status = {
-        let running = state.background.iter().filter(|c| c.is_streaming()).count();
+        let running = state
+            .background
+            .iter()
+            .filter(|c| c.kind == crate::app::conversation::ConversationKind::Sidechat && c.is_streaming())
+            .count();
         if running > 0 {
             format!(" btw:{running}")
+        } else {
+            String::new()
+        }
+    };
+    let chats_status = {
+        // Switchable parallel chats = focused + background sessions (not sidechats).
+        let sessions = 1 + state
+            .background
+            .iter()
+            .filter(|c| c.kind != crate::app::conversation::ConversationKind::Sidechat)
+            .count();
+        if sessions > 1 {
+            format!(" chats:{sessions}")
         } else {
             String::new()
         }
@@ -358,7 +375,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     } else {
         String::new()
     };
-    let left = format!(" {}{} · {}{}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status, btw_status);
+    let left = format!(" {}{} · {}{}{}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status, btw_status, chats_status);
 
     let status_tag = state.generation.last_status.as_deref().unwrap_or("");
 

@@ -53,17 +53,11 @@ pub enum ConversationKind {
 /// independently while the user looks at something else.
 pub struct Conversation {
     pub id: ConversationId,
-    // `kind`, `session_id`, `session_started_at`, and `provider` are written now
-    // but only read once switching/persistence land in Phase 3.
-    #[allow(dead_code)]
     pub kind: ConversationKind,
     pub title: String,
-    #[allow(dead_code)]
     pub session_id: String,
-    #[allow(dead_code)]
     pub session_started_at: String,
     pub messages: Vec<ChatMessage>,
-    #[allow(dead_code)]
     pub provider: Option<Arc<dyn LLMProvider>>,
     pub generation: GenerationState,
     pub agent_task: Option<tokio::task::JoinHandle<()>>,
