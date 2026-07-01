@@ -155,43 +155,19 @@ impl App {
                 AppEvent::AgentStarted(_) => {
                     conv.generation.begin(std::time::Instant::now());
                 }
-                AppEvent::BeginAssistantMessage(_) => {
-                    let needs_push = conv
-                        .messages
-                        .last()
-                        .is_none_or(|m| m.role != Role::Assistant || !m.content.is_empty());
-                    if needs_push {
-                        conv.messages.push(ChatMessage::assistant(""));
-                    }
-                }
-                AppEvent::AgentChunk(_, chunk) => {
-                    if let Some(last) = conv.messages.last_mut() {
-                        if last.role == Role::Assistant {
-                            last.content.push_str(&chunk);
-                        }
-                    }
-                }
+                AppEvent::BeginAssistantMessage(_) => conv.begin_assistant_message(),
+                AppEvent::AgentChunk(_, chunk) => conv.append_chunk(&chunk),
                 AppEvent::AddMessage(_, message) => conv.messages.push(message),
-                AppEvent::DiscardEmptyAssistantMessage(_) => {
-                    if conv
-                        .messages
-                        .last()
-                        .is_some_and(|m| m.role == Role::Assistant && m.content.is_empty())
-                    {
-                        conv.messages.pop();
-                    }
-                }
+                AppEvent::DiscardEmptyAssistantMessage(_) => conv.discard_empty_assistant(),
                 AppEvent::AgentDone(_, _) => {
-                    conv.generation.active = false;
-                    conv.agent_task = None;
-                    if conv.kind != conversation::ConversationKind::Session {
+                    conv.finish_turn("FINISHED");
+                    if conv.is_background_kind() {
                         finish = Finish::Done;
                     }
                 }
                 AppEvent::AgentError(_, err) => {
-                    conv.generation.active = false;
-                    conv.agent_task = None;
-                    if conv.kind != conversation::ConversationKind::Session {
+                    conv.finish_turn("ABORTED");
+                    if conv.is_background_kind() {
                         finish = Finish::Error(err);
                     }
                 }
@@ -237,9 +213,9 @@ impl App {
         // Deliver into the chat that spawned it; if the user has switched away,
         // drop the result there and just notify the focused chat.
         let focused_id = self.state.conversations.focused_id();
-        if let Some(pid) = conv.parent {
-            if pid != focused_id {
-                if let Some(pconv) = self.state.conversations.get_mut(pid) {
+        if let Some(pid) = conv.parent
+            && pid != focused_id
+                && let Some(pconv) = self.state.conversations.get_mut(pid) {
                     pconv.messages.push(ChatMessage::system(&block));
                     self.state.focused_mut().messages.push(ChatMessage::system(&format!(
                         "{label} finished in another chat — {}",
@@ -247,8 +223,6 @@ impl App {
                     )));
                     return;
                 }
-            }
-        }
 
         self.state.focused_mut().messages.push(ChatMessage::system(&block));
         self.auto_save_session();
@@ -298,12 +272,17 @@ impl App {
         };
     }
 
-    /// Cycle focus to the next (`+1`) / previous (`-1`) conversation by id order.
+    /// Cycle focus to the next (`+1`) / previous (`-1`) user chat by id order.
+    /// Sidechats / sub-agents are excluded — same set as the `/chats` picker;
+    /// they finalize-and-remove themselves, which focus must not race.
     pub(crate) fn cycle_focus(&mut self, dir: i64) {
-        if self.state.modal.is_some() || self.state.conversations.len() <= 1 {
+        if self.state.modal.is_some() {
             return;
         }
-        let ids = self.state.conversations.ordered_ids();
+        let ids = self.state.conversations.ordered_session_ids();
+        if ids.len() <= 1 {
+            return;
+        }
         let focused = self.state.conversations.focused_id();
         let cur = ids.iter().position(|&i| i == focused).unwrap_or(0);
         let len = ids.len() as i64;

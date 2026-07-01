@@ -3,7 +3,6 @@ use ratatui::style::Color;
 pub struct Theme {
     pub bg: Color,
     pub panel: Color,
-    pub panel_alt: Color,
     pub fg: Color,
     pub accent: Color,
     pub accent_dim: Color,
@@ -16,9 +15,7 @@ pub struct Theme {
     pub success: Color,
     pub warning: Color,
     pub user_bg: Color,
-    pub assistant_bg: Color,
     pub tool_bg: Color,
-    pub status_bg: Color,
     pub input_bg: Color,
     pub selection: Color,
 }
@@ -28,7 +25,6 @@ impl Theme {
         Self {
             bg: Color::Rgb(11, 14, 25),
             panel: Color::Rgb(17, 23, 39),
-            panel_alt: Color::Rgb(22, 30, 50),
             fg: Color::Rgb(226, 232, 240),
             accent: Color::Rgb(96, 165, 250),
             accent_dim: Color::Rgb(59, 130, 246),
@@ -41,9 +37,7 @@ impl Theme {
             success: Color::Rgb(166, 227, 161),
             warning: Color::Rgb(249, 226, 175),
             user_bg: Color::Rgb(28, 39, 64),
-            assistant_bg: Color::Rgb(17, 23, 39),
             tool_bg: Color::Rgb(38, 32, 58),
-            status_bg: Color::Rgb(12, 18, 32),
             input_bg: Color::Rgb(15, 21, 36),
             selection: Color::Rgb(34, 45, 72),
         }

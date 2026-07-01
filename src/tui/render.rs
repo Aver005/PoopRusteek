@@ -1,3 +1,10 @@
+//! Top-level frame assembly: routes to the chat view, the landing screen, or
+//! the MCP management view, plus modals and the status bar.
+//!
+//! The landing screen animates at a fixed low frame rate while idle, which
+//! made its `session::list_sessions` call (reads and JSON-parses every
+//! session file) a real per-frame cost; see [`landing_sessions_cached`].
+
 use crate::app::AppState;
 use crate::app::events::{Modal, PickerMode, PickerState, QuestionState, View};
 use crate::config::Config;
@@ -11,7 +18,35 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
+
+/// How long the landing screen's session list stays cached before
+/// `session::list_sessions` is asked to re-scan the sessions directory. The
+/// landing screen only shows up to 5 sessions and repaints at ~8fps while
+/// its logo animates, so a few seconds of staleness (new/renamed sessions
+/// appearing slightly late) is not user-visible.
+const LANDING_SESSIONS_TTL: Duration = Duration::from_secs(3);
+
+thread_local! {
+    static LANDING_SESSIONS_CACHE: RefCell<Option<(Instant, Vec<crate::session::SessionSummary>)>> = const { RefCell::new(None) };
+}
+
+/// The landing screen's recent-sessions list, refreshed at most once per
+/// [`LANDING_SESSIONS_TTL`] instead of on every animation frame.
+fn landing_sessions_cached(config: &Config) -> Vec<crate::session::SessionSummary> {
+    LANDING_SESSIONS_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((fetched_at, sessions)) = cache.as_ref()
+            && fetched_at.elapsed() < LANDING_SESSIONS_TTL {
+                return sessions.clone();
+            }
+        let sessions = crate::session::list_sessions(config).unwrap_or_default();
+        *cache = Some((Instant::now(), sessions.clone()));
+        sessions
+    })
+}
 
 pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> crate::error::AppResult<()> {
     let theme = Theme::default_dark();
@@ -133,8 +168,7 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
     let input_width = area.width.min(76);
     let x = (area.width - input_width) / 2;
 
-    let sessions = crate::session::list_sessions(config)
-        .unwrap_or_default();
+    let sessions = landing_sessions_cached(config);
     let session_count = sessions.len();
     let show_sessions = session_count > 0;
 
@@ -191,7 +225,7 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
     // Border below input
     let border_area = centered_h(chunks[ci], input_width);
     ci += 1;
-    render_input_border(frame, border_area, &theme);
+    render_input_border(frame, border_area, theme);
 
     // Shortcuts line
     let info_area = centered_h(chunks[ci], input_width);
@@ -314,6 +348,15 @@ fn centered_h(area: Rect, width: u16) -> Rect {
     Rect::new(x, area.y, width.min(area.width), area.height)
 }
 
+/// Padding between the left/center/right segments of the status bar, sized
+/// by display width (not byte length) so multibyte content — Cyrillic
+/// status text, emoji in the goal/MCP tags — doesn't overstate how much
+/// horizontal space a segment occupies and push `right` off-screen.
+fn status_bar_gap(left: &str, center: &str, right: &str, width: u16) -> usize {
+    let segments_width = UnicodeWidthStr::width(left) + UnicodeWidthStr::width(center) + UnicodeWidthStr::width(right);
+    width.saturating_sub(segments_width as u16).max(1) as usize
+}
+
 fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &Config, theme: &Theme) {
     let provider_name = provider_label(config);
     let model = &config.provider.model;
@@ -387,22 +430,19 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     let status_tag = state.focused().generation.last_status.as_deref().unwrap_or("");
 
     let center = if state.focused().generation.active {
-        let gen_info = if let Some(start) = state.focused().generation.start_time {
+        
+        if let Some(start) = state.focused().generation.start_time {
             let elapsed = start.elapsed().as_secs_f64();
             let tps = view_model::tokens_per_sec(state.focused().generation.last_tokens, elapsed);
             format!(" {} {} ", view_model::spinner_char(state.focused().generation.animation_tick), state.status_message)
                 + &format!("({} tok, {:.1}s, {:.0} t/s)", state.focused().generation.last_tokens, elapsed, tps)
         } else {
             format!(" {} {} ", view_model::spinner_char(state.focused().generation.animation_tick), state.status_message)
-        };
-        gen_info
+        }
     } else {
         let mut parts = vec![state.status_message.clone()];
         if !status_tag.is_empty() {
             parts.push(status_tag.to_string());
-        }
-        if state.focused().generation.last_think_fragments > 0 {
-            parts.push(format!("{} think", state.focused().generation.last_think_fragments));
         }
         let tps = view_model::tokens_per_sec(state.focused().generation.last_tokens, state.focused().generation.last_duration_secs);
         if tps > 0.0 {
@@ -426,7 +466,7 @@ fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &
     let session_prefix = format!(" {}", view_model::session_prefix(&state.focused().session_id));
     let right = format!("{} msgs:{} tot:{} | {} ", goal_tag, msg_count, total_tokens, session_prefix);
 
-    let gap = area.width.saturating_sub((left.len() + center.len() + right.len()) as u16).max(1) as usize;
+    let gap = status_bar_gap(&left, &center, &right, area.width);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -907,7 +947,7 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
     } else if is_yes_no {
         8u16
     } else {
-        let visible = qs.options.len().min(10).max(3) + 1;
+        let visible = qs.options.len().clamp(3, 10) + 1;
         (visible + 5) as u16
     };
     let popup_h = popup_height.min(area.height.saturating_sub(2));
@@ -1101,8 +1141,14 @@ fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
             let trimmed = line.trim();
-            let indent_len = line.len().saturating_sub(trimmed.len());
-            let indent = &line[..indent_len];
+            // `trim_start()`, not `trim()`: `trim()` also strips trailing
+            // whitespace, which understates `trimmed.len()` and makes
+            // `indent_len` overshoot into the line's actual content
+            // (and, since that overshoot byte offset isn't derived from a
+            // whitespace prefix, it's no longer guaranteed to land on a
+            // char boundary for multibyte content).
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = crate::util::truncate_at_char_boundary(line, indent_len);
 
             if let Some((k, rest)) = trimmed.split_once(':') {
                 let key_part = k.trim();
@@ -1339,4 +1385,89 @@ fn bigger_title(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_bar_gap_ascii_matches_byte_length_math() {
+        // Pure-ASCII case: display width equals byte length, so this should
+        // match what the old `.len()`-based formula produced.
+        let gap = status_bar_gap(" left ", " center ", " right ", 40);
+        assert_eq!(gap, 40usize.saturating_sub(6 + 8 + 7));
+    }
+
+    #[test]
+    fn status_bar_gap_multibyte_uses_display_width_not_byte_length() {
+        // Cyrillic text: each character is 2 bytes in UTF-8 but 1 display
+        // cell. A byte-length-based gap would undercount available space
+        // and push `right` further than it should.
+        let left = " статус "; // 8 chars, display width 8 cells, byte len 14 (6 Cyrillic letters x 2 bytes + 2 ASCII spaces)
+        let center = " ";
+        let right = " right ";
+        let gap_by_width = status_bar_gap(left, center, right, 40);
+
+        let byte_len_gap = 40usize.saturating_sub(
+            (left.len() + center.len() + right.len()).min(40),
+        );
+        assert_ne!(
+            gap_by_width, byte_len_gap,
+            "multibyte content should make the width- and byte-length-based gaps diverge"
+        );
+
+        let expected = 40usize.saturating_sub(
+            UnicodeWidthStr::width(left) + UnicodeWidthStr::width(center) + UnicodeWidthStr::width(right),
+        );
+        assert_eq!(gap_by_width, expected);
+    }
+
+    #[test]
+    fn status_bar_gap_never_zero() {
+        // `.max(1)` guards against a fully-collapsed gap even when segments
+        // overflow the available width.
+        let gap = status_bar_gap(&"x".repeat(100), "y", "z", 10);
+        assert_eq!(gap, 1);
+    }
+
+    fn theme() -> Theme {
+        Theme::default_dark()
+    }
+
+    #[test]
+    fn highlight_json_indent_trailing_whitespace_does_not_overshoot() {
+        // Old bug: `line.trim()` (strips both ends) made `indent_len`
+        // overshoot into the actual content when the line had trailing
+        // whitespace, since `trimmed.len()` was too small — e.g. for this
+        // input (2 leading spaces, 3 trailing) the old formula computed
+        // indent_len=5 instead of 2, so the indent span became `"  \"ke"`
+        // (bleeding into the key) instead of `"  "`. Assert the exact first
+        // span rather than just checking the rendered line contains "key",
+        // since the corrupted variant still contains that substring.
+        let text = "  \"key\": \"value\",   \n";
+        let lines = highlight_json(text, &theme());
+        assert_eq!(lines.len(), 1);
+        let first_span = &lines[0].spans[0];
+        assert_eq!(first_span.content.as_ref(), "  ", "indent span must be exactly the 2 leading spaces");
+
+        let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "  \"key\": \"value\",");
+    }
+
+    #[test]
+    fn highlight_json_indent_handles_multibyte_before_trailing_space() {
+        // A line with multibyte content followed by trailing whitespace
+        // must not panic when computing/slicing the indent.
+        let text = "  \"名前\": \"値\"   \n";
+        let lines = highlight_json(text, &theme());
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn highlight_json_plain_lines_still_render() {
+        let text = "{\n  \"a\": 1,\n  \"b\": true\n}\n";
+        let lines = highlight_json(text, &theme());
+        assert_eq!(lines.len(), 4);
+    }
 }

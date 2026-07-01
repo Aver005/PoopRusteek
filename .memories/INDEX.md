@@ -1,8 +1,10 @@
 # .memories INDEX
-> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-06-30 (post conversation-unification, sub-agents, sidechat, controllers refactor)
+> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-02 (added CLAUDE.md bridge + AUDIT-2026-07-02.md)
 
-> ⚠️ The app does **NOT** auto-load `.memories/`. An agent only benefits from this folder if it is
-> explicitly told to read `.memories/INDEX.md` first. (Wiring auto-load is an open PLANS item.)
+> ⚠️ `CLAUDE.md` at the repo root is now the auto-loaded bridge into this folder — **Claude Code**
+> reads it automatically and it points here. The **app itself** still does **NOT** auto-load
+> `.memories/` at runtime; any other agent only benefits from this folder if it is explicitly told
+> to read `.memories/INDEX.md` first. (Wiring runtime auto-load is an open PLANS item.)
 
 ## 1. READ ORDER
 
@@ -29,6 +31,7 @@
 | `reference/MCP.md` | MCP clients, transports, 8 config sources |
 | `reference/CONFIG.md` | Config schema, storage paths, sessions |
 | `reference/PROMPTS.md` | Prompt library + skills discovery |
+| `reference/AUDIT-2026-07-02.md` | Full-codebase audit (2026-07-02): severity-ranked defects, `[FIXING]`/`[OPEN]`/`[ACCEPTED]` status |
 
 ## 2. KEY SIGNALS
 

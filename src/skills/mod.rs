@@ -37,22 +37,73 @@ pub struct SkillFrontmatter {
 
 pub fn parse_skill_content(_path: &std::path::Path, content: &str) -> SkillFrontmatter {
     let content = content.trim();
-    if content.starts_with("---") {
-        if let Some(end) = content[3..].find("---") {
-            let fm_str = &content[3..3 + end];
+    let mut frontmatter = SkillFrontmatter { name: None, description: None };
+
+    if let Some(after_open) = content.strip_prefix("---")
+        && let Some(end) = after_open.find("---") {
+            let fm_str = &after_open[..end];
+            // Accumulate every recognized key across all frontmatter lines
+            // instead of returning on the first match — a file with both
+            // `name:` and `description:` used to silently drop whichever
+            // key came second.
             for line in fm_str.lines() {
                 let line = line.trim();
                 if let Some((key, value)) = line.split_once(':') {
                     let key = key.trim().to_lowercase();
                     let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
                     match key.as_str() {
-                        "name" => return SkillFrontmatter { name: Some(value), description: None },
-                        "description" => return SkillFrontmatter { name: None, description: Some(value) },
+                        "name" => frontmatter.name = Some(value),
+                        "description" => frontmatter.description = Some(value),
                         _ => {}
                     }
                 }
             }
         }
+
+    frontmatter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn both_keys_are_kept_name_then_description() {
+        let content = "---\nname: My Skill\ndescription: Does a thing\n---\nBody text.";
+        let fm = parse_skill_content(Path::new("SKILL.md"), content);
+        assert_eq!(fm.name.as_deref(), Some("My Skill"));
+        assert_eq!(fm.description.as_deref(), Some("Does a thing"));
     }
-    SkillFrontmatter { name: None, description: None }
+
+    #[test]
+    fn both_keys_are_kept_description_then_name() {
+        let content = "---\ndescription: Does a thing\nname: My Skill\n---\nBody text.";
+        let fm = parse_skill_content(Path::new("SKILL.md"), content);
+        assert_eq!(fm.name.as_deref(), Some("My Skill"));
+        assert_eq!(fm.description.as_deref(), Some("Does a thing"));
+    }
+
+    #[test]
+    fn quotes_are_stripped_from_values() {
+        let content = "---\nname: \"Quoted Name\"\ndescription: 'Single quoted'\n---\n";
+        let fm = parse_skill_content(Path::new("SKILL.md"), content);
+        assert_eq!(fm.name.as_deref(), Some("Quoted Name"));
+        assert_eq!(fm.description.as_deref(), Some("Single quoted"));
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_without_dropping_known_ones() {
+        let content = "---\nfoo: bar\nname: My Skill\nbaz: qux\ndescription: Does a thing\n---\n";
+        let fm = parse_skill_content(Path::new("SKILL.md"), content);
+        assert_eq!(fm.name.as_deref(), Some("My Skill"));
+        assert_eq!(fm.description.as_deref(), Some("Does a thing"));
+    }
+
+    #[test]
+    fn no_frontmatter_returns_empty() {
+        let fm = parse_skill_content(Path::new("SKILL.md"), "Just body text, no frontmatter.");
+        assert!(fm.name.is_none());
+        assert!(fm.description.is_none());
+    }
 }

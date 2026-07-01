@@ -13,9 +13,49 @@ use std::io::Read;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+
+/// Drain a child's stdout/stderr pipe into `buffer` line-by-line until EOF.
+///
+/// Uses `read_until` on raw bytes rather than `read_line` on a `String`:
+/// `read_line` fails the whole read with `InvalidData` on the first non-UTF8
+/// byte, and the old call sites treated that error like EOF (`break`) — a
+/// child that ever wrote one invalid byte (binary output, a mid-multibyte
+/// truncated write, a non-UTF8 locale) would silently go quiet forever while
+/// still showing as `running`. Reading raw bytes can't fail on encoding, so
+/// the reader survives arbitrary output; `from_utf8_lossy` is applied once
+/// here (replacement chars for anything invalid) and again defensively by
+/// `sanitize_terminal_output` at drain time.
+async fn pipe_reader_loop<R: AsyncRead + Unpin + Send + 'static>(
+    pipe: R,
+    buffer: OutputBuffer,
+    overflow: Arc<std::sync::atomic::AtomicBool>,
+    activity: ActivitySlot,
+) {
+    let mut reader = BufReader::new(pipe);
+    let mut raw_line: Vec<u8> = Vec::new();
+    loop {
+        raw_line.clear();
+        match reader.read_until(b'\n', &mut raw_line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&raw_line);
+                let mut b = buffer.lock().unwrap();
+                if b.len() + text.len() <= MAX_BUFFER_BYTES {
+                    b.extend_from_slice(text.as_bytes());
+                } else {
+                    overflow.store(true, Ordering::Relaxed);
+                }
+                *activity.lock().unwrap() = chrono::Utc::now();
+            }
+            // read_until on raw bytes only errors on genuine I/O failure
+            // (e.g. broken pipe), never on encoding — safe to stop here.
+            Err(_) => break,
+        }
+    }
+}
 
 /// Detached pipe-based background process (stdin = null, stdout/stderr piped).
 /// Use for long-running non-interactive commands (servers, watchers).
@@ -40,6 +80,16 @@ pub async fn spawn_background(
         command.as_std_mut().creation_flags(0x00000008);
     }
 
+    // Put the child in its own process group (pgid == its pid) so
+    // `force_kill_pid` can kill `-<pid>` (the whole group) instead of just
+    // the leader. Jobs are typically `bash -c "npm run dev"`: killing only
+    // the leader orphans grandchildren (node/vite) that keep the port bound.
+    // Windows achieves the equivalent via `taskkill /T` (process tree).
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+
     let mut child: Child = command
         .spawn()
         .map_err(|e| format!("Failed to spawn command: {e}"))?;
@@ -59,51 +109,13 @@ pub async fn spawn_background(
         let buf = Arc::clone(&buffer);
         let ovf = Arc::clone(&overflow);
         let activity = Arc::clone(&activity);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(out);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let mut b = buf.lock().unwrap();
-                        if b.len() + line.len() <= MAX_BUFFER_BYTES {
-                            b.extend_from_slice(line.as_bytes());
-                        } else {
-                            ovf.store(true, Ordering::Relaxed);
-                        }
-                        *activity.lock().unwrap() = chrono::Utc::now();
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        tokio::spawn(pipe_reader_loop(out, buf, ovf, activity));
     }
     if let Some(err) = stderr {
         let buf = Arc::clone(&buffer);
         let ovf = Arc::clone(&overflow);
         let activity = Arc::clone(&activity);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(err);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let mut b = buf.lock().unwrap();
-                        if b.len() + line.len() <= MAX_BUFFER_BYTES {
-                            b.extend_from_slice(line.as_bytes());
-                        } else {
-                            ovf.store(true, Ordering::Relaxed);
-                        }
-                        *activity.lock().unwrap() = chrono::Utc::now();
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        tokio::spawn(pipe_reader_loop(err, buf, ovf, activity));
     }
 
     {
@@ -121,14 +133,14 @@ pub async fn spawn_background(
                         match cmd {
                             Some(BgCmd::Kill(tx)) => {
                                 let res = match child_pid {
-                                    Some(pid) => force_kill_pid(pid),
+                                    Some(pid) => force_kill_pid(pid).await,
                                     None => child.kill().await,
                                 };
                                 let _ = tx.send(res);
                             }
                             None => {
                                 let _ = match child_pid {
-                                    Some(pid) => force_kill_pid(pid),
+                                    Some(pid) => force_kill_pid(pid).await,
                                     None => child.kill().await,
                                 };
                                 break;
@@ -166,13 +178,10 @@ pub async fn spawn_background(
         let mut b = buffer.lock().unwrap();
         sanitize_terminal_output(&std::mem::take(&mut *b))
     };
-    let status_snap = status.lock().unwrap().clone();
 
     Ok(SpawnOutcome {
         id,
         initial_output,
-        status: status_snap,
-        interactive: false,
         persistent,
         ttl_secs,
     })
@@ -283,7 +292,7 @@ pub async fn spawn_interactive(
                 match cmd {
                     BgCmd::Kill(tx) => {
                         let res = match child_pid {
-                            Some(pid) => force_kill_pid(pid),
+                            Some(pid) => force_kill_pid(pid).await,
                             None => killer.kill(),
                         };
                         let _ = tx.send(res);
@@ -292,7 +301,7 @@ pub async fn spawn_interactive(
             }
             // Channel closed (handle dropped) — ensure the process is reaped.
             let _ = match child_pid {
-                Some(pid) => force_kill_pid(pid),
+                Some(pid) => force_kill_pid(pid).await,
                 None => killer.kill(),
             };
         });
@@ -326,13 +335,10 @@ pub async fn spawn_interactive(
         let mut b = buffer.lock().unwrap();
         sanitize_terminal_output(&std::mem::take(&mut *b))
     };
-    let status_snap = status.lock().unwrap().clone();
 
     Ok(SpawnOutcome {
         id,
         initial_output,
-        status: status_snap,
-        interactive: true,
         persistent,
         ttl_secs,
     })

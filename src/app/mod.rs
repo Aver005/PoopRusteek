@@ -20,7 +20,10 @@ use crate::provider::estimate_tokens;
 use crate::tools::registry::ToolRegistry;
 use crate::commands::CommandSuggestion;
 use crate::skills::{discovery::discover_all_skills, SkillDefinition};
-use events::{AppEvent, GoalStage, Modal, QuestionRequest, ToolApprovalRequest, View};
+use events::{
+    AppEvent, GoalStage, Modal, PendingInteraction, QuestionRequest, QuestionState,
+    ToolApprovalRequest, View,
+};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -45,7 +48,7 @@ pub fn kill_foreground_child() {
         {
             // /T kills the entire process tree (child + grandchild processes).
             let _ = std::process::Command::new("taskkill")
-                .args(&["/F", "/T", "/PID", &pid.to_string()])
+                .args(["/F", "/T", "/PID", &pid.to_string()])
                 .spawn();
         }
         #[cfg(not(windows))]
@@ -98,11 +101,13 @@ pub struct AppState {
     pub input: input::InputState,
     pub status_message: String,
     pub scroll_offset: u32,
-    pub error: Option<String>,
     pub modal: Option<Modal>,
     pub approved_tools: std::collections::HashSet<String>,
+    /// The interaction currently on screen (tool approval / question)…
     pub pending_tool_approval: Option<ToolApprovalRequest>,
     pub pending_question: Option<QuestionRequest>,
+    /// …and the ones parked behind it, FIFO. See `present_next_interaction`.
+    pub pending_interactions: std::collections::VecDeque<PendingInteraction>,
     pub autocomplete: AutocompleteState,
     pub view: View,
     pub mcp_status: mcp_status::McpStatus,
@@ -201,11 +206,11 @@ impl App {
             },
             status_message: if has_provider { "Ready" } else { "No token configured" }.to_string(),
             scroll_offset: 0,
-            error: None,
             modal: None,
             approved_tools: crate::whitelist::load(),
             pending_tool_approval: None,
             pending_question: None,
+            pending_interactions: std::collections::VecDeque::new(),
             autocomplete: AutocompleteState::default(),
             view: View::Chat,
             mcp_status: mcp_status::McpStatus::default(),
@@ -264,6 +269,9 @@ impl App {
         // Kill all background/PTY processes so spawn_blocking waiters unblock
         // and the tokio runtime can shut down cleanly.
         let _ = crate::tools::background::shutdown_all().await;
+        // Terminate MCP server children — dropping them without close() used
+        // to orphan one subprocess per stdio server on every exit.
+        self.mcp.lock().await.shutdown_all().await;
         result
     }
 
@@ -279,8 +287,10 @@ impl App {
         let mut event_stream = EventStream::new();
 
         loop {
+            let mut dirty = false;
             tokio::select! {
                 _ = tick_interval.tick() => {
+                    dirty |= self.tick_is_visual();
                     self.handle_event(AppEvent::Tick).await?;
                 }
                 Some(Ok(event)) = event_stream.next() => {
@@ -292,17 +302,20 @@ impl App {
                                     | crossterm::event::KeyEventKind::Repeat
                             ) =>
                         {
+                            dirty = true;
                             if self.handle_event(AppEvent::Key(key)).await? {
                                 return Ok(());
                             }
                         }
                         crossterm::event::Event::Resize(w, h) => {
+                            dirty = true;
                             self.handle_event(AppEvent::Resize(w, h)).await?;
                         }
                         _ => {}
                     }
                 }
                 Some(event) = self.event_rx.recv() => {
+                    dirty = true;
                     if self.handle_event(event).await? {
                         return Ok(());
                     }
@@ -315,11 +328,29 @@ impl App {
                 }
             }
 
-            if self.state.view == View::Mcp {
-                self.state.mcp_status.refresh_view(&self.mcp).await;
+            // Drain whatever queued up while we were handling, then render
+            // ONCE. Without this a streaming burst (one event per token) costs
+            // one full render per token, and once render time exceeds chunk
+            // arrival time the unbounded queue only ever grows.
+            let mut drained = 0usize;
+            while drained < 256 {
+                match self.event_rx.try_recv() {
+                    Ok(event) => {
+                        drained += 1;
+                        dirty = true;
+                        if self.handle_event(event).await? {
+                            return Ok(());
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
-            self.state.mcp_status.update_stats(&self.mcp).await;
-            self.state.background.refresh().await;
+
+            if self.state.view == View::Mcp {
+                dirty |= self.state.mcp_status.refresh_view(&self.mcp).await;
+            }
+            dirty |= self.state.mcp_status.update_stats(&self.mcp).await;
+            dirty |= self.state.background.refresh().await;
 
             if consume_terminal_restore_request() {
                 self.state.needs_terminal_restore = true;
@@ -340,17 +371,37 @@ impl App {
                     crossterm::cursor::Show,
                 );
                 terminal.clear()?;
+                dirty = true;
             }
 
-            self.render(terminal)?;
+            // Idle ticks with nothing animating skip the draw entirely — this
+            // is what turns the former ~8 renders/sec at rest into zero.
+            if dirty {
+                self.render(terminal)?;
+            }
         }
+    }
+
+    /// Does a tick actually change pixels? The spinner and elapsed-time stats
+    /// animate while any conversation is streaming; the landing logo animates
+    /// while the chat is empty and no modal covers it.
+    fn tick_is_visual(&self) -> bool {
+        self.state.conversations.iter().any(|c| c.is_streaming())
+            || (self.state.focused().messages.is_empty() && self.state.modal.is_none())
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
         // Agent events for a background conversation are applied to its parked
-        // record, not the focused chat.
+        // record, not the focused chat. Sidechats/sub-agents route by KIND even
+        // while focused (Tab can land on one): their terminal events must
+        // finalize-and-flush into the parent, which the focused path never does.
         if let Some(target) = agent_event_target(&event) {
-            if target != self.state.conversations.focused_id() {
+            let background_kind = self
+                .state
+                .conversations
+                .get(target)
+                .is_some_and(|c| c.is_background_kind());
+            if target != self.state.conversations.focused_id() || background_kind {
                 self.handle_background_event(target, event);
                 return Ok(false);
             }
@@ -362,89 +413,49 @@ impl App {
                 self.state.status_message = "Thinking...".to_string();
             }
             AppEvent::BeginAssistantMessage(_) => {
-                let should_push = self.state.focused_mut().messages
-                    .last()
-                    .is_none_or(|message| message.role != Role::Assistant || !message.content.is_empty());
-                if should_push {
-                    self.state.focused_mut().messages.push(ChatMessage::assistant(""));
-                }
+                self.state.focused_mut().begin_assistant_message();
             }
             AppEvent::DiscardEmptyAssistantMessage(_) => {
-                if self.state.focused_mut().messages
-                    .last()
-                    .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
-                {
-                    self.state.focused_mut().messages.pop();
-                }
+                self.state.focused_mut().discard_empty_assistant();
             }
             AppEvent::AgentChunk(_, chunk) => {
-                if let Some(last) = self.state.focused_mut().messages.last_mut() {
-                    if last.role == Role::Assistant {
-                        last.content.push_str(&chunk);
-                    }
-                }
+                self.state.focused_mut().append_chunk(&chunk);
             }
             AppEvent::AgentDone(_, _result) => {
-                self.state.focused_mut().generation.active = false;
+                self.state.focused_mut().finish_turn("FINISHED");
                 self.state.status_message = "Ready".to_string();
-                self.state.focused_mut().generation.last_status = Some("FINISHED".to_string());
-                self.state.focused_mut().agent_task = None;
                 self.record_gen_stats();
-                if self.state.focused_mut().messages
-                    .last()
-                    .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
-                {
-                    self.state.focused_mut().messages.pop();
-                }
                 self.auto_save_session();
 
                 // --- GOAL cycle check ---
-                if self.state.goal.mode {
-                    match self.state.goal.stage.clone() {
-                        GoalStage::RunAgent1 => {
-                            // Agent 1 finished — get last assistant content for evaluation
-                            let agent_result = self.state.focused_mut().messages
-                                .iter()
-                                .rev()
-                                .find(|m| m.role == Role::Assistant)
-                                .map(|m| m.content.clone())
-                                .unwrap_or_default();
+                if self.state.goal.mode && self.state.goal.stage == GoalStage::RunAgent1 {
+                    // Agent 1 finished — get last assistant content for evaluation
+                    let agent_result = self.state.focused_mut().messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == Role::Assistant)
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default();
 
-                            if !agent_result.is_empty() {
-                                self.state.status_message = "Evaluating goal...".to_string();
-                                self.state.goal.stage = GoalStage::RunEvaluator;
-                                self.state.focused_mut().messages.push(ChatMessage::system(
-                                    "🔍 Evaluating result against goal..."
-                                ));
-                                self.run_goal_evaluation(agent_result).await;
-                            } else {
-                                self.state.focused_mut().messages.push(ChatMessage::system(
-                                    "⚠ Agent produced no output. Retrying..."
-                                ));
-                                self.retry_agent1().await;
-                            }
-                        }
-                        GoalStage::RunEvaluator => {
-                            // Evaluator finished — parse the verdict
-                            self.handle_goal_verdict().await;
-                        }
-                        _ => {}
+                    if !agent_result.is_empty() {
+                        self.state.status_message = "Evaluating goal...".to_string();
+                        self.state.goal.stage = GoalStage::RunEvaluator;
+                        self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                            "🔍 Evaluating result against goal..."
+                        ));
+                        self.spawn_goal_evaluation(agent_result);
+                    } else {
+                        self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                            "⚠ Agent produced no output. Retrying..."
+                        ));
+                        self.retry_agent1().await;
                     }
                 }
             }
             AppEvent::AgentError(_, err) => {
-                self.state.focused_mut().generation.active = false;
-                self.state.error = Some(err.clone());
                 self.state.status_message = err.clone();
-                self.state.focused_mut().generation.last_status = Some("ABORTED".to_string());
-                self.state.focused_mut().agent_task = None;
+                self.state.focused_mut().finish_turn("ABORTED");
                 self.record_gen_stats();
-                if self.state.focused_mut().messages
-                    .last()
-                    .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
-                {
-                    self.state.focused_mut().messages.pop();
-                }
                 self.auto_save_session();
 
                 // An error mid-cycle would otherwise leave goal mode stuck in a
@@ -472,44 +483,171 @@ impl App {
                     request.resolve(true).await;
                     self.state.focused_mut().generation.active = true;
                     self.state.status_message = format!("Running {} (auto-approved)", request.tool_name);
+                } else if self.state.modal.is_some()
+                    || self.state.pending_tool_approval.is_some()
+                    || self.state.pending_question.is_some()
+                {
+                    // Another interaction is on screen — park this one. An
+                    // overwrite would orphan the previous request's agent
+                    // task on a `Notify` nobody would ever fire.
+                    self.state
+                        .pending_interactions
+                        .push_back(PendingInteraction::Approval(request));
+                    self.state.status_message = format!(
+                        "{} interaction(s) queued",
+                        self.state.pending_interactions.len()
+                    );
                 } else {
-                    self.state.focused_mut().generation.active = false;
-                    self.state.status_message = format!("Approve tool {}?", request.tool_name);
-                    self.state.modal = Some(Modal::ToolApproval {
-                        tool_name: request.tool_name.clone(),
-                        arguments: request.arguments.clone(),
-                        scroll_offset: 0,
-                        always_allow: false,
-                    });
-                    self.state.pending_tool_approval = Some(request);
+                    self.present_tool_approval(request);
                 }
             }
             AppEvent::RequestQuestion(request, state) => {
-                self.state.pending_question = Some(request);
-                self.state.modal = Some(Modal::Question(state));
-                self.state.focused_mut().generation.active = false;
-                self.state.status_message = "Question pending...".to_string();
+                if self.state.modal.is_some()
+                    || self.state.pending_tool_approval.is_some()
+                    || self.state.pending_question.is_some()
+                {
+                    self.state
+                        .pending_interactions
+                        .push_back(PendingInteraction::Question(request, state));
+                } else {
+                    self.present_question(request, state);
+                }
             }
             AppEvent::Tick => {
                 if self.state.focused_mut().generation.active || (self.state.focused_mut().messages.is_empty() && self.state.modal.is_none()) {
                     self.state.focused_mut().generation.animation_tick = self.state.focused_mut().generation.animation_tick.wrapping_add(1);
                 }
             }
-            AppEvent::GoalEvaluationDone(verdict) => {
-                self.handle_goal_verdict_from(verdict).await;
-            }
-            AppEvent::GoalCycleFinished => {
-                self.state.status_message = "Goal achieved!".to_string();
+            AppEvent::GoalEvaluationDone(outcome) => {
+                self.handle_goal_evaluation_done(outcome).await;
             }
             AppEvent::SpawnSubAgent { parent, label, prompt } => {
                 self.spawn_sub_agent(parent, label, prompt).await?;
+            }
+            AppEvent::SessionFetched { conversation, session_id, result } => {
+                self.apply_fetched_session(conversation, &session_id, result).await;
+            }
+            AppEvent::McpOperationDone { message } => {
+                self.state.mcp_status.view.status_message = message.clone();
+                self.state.status_message = message.clone();
+                self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+                // Force the next loop iteration to re-pull fresh server info.
+                self.state.mcp_status.view.servers.clear();
+                self.state.mcp_status.last_stats_update = None;
             }
             _ => {}
         }
         Ok(false)
     }
 
-    async fn send_to_agent(&mut self, _input: String) -> AppResult<()> {
+    /// Put a tool-approval request on screen (modal + current slot).
+    fn present_tool_approval(&mut self, request: ToolApprovalRequest) {
+        self.state.focused_mut().generation.active = false;
+        self.state.status_message = format!("Approve tool {}?", request.tool_name);
+        self.state.modal = Some(Modal::ToolApproval {
+            tool_name: request.tool_name.clone(),
+            arguments: request.arguments.clone(),
+            scroll_offset: 0,
+            always_allow: false,
+        });
+        self.state.pending_tool_approval = Some(request);
+    }
+
+    /// Put a question request on screen (modal + current slot).
+    fn present_question(&mut self, request: QuestionRequest, state: QuestionState) {
+        self.state.pending_question = Some(request);
+        self.state.modal = Some(Modal::Question(state));
+        self.state.focused_mut().generation.active = false;
+        self.state.status_message = "Question pending...".to_string();
+    }
+
+    /// After a modal resolves, surface the next parked interaction (if any).
+    /// Approvals whitelisted meanwhile resolve immediately instead of showing.
+    pub(crate) async fn present_next_interaction(&mut self) {
+        while let Some(next) = self.state.pending_interactions.pop_front() {
+            match next {
+                PendingInteraction::Approval(request) => {
+                    if self.state.approved_tools.contains(&request.tool_name) {
+                        request.resolve(true).await;
+                        continue;
+                    }
+                    self.present_tool_approval(request);
+                    return;
+                }
+                PendingInteraction::Question(request, state) => {
+                    self.present_question(request, state);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Deny-and-drop every pending approval belonging to `conversation` — its
+    /// turn is being cancelled, so leaving them queued (or on screen) would
+    /// present approvals for a task that no longer exists.
+    pub(crate) async fn purge_interactions_for(
+        &mut self,
+        conversation: conversation::ConversationId,
+    ) {
+        let mut kept = std::collections::VecDeque::new();
+        while let Some(item) = self.state.pending_interactions.pop_front() {
+            match item {
+                PendingInteraction::Approval(request)
+                    if request.conversation == conversation =>
+                {
+                    request.resolve(false).await;
+                }
+                other => kept.push_back(other),
+            }
+        }
+        self.state.pending_interactions = kept;
+
+        let current_is_target = self
+            .state
+            .pending_tool_approval
+            .as_ref()
+            .is_some_and(|r| r.conversation == conversation);
+        if current_is_target {
+            if let Some(request) = self.state.pending_tool_approval.take() {
+                request.resolve(false).await;
+            }
+            if matches!(self.state.modal, Some(Modal::ToolApproval { .. })) {
+                self.state.modal = None;
+            }
+            self.present_next_interaction().await;
+        }
+    }
+
+    /// Cancel the focused conversation's in-flight turn: kill its foreground
+    /// child, abort the agent task, deny its pending approvals, and reset the
+    /// visible state. Shared by Esc and Ctrl+C.
+    pub(crate) async fn cancel_focused_turn(&mut self) {
+        // Kill the running foreground child process first.
+        kill_foreground_child();
+        if let Some(handle) = self.state.focused_mut().agent_task.take() {
+            handle.abort();
+        }
+        let conversation = self.state.conversations.focused_id();
+        self.purge_interactions_for(conversation).await;
+        let killed = self.state.background.shutdown_all().await;
+        self.state.focused_mut().generation.active = false;
+        self.state.status_message = if killed > 0 {
+            format!("Cancelled; killed {killed} background process(es)")
+        } else {
+            "Cancelled".to_string()
+        };
+        self.state.needs_terminal_restore = true;
+        self.state.focused_mut().discard_empty_assistant();
+        if self.state.goal.is_running() {
+            self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
+        }
+    }
+
+    /// Start an agent turn on the focused conversation. `user_message`, when
+    /// given, is appended to the chat first and therefore reaches the model —
+    /// this replaces an older `send_to_agent(input)` whose argument was
+    /// silently discarded. The provider sees every non-`ui_only` message.
+    async fn send_focused_turn(&mut self, user_message: Option<ChatMessage>) -> AppResult<()> {
         let provider = match &self.state.focused().provider {
             Some(p) => Arc::clone(p),
             None => {
@@ -520,8 +658,19 @@ impl App {
             }
         };
 
+        if let Some(message) = user_message {
+            self.state.focused_mut().messages.push(message);
+        }
+
         let conversation = self.state.conversations.focused_id();
-        let messages: Vec<ChatMessage> = self.state.focused().messages.clone();
+        let messages: Vec<ChatMessage> = self
+            .state
+            .focused()
+            .messages
+            .iter()
+            .filter(|m| !m.ui_only)
+            .cloned()
+            .collect();
         let system_prompt = system_prompt::build(
             &self.prompts,
             &self.skills,
@@ -567,7 +716,6 @@ impl App {
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = Default::default();
                 self.state.focused_mut().generation.active = false;
-                self.state.error = None;
                 if let Some(handle) = self.state.focused_mut().agent_task.take() {
                     handle.abort();
                 }
@@ -584,60 +732,24 @@ impl App {
             Err(_) => {
                 let remote_provider = self.state.focused().provider.clone();
                 if let Some(provider) = remote_provider {
-                    match provider.fetch_remote_session_messages(session_id).await {
-                        Ok(messages) => {
-                            if messages.is_empty() {
-                                self.state.focused_mut().messages.push(ChatMessage::system(
-                                    &format!("Remote session {session_id} has no messages"),
-                                ));
-                                return Ok(());
-                            }
-                            self.state.focused_mut().messages = messages;
-                            self.state.focused_mut().session_id = session_id.to_string();
-                            self.state.scroll_offset = 0;
-                            self.state.input.buffer.clear();
-                            self.state.input.cursor = 0;
-                            self.state.input.selection_anchor = None;
-                            self.state.autocomplete = Default::default();
-                            self.state.focused_mut().generation.active = false;
-                            self.state.error = None;
-                            if let Some(handle) = self.state.focused_mut().agent_task.take() {
-                                handle.abort();
-                            }
-
-                            let _ = provider.reset().await;
-
-                            let count = self.state.focused_mut().messages.len();
-                            let title = session::derive_title(&self.state.focused_mut().messages);
-                            let now = session::timestamp_now();
-                            if let Err(e) = session::save_local(
-                                &session::Session {
-                                    version: 1,
-                                    id: session_id.to_string(),
-                                    created_at: now.clone(),
-                                    updated_at: now,
-                                    workspace_root: std::env::current_dir()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .to_string(),
-                                    model_type: self.config.provider.model.clone(),
-                                    messages: self.state.focused_mut().messages.clone(),
-                                    tag: None,
-                                },
-                                &self.config,
-                            ) {
-                                tracing::warn!("Failed to save imported session: {e}");
-                            }
-                            self.state.status_message = format!(
-                                "Imported remote session {session_id}: {title} ({count} msgs)"
-                            );
-                        }
-                        Err(e) => {
-                            self.state.focused_mut().messages.push(ChatMessage::system(
-                                &format!("Session {session_id} not found locally and remote fetch failed: {e}"),
-                            ));
-                        }
-                    }
+                    // Fetch off the event loop — a slow network here used to
+                    // freeze the whole TUI until the response (or timeout).
+                    let conversation = self.state.conversations.focused_id();
+                    let sid = session_id.to_string();
+                    let event_tx = self.event_tx.clone();
+                    self.state.status_message =
+                        format!("Fetching remote session {session_id}...");
+                    tokio::spawn(async move {
+                        let result = provider
+                            .fetch_remote_session_messages(&sid)
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = event_tx.send(AppEvent::SessionFetched {
+                            conversation,
+                            session_id: sid,
+                            result,
+                        });
+                    });
                 } else {
                     self.state.focused_mut().messages.push(ChatMessage::system(
                         &format!("Session {session_id} not found locally"),
@@ -648,6 +760,88 @@ impl App {
         Ok(())
     }
 
+    /// Apply a remote-session fetch result delivered by `SessionFetched`.
+    async fn apply_fetched_session(
+        &mut self,
+        conversation: conversation::ConversationId,
+        session_id: &str,
+        result: Result<Vec<ChatMessage>, String>,
+    ) {
+        use crate::session;
+
+        let messages = match result {
+            Ok(m) if m.is_empty() => {
+                if let Some(conv) = self.state.conversations.get_mut(conversation) {
+                    conv.messages.push(ChatMessage::system(&format!(
+                        "Remote session {session_id} has no messages"
+                    )));
+                }
+                return;
+            }
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(conv) = self.state.conversations.get_mut(conversation) {
+                    conv.messages.push(ChatMessage::system(&format!(
+                        "Session {session_id} not found locally and remote fetch failed: {e}"
+                    )));
+                }
+                return;
+            }
+        };
+
+        let provider = self
+            .state
+            .conversations
+            .get(conversation)
+            .and_then(|c| c.provider.clone());
+        let Some(conv) = self.state.conversations.get_mut(conversation) else {
+            return;
+        };
+        conv.messages = messages;
+        conv.session_id = session_id.to_string();
+        conv.generation.active = false;
+        if let Some(handle) = conv.agent_task.take() {
+            handle.abort();
+        }
+        let count = conv.messages.len();
+        let title = session::derive_title(&conv.messages);
+        let snapshot = conv.messages.clone();
+
+        if conversation == self.state.conversations.focused_id() {
+            self.state.scroll_offset = 0;
+            self.state.input.buffer.clear();
+            self.state.input.cursor = 0;
+            self.state.input.selection_anchor = None;
+            self.state.autocomplete = Default::default();
+        }
+        if let Some(provider) = provider {
+            // Local session-state reset only — no network.
+            let _ = provider.reset().await;
+        }
+
+        let now = session::timestamp_now();
+        if let Err(e) = session::save_local(
+            &session::Session {
+                version: session::SESSION_VERSION,
+                id: session_id.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                workspace_root: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                model_type: self.config.provider.model.clone(),
+                messages: snapshot,
+                tag: None,
+            },
+            &self.config,
+        ) {
+            tracing::warn!("Failed to save imported session: {e}");
+        }
+        self.state.status_message =
+            format!("Imported remote session {session_id}: {title} ({count} msgs)");
+    }
+
     fn record_gen_stats(&mut self) {
         let conv = self.state.focused_mut();
         let Some(elapsed) = conv.generation.take_elapsed() else {
@@ -655,8 +849,8 @@ impl App {
         };
         let last_model = conv.generation.last_model.clone();
         let last_status = conv.generation.last_status.clone();
-        if let Some(last) = conv.messages.iter_mut().last() {
-            if last.role == Role::Assistant && !last.content.is_empty() {
+        if let Some(last) = conv.messages.iter_mut().last()
+            && last.role == Role::Assistant && !last.content.is_empty() {
                 let tokens = estimate_tokens(&last.content);
                 last.total_tokens = Some(tokens);
                 last.model = last_model;
@@ -666,7 +860,6 @@ impl App {
                 conv.generation.last_tokens = tokens;
                 conv.generation.last_duration_secs = elapsed;
             }
-        }
     }
 
     fn auto_save_session(&self) {
@@ -966,8 +1159,7 @@ fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Va
     if let Some(props) = schema
         .get("properties")
         .and_then(|p| p.as_object())
-    {
-        if !props.is_empty() {
+        && !props.is_empty() {
             result.push_str("\n  Parameters:");
             let required = schema
                 .get("required")
@@ -1003,7 +1195,6 @@ fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Va
                 ));
             }
         }
-    }
 
     result
 }

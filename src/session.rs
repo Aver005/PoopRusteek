@@ -3,7 +3,7 @@ use crate::error::AppResult;
 use crate::provider::ChatMessage;
 use serde::{Deserialize, Serialize};
 
-const SESSION_VERSION: i32 = 1;
+pub const SESSION_VERSION: i32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Session {
@@ -74,7 +74,7 @@ pub fn save_session_with_tag(
 
     let path = dir.join(format!("{id}.json"));
     let json = serde_json::to_string_pretty(&session)?;
-    std::fs::write(&path, json)?;
+    crate::util::atomic_write(&path, json.as_bytes())?;
     Ok(())
 }
 
@@ -86,6 +86,12 @@ pub fn load_local(id: &str, _config: &Config) -> AppResult<Session> {
     }
     let json = std::fs::read_to_string(&path)?;
     let session: Session = serde_json::from_str(&json)?;
+    if session.version != SESSION_VERSION {
+        return Err(crate::error::AppError::Custom(format!(
+            "session format v{} is not supported by this build (expected v{SESSION_VERSION})",
+            session.version
+        )));
+    }
     Ok(session)
 }
 
@@ -104,11 +110,17 @@ pub fn list_sessions(_config: &Config) -> AppResult<Vec<SessionSummary>> {
         }
         let json = match std::fs::read_to_string(&path) {
             Ok(j) => j,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!("Failed to read session file {}: {e}", path.display());
+                continue;
+            }
         };
         let session: Session = match serde_json::from_str(&json) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!("Failed to parse session file {}: {e}", path.display());
+                continue;
+            }
         };
         let title = derive_title(&session.messages);
         sessions.push(SessionSummary {
@@ -137,7 +149,7 @@ pub fn save_local(session: &Session, _config: &Config) -> AppResult<()> {
 
     let path = dir.join(format!("{}.json", session.id));
     let json = serde_json::to_string_pretty(session)?;
-    std::fs::write(&path, json)?;
+    crate::util::atomic_write(&path, json.as_bytes())?;
     Ok(())
 }
 
@@ -186,6 +198,81 @@ pub fn append_history(input: &str) {
         history.drain(0..history.len() - 500);
     }
     if let Ok(json) = serde_json::to_string(&history) {
-        let _ = std::fs::write(history_path(), json);
+        let _ = crate::util::atomic_write(&history_path(), json.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `contents` directly to `Config::sessions_dir()/{id}.json`,
+    /// bypassing `save_local`, so we can plant a session with an arbitrary
+    /// (including wrong) `version` field. `id` should be unique per test to
+    /// avoid colliding with other tests or a real user's sessions, since
+    /// `Config::sessions_dir()` is a fixed, non-injectable path.
+    fn plant_session_file(id: &str, contents: &str) -> std::path::PathBuf {
+        let dir = Config::sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_local_rejects_future_session_version() {
+        let id = "pooprusteek_test_session_future_version";
+        let future_version = SESSION_VERSION + 1;
+        let json = format!(
+            r#"{{"version":{future_version},"id":"{id}","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","workspace_root":"/tmp","model_type":"deepseek-chat","messages":[]}}"#
+        );
+        let path = plant_session_file(id, &json);
+
+        let config = Config::default();
+        let result = load_local(id, &config);
+
+        cleanup(&path);
+
+        let err = result.expect_err("session with a newer version must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains(&future_version.to_string()), "error should mention the file's version: {msg}");
+        assert!(msg.contains(&SESSION_VERSION.to_string()), "error should mention the expected version: {msg}");
+    }
+
+    #[test]
+    fn load_local_accepts_current_session_version() {
+        let id = "pooprusteek_test_session_current_version";
+        let json = format!(
+            r#"{{"version":{SESSION_VERSION},"id":"{id}","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","workspace_root":"/tmp","model_type":"deepseek-chat","messages":[]}}"#
+        );
+        let path = plant_session_file(id, &json);
+
+        let config = Config::default();
+        let result = load_local(id, &config);
+
+        cleanup(&path);
+
+        let session = result.expect("session at the current version must load");
+        assert_eq!(session.version, SESSION_VERSION);
+        assert_eq!(session.id, id);
+    }
+
+    #[test]
+    fn list_sessions_skips_unparseable_files_without_erroring() {
+        let id = "pooprusteek_test_session_corrupt";
+        let path = plant_session_file(id, "{ this is not valid json");
+
+        let config = Config::default();
+        let result = list_sessions(&config);
+
+        cleanup(&path);
+
+        // A single corrupt file must not fail the whole listing — it should
+        // be skipped (and, per session.rs, warned about via tracing).
+        assert!(result.is_ok(), "list_sessions should not error on a corrupt file: {result:?}");
     }
 }

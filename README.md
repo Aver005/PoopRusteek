@@ -14,7 +14,7 @@
 A free, terminal-native alternative to Claude Code — with parallel chats, sub-agents, an iterative goal loop, MCP, and skills.
 
 [![Rust](https://img.shields.io/badge/Rust-edition_2024-CE412B?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://www.rust-lang.org)
+[![MSRV](https://img.shields.io/badge/MSRV-1.91-blue)](https://www.rust-lang.org)
 [![TUI](https://img.shields.io/badge/TUI-ratatui-7C3AED)](https://ratatui.rs)
 [![Platform](https://img.shields.io/badge/platform-Windows_·_macOS_·_Linux-success)]()
 [![License](https://img.shields.io/badge/license-MIT-green)](#-license)
@@ -63,7 +63,7 @@ Markdown + syntax highlighting, streaming with a live thinking indicator, multi-
 cargo install --path .
 ```
 
-Requires a Rust toolchain (edition 2024, MSRV 1.85).
+Requires a Rust toolchain (edition 2024, MSRV 1.91).
 
 ## 🚀 Usage
 

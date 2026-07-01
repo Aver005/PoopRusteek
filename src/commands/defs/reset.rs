@@ -27,7 +27,6 @@ impl Command for ResetCommand {
         state.autocomplete = Default::default();
         state.focused_mut().generation.active = false;
         state.status_message = "Ready".to_string();
-        state.error = None;
 
         state.focused_mut().messages.push(crate::provider::ChatMessage::system(
             "Session reset. How can I help you?"

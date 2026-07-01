@@ -6,7 +6,7 @@ pub struct GoalCommand;
 
 impl Command for GoalCommand {
     fn name(&self) -> &str {
-        "/goal"
+        "goal"
     }
 
     fn description(&self) -> &str {

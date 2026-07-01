@@ -16,14 +16,12 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const DEEPSEEK_HOST: &str = "chat.deepseek.com";
-const API_BASE: &str = "https://chat.deepseek.com/api/v0";
 
 // Core chat
 const CREATE_POW_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
 const CREATE_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
 const SESSION_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history";
-const HISTORY_MESSAGES_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
 const TARGET_PATH: &str = "/api/v0/chat/completion";
 
 // Session management
@@ -59,19 +57,13 @@ const INDEX_QUERY_URL: &str = "https://chat.deepseek.com/api/v0/index/query";
 
 // User
 const CURRENT_USER_URL: &str = "https://chat.deepseek.com/api/v0/users/current";
-const USER_SETTINGS_URL: &str = "https://chat.deepseek.com/api/v0/users/settings";
-const UPDATE_USER_SETTINGS_URL: &str = "https://chat.deepseek.com/api/v0/users/update_settings";
 const LOGOUT_ALL_SESSIONS_URL: &str = "https://chat.deepseek.com/api/v0/users/logout_all_sessions";
 const SET_BIRTHDAY_URL: &str = "https://chat.deepseek.com/api/v0/users/set_birthday";
 
 // Client settings & telemetry
 const CLIENT_SETTINGS_URL: &str = "https://chat.deepseek.com/api/v0/client/settings";
 const CLIENT_SETTINGS_REPORT_URL: &str = "https://chat.deepseek.com/api/v0/client/settings/report";
-const CLIENT_SPAN_URL: &str = "https://chat.deepseek.com/api/v0/client/span";
 
-// Export
-const DOWNLOAD_EXPORT_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/download_export_history";
-const EXPORT_ALL_URL: &str = "https://chat.deepseek.com/api/v0/export_all";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
 
@@ -109,7 +101,13 @@ pub struct DeepseekProvider {
 
 impl DeepseekProvider {
     pub fn new(config: &ProviderConfig, rate_limit_ms: u64, max_retries: i32) -> AppResult<Self> {
-        let client = Client::builder().build()?;
+        // `read_timeout` (not `timeout`) so a stalled connection errors out
+        // while a healthy long-lived SSE stream keeps flowing: it bounds the
+        // gap *between* bytes, not the whole request.
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(120))
+            .build()?;
 
         let provider = Self {
             client,
@@ -160,7 +158,9 @@ impl DeepseekProvider {
         headers.insert("Host", HeaderValue::from_static(DEEPSEEK_HOST));
         headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
         headers.insert("Accept", HeaderValue::from_static("application/json"));
-        headers.insert("Accept-Encoding", HeaderValue::from_static("gzip"));
+        // No manual Accept-Encoding: setting it by hand disables reqwest's
+        // auto-decompression, and gzip isn't among our enabled features — a
+        // server honoring it would hand us bytes we'd garble.
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
         headers.insert("x-client-platform", HeaderValue::from_static("android"));
         headers.insert("x-client-version", HeaderValue::from_static("1.8.0"));
@@ -236,6 +236,14 @@ impl DeepseekProvider {
         let _ = self.last_request.lock().map(|mut last| *last = Instant::now());
     }
 
+    /// Exponential backoff for retry loops: 1s, 2s, 4s… capped at 30s.
+    /// Saturating on purpose — infinite-retry mode (`max_retries = -1`) reaches
+    /// attempt counts where `2u64.pow(attempt)` would overflow-panic.
+    fn retry_backoff(attempt: usize) -> Duration {
+        let exp = attempt.saturating_sub(1).min(5) as u32;
+        Duration::from_millis(1000u64 << exp).min(Duration::from_secs(30))
+    }
+
     async fn send_json_request(
         &self,
         action: &str,
@@ -268,8 +276,7 @@ impl DeepseekProvider {
                     }
 
                     attempt += 1;
-                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32 - 1));
-                    let capped = delay.min(Duration::from_secs(30));
+                    let capped = Self::retry_backoff(attempt);
                     tracing::warn!("{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}");
                     sleep(capped).await;
                 }
@@ -282,8 +289,7 @@ impl DeepseekProvider {
                         return Err(AppError::Http(error));
                     }
                     attempt += 1;
-                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32 - 1));
-                    let capped = delay.min(Duration::from_secs(30));
+                    let capped = Self::retry_backoff(attempt);
                     tracing::warn!("{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}");
                     sleep(capped).await;
                 }
@@ -404,15 +410,14 @@ impl DeepseekProvider {
                 .lock()
                 .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
 
-            if !should_reset {
-                if let Some(session_id) = &state.session_id {
+            if !should_reset
+                && let Some(session_id) = &state.session_id {
                     return Ok(SessionSnapshot {
                         session_id: session_id.clone(),
                         parent_message_id: state.parent_message_id,
                         system_sent_for_session: state.system_sent_for_session,
                     });
                 }
-            }
         }
 
         let session_id = self.create_session().await?;
@@ -548,8 +553,8 @@ impl DeepseekProvider {
     }
 
     fn extract_text_from_event(event: &Value) -> String {
-        if let Some(object) = event.as_object() {
-            if let Some(event_v) = object.get("v") {
+        if let Some(object) = event.as_object()
+            && let Some(event_v) = object.get("v") {
                 let patch_path = object.get("p").and_then(Value::as_str);
                 let operation = object.get("o").and_then(Value::as_str);
 
@@ -557,16 +562,14 @@ impl DeepseekProvider {
                     if text == "FINISHED" {
                         return String::new();
                     }
-                    if let Some(path) = patch_path {
-                        if !path.contains("/content") {
+                    if let Some(path) = patch_path
+                        && !path.contains("/content") {
                             return String::new();
                         }
-                    }
-                    if let Some(op) = operation {
-                        if op != "APPEND" && op != "SET" {
+                    if let Some(op) = operation
+                        && op != "APPEND" && op != "SET" {
                             return String::new();
                         }
-                    }
                     return text.to_string();
                 }
 
@@ -579,7 +582,6 @@ impl DeepseekProvider {
                     }
                 }
             }
-        }
 
         let paths = [
             [
@@ -721,11 +723,10 @@ impl DeepseekProvider {
                 if let Some(number) = value.as_i64() {
                     return Some(number);
                 }
-                if let Some(text) = value.as_str() {
-                    if let Ok(parsed) = text.parse::<i64>() {
+                if let Some(text) = value.as_str()
+                    && let Ok(parsed) = text.parse::<i64>() {
                         return Some(parsed);
                     }
-                }
             }
         }
 
@@ -773,108 +774,6 @@ impl DeepseekProvider {
             },
             parent_message_id,
         ))
-    }
-
-    /// Enhanced SSE parser that handles all DeepSeek SSE event types.
-    /// Processes raw SSE lines with `event:` and `data:` headers,
-    /// returning a structured event type.
-    fn parse_sse_event(
-        event_name: Option<&str>,
-        data: &str,
-    ) -> Option<types::ParsedSSEEvent> {
-        let data = data.trim();
-        if data.is_empty() {
-            return None;
-        }
-
-        let parsed: Value = serde_json::from_str(data).ok()?;
-
-        match event_name {
-            Some("ready") => {
-                let ev: types::CompletionReadyEvent =
-                    serde_json::from_value(parsed).ok()?;
-                Some(types::ParsedSSEEvent::Ready(ev))
-            }
-            Some("update_session") => {
-                let ev: types::CompletionUpdateSessionEvent =
-                    serde_json::from_value(parsed).ok()?;
-                Some(types::ParsedSSEEvent::UpdateSession(ev))
-            }
-            Some("title") => {
-                let ev: types::CompletionTitleEvent =
-                    serde_json::from_value(parsed).ok()?;
-                Some(types::ParsedSSEEvent::Title(ev))
-            }
-            Some("close") => {
-                let ev: types::CompletionCloseEvent =
-                    serde_json::from_value(parsed).ok()?;
-                Some(types::ParsedSSEEvent::Close(ev))
-            }
-            _ => {
-                let normalized = Self::normalize_event_payload(parsed.clone());
-
-                if normalized.is_object() {
-                    let obj = normalized.as_object()?;
-
-                    let op = obj.get("o").and_then(Value::as_str);
-                    let path = obj.get("p").and_then(Value::as_str);
-
-                    match (op, path) {
-                        (Some("APPEND"), Some(_)) if obj.get("v").and_then(Value::as_array).is_some() => {
-                            let ev: types::CompletionFragmentAppendEvent =
-                                serde_json::from_value(normalized).ok()?;
-                            Some(types::ParsedSSEEvent::FragmentAppend(ev))
-                        }
-                        (Some("APPEND"), Some(_)) => {
-                            let ev: types::CompletionContentAppendEvent =
-                                serde_json::from_value(normalized).ok()?;
-                            Some(types::ParsedSSEEvent::ContentAppend(ev))
-                        }
-                        (Some("SET"), Some(_)) => {
-                            let ev: types::CompletionFieldSetEvent =
-                                serde_json::from_value(normalized).ok()?;
-                            Some(types::ParsedSSEEvent::FieldSet(ev))
-                        }
-                        (Some("BATCH"), Some(_)) => {
-                            let ev: types::CompletionBatchEvent =
-                                serde_json::from_value(normalized).ok()?;
-                            Some(types::ParsedSSEEvent::Batch(ev))
-                        }
-                        _ => {
-                            if obj.contains_key("v") && !obj.contains_key("p") && !obj.contains_key("o") {
-                                if obj.get("v").and_then(Value::as_object).is_some() {
-                                    if obj["v"].get("response").is_some() {
-                                        let ev: types::CompletionResponseEvent =
-                                            serde_json::from_value(normalized).ok()?;
-                                        Some(types::ParsedSSEEvent::Response(ev))
-                                    } else {
-                                        Some(types::ParsedSSEEvent::Unknown(
-                                            serde_json::to_string(&normalized).unwrap_or_default(),
-                                        ))
-                                    }
-                                } else if let Some(text) = obj.get("v").and_then(Value::as_str) {
-                                    Some(types::ParsedSSEEvent::TokenDelta(
-                                        types::CompletionTokenDeltaEvent {
-                                            v: text.to_string(),
-                                        },
-                                    ))
-                                } else {
-                                    Some(types::ParsedSSEEvent::Unknown(
-                                        serde_json::to_string(&normalized).unwrap_or_default(),
-                                    ))
-                                }
-                            } else {
-                                Some(types::ParsedSSEEvent::Unknown(
-                                    serde_json::to_string(&normalized).unwrap_or_default(),
-                                ))
-                            }
-                        }
-                    }
-                } else {
-                    Some(types::ParsedSSEEvent::Unknown(data.to_string()))
-                }
-            }
-        }
     }
 
     fn mark_session_after_success(
@@ -937,7 +836,7 @@ impl DeepseekProvider {
                 _ => continue,
             };
             if role == Role::User || role == Role::Assistant {
-                messages.push(ChatMessage { role, content, name: None, tool_call_id: None, display_content: None, tool_error: false, created_at: String::new(), total_tokens: None, model: String::new(), status: None, think_elapsed_secs: 0.0, references_count: 0, search_triggered: false });
+                messages.push(ChatMessage { role, content, name: None, tool_call_id: None, display_content: None, tool_error: false, ui_only: false, created_at: String::new(), total_tokens: None, model: String::new(), status: None, think_elapsed_secs: 0.0, references_count: 0, search_triggered: false });
             }
         }
         Ok(messages)
@@ -976,8 +875,7 @@ impl DeepseekProvider {
                     }
 
                     attempt += 1;
-                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32 - 1));
-                    let capped = delay.min(Duration::from_secs(30));
+                    let capped = Self::retry_backoff(attempt);
                     tracing::warn!("{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}");
                     sleep(capped).await;
                 }
@@ -986,8 +884,7 @@ impl DeepseekProvider {
                         return Err(AppError::Http(error));
                     }
                     attempt += 1;
-                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt as u32 - 1));
-                    let capped = delay.min(Duration::from_secs(30));
+                    let capped = Self::retry_backoff(attempt);
                     tracing::warn!("{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}");
                     sleep(capped).await;
                 }
@@ -995,6 +892,18 @@ impl DeepseekProvider {
         }
     }
 
+}
+
+// The DeepSeek web API exposes a much larger surface than this TUI client
+// currently drives — session CRUD, sharing, search, file upload, user
+// settings. It is modeled here (methods + the request/response types in
+// `types.rs`) for parity with the reverse-engineered API and future feature
+// work, but nothing in this crate calls it yet, so clippy's dead_code lint
+// fires on all of it. Suppressed as a block rather than deleted: unlike the
+// verified-dead code removed elsewhere, this is intentionally-kept API
+// modeling, not litter.
+#[allow(dead_code)]
+impl DeepseekProvider {
     // ─── Session Management ────────────────────────────────────
 
     /// Fetch paginated list of remote sessions.
@@ -1461,35 +1370,6 @@ impl DeepseekProvider {
         Ok(payload.data.biz_data)
     }
 
-    /// Get user settings (training_allowed flag).
-    pub async fn get_user_settings(&self) -> AppResult<types::UserSettings> {
-        let headers = self.auth_headers()?;
-        let response = self
-            .send_get_request("user.settings", USER_SETTINGS_URL, &headers)
-            .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error_response("user.settings", response, "Get user settings failed").await);
-        }
-        let payload: types::ApiResponse<types::UserSettings> =
-            response.json().await?;
-        Ok(payload.data.biz_data)
-    }
-
-    /// Update user settings.
-    pub async fn update_user_settings(&self, settings: serde_json::Value) -> AppResult<types::UserSettings> {
-        let body = json!({ "settings": settings });
-        let headers = self.auth_headers()?;
-        let response = self
-            .send_json_request("user.update_settings", UPDATE_USER_SETTINGS_URL, &headers, &body)
-            .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error_response("user.update_settings", response, "Update settings failed").await);
-        }
-        let payload: types::ApiResponse<types::UserSettings> =
-            response.json().await?;
-        Ok(payload.data.biz_data)
-    }
-
     /// Logout all active sessions.
     pub async fn logout_all_sessions(&self) -> AppResult<()> {
         let body = json!({});
@@ -1559,7 +1439,9 @@ impl DeepseekProvider {
     }
 }
 
-/// Simple URL encoding for query parameters.
+/// Simple URL encoding for query parameters. Only used by the unused
+/// optional API surface above (`get_client_settings`).
+#[allow(dead_code)]
 fn urlencoding(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     for byte in input.bytes() {

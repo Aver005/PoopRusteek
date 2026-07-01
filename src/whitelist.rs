@@ -30,6 +30,17 @@ pub fn save(tools: &HashSet<String>) -> AppResult<()> {
         std::fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_string_pretty(tools)?;
-    std::fs::write(&path, content)?;
+    crate::util::atomic_write(&path, content.as_bytes())?;
     Ok(())
+}
+
+/// Add one tool to the persisted whitelist (read-modify-write). Used by the
+/// approval modal's "always allow" so the choice survives both the
+/// `/whitelist` picker (which reloads from this file) and restarts.
+pub fn persist_approval(tool_name: &str) {
+    let mut tools = load();
+    if tools.insert(tool_name.to_string())
+        && let Err(e) = save(&tools) {
+            tracing::warn!("Failed to persist tool approval for {tool_name}: {e}");
+        }
 }

@@ -29,27 +29,44 @@ impl McpStatus {
     const STATS_INTERVAL_SECS: u64 = 2;
 
     /// Throttled refresh of the cached counts and server list from the manager.
-    pub async fn update_stats(&mut self, mcp: &Mutex<MCPManager>) {
-        if let Some(last) = self.last_stats_update {
-            if last.elapsed().as_secs() < Self::STATS_INTERVAL_SECS {
-                return;
+    /// Returns whether the visible numbers changed (drives the dirty flag).
+    ///
+    /// `try_lock`, never `lock`: this runs on the event loop, and awaiting a
+    /// manager mutex that a slow operation holds would freeze the whole UI.
+    /// Stale counts for a poll interval are invisible; a frozen TUI is not.
+    pub async fn update_stats(&mut self, mcp: &Mutex<MCPManager>) -> bool {
+        if let Some(last) = self.last_stats_update
+            && last.elapsed().as_secs() < Self::STATS_INTERVAL_SECS {
+                return false;
             }
-        }
-        let servers = mcp.lock().await.get_servers_info();
-        self.connected_count = servers
+        let Ok(manager) = mcp.try_lock() else {
+            return false;
+        };
+        let servers = manager.get_servers_info();
+        drop(manager);
+
+        let connected = servers
             .iter()
             .filter(|s| s.enabled && s.status == "connected")
             .count();
+        let changed = connected != self.connected_count || servers.len() != self.server_count;
+        self.connected_count = connected;
         self.server_count = servers.len();
         self.view.servers = servers;
         self.last_stats_update = Some(Instant::now());
+        changed
     }
 
     /// Lazily populate the detail panel's server list when it is first shown.
-    pub async fn refresh_view(&mut self, mcp: &Mutex<MCPManager>) {
+    /// Returns whether the list was (re)populated.
+    pub async fn refresh_view(&mut self, mcp: &Mutex<MCPManager>) -> bool {
         if !self.view.servers.is_empty() {
-            return;
+            return false;
         }
-        self.view.servers = mcp.lock().await.get_servers_info();
+        let Ok(manager) = mcp.try_lock() else {
+            return false;
+        };
+        self.view.servers = manager.get_servers_info();
+        !self.view.servers.is_empty()
     }
 }

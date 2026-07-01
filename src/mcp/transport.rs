@@ -1,10 +1,18 @@
-use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
+//! Wire transports for MCP: stdio (child process), HTTP (Streamable HTTP),
+//! and SSE. Each implements the `Transport` trait's `send_request`, which
+//! turns one `JsonRpcRequest` into one matching `JsonRpcResponse` — the
+//! "matching" part is the interesting bit for stdio and SSE, since both can
+//! interleave notifications and server-initiated requests with the actual
+//! response on the same stream (see `send_request` on `StdioTransport` and
+//! `parse_sse_stream`/`parse_sse_fallback` on `SseTransport`).
+
+use super::jsonrpc::{ids_match, is_notification_or_request, JsonRpcRequest, JsonRpcResponse};
 use crate::error::AppResult;
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Mutex;
@@ -34,7 +42,11 @@ fn spawn_command(
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // Without this, dropping the `Child` (e.g. on `MCPManager` reload
+            // or replacement) leaves the subprocess running as an orphan —
+            // tokio only kills on drop if explicitly told to.
+            .kill_on_drop(true);
         if let Some(c) = cwd {
             cmd.current_dir(c);
         }
@@ -78,7 +90,10 @@ fn spawn_command(
 }
 
 impl StdioTransport {
+    /// `server_name` tags the drained stderr log lines (`mcp_stderr` target)
+    /// so they're attributable when multiple servers run concurrently.
     pub async fn new(
+        server_name: &str,
         command: &str,
         args: &[String],
         env: Option<&HashMap<String, String>>,
@@ -90,6 +105,46 @@ impl StdioTransport {
         let stdout = child.stdout.take()
             .ok_or_else(|| crate::error::AppError::Mcp("Failed to open stdout for MCP subprocess".to_string()))?;
         let reader = BufReader::new(stdout);
+
+        // The child's stderr pipe has a small OS buffer (~64KB on most
+        // platforms). If nothing ever reads it and the server writes enough
+        // diagnostic output, the pipe fills and the server blocks on its next
+        // stderr write — which for many MCP servers happens on the same
+        // thread/loop that would otherwise answer our stdout request, so the
+        // whole connection deadlocks. Drain it continuously into tracing so
+        // it can never back up, and so operators get server diagnostics for
+        // free.
+        //
+        // Read raw bytes (`read_until(b'\n', ..)`) rather than
+        // `AsyncBufReadExt::lines()`: `lines()` validates UTF-8 per line and
+        // yields `Err` on invalid sequences, which would stop this loop dead
+        // and silently reopen the exact pipe-fills-and-blocks deadlock this
+        // task exists to prevent. `from_utf8_lossy` never fails, so the drain
+        // loop can only stop on a real I/O error or EOF.
+        if let Some(stderr) = child.stderr.take() {
+            let name = server_name.to_string();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) => break, // EOF: child closed stderr (usually means it exited)
+                        Ok(_) => {
+                            let line = String::from_utf8_lossy(&buf);
+                            let line = line.trim_end_matches(['\r', '\n']);
+                            if !line.is_empty() {
+                                tracing::debug!(target: "mcp_stderr", server = %name, "{line}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(target: "mcp_stderr", server = %name, "stderr read error: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             child,
@@ -110,13 +165,79 @@ impl Transport for StdioTransport {
             stdin.flush().await?;
         }
 
-        let mut line = String::new();
-        timeout(Duration::from_secs(60), self.reader.read_line(&mut line))
-            .await
-            .map_err(|_| crate::error::AppError::Mcp("MCP request timed out after 60s".to_string()))??;
+        // A stdio server multiplexes everything onto stdout: our response,
+        // plus any notifications (`notifications/progress`, log messages)
+        // and server-initiated requests it feels like sending in between.
+        // Reading exactly one line and trusting it blind means a stray
+        // notification gets returned as our answer and every subsequent
+        // real response is then off by one. Loop until a line parses as a
+        // JSON-RPC message whose `id` matches this request; skip (and log)
+        // anything else. The 60s budget covers the *entire* wait, not each
+        // individual line — a chatty-but-slow server can't reset the clock
+        // by sending an endless stream of notifications.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            // `Instant::duration_since` on `tokio::time::Instant` returns a
+            // zero `Duration` (rather than panicking or requiring an
+            // `Option` unwrap) when `self` is already in the past relative
+            // to the argument — exactly the saturating-at-zero behavior
+            // needed here once the deadline has passed.
+            let remaining = deadline.duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(crate::error::AppError::Mcp("MCP request timed out after 60s".to_string()));
+            }
 
-        let response: JsonRpcResponse = serde_json::from_str(&line)?;
-        Ok(response)
+            let mut line = String::new();
+            let read = timeout(remaining, self.reader.read_line(&mut line)).await;
+            let bytes_read = match read {
+                Ok(inner) => inner?,
+                Err(_) => {
+                    return Err(crate::error::AppError::Mcp("MCP request timed out after 60s".to_string()));
+                }
+            };
+            if bytes_read == 0 {
+                return Err(crate::error::AppError::Mcp(
+                    "MCP subprocess closed stdout before sending a response".to_string(),
+                ));
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let value: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("MCP stdio: skipping non-JSON line on stdout: {e} ({trimmed})");
+                    continue;
+                }
+            };
+
+            if is_notification_or_request(&value) {
+                tracing::debug!("MCP stdio: skipping notification/server-request while awaiting id={}: {value}", request.id);
+                continue;
+            }
+
+            let response: JsonRpcResponse = match serde_json::from_value(value.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("MCP stdio: skipping unparseable response line: {e} ({value})");
+                    continue;
+                }
+            };
+
+            match &response.id {
+                Some(id) if ids_match(request.id, id) => return Ok(response),
+                other => {
+                    tracing::debug!(
+                        "MCP stdio: skipping response with non-matching id={:?} (waiting for id={})",
+                        other, request.id
+                    );
+                    continue;
+                }
+            }
+        }
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
@@ -143,10 +264,7 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(url: &str, headers: HashMap<String, String>) -> AppResult<Self> {
-        let client = reqwest::Client::builder()
-            .cookie_store(true)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let client = build_http_client()?;
 
         Ok(Self {
             client,
@@ -155,6 +273,29 @@ impl HttpTransport {
             session_id: Mutex::new(None),
         })
     }
+}
+
+/// Shared timeout policy for `HttpTransport` and `SseTransport`.
+///
+/// Previously both used a flat 30s *total* timeout (connect + send + full
+/// response), which is a much tighter budget than stdio's 60s and hard-cuts
+/// any tool call — or SSE body — that legitimately runs long. This aligns
+/// the per-request budget with stdio's 60s while giving connection setup its
+/// own short 10s allowance, so a slow-to-connect server doesn't eat into the
+/// time budgeted for the actual call. `read_timeout` additionally caps the
+/// gap between individual reads of a streaming (SSE) body — a stalled
+/// stream with no bytes for 60s is treated the same as a stalled non-stream
+/// response, rather than being able to hang indefinitely past the request
+/// timeout by trickling bytes just often enough (reqwest 0.12 supports both
+/// knobs directly on `ClientBuilder`, so there is no residual gap to
+/// document here).
+fn build_http_client() -> AppResult<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .cookie_store(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .build()?)
 }
 
 #[async_trait]
@@ -185,10 +326,15 @@ impl Transport for HttpTransport {
             crate::error::AppError::Mcp(format!("Failed to read HTTP response body at {}: {e}", self.url))
         })?;
 
-        // Try JSON first
-        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&body) {
-            return Ok(response);
-        }
+        // Try JSON first. Unlike stdio, a single POST here maps to a single
+        // response body — there's no interleaved-notifications stream to
+        // filter — but still guard against a server that mistakenly echoes
+        // a notification/request shape back as the "response".
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+            && !is_notification_or_request(&value)
+                && let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value) {
+                    return Ok(response);
+                }
 
         // JSON failed — fallback to SSE parsing if body looks like SSE
         if body.contains("data:") || body.starts_with("event:") {
@@ -238,10 +384,7 @@ pub struct SseTransport {
 
 impl SseTransport {
     pub fn new(url: &str, headers: HashMap<String, String>) -> AppResult<Self> {
-        let client = reqwest::Client::builder()
-            .cookie_store(true)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let client = build_http_client()?;
 
         Ok(Self {
             client,
@@ -283,17 +426,26 @@ impl SseTransport {
 
                 let json_str = data_lines.join("\n");
 
-                if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&json_str) {
-                    if response.id == Some(request_id) {
-                        return Ok(response);
-                    }
-                    tracing::debug!(
-                        "SSE skipp no-matching id={:?} (waiting for id={request_id})",
-                        response.id
-                    );
-                } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    if value.get("id").is_none() && value.get("method").is_some() {
-                        tracing::debug!("SSE notification: {:?}", value);
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+                    continue;
+                };
+
+                if is_notification_or_request(&value) {
+                    tracing::debug!("SSE notification/server-request while awaiting id={request_id}: {value}");
+                    continue;
+                }
+
+                let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value) else {
+                    continue;
+                };
+
+                match &response.id {
+                    Some(id) if ids_match(request_id, id) => return Ok(response),
+                    other => {
+                        tracing::debug!(
+                            "SSE skipping non-matching id={:?} (waiting for id={request_id})",
+                            other
+                        );
                     }
                 }
             }
@@ -424,11 +576,20 @@ impl SseTransport {
 
             let json_str = data_lines.join("\n");
 
-            if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&json_str) {
-                if response.id == Some(request_id) {
-                    return Ok(response);
-                }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+                continue;
+            };
+
+            if is_notification_or_request(&value) {
+                tracing::debug!("SSE fallback: skipping notification/server-request while awaiting id={request_id}: {value}");
+                continue;
             }
+
+            if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value)
+                && let Some(id) = &response.id
+                    && ids_match(request_id, id) {
+                        return Ok(response);
+                    }
         }
 
         Err(crate::error::AppError::Mcp(

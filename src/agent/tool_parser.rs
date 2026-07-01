@@ -81,10 +81,6 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
-pub fn has_tool_calls(text: &str) -> bool {
-    text.contains("<tool_use>") || text.contains("[TOOL:")
-}
-
 pub fn strip_tool_calls(text: &str) -> String {
     let without_xml = STRIP_TOOL_XML_RE.replace_all(text, "");
     let without_thinking = STRIP_THINKING_RE.replace_all(&without_xml, "");
@@ -147,7 +143,6 @@ mod tests {
     #[test]
     fn test_no_tool_calls() {
         let text = "This is just a regular response without any tools.";
-        assert!(!has_tool_calls(text));
         assert!(parse_tool_calls(text).is_empty());
     }
 

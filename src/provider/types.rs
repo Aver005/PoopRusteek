@@ -1,3 +1,12 @@
+//! Wire-format request/response modeling for the DeepSeek web API. Only a
+//! small slice (the streaming completion path, driven from `deepseek.rs`'s
+//! `impl LLMProvider`) is on the hot path this TUI actually exercises; the
+//! rest models the broader reverse-engineered API (session CRUD, sharing,
+//! search, file upload, user settings) for the unused-but-kept client
+//! methods in `deepseek.rs`. See the `#[allow(dead_code)]` on that impl
+//! block for why it's suppressed here rather than deleted.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 // ─── API Response Envelope ─────────────────────────────────────
@@ -41,6 +50,9 @@ pub type MessageId = i64;
 pub type FileId = String;
 pub type ShareId = String;
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TitleType {
@@ -49,6 +61,9 @@ pub enum TitleType {
     USER,
 }
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MessageStatus {
@@ -57,6 +72,9 @@ pub enum MessageStatus {
     ABORTED,
 }
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FragmentType {
@@ -65,6 +83,9 @@ pub enum FragmentType {
     THINK,
 }
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ChatSessionStatus {
@@ -83,6 +104,9 @@ pub enum ModelType {
     Vision,
 }
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ConversationMode {
@@ -117,6 +141,9 @@ pub struct CreateSessionData {
 
 // ─── Messages ──────────────────────────────────────────────────
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MessageRole {
@@ -256,21 +283,6 @@ pub struct CompletionBatchEvent {
     pub v: Vec<CompletionBatchPatch>,
 }
 
-#[derive(Debug, Clone)]
-pub enum ParsedSSEEvent {
-    Ready(CompletionReadyEvent),
-    UpdateSession(CompletionUpdateSessionEvent),
-    Title(CompletionTitleEvent),
-    Close(CompletionCloseEvent),
-    Response(CompletionResponseEvent),
-    ContentAppend(CompletionContentAppendEvent),
-    TokenDelta(CompletionTokenDeltaEvent),
-    FragmentAppend(CompletionFragmentAppendEvent),
-    FieldSet(CompletionFieldSetEvent),
-    Batch(CompletionBatchEvent),
-    Unknown(String),
-}
-
 // ─── Completion Request ────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +389,9 @@ pub struct DeleteSessionRequest {
 
 // ─── File ──────────────────────────────────────────────────────
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FileStatus {
@@ -385,6 +400,9 @@ pub enum FileStatus {
     FAILED,
 }
 
+// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
+// `rename_all`); renaming the variants would change what's serialized.
+#[expect(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ModelKind {
@@ -546,92 +564,3 @@ pub struct DeepSeekUser {
     pub need_birthday: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginData {
-    pub code: i64,
-    pub msg: String,
-    pub user: DeepSeekUser,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserSettings {
-    pub training_allowed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateUserSettingsRequest {
-    pub settings: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetBirthdayRequest {
-    pub birthday: String,
-}
-
-// ─── Client Settings ───────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SettingsScope {
-    Main,
-    Model,
-    WebUpgrade,
-    Banner,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettingsQueryParams {
-    pub did: String,
-    pub scope: SettingsScope,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileFeature {
-    pub token_limit: i64,
-    pub token_limit_with_thinking: i64,
-    pub max_input_file_count: i64,
-    pub max_upload_file_size: i64,
-    pub support_file_exts: Vec<String>,
-    pub conflict_with_search: bool,
-    pub vision: bool,
-    pub enable_thumbnail: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    pub model_type: String,
-    pub name: String,
-    pub description: String,
-    pub welcome_msg: String,
-    pub is_default: bool,
-    pub enabled: bool,
-    pub switchable: bool,
-    pub show_model_name_in_session: bool,
-    pub edit_quota: i64,
-    pub regenerate_quota: i64,
-    pub input_character_limit: i64,
-    #[serde(default)]
-    pub think_feature: Option<serde_json::Value>,
-    #[serde(default)]
-    pub search_feature: Option<serde_json::Value>,
-    #[serde(default)]
-    pub regenerate_options: Option<serde_json::Value>,
-    #[serde(default)]
-    pub file_feature: Option<FileFeature>,
-    pub tips: serde_json::Value,
-}
-
-// ─── Telemetry ─────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettingsReportRequest {
-    pub settings_ids: Vec<i64>,
-    pub did: String,
-    pub sso_id: String,
-}
-
-// ─── Constants ─────────────────────────────────────────────────
-
-pub const MAX_UPLOAD_FILE_SIZE: i64 = 104857600;
-pub const MAX_INPUT_FILE_COUNT: i64 = 50;
-pub const TOKEN_LIMIT: i64 = 890880;

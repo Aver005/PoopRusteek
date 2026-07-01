@@ -105,8 +105,13 @@ impl AcpServer {
                     images: Vec::new(),
                 });
 
-                let rt = tokio::runtime::Runtime::new().ok()?;
-                let result = rt.block_on(self.handle_prompt(&params));
+                // We're already inside #[tokio::main]'s runtime — creating a
+                // nested Runtime and block_on'ing it panics on first use.
+                // block_in_place + Handle::current() is the sanctioned way to
+                // run async work from this synchronous stdio loop.
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.handle_prompt(&params))
+                });
 
                 let result_value = match serde_json::to_value(result) {
                     Ok(v) => v,

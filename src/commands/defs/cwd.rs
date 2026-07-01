@@ -12,21 +12,6 @@ fn strip_verbatim(path: &str) -> String {
     }
 }
 
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix('~') {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_default();
-        if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') {
-            format!("{home}{rest}")
-        } else {
-            format!("{home}\\{rest}")
-        }
-    } else {
-        path.to_string()
-    }
-}
-
 pub struct CwdCommand {
     pub name: &'static str,
 }
@@ -50,12 +35,11 @@ impl Command for CwdCommand {
             return CommandResult::Error("Usage: /cwd <path>".to_string());
         }
 
-        let expanded = expand_tilde(path);
-        let target = std::path::Path::new(&expanded);
+        let target = crate::util::expand_tilde(path);
 
         // Convert to absolute without requiring existence (Rust 1.79+)
-        let absolute = std::path::absolute(target)
-            .unwrap_or_else(|_| target.to_path_buf());
+        let absolute = std::path::absolute(&target)
+            .unwrap_or_else(|_| target.clone());
 
         match std::env::set_current_dir(&absolute) {
             Ok(()) => {

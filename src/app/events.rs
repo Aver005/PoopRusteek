@@ -84,10 +84,25 @@ pub struct GoalVerdict {
     pub feedback: String,
 }
 
+/// What the spawned goal-evaluator task reports back to the event loop.
+/// Carries the evaluator's own messages so the verdict handler can persist the
+/// evaluation session under the (possibly swapped) evaluator session id.
+#[derive(Debug, Clone)]
+pub enum GoalEvalOutcome {
+    Verdict {
+        verdict: GoalVerdict,
+        eval_messages: Vec<ChatMessage>,
+    },
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     // TUI events
     Key(crossterm::event::KeyEvent),
+    // The new size only triggers a redraw (ratatui re-queries the terminal
+    // size when rendering); the dimensions themselves aren't read anywhere.
+    #[expect(dead_code, reason = "resize payload unused — redraw reads terminal size directly")]
     Resize(u16, u16),
     Tick,
 
@@ -103,14 +118,19 @@ pub enum AppEvent {
 
     // Tool events
     ToolStarted { conversation: ConversationId, name: String },
-    ToolDone { conversation: ConversationId, result: String },
+    ToolDone {
+        conversation: ConversationId,
+        // Every receiver currently discards this with `result: _` — the
+        // status line shows a generic "Tool finished" rather than a preview.
+        #[expect(dead_code, reason = "tool-result preview not surfaced by any receiver yet")]
+        result: String,
+    },
     ToolError { conversation: ConversationId, error: String },
     RequestToolApproval(ToolApprovalRequest),
     RequestQuestion(QuestionRequest, QuestionState),
 
     // Goal events
-    GoalEvaluationDone(GoalVerdict),
-    GoalCycleFinished,
+    GoalEvaluationDone(GoalEvalOutcome),
 
     /// A model `task` tool call asked for a detached sub-agent.
     SpawnSubAgent {
@@ -118,14 +138,30 @@ pub enum AppEvent {
         label: String,
         prompt: String,
     },
+
+    /// Result of a background remote-session fetch (started by `/load`).
+    SessionFetched {
+        conversation: ConversationId,
+        session_id: String,
+        result: Result<Vec<ChatMessage>, String>,
+    },
+
+    /// A detached MCP admin operation (reload / toggle / reconnect) finished.
+    McpOperationDone { message: String },
 }
 
+// Populated at the `AgentDone` send site but every current receiver
+// discards the payload (`AgentDone(_, _)`); goal-mode independently
+// re-derives the same text by scanning the message list instead of reading
+// this. Kept for future use rather than deleted in this pass.
+#[expect(dead_code, reason = "AgentDone payload not read by any current receiver")]
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     pub text: String,
     pub tool_calls: Vec<ToolCallInfo>,
 }
 
+#[expect(dead_code, reason = "AgentDone payload not read by any current receiver")]
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
     pub name: String,
@@ -135,6 +171,9 @@ pub struct ToolCallInfo {
 
 #[derive(Debug, Clone)]
 pub struct ToolApprovalRequest {
+    /// The conversation whose agent task is parked on this approval — lets the
+    /// app auto-deny leftovers when that conversation's turn is cancelled.
+    pub conversation: ConversationId,
     pub tool_name: String,
     pub arguments: String,
     decision: Arc<Mutex<Option<bool>>>,
@@ -142,8 +181,9 @@ pub struct ToolApprovalRequest {
 }
 
 impl ToolApprovalRequest {
-    pub fn new(tool_name: String, arguments: String) -> Self {
+    pub fn new(conversation: ConversationId, tool_name: String, arguments: String) -> Self {
         Self {
+            conversation,
             tool_name,
             arguments,
             decision: Arc::new(Mutex::new(None)),
@@ -170,6 +210,16 @@ impl ToolApprovalRequest {
         }
         self.notify.notify_waiters();
     }
+}
+
+/// A user interaction (tool approval / question) requested while another modal
+/// is already on screen. Parked in FIFO order until the current one resolves —
+/// overwriting the pending slot would leave the previous agent task waiting on
+/// a `Notify` that nobody will ever fire.
+#[derive(Debug, Clone)]
+pub enum PendingInteraction {
+    Approval(ToolApprovalRequest),
+    Question(QuestionRequest, QuestionState),
 }
 
 #[derive(Debug, Clone, PartialEq)]

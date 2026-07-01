@@ -9,12 +9,12 @@ use syntect::parsing::SyntaxSet;
 
 fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
+    SS.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
 fn theme_set() -> &'static ThemeSet {
     static TS: OnceLock<ThemeSet> = OnceLock::new();
-    TS.get_or_init(|| ThemeSet::load_defaults())
+    TS.get_or_init(ThemeSet::load_defaults)
 }
 
 fn syntect_to_ratatui(style: SynStyle) -> Style {
@@ -34,6 +34,11 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut code_block_lang = String::new();
     let mut code_buffer: Vec<String> = Vec::new();
     let mut in_table = false;
+    // Stack of active emphasis/strong/strikethrough modifiers, pushed on
+    // `Start` and popped on the matching `End` so nested spans (e.g. bold
+    // inside italic) revert to the right accumulated style rather than
+    // clearing everything.
+    let mut style_stack: Vec<Modifier> = Vec::new();
 
     for event in parser {
         match event {
@@ -82,13 +87,13 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                     ));
                 }
                 Tag::Emphasis => {
-                    current_line.push(Span::styled("", Style::default().add_modifier(Modifier::ITALIC)));
+                    style_stack.push(Modifier::ITALIC);
                 }
                 Tag::Strong => {
-                    current_line.push(Span::styled("", Style::default().add_modifier(Modifier::BOLD)));
+                    style_stack.push(Modifier::BOLD);
                 }
                 Tag::Strikethrough => {
-                    current_line.push(Span::styled("", Style::default().add_modifier(Modifier::CROSSED_OUT)));
+                    style_stack.push(Modifier::CROSSED_OUT);
                 }
                 Tag::BlockQuote(_) => {
                     current_line.push(Span::styled(
@@ -141,13 +146,20 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 TagEnd::Paragraph => {
                     flush_line(&mut lines, &mut current_line);
                 }
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                    style_stack.pop();
+                }
                 _ => {}
             },
             Event::Text(text) => {
                 if in_code_block {
                     code_buffer.push(text.to_string());
                 } else {
-                    current_line.push(Span::styled(text.to_string(), Style::default().fg(theme.fg)));
+                    let mut style = Style::default().fg(theme.fg);
+                    for modifier in &style_stack {
+                        style = style.add_modifier(*modifier);
+                    }
+                    current_line.push(Span::styled(text.to_string(), style));
                 }
             }
             Event::Code(code) => {
@@ -249,5 +261,69 @@ fn flush_line(lines: &mut Vec<Line<'static>>, current_line: &mut Vec<Span<'stati
     } else {
         let line: Line<'static> = Line::from(std::mem::take(current_line));
         lines.push(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_span_containing<'a>(lines: &'a [Line<'static>], needle: &str) -> Option<&'a Span<'static>> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains(needle))
+    }
+
+    #[test]
+    fn emphasis_applies_italic_modifier() {
+        let theme = Theme::default_dark();
+        let lines = render_markdown("*italic*", &theme);
+        let span = find_span_containing(&lines, "italic").expect("italic span present");
+        assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn strong_applies_bold_modifier() {
+        let theme = Theme::default_dark();
+        let lines = render_markdown("**bold**", &theme);
+        let span = find_span_containing(&lines, "bold").expect("bold span present");
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn strikethrough_applies_crossed_out_modifier() {
+        let theme = Theme::default_dark();
+        let lines = render_markdown("~~strike~~", &theme);
+        let span = find_span_containing(&lines, "strike").expect("strike span present");
+        assert!(span.style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn nested_strong_inside_emphasis_carries_both_modifiers() {
+        let theme = Theme::default_dark();
+        let lines = render_markdown("*outer **inner** outer*", &theme);
+        let inner = find_span_containing(&lines, "inner").expect("inner span present");
+        assert!(inner.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(inner.style.add_modifier.contains(Modifier::BOLD));
+
+        // Text outside the nested Strong should still be italic-only.
+        let outer = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("outer") && !s.content.contains("inner"))
+            .expect("outer span present");
+        assert!(outer.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(!outer.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn plain_text_has_no_emphasis_modifiers() {
+        let theme = Theme::default_dark();
+        let lines = render_markdown("plain text", &theme);
+        let span = find_span_containing(&lines, "plain").expect("plain span present");
+        assert!(!span.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!span.style.add_modifier.contains(Modifier::CROSSED_OUT));
     }
 }

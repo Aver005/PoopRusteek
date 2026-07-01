@@ -2,12 +2,10 @@
 //! These are `App` methods split out of `app/mod.rs`. Pure relocation.
 
 use super::events::{self, GoalStage, Modal, View};
-use super::{
-    conversation, format_size, kill_foreground_child, App, AutocompleteState, AUTOCOMPLETE_VISIBLE,
-};
+use super::{conversation, format_size, App, AutocompleteState, AUTOCOMPLETE_VISIBLE};
 use crate::commands::{CommandResult, CommandSuggestion};
 use crate::error::AppResult;
-use crate::provider::{ChatMessage, LLMProvider, Role};
+use crate::provider::{ChatMessage, LLMProvider};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -64,6 +62,7 @@ impl App {
                         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                             if always_allow {
                                 self.state.approved_tools.insert(tool_name.clone());
+                                crate::whitelist::persist_approval(&tool_name);
                             }
                             if let Some(request) = self.state.pending_tool_approval.take() {
                                 request.resolve(true).await;
@@ -71,6 +70,7 @@ impl App {
                             self.state.modal = None;
                             self.state.focused_mut().generation.active = true;
                             self.state.status_message = format!("Running {}", tool_name);
+                            self.present_next_interaction().await;
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                             if let Some(request) = self.state.pending_tool_approval.take() {
@@ -79,6 +79,7 @@ impl App {
                             self.state.modal = None;
                             self.state.focused_mut().generation.active = true;
                             self.state.status_message = format!("Denied {}", tool_name);
+                            self.present_next_interaction().await;
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
                             self.state.modal = Some(Modal::ToolApproval {
@@ -206,13 +207,12 @@ impl App {
                                     }
                                 }
                                 _ => {
-                                    if let Some(idx) = indices.first() {
-                                        if let Some(item) = picker.items.get(*idx) {
+                                    if let Some(idx) = indices.first()
+                                        && let Some(item) = picker.items.get(*idx) {
                                             let id = item.value.clone();
                                             self.state.modal = None;
                                             self.handle_load_session(&id).await?;
                                         }
-                                    }
                                     self.state.modal = None;
                                 }
                             }
@@ -235,6 +235,7 @@ impl App {
                         self.state.modal = None;
                         self.state.focused_mut().generation.active = true;
                         self.state.status_message = "Answer received".to_string();
+                        self.present_next_interaction().await;
                     } else {
                         self.state.modal = Some(Modal::Question(qs));
                         self.state.status_message = "Answering question...".to_string();
@@ -252,60 +253,22 @@ impl App {
             KeyCode::Char(c)
                 if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
             {
-                if self.state.focused_mut().generation.active {
-                    // Kill the running foreground child process first.
-                    kill_foreground_child();
-                    if let Some(handle) = self.state.focused_mut().agent_task.take() {
-                        handle.abort();
-                    }
-                    let killed = self.state.background.shutdown_all().await;
-                    self.state.focused_mut().generation.active = false;
-                    self.state.status_message = if killed > 0 {
-                        format!("Cancelled; killed {killed} background process(es)")
-                    } else {
-                        "Cancelled".to_string()
-                    };
-                    self.state.needs_terminal_restore = true;
-                    if self.state.focused_mut().messages
-                        .last()
-                        .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
-                    {
-                        self.state.focused_mut().messages.pop();
-                    }
-                    if self.state.goal.is_running() {
-                        self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
-                    }
+                // `agent_task.is_some()` (not just generation.active) so a turn
+                // wedged behind a lost approval can still be cancelled.
+                if self.state.focused().generation.active
+                    || self.state.focused().agent_task.is_some()
+                {
+                    self.cancel_focused_turn().await;
                     return Ok(false);
                 }
                 let _ = self.state.background.shutdown_all().await;
                 return Ok(true);
             }
             KeyCode::Esc => {
-                if self.state.focused_mut().generation.active {
-                    // Kill the running foreground child process first.
-                    kill_foreground_child();
-                    // Cancel the current agent turn: abort the spawned task,
-                    // reset is_generating so the user can type a new message.
-                    if let Some(handle) = self.state.focused_mut().agent_task.take() {
-                        handle.abort();
-                    }
-                    let killed = self.state.background.shutdown_all().await;
-                    self.state.focused_mut().generation.active = false;
-                    self.state.status_message = if killed > 0 {
-                        format!("Cancelled; killed {killed} background process(es)")
-                    } else {
-                        "Cancelled".to_string()
-                    };
-                    self.state.needs_terminal_restore = true;
-                    if self.state.focused_mut().messages
-                        .last()
-                        .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty())
-                    {
-                        self.state.focused_mut().messages.pop();
-                    }
-                    if self.state.goal.is_running() {
-                        self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
-                    }
+                if self.state.focused().generation.active
+                    || self.state.focused().agent_task.is_some()
+                {
+                    self.cancel_focused_turn().await;
                 } else if self.state.focused_mut().messages.is_empty() {
                     let _ = self.state.background.shutdown_all().await;
                     return Ok(true);
@@ -380,11 +343,15 @@ impl App {
                                 if self.state.goal.mode && !input.starts_with('/') {
                                     match self.state.goal.stage {
                                         GoalStage::Inactive => {
-                                            // First input in goal mode = the prompt
+                                            // First input in goal mode = the prompt.
+                                            // Echoes are ui_only: the model gets the
+                                            // combined agent-1 prompt once, below.
                                             self.state.goal.prompt = input.clone();
                                             self.state.goal.stage = GoalStage::WaitForGoal;
-                                            self.state.focused_mut().messages.push(ChatMessage::user(&input));
-                                            self.state.focused_mut().messages.push(ChatMessage::system(
+                                            let mut echo = ChatMessage::user(&input);
+                                            echo.ui_only = true;
+                                            self.state.focused_mut().messages.push(echo);
+                                            self.state.focused_mut().messages.push(ChatMessage::ui_system(
                                                 "🎯 Goal mode: now define your GOAL (what must be achieved)",
                                             ));
                                             return Ok(false);
@@ -392,9 +359,9 @@ impl App {
                                         GoalStage::WaitForGoal => {
                                             // Second input = the goal
                                             self.state.goal.text = input.clone();
-                                            self.state.focused_mut().messages.push(ChatMessage::user(&format!(
-                                                "GOAL: {}", input
-                                            )));
+                                            let mut echo = ChatMessage::user(&format!("GOAL: {}", input));
+                                            echo.ui_only = true;
+                                            self.state.focused_mut().messages.push(echo);
 
                                             // Without a provider the worker can't run; advancing
                                             // the stage would wedge the cycle, so bail cleanly.
@@ -413,12 +380,16 @@ impl App {
                                                 "{}\n\nIMPORTANT - GOAL to achieve: {}",
                                                 self.state.goal.prompt, self.state.goal.text
                                             );
-                                            self.send_to_agent(agent1_prompt).await?;
+                                            let message = ChatMessage::user_with_display(
+                                                &agent1_prompt,
+                                                "[Goal cycle started — attempt 1]",
+                                            );
+                                            self.send_focused_turn(Some(message)).await?;
                                             return Ok(false);
                                         }
                                         GoalStage::RunAgent1 | GoalStage::RunEvaluator => {
                                             // Block input while goal cycle is active
-                                            self.state.focused_mut().messages.push(ChatMessage::system(
+                                            self.state.focused_mut().messages.push(ChatMessage::ui_system(
                                                 "Goal cycle in progress. Wait for it to finish or type /goal to cancel.",
                                             ));
                                             return Ok(false);
@@ -436,16 +407,6 @@ impl App {
                                 self.commands.execute(&input, &mut self.state, &self.config);
                             match result {
                                 CommandResult::Handled => {}
-                                CommandResult::NeedsAgent(msg) => {
-                                    let killed = self.state.background.cleanup_before_user_turn().await;
-                                    if killed > 0 {
-                                        self.state.focused_mut().messages.push(ChatMessage::system(&format!(
-                                            "Cleaned {killed} ephemeral job(s) before the new turn."
-                                        )));
-                                    }
-                                    self.state.focused_mut().messages.push(ChatMessage::user(&input));
-                                    self.send_to_agent(msg).await?;
-                                }
                                 CommandResult::LoadSession(id) => {
                                     self.handle_load_session(&id).await?;
                                 }
@@ -480,15 +441,19 @@ impl App {
                                     ));
                                 }
                                 CommandResult::ReloadMcp => {
-                                    self.state.focused_mut().messages.push(ChatMessage::system(
+                                    self.state.focused_mut().messages.push(ChatMessage::ui_system(
                                         "Reloading all MCP servers...",
                                     ));
-                                    let mut mcp = self.mcp.lock().await;
-                                    mcp.reload_all().await;
-                                    self.state.mcp_status.view.servers = mcp.get_servers_info();
-                                    self.state.focused_mut().messages.push(ChatMessage::system(
-                                        "MCP servers reloaded",
-                                    ));
+                                    // Off the event loop: reconnecting every
+                                    // server can take seconds per server.
+                                    let mcp = Arc::clone(&self.mcp);
+                                    let event_tx = self.event_tx.clone();
+                                    tokio::spawn(async move {
+                                        mcp.lock().await.reload_all().await;
+                                        let _ = event_tx.send(events::AppEvent::McpOperationDone {
+                                            message: "MCP servers reloaded".to_string(),
+                                        });
+                                    });
                                 }
                                 CommandResult::ShowTools => {
                                     let tools_text = self.build_tools_display().await;
@@ -546,17 +511,19 @@ impl App {
                                 )));
                             }
                             let mut expanded = self.expand_file_mentions(&input);
+                            let mut attached_names: Vec<String> = Vec::new();
                             if !self.state.attached_files.is_empty() {
                                 let attach_header = if expanded.trim().is_empty() {
                                     String::new()
                                 } else {
-                                    format!("\n\n")
+                                    "\n\n".to_string()
                                 };
                                 let attach_section: String = self.state.attached_files
                                     .iter()
                                     .filter_map(|f| {
                                         let content = std::fs::read_to_string(&f.path).ok()?;
                                         let header = format!("File: {} ({}):", f.display_name, crate::app::format_size(f.size));
+                                        attached_names.push(f.display_name.clone());
                                         Some(format!("```\n{}\n{}\n```", header, content))
                                     })
                                     .collect::<Vec<_>>()
@@ -567,8 +534,18 @@ impl App {
                                 }
                                 self.state.attached_files.clear();
                             }
-                            self.state.focused_mut().messages.push(ChatMessage::user(&expanded));
-                            self.send_to_agent(expanded).await?;
+                            // Attachment bodies go to the model, not the chat
+                            // view — rendering a 2 MB log inline (and re-scanning
+                            // it every frame) helps nobody.
+                            let message = if attached_names.is_empty() {
+                                ChatMessage::user(&expanded)
+                            } else {
+                                ChatMessage::user_with_display(
+                                    &expanded,
+                                    &format!("{}\n📎 attached: {}", input, attached_names.join(", ")),
+                                )
+                            };
+                            self.send_focused_turn(Some(message)).await?;
                         }
                     }
                 }
@@ -664,30 +641,39 @@ impl App {
             KeyCode::Char(' ') if !details_open => {
                 if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
                     let name = info.name.clone();
-                    let mut mcp = self.mcp.lock().await;
-                    if let Err(e) = mcp.toggle_server(&name).await {
-                        self.state.mcp_status.view.status_message = format!("Toggle failed: {e}");
-                    } else {
-                        self.state.mcp_status.view.status_message = format!(
-                            "{} {}",
-                            name,
-                            if info.enabled { "disabled" } else { "enabled" },
-                        );
-                    }
-                    self.state.mcp_status.view.servers = mcp.get_servers_info();
+                    let was_enabled = info.enabled;
+                    self.state.mcp_status.view.status_message = format!(
+                        "{} {name}...",
+                        if was_enabled { "Disabling" } else { "Enabling" },
+                    );
+                    // Enabling spawns + initializes the server — off the loop.
+                    let mcp = Arc::clone(&self.mcp);
+                    let event_tx = self.event_tx.clone();
+                    tokio::spawn(async move {
+                        let message = match mcp.lock().await.toggle_server(&name).await {
+                            Err(e) => format!("Toggle failed: {e}"),
+                            Ok(_) => format!(
+                                "{name} {}",
+                                if was_enabled { "disabled" } else { "enabled" },
+                            ),
+                        };
+                        let _ = event_tx.send(events::AppEvent::McpOperationDone { message });
+                    });
                 }
             }
             KeyCode::Char('r') if !details_open => {
                 if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
                     let name = info.name.clone();
                     self.state.mcp_status.view.status_message = format!("Reconnecting {name}...");
-                    let mut mcp = self.mcp.lock().await;
-                    if let Err(e) = mcp.reconnect_server(&name).await {
-                        self.state.mcp_status.view.status_message = format!("Reconnect failed: {e}");
-                    } else {
-                        self.state.mcp_status.view.status_message = format!("{name} reconnected");
-                    }
-                    self.state.mcp_status.view.servers = mcp.get_servers_info();
+                    let mcp = Arc::clone(&self.mcp);
+                    let event_tx = self.event_tx.clone();
+                    tokio::spawn(async move {
+                        let message = match mcp.lock().await.reconnect_server(&name).await {
+                            Err(e) => format!("Reconnect failed: {e}"),
+                            Ok(_) => format!("{name} reconnected"),
+                        };
+                        let _ = event_tx.send(events::AppEvent::McpOperationDone { message });
+                    });
                 }
             }
             KeyCode::Char('d') if !details_open => {

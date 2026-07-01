@@ -2,6 +2,7 @@ use crate::app::AppState;
 use crate::commands::{Command, CommandResult};
 use crate::config::Config;
 use crate::provider::{ChatMessage, Role};
+use crate::session::SESSION_VERSION;
 
 pub struct ImportCommand;
 
@@ -46,7 +47,7 @@ impl Command for ImportCommand {
             .to_string();
 
         let session = crate::session::Session {
-            version: 1,
+            version: SESSION_VERSION,
             id: session_id.clone(),
             created_at: now.clone(),
             updated_at: now,
@@ -67,7 +68,6 @@ impl Command for ImportCommand {
         state.input.cursor = 0;
         state.input.selection_anchor = None;
         state.focused_mut().generation.active = false;
-        state.error = None;
 
         state.status_message = format!(
             "Imported session {} ({} messages, tagged Imported)",
@@ -98,6 +98,7 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
                     tool_call_id: current_tool_call_id.take(),
                     display_content: None,
                     tool_error: false,
+                    ui_only: false,
                     created_at,
                     total_tokens: None,
                     model: String::new(),
@@ -127,8 +128,8 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
             current_created_at = Some(val.trim().to_string());
         } else if line == "---" {
             // separator, skip
-        } else if current_role.is_some() {
-            if !current_content.is_empty() || !line.trim().is_empty() {
+        } else if current_role.is_some()
+            && (!current_content.is_empty() || !line.trim().is_empty()) {
                 if current_content.is_empty() {
                     current_content.push_str(line.trim_end());
                 } else {
@@ -136,7 +137,6 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
                     current_content.push_str(line.trim_end());
                 }
             }
-        }
     }
 
     if let Some(role) = current_role {
@@ -148,6 +148,7 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
             tool_call_id: current_tool_call_id.take(),
             display_content: None,
             tool_error: false,
+            ui_only: false,
             created_at,
             total_tokens: None,
             model: String::new(),

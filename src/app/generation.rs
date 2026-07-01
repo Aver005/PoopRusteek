@@ -25,8 +25,6 @@ pub struct GenerationState {
     pub last_model: String,
     /// Status string of the last assistant message (e.g. finish reason).
     pub last_status: Option<String>,
-    /// "Thinking" fragment count of the last turn.
-    pub last_think_fragments: u32,
 }
 
 impl GenerationState {

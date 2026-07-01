@@ -1,3 +1,6 @@
+//! Shared value types for the MCP subsystem: server config/status,
+//! discovered tools/resources, and the UI-facing display structs.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -31,10 +34,31 @@ pub enum MCPServerConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MCPServerStatus {
     Pending,
+    // The connect path resolves straight to `Connected`/`Error` in one
+    // await with no intermediate progress point, so nothing constructs this
+    // today. The status-label match in manager.rs already handles it, so
+    // it's kept rather than removed.
+    #[expect(dead_code, reason = "no intermediate progress point in the current connect path")]
     Connecting,
     Connected,
     Error(String),
     Disabled,
+}
+
+/// Where a server's config came from — determines what `MCPManager`'s
+/// `persist_config` is allowed to write for it. `Own` servers were found in
+/// our own `mcp.json` (or added/edited in-app in the future); their full
+/// config is ours to freely rewrite. `Foreign` servers were discovered from
+/// another tool's config (Claude Desktop, VS Code, Cursor, opencode, the
+/// Claude CLI, or a workspace file) — read-only sources we must never copy
+/// wholesale into our own file, since their `env` maps can carry secrets
+/// that belong to that other tool, not to us. Only a `Foreign` server's
+/// enabled/disabled state (as a name-keyed override, no config) is ever
+/// persisted — see `config::save_mcp_config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSource {
+    Own,
+    Foreign,
 }
 
 #[derive(Debug, Clone)]

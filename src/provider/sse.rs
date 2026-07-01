@@ -7,30 +7,45 @@
 //! job, since the event shapes are provider-specific.
 
 /// Accumulates raw bytes and yields complete lines as they become available.
+///
+/// Bytes are buffered raw and decoded per *line*, not per chunk: a multibyte
+/// UTF-8 char split across two network chunks must not turn into `�`, which is
+/// exactly what per-chunk `from_utf8_lossy` would do. `\n` is a single byte,
+/// so splitting on it can never cut a character in half.
 #[derive(Default)]
 pub struct SseLineBuffer {
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 impl SseLineBuffer {
+    /// A line with no `\n` must not grow memory without bound (runaway or
+    /// malicious stream). Past this cap the partial line is force-flushed.
+    const MAX_BUFFERED_LINE: usize = 4 * 1024 * 1024;
+
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Feed a chunk of bytes (decoded lossily as UTF-8) and return every
-    /// complete line it produces. A trailing partial line — one not yet
-    /// terminated by `\n` — is retained until the next call.
+    /// Feed a chunk of bytes and return every complete line it produces.
+    /// A trailing partial line — one not yet terminated by `\n` — is retained
+    /// until the next call.
     pub fn push_bytes(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
-        self.drain_lines()
-    }
+        self.buffer.extend_from_slice(chunk);
 
-    fn drain_lines(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
-        while let Some(line_end) = self.buffer.find('\n') {
-            let line = self.buffer[..line_end].to_string();
-            self.buffer = self.buffer[line_end + 1..].to_string();
-            lines.push(line);
+        let mut start = 0;
+        while let Some(offset) = self.buffer[start..].iter().position(|&b| b == b'\n') {
+            let line_end = start + offset;
+            lines.push(String::from_utf8_lossy(&self.buffer[start..line_end]).into_owned());
+            start = line_end + 1;
+        }
+        if start > 0 {
+            self.buffer.drain(..start);
+        }
+
+        if self.buffer.len() > Self::MAX_BUFFERED_LINE {
+            lines.push(String::from_utf8_lossy(&self.buffer).into_owned());
+            self.buffer.clear();
         }
         lines
     }
@@ -76,5 +91,26 @@ mod tests {
     fn no_newline_yields_nothing() {
         let mut buf = SseLineBuffer::new();
         assert!(buf.push_bytes(b"data: incomplete").is_empty());
+    }
+
+    #[test]
+    fn multibyte_char_split_across_chunks_decodes_cleanly() {
+        // "привет" — each Cyrillic char is 2 bytes; split one mid-char.
+        let bytes = "data: привет\n".as_bytes();
+        let (a, b) = bytes.split_at(9); // cuts inside "р"
+        let mut buf = SseLineBuffer::new();
+        assert!(buf.push_bytes(a).is_empty());
+        assert_eq!(buf.push_bytes(b), vec!["data: привет".to_string()]);
+    }
+
+    #[test]
+    fn oversized_partial_line_is_force_flushed() {
+        let mut buf = SseLineBuffer::new();
+        let big = vec![b'x'; SseLineBuffer::MAX_BUFFERED_LINE + 1];
+        let lines = buf.push_bytes(&big);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), SseLineBuffer::MAX_BUFFERED_LINE + 1);
+        // Buffer is empty again afterwards.
+        assert!(buf.push_bytes(b"tail\n") == vec!["tail".to_string()]);
     }
 }

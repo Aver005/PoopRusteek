@@ -35,9 +35,19 @@ pub fn extract_mentions(input: &str, workspace: &Path) -> Vec<FileMention> {
 
         let (content, line_start, line_end) = if let Some((start, end)) = line_range {
             let lines: Vec<&str> = content.lines().collect();
-            let start_idx = start.saturating_sub(1);
-            let end_idx = end.min(lines.len());
-            let sliced = lines[start_idx..end_idx].join("\n");
+            // Clamp both ends to the file's actual line count. `start` and
+            // `end` come straight from user input (`@file.rs:500-600`) and
+            // may exceed `lines.len()`, or `end` may be less than `start` for
+            // a reversed range like `:30-10` — either previously panicked on
+            // `lines[start_idx..end_idx]`. `end_idx.max(start_idx)` keeps the
+            // range non-inverted so the slice is empty instead of panicking.
+            let start_idx = start.saturating_sub(1).min(lines.len());
+            let end_idx = end.min(lines.len()).max(start_idx);
+            let sliced = if start_idx >= end_idx {
+                format!("[range out of bounds: file has {} lines]", lines.len())
+            } else {
+                lines[start_idx..end_idx].join("\n")
+            };
             (sliced, Some(start), Some(end))
         } else {
             (content, None, None)
@@ -65,11 +75,10 @@ fn parse_path_with_lines(s: &str) -> (PathBuf, Option<(usize, usize)>) {
             if start > 0 && end > 0 {
                 return (PathBuf::from(path_part), Some((start, end)));
             }
-        } else if let Ok(line) = line_part.parse::<usize>() {
-            if line > 0 {
+        } else if let Ok(line) = line_part.parse::<usize>()
+            && line > 0 {
                 return (PathBuf::from(path_part), Some((line, line)));
             }
-        }
 
         (PathBuf::from(s), None)
     } else {
@@ -85,4 +94,83 @@ pub fn format_mention(mention: &FileMention) -> String {
     };
 
     format!("{header}\n```\n{}\n```", mention.content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a 100-line file (lines "line 1" .. "line 100") under a unique
+    /// scratch dir and returns (workspace_dir, filename). Each test gets its
+    /// own subdirectory so parallel test runs don't collide.
+    fn write_100_line_file(test_name: &str) -> (PathBuf, &'static str) {
+        let dir = std::env::temp_dir()
+            .join("pooprusteek_file_mentions_test")
+            .join(test_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let filename = "hundred.txt";
+        let content = (1..=100)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join(filename), content).unwrap();
+        (dir, filename)
+    }
+
+    #[test]
+    fn out_of_range_end_does_not_panic() {
+        let (dir, filename) = write_100_line_file("out_of_range_end");
+        let input = format!("@{filename}:500-600");
+        let mentions = extract_mentions(&input, &dir);
+        assert_eq!(mentions.len(), 1);
+        assert!(
+            mentions[0].content.contains("range out of bounds"),
+            "expected an out-of-bounds note, got: {}",
+            mentions[0].content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reversed_range_does_not_panic() {
+        let (dir, filename) = write_100_line_file("reversed_range");
+        let input = format!("@{filename}:30-10");
+        let mentions = extract_mentions(&input, &dir);
+        assert_eq!(mentions.len(), 1);
+        assert!(
+            mentions[0].content.contains("range out of bounds"),
+            "expected an out-of-bounds note, got: {}",
+            mentions[0].content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_boundary_range_returns_full_slice() {
+        let (dir, filename) = write_100_line_file("exact_boundary");
+        // 1-100 on a 100-line file is exactly in range: no clamping needed,
+        // no out-of-bounds note, and the full content should come through.
+        let input = format!("@{filename}:1-100");
+        let mentions = extract_mentions(&input, &dir);
+        assert_eq!(mentions.len(), 1);
+        assert!(!mentions[0].content.contains("range out of bounds"));
+        assert!(mentions[0].content.starts_with("line 1\n"));
+        assert!(mentions[0].content.ends_with("line 100"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn end_beyond_file_clamps_instead_of_panicking() {
+        let (dir, filename) = write_100_line_file("end_beyond_file");
+        // start is in range, end overruns — should clamp to the last line
+        // rather than treat it as fully out of bounds.
+        let input = format!("@{filename}:95-150");
+        let mentions = extract_mentions(&input, &dir);
+        assert_eq!(mentions.len(), 1);
+        assert!(!mentions[0].content.contains("range out of bounds"));
+        assert!(mentions[0].content.starts_with("line 95\n"));
+        assert!(mentions[0].content.ends_with("line 100"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

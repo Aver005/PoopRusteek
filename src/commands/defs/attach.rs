@@ -37,13 +37,13 @@ impl Command for AttachCommand {
             };
 
             if !resolved.exists() {
-                let _ = state.focused_mut().messages.push(crate::provider::ChatMessage::system(
+                state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                     &format!("File not found: {raw_path}"),
                 ));
                 continue;
             }
             if !resolved.is_file() {
-                let _ = state.focused_mut().messages.push(crate::provider::ChatMessage::system(
+                state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                     &format!("Not a file: {raw_path}"),
                 ));
                 continue;
@@ -52,7 +52,7 @@ impl Command for AttachCommand {
             let metadata = match resolved.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = state.focused_mut().messages.push(crate::provider::ChatMessage::system(
+                    state.focused_mut().messages.push(crate::provider::ChatMessage::system(
                         &format!("Cannot read {raw_path}: {e}"),
                     ));
                     continue;
@@ -82,7 +82,7 @@ impl Command for AttachCommand {
 
         if attached > 0 {
             if state.attached_files.len() == 1 {
-                state.status_message = format!("1 file attached");
+                state.status_message = "1 file attached".to_string();
             } else {
                 state.status_message = format!("{} files attached", state.attached_files.len());
             }
@@ -94,11 +94,10 @@ impl Command for AttachCommand {
 
 fn parse_paths(input: &str) -> Vec<String> {
     let mut paths = Vec::new();
-    let mut chars = input.chars().peekable();
     let mut current = String::new();
     let mut in_quotes = false;
 
-    while let Some(ch) = chars.next() {
+    for ch in input.chars() {
         match ch {
             '"' => {
                 in_quotes = !in_quotes;

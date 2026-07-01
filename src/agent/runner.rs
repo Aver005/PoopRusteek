@@ -46,17 +46,24 @@ pub async fn run_agent_loop(
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        if let Err(error) = provider.complete_stream(request, tx).await {
-            let _ = event_tx.send(AppEvent::AgentError(conversation, error.to_string()));
-            return;
-        }
+        // The stream runs in its own task so chunks render live and the idle
+        // timeout below actually races the network. Awaiting `complete_stream`
+        // inline would buffer the whole response before the first chunk was
+        // read — no visible streaming, and a stalled connection (open socket,
+        // no bytes) would hang the turn with the timeout never firing.
+        let stream_provider = Arc::clone(&provider);
+        let stream_task = tokio::spawn(async move {
+            stream_provider.complete_stream(request, tx).await
+        });
 
         let mut full_response = String::new();
         let mut streamed_visible = String::new();
+        let mut got_stop = false;
         let idle_timeout = std::time::Duration::from_secs(120);
         loop {
             match tokio::time::timeout(idle_timeout, rx.recv()).await {
                 Err(_) => {
+                    stream_task.abort();
                     let _ = event_tx.send(AppEvent::AgentError(
                         conversation,
                         "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
@@ -81,8 +88,30 @@ pub async fn run_agent_loop(
                         streamed_visible = next_visible;
                     }
                     if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
+                        got_stop = true;
                         break;
                     }
+                }
+            }
+        }
+
+        // A closed channel without a "stop" chunk means the provider bailed
+        // mid-stream — surface its error instead of treating it as end-of-turn.
+        match stream_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if !got_stop {
+                    let _ = event_tx.send(AppEvent::AgentError(conversation, error.to_string()));
+                    return;
+                }
+            }
+            Err(join_error) => {
+                if !got_stop {
+                    let _ = event_tx.send(AppEvent::AgentError(
+                        conversation,
+                        format!("Stream task failed: {join_error}"),
+                    ));
+                    return;
                 }
             }
         }
@@ -109,8 +138,29 @@ pub async fn run_agent_loop(
             let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage(conversation));
         }
 
-        for tool_call in tool_calls.into_iter().take(max_tools_per_step) {
+        let total_calls = tool_calls.len();
+        for (call_index, tool_call) in tool_calls.into_iter().enumerate() {
             let tool_id = uuid::Uuid::new_v4().to_string();
+
+            // Calls beyond the per-step limit still get a tool_result — the
+            // model must learn they were skipped, not reason from phantom
+            // results it assumes came back.
+            if call_index >= max_tools_per_step {
+                let skipped = format!(
+                    "Skipped: per-step tool-call limit of {max_tools_per_step} reached \
+                    ({total_calls} calls requested). Re-issue this call next step if still needed."
+                );
+                let tool_message = ChatMessage::tool_with_display(
+                    &tool_id,
+                    &tool_call.name,
+                    &skipped,
+                    &summarize_tool_result(&skipped),
+                    true,
+                );
+                messages.push(tool_message.clone());
+                let _ = event_tx.send(AppEvent::AddMessage(conversation, tool_message));
+                continue;
+            }
 
             let (tool_result, is_error) = if tool_call.name == "question" {
                 // Background turns (auto_approve) have no user to answer.
@@ -210,6 +260,7 @@ pub async fn run_agent_loop(
                         serde_json::to_string_pretty(&tool_call.arguments)
                             .unwrap_or_else(|_| tool_call.arguments.to_string());
                     let approval = ToolApprovalRequest::new(
+                        conversation,
                         tool_call.name.clone(),
                         arguments_preview,
                     );
@@ -224,16 +275,26 @@ pub async fn run_agent_loop(
                         name: tool_call.name.clone(),
                     });
                     if tool_call.name.starts_with("mcp__") {
-                        let mut mcp = mcp.lock().await;
-                        match mcp
-                            .call_tool(
-                                &tool_call.name,
-                                tool_call.arguments.clone(),
-                            )
-                            .await
-                        {
-                            Ok(result) => (result.content, result.is_error),
-                            Err(error) => (error.to_string(), true),
+                        // Resolve the client under a short-lived lock, then
+                        // call on the owned handle. Holding the manager mutex
+                        // across the network await froze the whole UI — the
+                        // event loop polls the same mutex for status counts.
+                        let client = { mcp.lock().await.client_for(&tool_call.name) };
+                        match client {
+                            Some((client, bare_name)) => match client
+                                .call_tool(&bare_name, tool_call.arguments.clone())
+                                .await
+                            {
+                                Ok(result) => (result.content, result.is_error),
+                                Err(error) => (error.to_string(), true),
+                            },
+                            None => (
+                                format!(
+                                    "MCP tool '{}' is not available (server not connected)",
+                                    tool_call.name
+                                ),
+                                true,
+                            ),
                         }
                     } else {
                         let result = tools

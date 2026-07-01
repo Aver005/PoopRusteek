@@ -1,13 +1,13 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-06-30 (refreshed line refs after refactor; logged session-fork fix)
+> Last updated: 2026-07-02 (2026-07-02 audit: moved stale GOAL-cap entry to RESOLVED)
+> Full audit digest: `reference/AUDIT-2026-07-02.md` (2026-07-02)
 
 ## CRITICAL
 None currently known.
 
 ## HIGH
 
-- `[BUG]` GOAL cycle has **no max-iteration cap** → if the evaluator never returns SUCCESS, agent↔evaluator can loop indefinitely. `→ src/app/goal.rs`
 - `[BUG]` Retry with `max_retries=-1` (infinite) has **no total-time cap and no jitter** → a persistently-failing endpoint can hang the turn forever. `→ src/provider/deepseek.rs:225`
 
 ## MEDIUM
@@ -38,4 +38,5 @@ None currently known.
 ## RESOLVED / MOOT
 - ✅ `~~Messages "evaporate" — appear in the TUI but never reach DeepSeek / the web view~~` — `parent_message_id` desync forked the session onto an invisible branch (triggered by interrupted/errored streams). Fixed by incremental persist + flush-on-error (`deepseek.rs`, commit `183712e`); structurally prevented by per-conversation `fork()` isolation.
 - ✅ `~~GOAL pipeline wedges on empty prompt/goal, interrupt+new message~~` — overhaul `c0d4280`.
+- ✅ `~~GOAL cycle has no max-iteration cap~~` — was fixed by the goal overhaul; BUGS.md had gone stale. `MAX_GOAL_ITERATIONS = 10` (`src/app/goal.rs`); `apply_verdict` gives up at the cap (test `gives_up_at_iteration_cap`).
 - `~~No .gitignore entry for .memories/JOURNAL/~~` — JOURNAL is intentionally tracked in git.

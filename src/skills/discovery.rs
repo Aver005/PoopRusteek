@@ -16,15 +16,6 @@ fn data_dir() -> Option<PathBuf> {
     dirs::data_dir()
 }
 
-fn expand_tilde(p: &str) -> PathBuf {
-    if p.starts_with('~') {
-        let h = home().unwrap_or_else(|| PathBuf::from("."));
-        h.join(p.strip_prefix('~').unwrap_or(p))
-    } else {
-        PathBuf::from(p)
-    }
-}
-
 /// Collect ALL candidate skill directories from every known agent location.
 fn collect_skill_dirs() -> Vec<(PathBuf, SkillSource)> {
     let mut dirs: Vec<(PathBuf, SkillSource)> = Vec::new();
@@ -68,11 +59,10 @@ fn collect_skill_dirs() -> Vec<(PathBuf, SkillSource)> {
     dirs.push((Config::data_dir().join("skills"), SkillSource::Installed));
 
     // ── Built-in prompts from assets/prompts/ ──
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             dirs.push((dir.join("assets").join("prompts"), SkillSource::BuiltIn));
         }
-    }
     let cargo_prompts = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("prompts");
     if !dirs.iter().any(|(p, _)| p == &cargo_prompts) {
         dirs.push((cargo_prompts, SkillSource::BuiltIn));
@@ -88,7 +78,7 @@ pub fn discover_all_skills(config_paths: &[String]) -> Vec<SkillDefinition> {
     let mut base_dirs = collect_skill_dirs();
 
     for p in config_paths {
-        let expanded = expand_tilde(p);
+        let expanded = crate::util::expand_tilde(p);
         if expanded.exists() {
             base_dirs.push((expanded, SkillSource::Local));
         }
@@ -126,11 +116,10 @@ fn scan_directory(
             // Standard layout: subdir/SKILL.md (skill name = directory name)
             let skill_file = path.join(SKILL_FILE_NAME);
             if skill_file.exists() {
-                if let Some(skill) = load_skill_from_file(&skill_file, source, &path) {
-                    if seen_slugs.insert(skill.slug.clone()) {
+                if let Some(skill) = load_skill_from_file(&skill_file, source, &path)
+                    && seen_slugs.insert(skill.slug.clone()) {
                         skills.push(skill);
                     }
-                }
                 continue;
             }
 
@@ -156,21 +145,16 @@ fn scan_directory(
         // Backward compat: .prompt.md files only in built-in dirs.
         // Skip base.prompt.md and tools.prompt.md — they are already loaded
         // by PromptFiles and injected directly into the system prompt.
-        if source == SkillSource::BuiltIn {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".prompt.md")
+        if source == SkillSource::BuiltIn
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".prompt.md")
                     && name != SKILL_FILE_NAME
                     && name != "base.prompt.md"
                     && name != "tools.prompt.md"
-                {
-                    if let Some(skill) = load_prompt_file(&path, source) {
-                        if seen_slugs.insert(skill.slug.clone()) {
+                    && let Some(skill) = load_prompt_file(&path, source)
+                        && seen_slugs.insert(skill.slug.clone()) {
                             skills.push(skill);
                         }
-                    }
-                }
-            }
-        }
     }
 }
 

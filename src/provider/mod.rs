@@ -30,6 +30,11 @@ pub struct ChatMessage {
     pub display_content: Option<String>,
     #[serde(skip)]
     pub tool_error: bool,
+    /// UI-only notice (status lines, goal-cycle chrome). Rendered in the chat
+    /// but filtered out of what is sent to the provider, so decorating the UI
+    /// can never silently change what the model sees.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ui_only: bool,
     #[serde(default)]
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -50,6 +55,10 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl ChatMessage {
     pub fn system(content: &str) -> Self {
         Self {
@@ -59,6 +68,7 @@ impl ChatMessage {
             tool_call_id: None,
             display_content: None,
             tool_error: false,
+            ui_only: false,
             created_at: now_rfc3339(),
             total_tokens: None,
             model: String::new(),
@@ -77,6 +87,7 @@ impl ChatMessage {
             tool_call_id: None,
             display_content: None,
             tool_error: false,
+            ui_only: false,
             created_at: now_rfc3339(),
             total_tokens: None,
             model: String::new(),
@@ -95,6 +106,7 @@ impl ChatMessage {
             tool_call_id: None,
             display_content: None,
             tool_error: false,
+            ui_only: false,
             created_at: now_rfc3339(),
             total_tokens: None,
             model: String::new(),
@@ -113,6 +125,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.to_string()),
             display_content: None,
             tool_error: false,
+            ui_only: false,
             created_at: now_rfc3339(),
             total_tokens: None,
             model: String::new(),
@@ -137,6 +150,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.to_string()),
             display_content: Some(display.to_string()),
             tool_error: is_error,
+            ui_only: false,
             created_at: now_rfc3339(),
             total_tokens: None,
             model: String::new(),
@@ -144,6 +158,23 @@ impl ChatMessage {
             think_elapsed_secs: 0.0,
             references_count: 0,
             search_triggered: false,
+        }
+    }
+
+    /// A system-styled notice shown in the chat but never sent to the model.
+    pub fn ui_system(content: &str) -> Self {
+        Self {
+            ui_only: true,
+            ..Self::system(content)
+        }
+    }
+
+    /// A real user message whose chat rendering is a short label instead of
+    /// the full content (e.g. goal-retry prompts).
+    pub fn user_with_display(content: &str, display: &str) -> Self {
+        Self {
+            display_content: Some(display.to_string()),
+            ..Self::user(content)
         }
     }
 
@@ -170,6 +201,11 @@ pub struct CompletionRequest {
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
+    // Populated at every call site (true for streaming turns, false for the
+    // ACP and goal-evaluator one-shots) but the provider picks streaming vs.
+    // non-streaming by which trait method the caller invokes
+    // (`complete`/`complete_stream`), not by reading this back.
+    #[expect(dead_code, reason = "streaming choice is made by which trait method is called, not this flag")]
     pub stream: bool,
 }
 
@@ -182,7 +218,11 @@ pub struct CompletionChunk {
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub content: String,
+    // Populated by every `complete()` implementation but no caller
+    // (src/acp/server.rs, app/goal.rs) reads past `.content`.
+    #[expect(dead_code, reason = "no caller of complete() reads finish_reason/usage yet")]
     pub finish_reason: Option<String>,
+    #[expect(dead_code, reason = "no caller of complete() reads finish_reason/usage yet")]
     pub usage: Option<Usage>,
 }
 

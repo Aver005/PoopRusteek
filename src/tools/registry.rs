@@ -19,8 +19,14 @@ impl ToolRegistry {
     }
 
     fn register_default_tools(&self) {
-        self.register(Arc::new(shell::ShellTool::bash()));
-        self.register(Arc::new(shell::ShellTool::powershell()));
+        // PowerShell is Windows-only; on non-Windows only bash is on PATH.
+        // Windows dev boxes commonly also have Git Bash, so register both there.
+        if cfg!(windows) {
+            self.register(Arc::new(shell::ShellTool::powershell()));
+            self.register(Arc::new(shell::ShellTool::bash()));
+        } else {
+            self.register(Arc::new(shell::ShellTool::bash()));
+        }
         self.register(Arc::new(question::QuestionTool));
         self.register(Arc::new(task::TaskTool));
         self.register(Arc::new(shell_control::ShellOutputTool));
@@ -56,5 +62,26 @@ impl ToolRegistry {
         });
         *self.skill_tool.lock().unwrap() = Some(Arc::clone(&skill_tool));
         self.tools.lock().unwrap().insert("skill".to_string(), skill_tool);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_is_always_registered() {
+        // bash is on PATH on every supported platform (Git Bash on Windows
+        // dev boxes, native bash elsewhere) — registered unconditionally.
+        let registry = ToolRegistry::new();
+        assert!(registry.get("bash").is_some());
+    }
+
+    #[test]
+    fn powershell_registration_matches_the_host_platform() {
+        // PowerShell only exists on Windows; on non-Windows hosts it must
+        // not be registered (there's no interpreter on PATH to run it).
+        let registry = ToolRegistry::new();
+        assert_eq!(registry.get("powershell").is_some(), cfg!(windows));
     }
 }

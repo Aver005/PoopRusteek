@@ -130,5 +130,18 @@ pub fn save(config: &Config) -> AppResult<()> {
         std::fs::create_dir_all(parent).map_err(|e| AppError::Config(e.to_string()))?;
     }
     let content = toml::to_string_pretty(config).map_err(|e| AppError::Config(e.to_string()))?;
-    std::fs::write(path, content).map_err(|e| AppError::Config(e.to_string()))
+    crate::util::atomic_write(&path, content.as_bytes())
+        .map_err(|e| AppError::Config(e.to_string()))?;
+
+    // The config file holds the DeepSeek token in plaintext — restrict it to
+    // the owner. No-op on Windows, which has no POSIX mode bits; ACLs are a
+    // separate concern out of scope for this fix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, perms).map_err(|e| AppError::Config(e.to_string()))?;
+    }
+
+    Ok(())
 }

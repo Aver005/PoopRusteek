@@ -53,7 +53,6 @@ pub(crate) async fn insert_handle(
     reg.procs.insert(
         id,
         Arc::new(BackgroundHandle {
-            id,
             pid,
             command: command_str,
             shell,
@@ -148,7 +147,7 @@ pub async fn process_snapshots() -> Vec<ProcessSnapshot> {
             shell: h.shell.clone(),
             command: h.command.clone(),
             started_at: h.started_at,
-            last_activity_at: h.last_activity_at.lock().unwrap().clone(),
+            last_activity_at: *h.last_activity_at.lock().unwrap(),
             status: h.status.lock().unwrap().clone(),
             interactive: h.interactive,
             persistent: h.persistent,
@@ -191,7 +190,7 @@ pub async fn expire_persistent_idle_processes() -> usize {
                 if ttl_secs == 0 {
                     return None;
                 }
-                let last_activity_at = handle.last_activity_at.lock().unwrap().clone();
+                let last_activity_at = *handle.last_activity_at.lock().unwrap();
                 let status = handle.status.lock().unwrap().clone();
                 let idle_secs = now.signed_duration_since(last_activity_at).num_seconds().max(0) as u64;
                 (handle.persistent && is_running_status(&status) && idle_secs >= ttl_secs).then_some(*id)

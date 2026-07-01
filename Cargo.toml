@@ -2,7 +2,7 @@
 name = "pooprusteek"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 description = "A fast, beautiful TUI coding agent powered by DeepSeek"
 license = "MIT"
 
@@ -14,7 +14,9 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 # TUI
-ratatui = "0.29"
+# `unstable-rendered-line-info` exposes Paragraph::line_count — the real
+# WordWrapper row count used for scroll math (estimates diverge on CJK/wrap).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # HTTP

@@ -46,7 +46,6 @@ static ANSI_ESCAPE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| 
 });
 
 pub struct BackgroundHandle {
-    pub id: u64,
     pub pid: Option<u32>,
     pub command: String,
     pub shell: String,
@@ -73,7 +72,10 @@ impl BackgroundHandle {
             std::mem::take(&mut *b)
         };
         let text = sanitize_terminal_output(&bytes);
-        if self.overflow.load(Ordering::Relaxed) {
+        // swap(false) so the marker fires once per actual overflow instead of
+        // on every subsequent read — a sticky flag would keep telling the
+        // model output was dropped long after the buffer caught up.
+        if self.overflow.swap(false, Ordering::Relaxed) {
             format!("{text}\n[output buffer overflowed — some output was dropped]\n")
         } else {
             text
@@ -105,12 +107,19 @@ pub(crate) fn is_running_status(status: &ProcessStatus) -> bool {
     matches!(status, ProcessStatus::Running)
 }
 
-pub(crate) fn force_kill_pid(pid: u32) -> std::io::Result<()> {
+/// Force-kill a background job's process (tree on Windows, process group on
+/// Unix) by pid. Async so it never blocks a tokio runtime worker — this is
+/// called from supervisor tasks reached via `.await`, and the old
+/// `std::process::Command::status()` was a synchronous blocking syscall on
+/// those workers.
+pub(crate) async fn force_kill_pid(pid: u32) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("taskkill")
+        // /T kills the entire process tree (child + grandchild processes).
+        let status = tokio::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
-            .status()?;
+            .status()
+            .await?;
         if status.success() {
             Ok(())
         } else {
@@ -121,9 +130,23 @@ pub(crate) fn force_kill_pid(pid: u32) -> std::io::Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let status = std::process::Command::new("kill")
+        // Background jobs are spawned in their own process group (pgid ==
+        // pid, see `process_group(0)` in spawn.rs), so `-<pid>` targets the
+        // whole group: killing just the leader (e.g. `bash -c "npm run
+        // dev"`) would orphan grandchildren (node/vite) that keep the port
+        // bound. Fall back to a plain-pid kill if group-kill errors — e.g.
+        // the process never got its own group, or already exited.
+        let group_status = tokio::process::Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .status()
+            .await?;
+        if group_status.success() {
+            return Ok(());
+        }
+        let status = tokio::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
-            .status()?;
+            .status()
+            .await?;
         if status.success() {
             Ok(())
         } else {
@@ -137,8 +160,6 @@ pub(crate) fn force_kill_pid(pid: u32) -> std::io::Result<()> {
 pub struct SpawnOutcome {
     pub id: u64,
     pub initial_output: String,
-    pub status: ProcessStatus,
-    pub interactive: bool,
     pub persistent: bool,
     pub ttl_secs: Option<u64>,
 }
@@ -184,5 +205,46 @@ mod tests {
     fn is_running_only_for_running() {
         assert!(is_running_status(&ProcessStatus::Running));
         assert!(!is_running_status(&ProcessStatus::Finished(None)));
+    }
+
+    fn test_handle(overflowed: bool) -> BackgroundHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<BgCmd>();
+        BackgroundHandle {
+            pid: None,
+            command: "test".to_string(),
+            shell: "bash".to_string(),
+            started_at: chrono::Utc::now(),
+            last_activity_at: Arc::new(std::sync::Mutex::new(chrono::Utc::now())),
+            buffer: Arc::new(std::sync::Mutex::new(b"hi\n".to_vec())),
+            overflow: Arc::new(std::sync::atomic::AtomicBool::new(overflowed)),
+            status: Arc::new(std::sync::Mutex::new(ProcessStatus::Running)),
+            cmd_tx,
+            writer: None,
+            interactive: false,
+            persistent: false,
+            ttl_secs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_marker_is_one_shot() {
+        let handle = test_handle(true);
+        let first = handle.drain_output().await;
+        assert!(first.contains("[output buffer overflowed — some output was dropped]"));
+
+        // No new bytes and no fresh overflow: the flag must not still be set,
+        // so a second read must NOT repeat the marker.
+        *handle.buffer.lock().unwrap() = b"more\n".to_vec();
+        let second = handle.drain_output().await;
+        assert!(!second.contains("overflowed"));
+        assert_eq!(second, "more");
+    }
+
+    #[tokio::test]
+    async fn drain_output_without_overflow_has_no_marker() {
+        let handle = test_handle(false);
+        let out = handle.drain_output().await;
+        assert_eq!(out, "hi");
+        assert!(!out.contains("overflowed"));
     }
 }

@@ -69,6 +69,55 @@ impl Conversation {
     pub fn is_streaming(&self) -> bool {
         self.generation.active
     }
+
+    /// Is this a background-kind conversation (sidechat / sub-agent) whose
+    /// terminal events must finalize-and-flush regardless of focus?
+    pub fn is_background_kind(&self) -> bool {
+        matches!(self.kind, ConversationKind::Sidechat | ConversationKind::SubAgent)
+    }
+
+    // ─── Shared agent-event reducer ────────────────────────────
+    // One implementation for both the focused and background event paths, so
+    // streaming semantics can't drift between them.
+
+    /// `BeginAssistantMessage`: open an empty assistant message unless one is
+    /// already open.
+    pub fn begin_assistant_message(&mut self) {
+        let needs_push = self
+            .messages
+            .last()
+            .is_none_or(|m| m.role != crate::provider::Role::Assistant || !m.content.is_empty());
+        if needs_push {
+            self.messages.push(ChatMessage::assistant(""));
+        }
+    }
+
+    /// `AgentChunk`: append streamed content to the open assistant message.
+    pub fn append_chunk(&mut self, chunk: &str) {
+        if let Some(last) = self.messages.last_mut()
+            && last.role == crate::provider::Role::Assistant {
+                last.content.push_str(chunk);
+            }
+    }
+
+    /// Drop a trailing assistant message that never received content.
+    pub fn discard_empty_assistant(&mut self) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|m| m.role == crate::provider::Role::Assistant && m.content.is_empty())
+        {
+            self.messages.pop();
+        }
+    }
+
+    /// Terminal-event bookkeeping shared by `AgentDone` / `AgentError`.
+    pub fn finish_turn(&mut self, status: &str) {
+        self.generation.active = false;
+        self.generation.last_status = Some(status.to_string());
+        self.agent_task = None;
+        self.discard_empty_assistant();
+    }
 }
 
 /// The set of open conversations with one focused. There is no live/parked
@@ -137,11 +186,10 @@ impl Conversations {
     pub fn remove(&mut self, id: ConversationId) -> Option<Conversation> {
         let pos = self.items.iter().position(|c| c.id == id)?;
         let removed = self.items.remove(pos);
-        if self.focused == id {
-            if let Some(first) = self.items.iter().map(|c| c.id).min_by_key(|c| c.0) {
+        if self.focused == id
+            && let Some(first) = self.items.iter().map(|c| c.id).min_by_key(|c| c.0) {
                 self.focused = first;
             }
-        }
         Some(removed)
     }
 
@@ -153,13 +201,37 @@ impl Conversations {
         self.items.iter_mut()
     }
 
+    // Not currently called; kept as the natural counterpart to `iter`/`get`
+    // for callers that need a count or a stable cycling order. Not verified
+    // dead against the same bar as the audited deletions elsewhere in this
+    // pass, so annotated rather than removed.
+    #[expect(dead_code, reason = "small accessor pair, not part of this pass's verified-dead list")]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
+    pub fn get(&self, id: ConversationId) -> Option<&Conversation> {
+        self.items.iter().find(|c| c.id == id)
+    }
+
     /// Conversation ids in stable (id) order — for cycling focus.
+    #[expect(dead_code, reason = "small accessor pair, not part of this pass's verified-dead list")]
     pub fn ordered_ids(&self) -> Vec<ConversationId> {
         let mut ids: Vec<ConversationId> = self.items.iter().map(|c| c.id).collect();
+        ids.sort_by_key(|c| c.0);
+        ids
+    }
+
+    /// Ids of user-facing chats only (main + parallel sessions), id-ordered.
+    /// Tab cycles through these; sidechats/sub-agents live in `/agents`, and
+    /// focusing one would race its own finalize-and-remove lifecycle.
+    pub fn ordered_session_ids(&self) -> Vec<ConversationId> {
+        let mut ids: Vec<ConversationId> = self
+            .items
+            .iter()
+            .filter(|c| !c.is_background_kind())
+            .map(|c| c.id)
+            .collect();
         ids.sort_by_key(|c| c.0);
         ids
     }
