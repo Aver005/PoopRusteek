@@ -1,9 +1,9 @@
 # CONVENTIONS
 > Code style & patterns to follow when contributing. Match the surrounding code.
-> Last updated: 2026-06-30 (added decomposition/controller + conversation patterns)
+> Last updated: 2026-07-02 (MSRV 1.85→1.91)
 
 ## LANGUAGE & EDITION
-- Rust **edition 2024**, MSRV **1.85**. Use modern idioms (`let-else`, `LazyLock`, `floor_char_boundary`, etc.).
+- Rust **edition 2024**, MSRV **1.91**. Use modern idioms (`let-else`, `LazyLock`, `floor_char_boundary`, etc.).
 
 ## ERROR HANDLING
 - Use `AppResult<T>` + `AppError` (`src/error.rs`) for fallible fns; propagate with `?`.
@@ -40,10 +40,10 @@
 - Keep render pure: `render()` reads `&AppState`, never mutates.
 
 ## TESTS
-- **84 tests** today (`cargo test --bin pooprusteek`), all in-file `#[cfg(test)] mod tests` — provider `fork` isolation (`deepseek.rs`), goal `apply_verdict` (pure core), conversation ids, tool-parser, runner, etc.
+- **189 tests** today (`cargo test --bin pooprusteek`, was 84 pre-2026-07-02), all in-file `#[cfg(test)] mod tests` — provider `fork` isolation (`deepseek.rs`), goal `apply_verdict` + iteration-cap (`goal.rs`), conversation ids, tool-parser, runner, command-registry round-trips, `mcp_row_layout`, overflow-marker one-shot behavior, etc.
 - Edge cases worth testing: multibyte/emoji boundaries, partial tool-tag streaming, all 3 tool-call formats, fork session independence.
 - Favor a **pure functional core** (like `goal::apply_verdict`) so logic is testable without a live `App`.
-- **Verification baseline = `cargo build` + `cargo test --bin pooprusteek`.** `cargo clippy` not yet clean (run it before large changes).
+- **Verification baseline = `cargo build` + `cargo test --bin pooprusteek` + `cargo clippy`.** Clippy is now **0 warnings** (was ~220) — keep it that way; CI runs it advisory for now, but treat new warnings as build breaks.
 
 ## ASSETS
 - Anything loaded at runtime (prompts, the PoW WASM) resolves via `CARGO_MANIFEST_DIR` → CWD → exe-dir. Add new assets under `assets/` and follow that resolution pattern.

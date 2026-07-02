@@ -1,6 +1,6 @@
 # ARCHITECTURE
 > How the pieces fit and how data flows. Read after MAP.md.
-> Last updated: 2026-06-30 (post conversation-unification + controllers refactor)
+> Last updated: 2026-07-02 (post stability/perf overhaul — event-driven GOAL evaluator, drain+dirty render, interaction queue)
 
 ## LAYERS (clean-ish, layered architecture)
 
@@ -34,22 +34,23 @@ The single biggest architectural change. Previously the app was strictly single-
 - `AppState::focused()/focused_mut()` delegate to the store; `push_message`/`push_system` helpers avoid borrow conflicts.
 - **Isolation via `fork()`**: each conversation gets its own `LLMProvider` instance with a fresh `SessionState`, so concurrent turns never collide on `session_state` — this is also what structurally prevents the old `parent_message_id` fork-bug.
 
-## EVENT LOOP (`App::run_loop`, `app/mod.rs:256`)
+## EVENT LOOP (`App::run_loop`, `app/mod.rs`)
 
 A single `tokio::select!` at **120 ms tick** multiplexes:
-1. **Tick** → animations, periodic MCP/background stat refresh (MCP every 2s).
+1. **Tick** → animations, periodic MCP/background stat refresh (MCP every 2s). `tick_is_visual` distinguishes ticks that must repaint (animation frames, streaming) from ones that don't, so a fully idle session draws zero frames.
 2. **Crossterm** key/resize (`EventStream`) → `handle_key` / `handle_event`.
 3. **Internal channel** (`event_rx`) → `handle_event` for `AppEvent`s emitted by the agent/tools.
-4. **Ctrl+C** → kill foreground child, shutdown background jobs, exit.
-After each iteration: refresh MCP view if active, handle terminal-restore flag, `render()`.
+4. **Ctrl+C** → kill foreground child, shutdown background jobs (`tools::background::shutdown_all`) and MCP servers (`MCPManager::shutdown_all`), exit.
 
-This is the "event-driven, no render races" design from the README: the agent runs in a **spawned task** and communicates only via `AppEvent`s + channels, never touching `AppState` directly.
+**Render batching**: instead of rendering on every single event, `run_loop` drains up to **256** queued events per iteration before repainting once, behind a dirty flag. Combined with a per-message thread-local markdown/syntect cache (`tui/widgets/chat.rs`, keyed by a content fingerprint, evicted past 4096 entries) and cached token-count estimates, this replaced the old "re-parse the entire transcript on every streamed token" behavior that caused a streaming death-spiral on long sessions.
+
+This is the "event-driven, no render races" design from the README: the agent runs in a **spawned task** and communicates only via `AppEvent`s + channels, never touching `AppState` directly. Streaming itself is also spawned as its own task (`complete_stream` inside `run_agent_loop`/`run_sub_agent`) so the 120s idle-stream guard races the *live* network call instead of watching an already-fully-drained channel.
 
 ## `AppEvent` (`app/events.rs`)
 
-TUI: `Key, Resize, Tick`. Agent (now **tagged with `ConversationId`** so background turns stream into the right buffer): `AgentStarted(id), AgentChunk(id, String), AgentDone(id, AgentResult), AgentError(id, String), BeginAssistantMessage(id), DiscardEmptyAssistantMessage(id), AddMessage(id, …)`. Tools: `ToolStarted, ToolDone, ToolError, RequestToolApproval, RequestQuestion`. Goal: `GoalEvaluationDone(GoalVerdict), GoalCycleFinished`. Sub-agent: `SpawnSubAgent { parent, label, prompt }`.
+TUI: `Key, Resize, Tick`. Agent (now **tagged with `ConversationId`** so background turns stream into the right buffer): `AgentStarted(id), AgentChunk(id, String), AgentDone(id, AgentResult), AgentError(id, String), BeginAssistantMessage(id), DiscardEmptyAssistantMessage(id), AddMessage(id, …)`. Tools: `ToolStarted, ToolDone, ToolError, RequestToolApproval, RequestQuestion`. Goal: `GoalEvaluationDone(GoalEvalOutcome)` (the old unused `GoalCycleFinished` variant was removed). MCP: `McpOperationDone` (reload/toggle/reconnect results delivered off the event loop). Sub-agent: `SpawnSubAgent { parent, label, prompt }`.
 
-`handle_event` first calls `agent_event_target(&event)`; if the target id ≠ focused, it routes to `handle_background_event` (`app/multichat.rs`) which mutates that conversation's parked record instead of the focused chat. Rendering only ever shows the focused conversation.
+`handle_event` first calls `agent_event_target(&event)`; if the target id ≠ focused, it routes to `handle_background_event` (`app/multichat.rs`) which mutates that conversation's parked record instead of the focused chat via the same unified reducer methods the focused path uses (`begin_assistant_message`/`append_chunk`/`discard_empty_assistant`/`finish_turn` on `Conversation`, `app/conversation.rs`) — the two paths no longer duplicate/diverge in logic. Rendering only ever shows the focused conversation. A focused sidechat that's tabbed away from and back still finalizes correctly into its parent on completion (kind-based routing, not focus-based).
 
 ## PRIMARY DATA FLOW (a normal turn)
 
@@ -73,19 +74,20 @@ key 'Enter' → handle_key (app/keys.rs)
 Cross-task request/response uses `Arc<Mutex<Option<T>>> + tokio::Notify`:
 - Agent task builds a `ToolApprovalRequest`/`QuestionRequest`, sends it as an `AppEvent`, then `await`s `.wait()`.
 - Main loop shows the modal, captures the key, calls `.resolve(value)` which notifies the waiting agent task.
-- **Consequence**: while a modal is open the agent task is parked — and the modal also blocks input handling (known limitation in BUGS.md).
+- **Interaction queue**: pending approval/question requests are held in a `PendingInteraction` `VecDeque` rather than a single overwritable slot, so a second request while one is displayed no longer orphans the first waiter forever. Esc/Ctrl+C now cancels a wedged turn (checked via `agent_task` presence) and purges its queued interactions (`purge_interactions_for`) instead of silently clearing the chat.
+- While a modal is open the agent task for that conversation is still parked — this remains a deliberate, understood trade-off, not a bug.
 
 ## GOAL MODE (state machine) — `app/goal.rs`, `events.rs`
 
 `GoalStage`: `Inactive → WaitForGoal → RunAgent1 → RunEvaluator → Done`.
 1. `/goal` arms it; first user message = `goal_prompt`; second = `goal_text` (the success spec).
 2. Agent 1 works a normal turn toward the goal.
-3. On `AgentDone`, `run_goal_evaluation()` calls a **separate evaluator** (non-streaming `complete()`, lower temp) with `goal-evaluator.prompt.md`.
+3. On `AgentDone`, `spawn_goal_evaluation()` **spawns a task** that calls a **separate evaluator** (non-streaming `complete()`, lower temp) with `goal-evaluator.prompt.md`, off the `select!` loop — the evaluation call used to run inline inside `handle_event`, freezing the whole UI for its duration; it no longer does. The task reports back via `AppEvent::GoalEvaluationDone(GoalEvalOutcome)`, handled by a single `handle_goal_evaluation_done` path (the old duplicate/drifted inline-vs-event handling was removed, along with the dead unused `GoalCycleFinished` variant). A stale-verdict guard drops an evaluation result that arrives after the goal cycle has already moved on (e.g. cancelled mid-flight).
 4. `parse_goal_verdict()` reads `**Status:** SUCCESS/FAILURE` + summary/issues/feedback.
    - SUCCESS → `Done`, evaluator session saved tagged `__goal_system__`.
-   - FAILURE → feedback fed back to Agent 1; counters increment.
+   - FAILURE → feedback fed back to Agent 1 as a real user-visible retry prompt via `user_with_display` (previously this only showed as a UI notice and never actually reached the model); counters increment.
 5. **Session swapping**: after **3** agent-1 failures → fresh agent-1 session; after **5** evaluator failures → fresh evaluator session. Two distinct session ids tracked (`goal_agent1_session_id`, `goal_agent2_session_id`).
-6. ⚠ No hard iteration cap → potential infinite loop (see BUGS).
+6. **Hard iteration cap**: `MAX_GOAL_ITERATIONS = 10` (`app/goal.rs`) — `apply_verdict` gives up at the cap instead of looping forever (tested: `gives_up_at_iteration_cap`).
 
 ## AGENT-TURN LAUNCH (`AgentRuntime` + `TurnSpec`)
 

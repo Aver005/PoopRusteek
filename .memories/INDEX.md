@@ -1,5 +1,5 @@
 # .memories INDEX
-> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-02 (added CLAUDE.md bridge + AUDIT-2026-07-02.md)
+> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-02 (post stability/perf overhaul — clippy 0, tests 189, MSRV 1.91)
 
 > ⚠️ `CLAUDE.md` at the repo root is now the auto-loaded bridge into this folder — **Claude Code**
 > reads it automatically and it points here. The **app itself** still does **NOT** auto-load
@@ -31,7 +31,7 @@
 | `reference/MCP.md` | MCP clients, transports, 8 config sources |
 | `reference/CONFIG.md` | Config schema, storage paths, sessions |
 | `reference/PROMPTS.md` | Prompt library + skills discovery |
-| `reference/AUDIT-2026-07-02.md` | Full-codebase audit (2026-07-02): severity-ranked defects, `[FIXING]`/`[OPEN]`/`[ACCEPTED]` status |
+| `reference/AUDIT-2026-07-02.md` | Full-codebase audit (2026-07-02): severity-ranked defects, `[FIXED]`/`[OPEN]`/`[ACCEPTED]` status |
 
 ## 2. KEY SIGNALS
 
@@ -48,9 +48,9 @@
 ## 3. EXTERNAL CONTEXT
 
 - Original repo (TS): https://github.com/aver005/poopseek
-- This project: Rust rewrite (edition 2024, MSRV 1.85), ~15k LOC, License MIT.
+- This project: Rust rewrite (edition 2024, MSRV 1.91), ~15k LOC, License MIT.
 - LLM backend: DeepSeek **web** API (reverse-engineered, v0) — cookie/token auth, requires PoW.
-- Primary verification: `cargo build`. `cargo clippy` not yet clean. Minimal test suite.
+- Primary verification: `cargo build` + `cargo test --bin pooprusteek` (189 passing) + `cargo clippy` (0 warnings). CI (`.github/workflows/ci.yml`) runs build+test on Windows/Linux; clippy advisory.
 
 ## 4. MAINTENANCE RULE
 

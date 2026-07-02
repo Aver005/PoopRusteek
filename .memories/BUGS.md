@@ -1,33 +1,33 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-07-02 (2026-07-02 audit: moved stale GOAL-cap entry to RESOLVED)
+> Last updated: 2026-07-02 (2026-07-02 refactor session: all CRITICAL/most MEDIUM fixed — see RESOLVED)
 > Full audit digest: `reference/AUDIT-2026-07-02.md` (2026-07-02)
 
 ## CRITICAL
 None currently known.
 
 ## HIGH
-
-- `[BUG]` Retry with `max_retries=-1` (infinite) has **no total-time cap and no jitter** → a persistently-failing endpoint can hang the turn forever. `→ src/provider/deepseek.rs:225`
+None currently known. (The infinite-retry-hang entry that used to live here was fixed this session — see RESOLVED.)
 
 ## MEDIUM
 
-- `[BUG]` Tool-approval modal **blocks the event loop** — input is frozen until the user answers (agent task is also parked on `.wait()`). A non-focused conversation's pending approval can't surface until it's focused. `→ src/app/mod.rs` (handle_event) + `src/agent/runner.rs`
-- `[BUG]` No request-level timeout on DeepSeek HTTP calls (only a 120s **idle** stream timeout in the agent loop). A stalled connection between bytes relies on reqwest defaults. `→ src/provider/deepseek.rs`
 - `[BUG]` MCP tool arguments are passed to `tools/call` with **no schema validation**. `→ src/mcp/client.rs`
-- `[BUG]` `stream_visible_text` truncates at the first bare `<` → legitimate text containing `<` (C++ templates, `a < b`, HTML) is hidden mid-stream. `→ src/agent/tool_parser.rs:100`
-- `[BUG]` PoW challenge **expiry not checked** before submit; a slow WASM solve can send a stale challenge with no retry. `→ src/provider/pow.rs`
-- `[BUG]` Background output buffer is capped at 256 KiB; on overflow data is dropped (flagged but unrecoverable). `→ src/tools/background.rs:94`
+- `[BUG]` `stream_visible_text` truncates at the first bare `<` → legitimate text containing `<` (C++ templates, `a < b`, HTML) is hidden mid-stream. `→ src/agent/tool_parser.rs`
+- `[BUG]` PoW challenge is solved once before the retry loop (not re-solved per attempt) and the solve runs on the async task instead of `spawn_blocking`, competing with the executor. `→ src/provider/pow.rs` + `src/provider/deepseek.rs`
+- `[BUG]` Legacy `[TOOL:name] {json}` regex uses a non-nesting brace pattern and can't parse nested JSON objects. `→ src/agent/tool_parser.rs`
+- `[BUG]` Fenced code-block examples containing tool-call syntax can be parsed and executed as real tool calls during auto-approve (background) turns. `→ src/agent/tool_parser.rs`
+- `[BUG]` DeepSeek remote chat sessions are created on fork/new-chat but never deleted — `delete_remote_session` is fully implemented with **zero call sites**, so the DeepSeek account accumulates junk sessions unboundedly. `→ src/provider/deepseek.rs` (`delete_remote_session`)
 
 ## LOW
 
-- `[BUG]` `/import` overwrites the session tag with `"Imported"`, losing any original tag/metadata. `→ src/commands/defs/import.rs:56`
-- `[BUG]` `@file` mention expansion may mishandle paths with spaces. `→ src/cli/file_mentions.rs`
+- `[BUG]` `/import` overwrites the session tag with `"Imported"`, losing any original tag/metadata. `→ src/commands/defs/import.rs`
 - `[BUG]` Autocomplete file paths resolve against `current_dir()`, which can drift from `workspace_path` after a subprocess `cd`. `→ src/app/keys.rs` (autocomplete)
 - `[BUG]` Theme is hardcoded Catppuccin Mocha; `ui.theme` config is ignored. `→ src/tui/theme.rs`
-- `[BUG]` MCP image content is dropped to `[Image: {mime}]` text; non-text/image/resource content types ignored. `→ src/mcp/client.rs:216`
-- `[BUG]` `mcp__` uses `__` as separator → name collision possible if a server/tool name contains `__`. `→ src/mcp/manager.rs:186`
-- `[BUG]` History deduplication only catches **consecutive** duplicates. `→ src/session.rs:182`
+- `[BUG]` MCP image content is dropped to `[Image: {mime}]` text; non-text/image/resource content types ignored. `→ src/mcp/client.rs`
+- `[BUG]` `mcp__` uses `__` as separator → name collision possible if a server/tool name contains `__`. `→ src/mcp/manager.rs`
+- `[BUG]` History deduplication only catches **consecutive** duplicates. `→ src/session.rs`
+- `[BUG]` `"model"` field in the outgoing request body is a hardcoded literal `"deepseek-chat"`, ignoring the user's configured model. `→ src/provider/deepseek.rs`
+- `[BUG]` Foreground child PID tracking is a single global slot (`AtomicU32`), not per-conversation — Esc/Ctrl+C in one conversation can kill a different conversation's foreground process; also an upward `tools`→`app` dependency. `→ src/app/mod.rs` (`FOREGROUND_CHILD_PID`) + `src/tools/shell.rs`
 
 ## WONTFIX / ACCEPTED
 
@@ -36,6 +36,20 @@ None currently known.
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **2026-07-02 refactor session** — see `reference/AUDIT-2026-07-02.md` for full detail; `JOURNAL/2026-07-02.md` for the session narrative. One line per subsystem:
+  - **Streaming**: `complete_stream` now spawned as a task so the 120s idle guard races the live network call; reqwest client got `connect_timeout(10s)`/`read_timeout(120s)`; stray `gzip` header removed; `SseLineBuffer` rewritten byte-based with a 4MiB cap (was unbounded + O(n²)).
+  - **MCP**: lock-free `client_for` handles replace holding `MCPManager`'s mutex across network `.await`s; stdio stderr now drained; JSON-RPC `id` correlation replaces order-assumed matching; `Transport::close()` now has real call sites (toggle/remove/reload/app-exit `shutdown_all`); `connect_all` now concurrent; honest connection-failure status; `persist_config` no longer copies foreign servers' secrets.
+  - **GOAL**: evaluator moved off the event loop via `spawn_goal_evaluation` → `GoalEvaluationDone`; dead duplicate inline path and unused `GoalCycleFinished` variant removed; stale-verdict guard added.
+  - **Commands/ACP**: `/goal` leading-slash registration bug fixed (+ round-trip test); `--acp` nested-runtime panic fixed with `block_in_place`.
+  - **Render**: `run_loop` drains ≤256 events then renders once behind a dirty flag (idle = zero draws); per-message markdown/syntect cache in `tui/widgets/chat.rs`; token-estimate caching.
+  - **Interaction/approval**: single-slot approval waiter replaced by a `PendingInteraction` queue; Esc/Ctrl+C now cancels wedged turns; `whitelist::persist_approval` makes "always allow" survive restarts.
+  - **Conversation model**: `ChatMessage.ui_only` splits model-visible history from UI chrome; unified reducer methods (`begin_assistant_message`/`append_chunk`/`discard_empty_assistant`/`finish_turn`) replace the diverged focused/background duplicate logic; `send_to_agent` → `send_focused_turn(Option<ChatMessage>)` whose argument now actually reaches the model.
+  - **Shell/background**: foreground shell got a 300s timeout + 1MiB cap + kill_on_drop + tree-kill; PowerShell UTF-8 prefix fixes cp866 mojibake; background readers survive non-UTF8; Unix process-group kill; async `force_kill_pid`; overflow flag no longer sticky.
+  - **Persistence**: `util::atomic_write` wired into config/session/whitelist/mcp-config saves (was unused, zero call sites); session version checked on load; config file 0600 on Unix.
+  - **Misc**: `/help` generated from the command registry; `@file` mention range clamp; skills frontmatter keeps repeated keys; markdown bold/italic/strikethrough now actually styled; MCP panel gap underflow fixed; scroll row-count uses ratatui's real line-count; stats-panel/landing-session disk reads cached; retry backoff made `saturating`.
+  - **Dead code removed**: `parse_sse_event`/`ParsedSSEEvent` family, ~12 dead structs/consts in `provider/types.rs`, `AppState.error`, `GoalCycleFinished`, `CommandResult::NeedsAgent`, unused theme fields, `BackgroundHandle.id`, `SpawnOutcome.status/interactive`, `API_BASE`.
+  - **Result**: clippy ~220→0 warnings, tests 84→189, CI added (`.github/workflows/ci.yml`).
 - ✅ `~~Messages "evaporate" — appear in the TUI but never reach DeepSeek / the web view~~` — `parent_message_id` desync forked the session onto an invisible branch (triggered by interrupted/errored streams). Fixed by incremental persist + flush-on-error (`deepseek.rs`, commit `183712e`); structurally prevented by per-conversation `fork()` isolation.
 - ✅ `~~GOAL pipeline wedges on empty prompt/goal, interrupt+new message~~` — overhaul `c0d4280`.
 - ✅ `~~GOAL cycle has no max-iteration cap~~` — was fixed by the goal overhaul; BUGS.md had gone stale. `MAX_GOAL_ITERATIONS = 10` (`src/app/goal.rs`); `apply_verdict` gives up at the cap (test `gives_up_at_iteration_cap`).
