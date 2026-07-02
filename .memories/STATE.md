@@ -32,7 +32,7 @@
    - `keys.rs` decomposition: key→intent + intent→effect split (testable without a live `App`). Not started.
    - `deepseek.rs` split (endpoints/http/session/stream) + dedupe the ~26 unused REST wrappers currently parked in a `#[allow(dead_code)]` impl block.
    - Dependency major-version bumps: `reqwest` 0.13, `ratatui` 0.30.2 + `crossterm` 0.29, `pulldown-cmark` 0.13, `toml` 1.x.
-   - `wasmtime` 27 → native SHA-3 PoW reimplementation (drops the wasm dependency entirely).
+   - PoW wasm: embed via `include_bytes!` (today it is read from `assets/` resolved through compile-time `CARGO_MANIFEST_DIR`/cwd/exe-dir — an installed binary breaks if the source checkout moves). Native SHA-3 reimpl REJECTED by owner (2026-07): the point of the workaround is executing DeepSeek's own solver. Stretch: fetch the wasm the server references at runtime (real rotation-resilience).
 3. Phase-4 polish (multi-theme on hold; mouse, copy/paste, error recovery).
 4. MCP tool-arg schema validation (still absent).
 
@@ -44,7 +44,7 @@
 - DeepSeek streaming never reports token usage (`usage` always None).
 - Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`
 - No persistent RAG / codebase search.
-- `wasmtime` 27 WASM PoW solver — native SHA-3 reimplementation planned to drop the dependency.
+- PoW wasm read from a loose `assets/` file (not embedded); `wasmtime` stays by owner decision — see CURRENT FOCUS.
 - `deepseek.rs` still a large multi-responsibility file; split (endpoints/http/session/stream) planned, along with REST-wrapper dedupe.
 - `keys.rs` decomposition (key→intent/intent→effect) planned, not started.
 - DeepSeek remote-session leak: `delete_remote_session` has zero call sites — sessions accumulate on the DeepSeek account unbounded.

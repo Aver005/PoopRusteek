@@ -31,7 +31,7 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 
 ## WONTFIX / ACCEPTED
 
-- `[?]` PoW WASM binary checked in as a blob — increases repo size. Native SHA-3 reimpl would avoid it.
+- `[?]` PoW runs DeepSeek's own wasm blob via `wasmtime` (heavy dep, repo blob). Native SHA-3 reimpl REJECTED by owner (2026-07): the workaround must execute upstream's solver as-is. Remaining improvements: `include_bytes!` the wasm (binary currently breaks without `assets/` reachable), optionally fetch the server-referenced wasm at runtime.
 - `[?]` DeepSeek web API is reverse-engineered; may break on any server update. No SLA.
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
