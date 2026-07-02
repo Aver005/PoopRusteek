@@ -271,6 +271,31 @@ impl LLMProvider for DeepseekProvider {
     ) -> AppResult<Vec<ChatMessage>> {
         self.fetch_remote_history(session_id).await
     }
+
+    async fn list_remote_sessions(&self) -> AppResult<Vec<RemoteSessionInfo>> {
+        let sessions = self.fetch_remote_sessions(None).await?;
+        Ok(sessions
+            .into_iter()
+            .map(|s| {
+                // The API reports epoch time; guard against seconds vs millis.
+                let secs = if s.updated_at > 1_000_000_000_000 {
+                    s.updated_at / 1000
+                } else {
+                    s.updated_at
+                };
+                RemoteSessionInfo {
+                    id: s.id,
+                    title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
+                    updated_at: chrono::DateTime::from_timestamp(secs, 0)
+                        .map(|dt| dt.to_rfc3339()),
+                }
+            })
+            .collect())
+    }
+
+    async fn delete_remote_session_by_id(&self, session_id: &str) -> AppResult<()> {
+        self.delete_remote_session(session_id).await
+    }
 }
 
 #[cfg(test)]

@@ -148,6 +148,13 @@ pub enum AppEvent {
 
     /// A detached MCP admin operation (reload / toggle / reconnect) finished.
     McpOperationDone { message: String },
+
+    /// Background fetch of the remote session list for the `/delete` picker.
+    RemoteSessionsListed {
+        result: Result<Vec<crate::provider::RemoteSessionInfo>, String>,
+    },
+    /// A background session-deletion batch finished.
+    SessionsDeleted { deleted: usize, failed: Vec<String> },
 }
 
 // Populated at the `AgentDone` send site but every current receiver
@@ -424,6 +431,253 @@ pub enum Modal {
     },
     Picker(PickerState),
     Question(QuestionState),
+    DeleteSessions(DeleteSessionsState),
+}
+
+// ─── /delete — session deletion picker ────────────────────────────
+
+/// Which sessions the delete picker shows — and, at confirm time, WHERE the
+/// deletion applies: `All` removes both copies, `Local` only the on-disk
+/// file, `Remote` only the account-side chat. `/delete` opens on `All`,
+/// `/delete-local` on `Local`; Tab/arrows retarget freely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope {
+    All,
+    Local,
+    Remote,
+}
+
+impl SessionScope {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Local,
+            Self::Local => Self::Remote,
+            Self::Remote => Self::All,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Remote,
+            Self::Local => Self::All,
+            Self::Remote => Self::Local,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Local => "Local",
+            Self::Remote => "Remote",
+        }
+    }
+}
+
+/// One row in the delete picker: a session existing locally, remotely, or both.
+#[derive(Debug, Clone)]
+pub struct DeleteEntry {
+    pub id: String,
+    pub title: String,
+    pub local: bool,
+    pub remote: bool,
+    /// Display timestamp (may be empty).
+    pub updated_at: String,
+}
+
+/// Progress of the background remote-list fetch shown in the picker footer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoteListStatus {
+    NoProvider,
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteStage {
+    Selecting,
+    Confirming,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteSessionsState {
+    pub entries: Vec<DeleteEntry>,
+    pub filter: SessionScope,
+    pub stage: DeleteStage,
+    pub cursor: usize,
+    pub scroll_offset: usize,
+    /// Checked ids; survives filter switches, but a confirm only targets ids
+    /// visible under the filter active at that moment — what you see is what
+    /// you delete.
+    pub checked: HashSet<String>,
+    /// Targets captured when entering the confirm stage.
+    pub confirm_ids: Vec<String>,
+    pub remote_status: RemoteListStatus,
+}
+
+impl DeleteSessionsState {
+    pub fn new(
+        entries: Vec<DeleteEntry>,
+        filter: SessionScope,
+        remote_status: RemoteListStatus,
+    ) -> Self {
+        Self {
+            entries,
+            filter,
+            stage: DeleteStage::Selecting,
+            cursor: 0,
+            scroll_offset: 0,
+            checked: HashSet::new(),
+            confirm_ids: Vec::new(),
+            remote_status,
+        }
+    }
+
+    /// Entries visible under the current filter, in stored order.
+    pub fn visible(&self) -> Vec<&DeleteEntry> {
+        self.entries
+            .iter()
+            .filter(|e| match self.filter {
+                SessionScope::All => true,
+                SessionScope::Local => e.local,
+                SessionScope::Remote => e.remote,
+            })
+            .collect()
+    }
+
+    /// Merge the fetched remote list into the local-seeded entries (by id).
+    pub fn merge_remote(&mut self, sessions: Vec<crate::provider::RemoteSessionInfo>) {
+        for s in sessions {
+            if let Some(entry) = self.entries.iter_mut().find(|e| e.id == s.id) {
+                entry.remote = true;
+                if entry.updated_at.is_empty() {
+                    entry.updated_at = s.updated_at.unwrap_or_default();
+                }
+            } else {
+                self.entries.push(DeleteEntry {
+                    id: s.id,
+                    title: s.title,
+                    local: false,
+                    remote: true,
+                    updated_at: s.updated_at.unwrap_or_default(),
+                });
+            }
+        }
+        self.remote_status = RemoteListStatus::Ready;
+    }
+
+    /// The ids a confirm would target: checked entries visible under the
+    /// current filter, or the highlighted one when nothing is checked.
+    pub fn confirm_targets(&self) -> Vec<String> {
+        let visible = self.visible();
+        let checked: Vec<String> = visible
+            .iter()
+            .filter(|e| self.checked.contains(&e.id))
+            .map(|e| e.id.clone())
+            .collect();
+        if !checked.is_empty() {
+            return checked;
+        }
+        visible
+            .get(self.cursor)
+            .map(|e| vec![e.id.clone()])
+            .unwrap_or_default()
+    }
+}
+
+/// What the delete-picker key handler asks the app shell to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteAction {
+    None,
+    Close,
+    Execute { ids: Vec<String>, scope: SessionScope },
+}
+
+pub fn handle_delete_sessions_key(
+    state: &mut DeleteSessionsState,
+    key: crossterm::event::KeyCode,
+) -> DeleteAction {
+    use crossterm::event::KeyCode;
+    const VISIBLE: usize = 12;
+
+    match state.stage {
+        DeleteStage::Confirming => match key {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => DeleteAction::Execute {
+                ids: std::mem::take(&mut state.confirm_ids),
+                scope: state.filter,
+            },
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                state.stage = DeleteStage::Selecting;
+                state.confirm_ids.clear();
+                DeleteAction::None
+            }
+            _ => DeleteAction::None,
+        },
+        DeleteStage::Selecting => match key {
+            KeyCode::Esc | KeyCode::Char('q') => DeleteAction::Close,
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.cursor = state.cursor.saturating_sub(1);
+                if state.cursor < state.scroll_offset {
+                    state.scroll_offset = state.cursor;
+                }
+                DeleteAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = state.visible().len();
+                if len > 0 && state.cursor + 1 < len {
+                    state.cursor += 1;
+                }
+                if state.cursor >= state.scroll_offset + VISIBLE {
+                    state.scroll_offset = state.cursor + 1 - VISIBLE;
+                }
+                DeleteAction::None
+            }
+            KeyCode::Char(' ') => {
+                if let Some(id) = state.visible().get(state.cursor).map(|e| e.id.clone())
+                    && !state.checked.remove(&id) {
+                        state.checked.insert(id);
+                    }
+                DeleteAction::None
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                state.filter = state.filter.next();
+                state.cursor = 0;
+                state.scroll_offset = 0;
+                DeleteAction::None
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                state.filter = state.filter.prev();
+                state.cursor = 0;
+                state.scroll_offset = 0;
+                DeleteAction::None
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Toggle select-all within the current filter view.
+                let visible_ids: Vec<String> =
+                    state.visible().iter().map(|e| e.id.clone()).collect();
+                let all_checked = !visible_ids.is_empty()
+                    && visible_ids.iter().all(|id| state.checked.contains(id));
+                for id in visible_ids {
+                    if all_checked {
+                        state.checked.remove(&id);
+                    } else {
+                        state.checked.insert(id);
+                    }
+                }
+                DeleteAction::None
+            }
+            KeyCode::Enter => {
+                let targets = state.confirm_targets();
+                if targets.is_empty() {
+                    return DeleteAction::None;
+                }
+                state.confirm_ids = targets;
+                state.stage = DeleteStage::Confirming;
+                DeleteAction::None
+            }
+            _ => DeleteAction::None,
+        },
+    }
 }
 
 pub fn handle_question_key(qs: &mut QuestionState, key: crossterm::event::KeyCode) -> Option<String> {
@@ -532,5 +786,137 @@ impl QuestionState {
         } else if self.selected >= self.scroll_offset + VISIBLE {
             self.scroll_offset = self.selected + 1 - VISIBLE;
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_picker_tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    fn entry(id: &str, local: bool, remote: bool) -> DeleteEntry {
+        DeleteEntry {
+            id: id.to_string(),
+            title: format!("title-{id}"),
+            local,
+            remote,
+            updated_at: String::new(),
+        }
+    }
+
+    fn state(filter: SessionScope) -> DeleteSessionsState {
+        DeleteSessionsState::new(
+            vec![entry("both", true, true), entry("loc", true, false), entry("rem", false, true)],
+            filter,
+            RemoteListStatus::Ready,
+        )
+    }
+
+    #[test]
+    fn filter_controls_visibility() {
+        let mut s = state(SessionScope::All);
+        assert_eq!(s.visible().len(), 3);
+        s.filter = SessionScope::Local;
+        assert_eq!(s.visible().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["both", "loc"]);
+        s.filter = SessionScope::Remote;
+        assert_eq!(s.visible().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["both", "rem"]);
+    }
+
+    #[test]
+    fn tab_cycles_filter_and_resets_cursor() {
+        let mut s = state(SessionScope::All);
+        s.cursor = 2;
+        assert_eq!(handle_delete_sessions_key(&mut s, KeyCode::Tab), DeleteAction::None);
+        assert_eq!(s.filter, SessionScope::Local);
+        assert_eq!(s.cursor, 0);
+        handle_delete_sessions_key(&mut s, KeyCode::Tab);
+        assert_eq!(s.filter, SessionScope::Remote);
+        handle_delete_sessions_key(&mut s, KeyCode::Tab);
+        assert_eq!(s.filter, SessionScope::All);
+        handle_delete_sessions_key(&mut s, KeyCode::BackTab);
+        assert_eq!(s.filter, SessionScope::Remote);
+    }
+
+    #[test]
+    fn space_toggles_check_and_enter_confirms_checked_visible_only() {
+        let mut s = state(SessionScope::All);
+        handle_delete_sessions_key(&mut s, KeyCode::Char(' ')); // check "both"
+        handle_delete_sessions_key(&mut s, KeyCode::Down);
+        handle_delete_sessions_key(&mut s, KeyCode::Char(' ')); // check "loc"
+        assert!(s.checked.contains("both") && s.checked.contains("loc"));
+
+        // Under the Remote filter only "both" of the checked set is visible —
+        // confirm must target just that one (what you see is what you delete).
+        s.filter = SessionScope::Remote;
+        handle_delete_sessions_key(&mut s, KeyCode::Enter);
+        assert_eq!(s.stage, DeleteStage::Confirming);
+        assert_eq!(s.confirm_ids, vec!["both".to_string()]);
+
+        // Execute binds the scope to the active filter.
+        let action = handle_delete_sessions_key(&mut s, KeyCode::Enter);
+        assert_eq!(
+            action,
+            DeleteAction::Execute { ids: vec!["both".to_string()], scope: SessionScope::Remote }
+        );
+    }
+
+    #[test]
+    fn enter_with_nothing_checked_targets_cursor_row() {
+        let mut s = state(SessionScope::Local);
+        handle_delete_sessions_key(&mut s, KeyCode::Down); // cursor -> "loc"
+        handle_delete_sessions_key(&mut s, KeyCode::Enter);
+        assert_eq!(s.confirm_ids, vec!["loc".to_string()]);
+    }
+
+    #[test]
+    fn confirm_stage_backs_out_on_n_or_esc() {
+        let mut s = state(SessionScope::All);
+        handle_delete_sessions_key(&mut s, KeyCode::Enter);
+        assert_eq!(s.stage, DeleteStage::Confirming);
+        assert_eq!(handle_delete_sessions_key(&mut s, KeyCode::Char('n')), DeleteAction::None);
+        assert_eq!(s.stage, DeleteStage::Selecting);
+        assert!(s.confirm_ids.is_empty());
+    }
+
+    #[test]
+    fn select_all_toggles_within_filter_view() {
+        let mut s = state(SessionScope::Local);
+        handle_delete_sessions_key(&mut s, KeyCode::Char('a'));
+        assert!(s.checked.contains("both") && s.checked.contains("loc") && !s.checked.contains("rem"));
+        handle_delete_sessions_key(&mut s, KeyCode::Char('a'));
+        assert!(s.checked.is_empty());
+    }
+
+    #[test]
+    fn merge_remote_marks_existing_and_appends_new() {
+        let mut s = DeleteSessionsState::new(
+            vec![entry("shared", true, false), entry("local-only", true, false)],
+            SessionScope::All,
+            RemoteListStatus::Loading,
+        );
+        s.merge_remote(vec![
+            crate::provider::RemoteSessionInfo {
+                id: "shared".to_string(),
+                title: "remote title".to_string(),
+                updated_at: Some("2026-07-03T00:00:00Z".to_string()),
+            },
+            crate::provider::RemoteSessionInfo {
+                id: "remote-only".to_string(),
+                title: "fresh".to_string(),
+                updated_at: None,
+            },
+        ]);
+        assert_eq!(s.remote_status, RemoteListStatus::Ready);
+        let shared = s.entries.iter().find(|e| e.id == "shared").unwrap();
+        assert!(shared.local && shared.remote);
+        let fresh = s.entries.iter().find(|e| e.id == "remote-only").unwrap();
+        assert!(!fresh.local && fresh.remote);
+        assert_eq!(s.entries.len(), 3);
+    }
+
+    #[test]
+    fn escape_closes_from_selecting() {
+        let mut s = state(SessionScope::All);
+        assert_eq!(handle_delete_sessions_key(&mut s, KeyCode::Esc), DeleteAction::Close);
     }
 }

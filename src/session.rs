@@ -139,6 +139,24 @@ pub fn list_sessions(_config: &Config) -> AppResult<Vec<SessionSummary>> {
     Ok(sessions)
 }
 
+/// Does a locally stored session file exist for this id? Cheaper than
+/// `load_local` (no read/parse) and indifferent to version mismatches —
+/// `/delete` must offer to remove even files this build can't load.
+pub fn local_exists(id: &str) -> bool {
+    Config::sessions_dir().join(format!("{id}.json")).exists()
+}
+
+/// Delete a locally stored session file. Returns `false` when no such file
+/// existed (not an error — `/delete` treats "already gone" as success).
+pub fn delete_local(id: &str, _config: &Config) -> AppResult<bool> {
+    let path = Config::sessions_dir().join(format!("{id}.json"));
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path)?;
+    Ok(true)
+}
+
 pub fn timestamp_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }

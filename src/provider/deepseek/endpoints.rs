@@ -89,6 +89,13 @@ impl DeepseekProvider {
     }
 }
 
+/// The `fetch_page` response's `biz_data` — the session array arrives under
+/// `chat_sessions`, not a generic `items` field.
+#[derive(Debug, serde::Deserialize)]
+struct FetchSessionsBizData {
+    chat_sessions: Vec<types::ChatSession>,
+}
+
 impl DeepseekProvider {
     // ─── Session Management ────────────────────────────────────
 
@@ -104,6 +111,19 @@ impl DeepseekProvider {
         }
         Ok(())
     }
+
+    /// Fetch the account's remote session list (first page).
+    pub async fn fetch_remote_sessions(
+        &self,
+        pinned: Option<bool>,
+    ) -> AppResult<Vec<types::ChatSession>> {
+        let mut url = FETCH_SESSIONS_URL.to_string();
+        if let Some(p) = pinned {
+            url.push_str(&format!("?lte_cursor.pinned={p}"));
+        }
+        let data: FetchSessionsBizData = self.get_biz("sessions.fetch", &url).await?;
+        Ok(data.chat_sessions)
+    }
 }
 
 // See the module doc comment for why this block is suppressed rather than
@@ -111,17 +131,6 @@ impl DeepseekProvider {
 // verified-dead litter.
 #[allow(dead_code)]
 impl DeepseekProvider {
-    /// Fetch paginated list of remote sessions.
-    pub async fn fetch_remote_sessions(
-        &self,
-        pinned: Option<bool>,
-    ) -> AppResult<types::PaginatedResponse<types::ChatSession>> {
-        let mut url = FETCH_SESSIONS_URL.to_string();
-        if let Some(p) = pinned {
-            url.push_str(&format!("?lte_cursor.pinned={p}"));
-        }
-        self.get_biz("sessions.fetch", &url).await
-    }
 
     /// Delete all remote sessions.
     pub async fn delete_all_remote_sessions(&self) -> AppResult<()> {

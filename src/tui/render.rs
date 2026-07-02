@@ -803,7 +803,221 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
         }
         Modal::Picker(picker) => render_picker(frame, area, picker, theme),
         Modal::Question(qs) => render_question(frame, area, qs, theme),
+        Modal::DeleteSessions(st) => render_delete_sessions(frame, area, st, theme),
     }
+}
+
+fn render_delete_sessions(
+    frame: &mut Frame,
+    area: Rect,
+    st: &crate::app::events::DeleteSessionsState,
+    theme: &Theme,
+) {
+    use crate::app::events::{DeleteStage, RemoteListStatus, SessionScope};
+
+    // ── Confirmation stage: compact warning box ──
+    if st.stage == DeleteStage::Confirming {
+        let popup_width = area.width.clamp(44, 66);
+        let popup_h = 8u16.min(area.height.saturating_sub(2));
+        let x = (area.width.saturating_sub(popup_width)) / 2;
+        let y = (area.height.saturating_sub(popup_h)) / 2;
+        let popup_area = Rect::new(x, y, popup_width, popup_h);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.error))
+            .title(" \u{1F5D1} Confirm deletion ")
+            .title_style(Style::default().fg(theme.error).add_modifier(Modifier::BOLD))
+            .style(Style::default().bg(theme.panel));
+        let inner = block.inner(popup_area);
+
+        let n = st.confirm_ids.len();
+        let scope_text = match st.filter {
+            SessionScope::All => "everywhere: DeepSeek account + local files",
+            SessionScope::Local => "local files only (account copies stay)",
+            SessionScope::Remote => "DeepSeek account only (local files stay)",
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                format!(
+                    " Are you sure you want to delete {n} session{}?",
+                    if n == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(" Scope: {scope_text}"),
+                Style::default().fg(theme.text_soft),
+            )),
+            Line::from(Span::styled(
+                " This action is irreversible.",
+                Style::default().fg(theme.error),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Enter/y — delete    n/Esc — back",
+                Style::default().fg(theme.text_dim),
+            )),
+        ];
+
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(block, popup_area);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+            inner,
+        );
+        return;
+    }
+
+    // ── Selection stage: filter tabs + checkbox list ──
+    const VISIBLE: usize = 12;
+    let visible_entries = st.visible();
+    let rows = visible_entries.len().clamp(3, VISIBLE);
+    let popup_width = area.width.clamp(52, 84);
+    let popup_h = ((rows + 7) as u16).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.warning))
+        .title(" \u{1F5D1} Delete sessions ")
+        .title_style(Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(theme.panel));
+    let inner = block.inner(popup_area);
+    let inner_w = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Filter tabs + remote-list status.
+    let mut tab_spans: Vec<Span> = vec![Span::styled(" ", Style::default().bg(theme.panel))];
+    for scope in [SessionScope::All, SessionScope::Local, SessionScope::Remote] {
+        let active = scope == st.filter;
+        let style = if active {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.selection)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim).bg(theme.panel)
+        };
+        tab_spans.push(Span::styled(format!(" {} ", scope.label()), style));
+        tab_spans.push(Span::styled(" ", Style::default().bg(theme.panel)));
+    }
+    let remote_note = match &st.remote_status {
+        RemoteListStatus::Loading => " remote: loading\u{2026}".to_string(),
+        RemoteListStatus::Failed(e) => format!(" remote: failed ({})", truncate(e, 24)),
+        RemoteListStatus::NoProvider => " remote: no provider".to_string(),
+        RemoteListStatus::Ready => String::new(),
+    };
+    if !remote_note.is_empty() {
+        tab_spans.push(Span::styled(
+            remote_note,
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        ));
+    }
+    lines.push(Line::from(tab_spans));
+
+    let sep = "\u{2500}".repeat(inner_w.saturating_sub(4));
+    lines.push(Line::from(Span::styled(
+        format!("  {sep}"),
+        Style::default().fg(theme.border).bg(theme.panel),
+    )));
+
+    if visible_entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no sessions under this filter)",
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        )));
+    }
+
+    let end = (st.scroll_offset + VISIBLE).min(visible_entries.len());
+    if st.scroll_offset > 0 {
+        lines.push(Line::from(Span::styled(
+            "  \u{2191} more ",
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        )));
+    }
+    for (i, entry) in visible_entries
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(st.scroll_offset)
+    {
+        let is_cursor = i == st.cursor;
+        let is_checked = st.checked.contains(&entry.id);
+        let bg = if is_cursor { theme.selection } else { theme.panel };
+
+        let checkbox = if is_checked { "\u{2611} " } else { "\u{2610} " };
+        let badge = match (entry.local, entry.remote) {
+            (true, true) => "[L+G]",
+            (true, false) => "[L]  ",
+            (false, true) => "[G]  ",
+            (false, false) => "[?]  ",
+        };
+        let date = entry.updated_at.chars().take(10).collect::<String>();
+        let title_budget = inner_w.saturating_sub(14 + date.len());
+        let title = truncate(&entry.title, title_budget);
+
+        lines.push(Line::from(vec![
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(
+                checkbox,
+                Style::default()
+                    .fg(if is_checked { theme.warning } else { theme.text_dim })
+                    .bg(bg),
+            ),
+            Span::styled(
+                format!("{badge} "),
+                Style::default().fg(theme.accent_dim).bg(bg),
+            ),
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(if is_cursor { theme.fg } else { theme.text_soft })
+                    .bg(bg),
+            ),
+            Span::styled(
+                format!("  {date}"),
+                Style::default().fg(theme.text_dim).bg(bg),
+            ),
+        ]));
+    }
+    if end < visible_entries.len() {
+        lines.push(Line::from(Span::styled(
+            "  \u{2193} more ",
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        )));
+    }
+
+    while lines.len() < inner.height.saturating_sub(2) as usize {
+        lines.push(Line::from(Span::styled(
+            " ".repeat(inner_w),
+            Style::default().bg(theme.panel),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  {sep}"),
+        Style::default().fg(theme.border).bg(theme.panel),
+    )));
+    let checked_visible = visible_entries
+        .iter()
+        .filter(|e| st.checked.contains(&e.id))
+        .count();
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {checked_visible} selected \u{00B7} \u{2191}\u{2193} move  Space select  A all  Tab filter  Enter delete  Esc close"
+        ),
+        Style::default().fg(theme.text_dim).bg(theme.panel),
+    )));
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+        inner,
+    );
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Theme) {

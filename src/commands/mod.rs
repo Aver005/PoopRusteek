@@ -46,6 +46,12 @@ pub enum CommandResult {
     SpawnAgent(String),
     /// `/agents` — open the running-agents picker (to stop them).
     OpenAgents,
+    /// `/delete` / `/delete-local` — open the session-deletion picker (or,
+    /// with an explicit id, jump straight to its confirmation step).
+    OpenDeleteSessions {
+        scope: crate::app::events::SessionScope,
+        session_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +125,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::chats::ChatsCommand));
         self.register(Box::new(defs::agent::AgentCommand));
         self.register(Box::new(defs::agent::AgentsCommand));
+        self.register(Box::new(defs::delete::DeleteCommand));
+        self.register(Box::new(defs::delete::DeleteLocalCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

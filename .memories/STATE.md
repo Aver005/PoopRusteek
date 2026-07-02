@@ -30,9 +30,9 @@
 1. Stability/perf overhaul (2026-07-02) is done — all 7 audit criticals + ~30 majors fixed, dead code swept, clippy clean. See `reference/AUDIT-2026-07-02.md`.
 2. Next candidates (in rough priority order):
    - `keys.rs` decomposition: key→intent + intent→effect split (testable without a live `App`). Not started.
-   - `deepseek.rs` split (endpoints/http/session/stream) + dedupe the ~26 unused REST wrappers currently parked in a `#[allow(dead_code)]` impl block.
-   - Dependency major-version bumps: `reqwest` 0.13, `ratatui` 0.30.2 + `crossterm` 0.29, `pulldown-cmark` 0.13, `toml` 1.x.
-   - PoW wasm: embed via `include_bytes!` (today it is read from `assets/` resolved through compile-time `CARGO_MANIFEST_DIR`/cwd/exe-dir — an installed binary breaks if the source checkout moves). Native SHA-3 reimpl REJECTED by owner (2026-07): the point of the workaround is executing DeepSeek's own solver. Stretch: fetch the wasm the server references at runtime (real rotation-resilience).
+   - ~~deepseek.rs split~~ DONE 2026-07-03: `provider/deepseek/{mod,http,session,stream,endpoints}.rs`, 8/26 wrappers deduped onto `post_biz`/`get_biz`.
+   - ~~Dependency bumps~~ DONE 2026-07-03: reqwest 0.13 (`rustls-tls`→`rustls` feature), ratatui 0.30 + crossterm 0.29, pulldown-cmark 0.13, toml 1.x — zero source changes forced.
+   - ~~PoW wasm embed~~ DONE 2026-07-03: `include_bytes!` with a disk-file override for dev drop-ins. Native SHA-3 reimpl remains REJECTED by owner; stretch: fetch the server-referenced wasm at runtime (real rotation-resilience).
 3. Phase-4 polish (multi-theme on hold; mouse, copy/paste, error recovery).
 4. MCP tool-arg schema validation (still absent).
 
@@ -44,10 +44,7 @@
 - DeepSeek streaming never reports token usage (`usage` always None).
 - Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`
 - No persistent RAG / codebase search.
-- PoW wasm read from a loose `assets/` file (not embedded); `wasmtime` stays by owner decision — see CURRENT FOCUS.
-- `deepseek.rs` still a large multi-responsibility file; split (endpoints/http/session/stream) planned, along with REST-wrapper dedupe.
 - `keys.rs` decomposition (key→intent/intent→effect) planned, not started.
-- DeepSeek remote-session leak: `delete_remote_session` has zero call sites — sessions accumulate on the DeepSeek account unbounded.
 - Foreground child PID tracking is a single global slot, not per-conversation (also an upward `tools`→`app` dependency).
 - PoW challenge solved once per request, not re-solved per retry attempt; solve runs on the async task rather than `spawn_blocking`.
 - `"model"` field is hardcoded `"deepseek-chat"` in the request body, ignoring user config.

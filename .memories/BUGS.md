@@ -16,7 +16,6 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 - `[BUG]` PoW challenge is solved once before the retry loop (not re-solved per attempt) and the solve runs on the async task instead of `spawn_blocking`, competing with the executor. `→ src/provider/pow.rs` + `src/provider/deepseek.rs`
 - `[BUG]` Legacy `[TOOL:name] {json}` regex uses a non-nesting brace pattern and can't parse nested JSON objects. `→ src/agent/tool_parser.rs`
 - `[BUG]` Fenced code-block examples containing tool-call syntax can be parsed and executed as real tool calls during auto-approve (background) turns. `→ src/agent/tool_parser.rs`
-- `[BUG]` DeepSeek remote chat sessions are created on fork/new-chat but never deleted — `delete_remote_session` is fully implemented with **zero call sites**, so the DeepSeek account accumulates junk sessions unboundedly. `→ src/provider/deepseek.rs` (`delete_remote_session`)
 
 ## LOW
 
@@ -31,11 +30,13 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 
 ## WONTFIX / ACCEPTED
 
-- `[?]` PoW runs DeepSeek's own wasm blob via `wasmtime` (heavy dep, repo blob). Native SHA-3 reimpl REJECTED by owner (2026-07): the workaround must execute upstream's solver as-is. Remaining improvements: `include_bytes!` the wasm (binary currently breaks without `assets/` reachable), optionally fetch the server-referenced wasm at runtime.
+- `[?]` PoW runs DeepSeek's own wasm blob via `wasmtime` (heavy dep, repo blob). Native SHA-3 reimpl REJECTED by owner (2026-07): the workaround must execute upstream's solver as-is. The wasm is now embedded via `include_bytes!` (2026-07-03; a file in `assets/` still overrides for dev drop-ins). Remaining stretch: fetch the server-referenced wasm at runtime.
 - `[?]` DeepSeek web API is reverse-engineered; may break on any server update. No SLA.
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **2026-07-03 follow-ups** — ephemeral remote-session leak fixed: `LLMProvider::discard_remote_session` wired into sidechat/sub-agent finalize, stop, foreground `task` forks, and (bounded, 3s) app exit; user-facing `/delete [id]` + `/delete-local [id]` added (shared multi-select picker, All/Local/Remote filter = deletion scope, confirm step, background remote fetch/delete via `RemoteSessionsListed`/`SessionsDeleted` events); `deepseek.rs` split into `deepseek/{mod,http,session,stream,endpoints}.rs`; deps bumped (reqwest 0.13, ratatui 0.30, crossterm 0.29, pulldown-cmark 0.13, toml 1.x); PoW wasm embedded via `include_bytes!`.
 
 - ✅ **2026-07-02 refactor session** — see `reference/AUDIT-2026-07-02.md` for full detail; `JOURNAL/2026-07-02.md` for the session narrative. One line per subsystem:
   - **Streaming**: `complete_stream` now spawned as a task so the 120s idle guard races the live network call; reqwest client got `connect_timeout(10s)`/`read_timeout(120s)`; stray `gzip` header removed; `SseLineBuffer` rewritten byte-based with a 4MiB cap (was unbounded + O(n²)).

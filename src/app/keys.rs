@@ -226,6 +226,23 @@ impl App {
                     }
                     return Ok(false);
                 }
+                Modal::DeleteSessions(mut st) => {
+                    match events::handle_delete_sessions_key(&mut st, key.code) {
+                        events::DeleteAction::None => {
+                            self.state.modal = Some(Modal::DeleteSessions(st));
+                        }
+                        events::DeleteAction::Close => {
+                            self.state.modal = None;
+                            self.present_next_interaction().await;
+                        }
+                        events::DeleteAction::Execute { ids, scope } => {
+                            self.state.modal = None;
+                            self.execute_delete_sessions(ids, scope, st.entries).await;
+                            self.present_next_interaction().await;
+                        }
+                    }
+                    return Ok(false);
+                }
                 Modal::Question(mut qs) => {
                     let result = events::handle_question_key(&mut qs, key.code);
                     if let Some(answer) = result {
@@ -498,6 +515,9 @@ impl App {
                                 }
                                 CommandResult::OpenAgents => {
                                     self.open_agents_picker().await;
+                                }
+                                CommandResult::OpenDeleteSessions { scope, session_id } => {
+                                    self.open_delete_sessions(scope, session_id);
                                 }
                                 CommandResult::Error(err) => {
                                     self.state.focused_mut().messages.push(ChatMessage::system(&err));

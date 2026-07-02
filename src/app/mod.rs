@@ -546,6 +546,33 @@ impl App {
             AppEvent::SessionFetched { conversation, session_id, result } => {
                 self.apply_fetched_session(conversation, &session_id, result).await;
             }
+            AppEvent::RemoteSessionsListed { result } => {
+                if let Some(Modal::DeleteSessions(st)) = self.state.modal.as_mut() {
+                    match result {
+                        Ok(sessions) => st.merge_remote(sessions),
+                        Err(e) => st.remote_status = events::RemoteListStatus::Failed(e),
+                    }
+                }
+            }
+            AppEvent::SessionsDeleted { deleted, failed } => {
+                let mut message = format!(
+                    "🗑 Deleted {deleted} session cop{}",
+                    if deleted == 1 { "y" } else { "ies" }
+                );
+                if !failed.is_empty() {
+                    message.push_str(&format!(
+                        "; {} failed:\n  {}",
+                        failed.len(),
+                        failed.join("\n  ")
+                    ));
+                }
+                self.state.status_message = if failed.is_empty() {
+                    "Sessions deleted".to_string()
+                } else {
+                    "Some session deletions failed".to_string()
+                };
+                self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+            }
             AppEvent::McpOperationDone { message } => {
                 self.state.mcp_status.view.status_message = message.clone();
                 self.state.status_message = message.clone();
@@ -859,6 +886,151 @@ impl App {
         }
         self.state.status_message =
             format!("Imported remote session {session_id}: {title} ({count} msgs)");
+    }
+
+    /// Open the `/delete` picker. Local sessions seed the list synchronously
+    /// (fast disk scan); the remote list arrives via `RemoteSessionsListed`
+    /// from a spawned fetch so the event loop never waits on the network.
+    fn open_delete_sessions(
+        &mut self,
+        scope: events::SessionScope,
+        session_id: Option<String>,
+    ) {
+        use events::{DeleteEntry, DeleteSessionsState, DeleteStage, RemoteListStatus};
+
+        let provider = self.state.focused().provider.clone();
+
+        // Direct-id form (`/delete <id>`): jump straight to confirmation.
+        if let Some(id) = session_id {
+            let entry = DeleteEntry {
+                id: id.clone(),
+                title: id.clone(),
+                local: crate::session::local_exists(&id),
+                // Unknown without a fetch — assume deletable remotely when a
+                // provider exists; a "not found" upstream is reported softly.
+                remote: provider.is_some(),
+                updated_at: String::new(),
+            };
+            let mut st = DeleteSessionsState::new(
+                vec![entry],
+                scope,
+                if provider.is_some() {
+                    RemoteListStatus::Ready
+                } else {
+                    RemoteListStatus::NoProvider
+                },
+            );
+            st.confirm_ids = vec![id];
+            st.stage = DeleteStage::Confirming;
+            self.state.modal = Some(Modal::DeleteSessions(st));
+            return;
+        }
+
+        let entries: Vec<DeleteEntry> = crate::session::list_sessions(&self.config)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| DeleteEntry {
+                id: s.id,
+                title: s.title,
+                local: true,
+                remote: false,
+                updated_at: s.updated_at,
+            })
+            .collect();
+
+        let remote_status = match &provider {
+            Some(provider) => {
+                let provider = Arc::clone(provider);
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let result = provider
+                        .list_remote_sessions()
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = event_tx.send(AppEvent::RemoteSessionsListed { result });
+                });
+                RemoteListStatus::Loading
+            }
+            None => RemoteListStatus::NoProvider,
+        };
+
+        self.state.modal = Some(Modal::DeleteSessions(DeleteSessionsState::new(
+            entries,
+            scope,
+            remote_status,
+        )));
+    }
+
+    /// Perform a confirmed `/delete`. Local files are removed synchronously
+    /// (fast fs ops); remote deletions run in a spawned batch that reports
+    /// back via `SessionsDeleted`. The scope decides WHERE ids are deleted:
+    /// `All` = both copies, `Local` = disk only, `Remote` = account only.
+    async fn execute_delete_sessions(
+        &mut self,
+        ids: Vec<String>,
+        scope: events::SessionScope,
+        entries: Vec<events::DeleteEntry>,
+    ) {
+        use events::SessionScope as Scope;
+
+        let mut deleted = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        let mut remote_ids: Vec<String> = Vec::new();
+        let mut touched_focused = false;
+
+        for id in &ids {
+            let entry = entries.iter().find(|e| &e.id == id);
+            let (has_local, has_remote) =
+                entry.map(|e| (e.local, e.remote)).unwrap_or((true, true));
+
+            if matches!(scope, Scope::All | Scope::Local) && has_local {
+                match crate::session::delete_local(id, &self.config) {
+                    Ok(true) => deleted += 1,
+                    Ok(false) => {}
+                    Err(e) => failed.push(format!("{id} (local: {e})")),
+                }
+            }
+            if matches!(scope, Scope::All | Scope::Remote) && has_remote {
+                remote_ids.push(id.clone());
+            }
+            if self.state.focused().session_id == *id {
+                touched_focused = true;
+            }
+        }
+
+        // The focused chat's session was among the targets — reset the
+        // provider's threading so the next message starts a clean session
+        // instead of posting onto a deleted remote thread.
+        if touched_focused
+            && let Some(provider) = self.state.focused().provider.clone() {
+                let _ = provider.reset().await;
+            }
+
+        if remote_ids.is_empty() {
+            let _ = self
+                .event_tx
+                .send(AppEvent::SessionsDeleted { deleted, failed });
+            return;
+        }
+
+        let provider = self.state.focused().provider.clone();
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let mut deleted = deleted;
+            let mut failed = failed;
+            match provider {
+                Some(provider) => {
+                    for id in remote_ids {
+                        match provider.delete_remote_session_by_id(&id).await {
+                            Ok(()) => deleted += 1,
+                            Err(e) => failed.push(format!("{id} (remote: {e})")),
+                        }
+                    }
+                }
+                None => failed.push("remote deletion unavailable: no provider".to_string()),
+            }
+            let _ = event_tx.send(AppEvent::SessionsDeleted { deleted, failed });
+        });
     }
 
     fn record_gen_stats(&mut self) {

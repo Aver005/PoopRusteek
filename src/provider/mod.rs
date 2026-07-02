@@ -183,6 +183,15 @@ impl ChatMessage {
     }
 }
 
+/// A server-side chat session as shown in the `/delete` picker.
+#[derive(Debug, Clone)]
+pub struct RemoteSessionInfo {
+    pub id: String,
+    pub title: String,
+    /// RFC 3339, when the provider reports it.
+    pub updated_at: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttachedFile {
     pub display_name: String,
@@ -260,6 +269,25 @@ pub trait LLMProvider: Send + Sync {
     /// continue them from the web UI. Default: nothing to clean.
     async fn discard_remote_session(&self) -> crate::error::AppResult<()> {
         Ok(())
+    }
+
+    /// List the account's server-side chat sessions (for `/delete`).
+    /// Default: unsupported.
+    async fn list_remote_sessions(&self) -> crate::error::AppResult<Vec<RemoteSessionInfo>> {
+        Err(crate::error::AppError::Custom(
+            "Remote session listing not supported by this provider".to_string(),
+        ))
+    }
+
+    /// Delete a server-side session by its id (for `/delete`).
+    /// Default: unsupported.
+    async fn delete_remote_session_by_id(
+        &self,
+        _session_id: &str,
+    ) -> crate::error::AppResult<()> {
+        Err(crate::error::AppError::Custom(
+            "Remote session deletion not supported by this provider".to_string(),
+        ))
     }
 
     async fn fetch_remote_session_messages(

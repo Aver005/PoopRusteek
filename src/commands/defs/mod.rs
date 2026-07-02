@@ -25,3 +25,4 @@ pub mod ps;
 pub mod btw;
 pub mod chats;
 pub mod agent;
+pub mod delete;

@@ -103,6 +103,7 @@ On first launch, an onboarding flow helps you set your DeepSeek token and model.
 | `/compact` | Summarize history to shrink context |
 | `/reset` · `/last` | Reset session · open the most recent session |
 | `/load <id>` · `/sessions` · `/session` | Load a session · list sessions · current session info |
+| `/delete [id]` · `/delete-local [id]` | Delete sessions — account + local, or local-only; multi-select picker with an All/Local/Remote filter and a confirm step |
 | `/export [path]` · `/import <path.md>` | Export / import chat as Markdown |
 | `/cwd` (`/cd`, `/move`) `<path>` | Change working directory |
 | `/attach <path…>` | Attach files to the next message |

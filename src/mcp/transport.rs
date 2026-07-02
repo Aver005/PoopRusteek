@@ -286,7 +286,7 @@ impl HttpTransport {
 /// gap between individual reads of a streaming (SSE) body — a stalled
 /// stream with no bytes for 60s is treated the same as a stalled non-stream
 /// response, rather than being able to hang indefinitely past the request
-/// timeout by trickling bytes just often enough (reqwest 0.12 supports both
+/// timeout by trickling bytes just often enough (reqwest supports both
 /// knobs directly on `ClientBuilder`, so there is no residual gap to
 /// document here).
 fn build_http_client() -> AppResult<reqwest::Client> {
