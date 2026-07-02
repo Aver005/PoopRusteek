@@ -16,11 +16,11 @@ tokio = { version = "1", features = ["full"] }
 # TUI
 # `unstable-rendered-line-info` exposes Paragraph::line_count — the real
 # WordWrapper row count used for scroll math (estimates diverge on CJK/wrap).
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "stream", "cookies", "rustls-tls", "multipart"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "stream", "cookies", "rustls", "multipart"], default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +34,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
 # Config
-toml = "0.8"
+toml = "1"
 dirs = "6"
 
 # Logging / tracing
@@ -46,7 +46,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # Markdown / syntax
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 # Misc

@@ -266,6 +266,25 @@ impl App {
                 handle.abort();
             }
         }
+        // Ephemeral conversations' remote sessions die with them. Bounded —
+        // exiting must not hang on a dead network.
+        let discards: Vec<_> = self
+            .state
+            .conversations
+            .iter()
+            .filter(|c| c.is_background_kind())
+            .filter_map(|c| c.provider.clone())
+            .map(|provider| async move {
+                let _ = provider.discard_remote_session().await;
+            })
+            .collect();
+        if !discards.is_empty() {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                futures::future::join_all(discards),
+            )
+            .await;
+        }
         // Kill all background/PTY processes so spawn_blocking waiters unblock
         // and the tokio runtime can shut down cleanly.
         let _ = crate::tools::background::shutdown_all().await;

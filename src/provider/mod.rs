@@ -253,6 +253,15 @@ pub trait LLMProvider: Send + Sync {
         Ok(())
     }
 
+    /// Delete this instance's server-side session, if one was created.
+    /// Called when an ephemeral conversation (sidechat / sub-agent fork) is
+    /// discarded, so one-shot runs don't pile up junk chats on the user's
+    /// account. Main chats are never discarded — the user may want to
+    /// continue them from the web UI. Default: nothing to clean.
+    async fn discard_remote_session(&self) -> crate::error::AppResult<()> {
+        Ok(())
+    }
+
     async fn fetch_remote_session_messages(
         &self,
         _session_id: &str,

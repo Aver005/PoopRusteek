@@ -233,7 +233,8 @@ pub async fn run_agent_loop(
                             name: "task".to_string(),
                         });
                         let sub_provider = provider.fork();
-                        match crate::agent::sub_agent::run_sub_agent(
+                        let session_cleanup = Arc::clone(&sub_provider);
+                        let outcome = match crate::agent::sub_agent::run_sub_agent(
                             sub_provider,
                             Arc::clone(&tools),
                             Arc::clone(&mcp),
@@ -249,7 +250,13 @@ pub async fn run_agent_loop(
                         {
                             Ok(text) => (text, false),
                             Err(e) => (format!("Sub-agent failed: {e}"), true),
-                        }
+                        };
+                        // The fork is one-shot — delete its server-side
+                        // session so it doesn't linger on the account.
+                        tokio::spawn(async move {
+                            let _ = session_cleanup.discard_remote_session().await;
+                        });
+                        outcome
                     }
                 }
             } else {

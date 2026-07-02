@@ -7,12 +7,19 @@ use std::sync::OnceLock;
 use wasmtime::{Engine, Linker, Memory, Module, Store, TypedFunc};
 
 const WASM_ASSET_NAME: &str = "sha3_wasm_bg.7b9ca65ddd.wasm";
+/// DeepSeek's own solver, embedded so an installed binary works with no
+/// `assets/` folder nearby (the compile-time `CARGO_MANIFEST_DIR` fallback
+/// broke as soon as the source checkout moved). A file on disk still wins —
+/// see [`WasmPowRuntime::load`].
+const EMBEDDED_WASM: &[u8] = include_bytes!("../../assets/sha3_wasm_bg.7b9ca65ddd.wasm");
 static WASM_RUNTIME: OnceLock<Result<WasmPowRuntime, String>> = OnceLock::new();
 
 struct WasmPowRuntime {
     engine: Engine,
     module: Module,
-    path: PathBuf,
+    /// Where the wasm bytes came from ("embedded" or a filesystem path) —
+    /// debug-log only.
+    source: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,7 +87,7 @@ pub fn solve_pow(challenge: &PowChallengeData) -> Option<PowSolution> {
     let runtime = get_wasm_runtime().ok()?;
     debug_log::log(
         "pow.solver.runtime",
-        format!("using wasm asset {}", runtime.path.display()),
+        format!("using wasm asset from {}", runtime.source),
     );
 
     let answer = runtime
@@ -122,13 +129,24 @@ fn get_wasm_runtime() -> Result<&'static WasmPowRuntime, String> {
 
 impl WasmPowRuntime {
     fn load() -> Result<Self, String> {
-        let path = resolve_wasm_path()
-            .ok_or_else(|| "WASM file not found in any candidate location".to_string())?;
-        let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+        // A wasm file on disk (dev checkout / manual drop-in) overrides the
+        // embedded copy, so a newer upstream solver takes effect without a
+        // rebuild; with no file anywhere the binary is self-contained.
+        let (bytes, source) = match resolve_wasm_path() {
+            Some(path) => {
+                let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+                let source = path.display().to_string();
+                (std::borrow::Cow::Owned(bytes), source)
+            }
+            None => (
+                std::borrow::Cow::Borrowed(EMBEDDED_WASM),
+                "embedded".to_string(),
+            ),
+        };
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &bytes).map_err(|error| error.to_string())?;
 
-        Ok(Self { engine, module, path })
+        Ok(Self { engine, module, source })
     }
 
     fn solve(&self, challenge: &str, prefix: &str, difficulty: f64) -> Result<Option<u64>, String> {

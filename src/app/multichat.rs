@@ -9,6 +9,20 @@ use crate::error::AppResult;
 use crate::provider::{ChatMessage, Role};
 use std::sync::Arc;
 
+/// Fire-and-forget deletion of an ephemeral conversation's server-side
+/// session — one-shot sidechat/sub-agent runs must not pile up junk chats on
+/// the user's DeepSeek account. Detached: session cleanup must never block
+/// the event loop, and a failure only means one leftover chat upstream.
+fn discard_remote_session_of(conv: &conversation::Conversation) {
+    if let Some(provider) = conv.provider.clone() {
+        tokio::spawn(async move {
+            if let Err(e) = provider.discard_remote_session().await {
+                tracing::debug!("failed to delete ephemeral remote session: {e}");
+            }
+        });
+    }
+}
+
 /// A short display title for a conversation, from its first user message.
 fn conversation_title(messages: &[ChatMessage]) -> String {
     messages
@@ -127,6 +141,7 @@ impl App {
             if let Some(handle) = conv.agent_task.take() {
                 handle.abort();
             }
+            discard_remote_session_of(&conv);
             let title = if conv.title.is_empty() { "(background agent)".to_string() } else { conv.title };
             self.state
                 .focused_mut()
@@ -192,6 +207,7 @@ impl App {
         let Some(conv) = self.state.conversations.remove(target) else {
             return;
         };
+        discard_remote_session_of(&conv);
         let label = match conv.kind {
             conversation::ConversationKind::SubAgent => "🤖 sub-agent",
             _ => "◈ btw",
