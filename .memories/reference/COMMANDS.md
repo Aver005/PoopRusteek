@@ -1,6 +1,6 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-06-30 (added /btw, /new, /chats, /agent, /agents)
+> Last updated: 2026-07-02 (added /logout, /wipe)
 
 ## HOW COMMANDS WORK
 
@@ -11,9 +11,9 @@
 - Command files live in `src/commands/defs/` (one file per command).
 
 ### `CommandResult` variants (`src/commands/mod.rs:26`)
-`Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)`
+`Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)` · `OpenConfirm(ConfirmAction)`
 
-## FULL COMMAND LIST (30 commands, +2 `/cwd` aliases)
+## FULL COMMAND LIST (32 commands, +2 `/cwd` aliases)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -46,10 +46,13 @@
 | `/chats` | — | — | Picker to switch between parallel chats (Tab/Ctrl also cycles focus) | `defs/chats.rs` (`ChatsCommand`) |
 | `/agent` | — | `<task>` | Launch a background sub-agent for a task | `defs/agent.rs` (`AgentCommand`) |
 | `/agents` | — | — | List and stop running background sub-agents (picker) | `defs/agent.rs` (`AgentsCommand`) |
+| `/logout` | — | — | Confirm → cancel all turns, clear `provider.token`, save config, show onboarding (`reset_to_onboarding`) | `defs/logout.rs` |
+| `/wipe` | — | — | Confirm → cancel all turns, `remove_dir_all` over `wipe_roots()` (config-file parent + data dir, deduped), factory reset to `Config::default`, clear whitelist/history, show onboarding | `defs/wipe.rs` |
 
 ## NOTES & GOTCHAS
 
 - `/btw`, `/new`+`/chats`, `/agent`+`/agents` arrived with the multi-chat wave (commits `438e60d`, `6c04774`, `38ce06f`). They rely on the `Conversation`/`Conversations` model and `LLMProvider::fork()` — see `ARCHITECTURE.md`.
+- `/logout` and `/wipe` route through `CommandResult::OpenConfirm(ConfirmAction)` → `Modal::Confirm(ConfirmState)` rendered by `render_confirm` (dynamic-height, error-red border, Enter/y + n/Esc hints). `/wipe` deletes only paths in `wipe_roots()` — foreign configs (e.g. `~/.claude`, `~/.cursor`, VS Code) are never touched.
 - The model can also spawn a sub-agent itself via the `task` tool (special-cased in `run_agent_loop`), independent of `/agent`.
 
 - `/jobs` and `/ps` were added in commit `e801dbe` (2026-06-28) alongside GOAL mode.

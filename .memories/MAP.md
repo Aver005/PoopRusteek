@@ -1,6 +1,6 @@
 # MAP
 > Codebase map — file → purpose. Navigation aid. (~15k LOC)
-> Last updated: 2026-07-02 (post stability/perf overhaul — sizes approximate, anchor to names not lines)
+> Last updated: 2026-07-02 (in-TUI onboarding, /logout, /wipe — sizes approximate, anchor to names not lines)
 
 ## ENTRY / ROOT
 | File | Purpose | Lines |
@@ -15,7 +15,7 @@
 | File | Purpose | Lines |
 |------|---------|-------|
 | `src/app/mod.rs` | Coordinator: `App` + `AppState`, event loop (`run_loop` — drains ≤256 events then renders once behind a dirty flag), `handle_event`, `send_focused_turn`, `FOREGROUND_CHILD_PID`, autocomplete/session helpers, `PendingInteraction` queue, `purge_interactions_for`. No longer a god-file. | ~1100 (grew this session: interaction queue, ui_only routing, shutdown_all wiring) |
-| `src/app/conversation.rs` | `ConversationId`, `ConversationKind` (Main/Session/Sidechat/SubAgent), `Conversation` (owns messages/provider/generation/agent_task) with unified reducer methods (`begin_assistant_message`/`append_chunk`/`discard_empty_assistant`/`finish_turn`), `Conversations` store (`focused()/focused_mut()/open()/add_background()/remove()/iter()`…) | ~230 |
+| `src/app/conversation.rs` | `ConversationId`, `ConversationKind` (Main/Session/Sidechat/SubAgent), `Conversation` (owns messages/provider/generation/agent_task) with unified reducer methods (`begin_assistant_message`/`append_chunk`/`discard_empty_assistant`/`finish_turn`), `Conversations` store (`focused()/focused_mut()/open()/add_background()/remove()/iter()`…), `Conversation::fresh_main` (shared constructor used by `App::new` and `reset_to_onboarding`) | ~230 |
 | `src/app/runtime.rs` | `AgentRuntime` controller — owns `tools`/`mcp`/`event_tx`; `spawn(TurnSpec)` is the one place agent turns launch | ~65 |
 | `src/app/system_prompt.rs` | `build(prompts, skills, tools, mcp, workspace)` — system-prompt assembly with explicit narrow deps (was god-method on `&self`) | ~80 |
 | `src/app/background_stats.rs` | `BackgroundCounters` (total/interactive/persistent) + refresh/shutdown/kill/prune methods (data clump lifted off `AppState`) | ~100 |
@@ -23,9 +23,9 @@
 | `src/app/generation.rs` | `GenerationState` — per-turn streaming/animation/stats status | ~60 |
 | `src/app/input.rs` | `InputState` + autocomplete state and input-editing logic | ~350 |
 | `src/app/goal.rs` | `GoalState`, `GoalOutcome`, `MAX_GOAL_ITERATIONS`, pure `apply_verdict`, `parse_goal_verdict`, `spawn_goal_evaluation`/`handle_goal_evaluation_done` (event-driven evaluator) + goal `impl App` methods | ~700 (grew: event-driven evaluator replaced the inline blocking call) |
-| `src/app/keys.rs` | `handle_key`/`handle_mcp_key`/autocomplete key handling | ~950 |
+| `src/app/keys.rs` | `handle_key`/`handle_mcp_key`/autocomplete key handling; `handle_onboarding_key` | ~950 |
 | `src/app/multichat.rs` | `spawn_background_agent`/`spawn_sidechat`/`spawn_sub_agent`/`stop_background`/`handle_background_event`/`new_conversation`/`switch_to`/`cycle_focus`/pickers — kind-based routing so a focused sidechat still finalizes into its parent | ~400 |
-| `src/app/events.rs` | `AppEvent` (agent variants tagged with `ConversationId`; `SpawnSubAgent`; `GoalEvaluationDone(GoalEvalOutcome)`; `McpOperationDone`), `Modal`, `PickerState`, `QuestionState`, `GoalStage`, `PendingInteraction` | ~500 |
+| `src/app/events.rs` | `AppEvent` (agent variants tagged with `ConversationId`; `SpawnSubAgent`; `GoalEvaluationDone(GoalEvalOutcome)`; `McpOperationDone`), `Modal` (incl. `Modal::Confirm(ConfirmState)`), `PickerState`, `QuestionState`, `GoalStage`, `PendingInteraction`, `OnboardingState`, `ConfirmAction {Logout, Wipe}`, `ConfirmLine`/`ConfirmLineKind` | ~500 |
 | `src/config/mod.rs` | `Config` schema (provider/ui/agent/mcp/skills), paths, load/save (now via `util::atomic_write`) | ~140 |
 
 ## PROVIDER (Domain)
@@ -72,7 +72,7 @@
 | File | Purpose | Lines |
 |------|---------|-------|
 | `src/tui/mod.rs` | Terminal init/restore | — |
-| `src/tui/render.rs` | All views: landing, chat, MCP, modals, status bar; landing-session and stats-panel disk reads now cached (3s/5s) instead of re-parsing every frame/tick; MCP panel gap-underflow crash fixed | ~1450 |
+| `src/tui/render.rs` | All views: landing, chat, MCP, modals (`render_confirm` for `Modal::Confirm`), status bar; `render_onboarding` (`View::Onboarding` — animated `pulsing_title`, steps panel, token input, model selector, mini-status); landing-session and stats-panel disk reads now cached (3s/5s) instead of re-parsing every frame/tick; MCP panel gap-underflow crash fixed | ~1450 |
 | `src/tui/theme.rs` | Catppuccin Mocha palette (`Theme`) — unused color fields removed | — |
 | `src/tui/markdown.rs` | Markdown + syntect highlight renderer; bold/italic/strikethrough now actually apply their style (were previously no-ops) | ~300 |
 | `src/tui/widgets/input.rs` | Multi-line input, cursor, selection, wrapping | ~270 |
@@ -83,8 +83,10 @@
 ## COMMANDS
 | File | Purpose |
 |------|---------|
-| `src/commands/mod.rs` | `Command` trait, `CommandRegistry`, `CommandResult` (`NeedsAgent` dead variant removed) |
-| `src/commands/defs/*.rs` | ~28 commands (one per file) — incl. `/btw`, `/new`+`/chats`, `/agent`+`/agents`, `/goal` (leading-slash registration bug fixed) — see `reference/COMMANDS.md`. `/help` is now generated from the live registry instead of a hand-maintained list. |
+| `src/commands/mod.rs` | `Command` trait, `CommandRegistry`, `CommandResult` (`NeedsAgent` dead variant removed; `OpenConfirm` variant added for confirm-modal routing) |
+| `src/commands/defs/*.rs` | 30 commands (one per file) — incl. `/btw`, `/new`+`/chats`, `/agent`+`/agents`, `/goal` (leading-slash registration bug fixed), `/logout`, `/wipe` — see `reference/COMMANDS.md`. `/help` is now generated from the live registry instead of a hand-maintained list. |
+| `src/commands/defs/logout.rs` | `/logout` — confirm → `cancel_all_turns`, clear `provider.token`, `config::save`, `reset_to_onboarding` ("Logged out") |
+| `src/commands/defs/wipe.rs` | `/wipe` — confirm → `cancel_all_turns`, `remove_dir_all` over `wipe_roots()` (deduped config-file parent + data dir; on Linux these differ, on Windows coincide), in-memory `Config::default` + cleared whitelist/history, lands on onboarding; errors go to tracing + status line |
 
 ## OTHER
 | File | Purpose |
@@ -94,7 +96,7 @@
 | `src/skills/mod.rs` | `SkillDefinition`, `SkillSource`, frontmatter parse — now keeps repeated keys instead of only the first occurrence |
 | `src/skills/discovery.rs` | Skill discovery (many dirs), formats; tilde expansion fixed via `util::expand_tilde` | ~280 |
 | `src/util.rs` | `atomic_write` (now actually used everywhere), `expand_tilde` (single shared impl), `truncate_at_char_boundary` |
-| `src/cli/onboarding.rs` | First-launch token/model setup | ~80 |
+| `src/cli/onboarding.rs` | **DELETED** — replaced by `View::Onboarding` in-TUI flow | — |
 | `src/cli/file_mentions.rs` | `@file:line` expansion — line-range clamp fixed (was an out-of-bounds slice panic) | ~120 |
 | `assets/prompts/` | base/tools/compact/goal-evaluator + persona & figma prompts |
 | `assets/sha3_wasm_bg.*.wasm` | DeepSeek PoW solver blob |

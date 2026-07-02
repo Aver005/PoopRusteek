@@ -13,6 +13,11 @@ impl App {
     pub(crate) async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // Onboarding view captures all keys while it is active.
+        if self.state.view == View::Onboarding {
+            return self.handle_onboarding_key(key).await;
+        }
+
         // Global Tab/Up/Down are intercepted by autocomplete when visible.
         let ac_visible = self.state.autocomplete.visible
             && !self.state.autocomplete.items.is_empty()
@@ -256,6 +261,25 @@ impl App {
                     } else {
                         self.state.modal = Some(Modal::Question(qs));
                         self.state.status_message = "Answering question...".to_string();
+                    }
+                    return Ok(false);
+                }
+                Modal::Confirm(cs) => {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let action = cs.action.clone();
+                            self.state.modal = None;
+                            match action {
+                                events::ConfirmAction::Logout => self.execute_logout().await,
+                                events::ConfirmAction::Wipe => self.execute_wipe().await,
+                            }
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                            self.state.modal = None;
+                        }
+                        _ => {
+                            self.state.modal = Some(Modal::Confirm(cs));
+                        }
                     }
                     return Ok(false);
                 }
@@ -519,6 +543,9 @@ impl App {
                                 CommandResult::OpenDeleteSessions { scope, session_id } => {
                                     self.open_delete_sessions(scope, session_id);
                                 }
+                                CommandResult::OpenConfirm(action) => {
+                                    self.open_confirm(action);
+                                }
                                 CommandResult::Error(err) => {
                                     self.state.focused_mut().messages.push(ChatMessage::system(&err));
                                 }
@@ -620,6 +647,64 @@ impl App {
             _ => {}
         }
         self.refresh_autocomplete();
+        Ok(false)
+    }
+
+    async fn handle_onboarding_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        match key.code {
+            // Ctrl+C quits (handled by the main select! before we get here — belt-and-suspenders).
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(true);
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Left | KeyCode::BackTab => {
+                self.state.onboarding.toggle_model();
+            }
+            KeyCode::Backspace => {
+                self.state.onboarding.backspace();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.state.onboarding.insert(c);
+            }
+            KeyCode::Enter => {
+                if let Some(token) = self.state.onboarding.submit() {
+                    // Commit token + model to config and save.
+                    self.config.provider.token = token.clone();
+                    self.config.provider.model = self.state.onboarding.model_str().to_string();
+                    if let Err(e) = crate::config::save(&self.config) {
+                        tracing::warn!("Onboarding: failed to save config: {e}");
+                    }
+
+                    // Hot-create the provider so the app works without restart.
+                    let provider = match crate::provider::deepseek::DeepseekProvider::new(
+                        &self.config.provider,
+                        self.config.agent.rate_limit_ms,
+                        self.config.agent.max_retries,
+                    ) {
+                        Ok(ds) => Arc::new(ds) as Arc<dyn LLMProvider>,
+                        Err(e) => {
+                            tracing::warn!("Onboarding: provider init failed: {e}");
+                            self.state.onboarding.error =
+                                Some("Failed to initialize provider — see log");
+                            return Ok(false);
+                        }
+                    };
+
+                    // Swap in a fresh main conversation carrying the provider —
+                    // safe, the current one has no messages yet.
+                    self.state.conversations = super::conversation::Conversations::new(
+                        super::conversation::Conversation::fresh_main(Some(provider)),
+                    );
+                    self.state.status_message = "Ready".to_string();
+                    self.state.view = View::Chat;
+                }
+                // If submit() returned None it set an error; the view stays on onboarding.
+            }
+            _ => {}
+        }
         Ok(false)
     }
 

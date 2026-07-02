@@ -6,7 +6,7 @@
 //! session file) a real per-frame cost; see [`landing_sessions_cached`].
 
 use crate::app::AppState;
-use crate::app::events::{Modal, PickerMode, PickerState, QuestionState, View};
+use crate::app::events::{ConfirmState, Modal, OnboardingState, PickerMode, PickerState, QuestionState, View};
 use crate::config::Config;
 use crate::mcp::types::McpViewState;
 use crate::tui::TuiTerminal;
@@ -58,7 +58,14 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             area,
         );
 
-        if state.view == View::Mcp {
+        if state.view == View::Onboarding {
+            render_onboarding(frame, area, &state.onboarding, state.focused().generation.animation_tick, &theme, &cursor_cell);
+            // Bottom status line — /logout and /wipe land here with their result.
+            if area.height > 1 {
+                let status_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+                render_mini_status(frame, status_area, state, config, &theme);
+            }
+        } else if state.view == View::Mcp {
             render_mcp_view(frame, area, &state.mcp_status.view, &theme);
         } else if state.focused().messages.is_empty() && !state.focused().generation.active {
             render_landing(frame, area, state, config, &theme, &cursor_cell);
@@ -137,6 +144,8 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
     if state.modal.is_some() || state.focused().generation.active || state.view == View::Mcp {
         terminal.hide_cursor()?;
     } else {
+        // For the onboarding view the cursor is positioned by render_onboarding
+        // into cursor_cell — show_cursor makes it visible; hide is handled above.
         terminal.show_cursor()?;
     }
     Ok(())
@@ -202,7 +211,7 @@ fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Conf
     // Logo block
     let logo_area = centered_h(chunks[ci], input_width);
     ci += 1;
-    let title_spans = bigger_title(state, theme);
+    let title_spans = pulsing_title(state.focused().generation.animation_tick, theme);
     frame.render_widget(
         Paragraph::new(Line::from(title_spans))
             .alignment(Alignment::Center)
@@ -804,6 +813,7 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
         Modal::Picker(picker) => render_picker(frame, area, picker, theme),
         Modal::Question(qs) => render_question(frame, area, qs, theme),
         Modal::DeleteSessions(st) => render_delete_sessions(frame, area, st, theme),
+        Modal::Confirm(cs) => render_confirm(frame, area, cs, theme),
     }
 }
 
@@ -1010,6 +1020,54 @@ fn render_delete_sessions(
             " {checked_visible} selected \u{00B7} \u{2191}\u{2193} move  Space select  A all  Tab filter  Enter delete  Esc close"
         ),
         Style::default().fg(theme.text_dim).bg(theme.panel),
+    )));
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+        inner,
+    );
+}
+
+fn render_confirm(frame: &mut Frame, area: Rect, cs: &ConfirmState, theme: &Theme) {
+    use crate::app::events::ConfirmLineKind;
+
+    let hint = " Enter/y \u{2014} confirm    n/Esc \u{2014} cancel";
+    let content_lines = cs.lines.len() + 2; // lines + blank + hint
+    let popup_h = (content_lines as u16 + 4).clamp(6, area.height.saturating_sub(2));
+    let max_line_w = cs.lines.iter()
+        .map(|l| l.text.len())
+        .chain(std::iter::once(hint.len()))
+        .max()
+        .unwrap_or(40) as u16;
+    let popup_width = (max_line_w + 4).clamp(44, area.width.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_h);
+
+    let title = format!(" {} ", cs.title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.error))
+        .title(title.as_str())
+        .title_style(Style::default().fg(theme.error).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(theme.panel));
+    let inner = block.inner(popup_area);
+
+    let mut lines: Vec<Line> = cs.lines.iter().map(|cl| {
+        let style = match cl.kind {
+            ConfirmLineKind::Normal => Style::default().fg(theme.fg),
+            ConfirmLineKind::Soft => Style::default().fg(theme.text_soft),
+            ConfirmLineKind::Dim => Style::default().fg(theme.text_dim),
+            ConfirmLineKind::Danger => Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+        };
+        Line::from(Span::styled(format!(" {}", cl.text), style))
+    }).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(" {hint}"),
+        Style::default().fg(theme.text_dim),
     )));
 
     frame.render_widget(Clear, popup_area);
@@ -1574,12 +1632,199 @@ fn render_attach_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     );
 }
 
-fn bigger_title(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
+fn render_onboarding(
+    frame: &mut Frame,
+    area: Rect,
+    ob: &OnboardingState,
+    animation_tick: u64,
+    theme: &Theme,
+    cursor_cell: &Cell<Option<(u16, u16)>>,
+) {
+    // ── Layout constants ───────────────────────────────────────────
+    const MAX_W: u16 = 72;
+    // logo(1) + gap(1) + tagline(1) + gap(1) + steps_panel(7) + gap(1)
+    // + input_box(3) + model_line(1) + gap(1) + footer(1) + error_reserve(1)
+    const CONTENT_H: u16 = 19;
+
+    let col_w = area.width.min(MAX_W);
+    let col_x = area.x + area.width.saturating_sub(col_w) / 2;
+    let top_pad = area.height.saturating_sub(CONTENT_H) / 2;
+
+    // Build a vertical layout within the centered column.
+    let col_area = Rect::new(col_x, area.y, col_w, area.height);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_pad),   // 0 — top padding
+            Constraint::Length(1),          // 1 — logo
+            Constraint::Length(1),          // 2 — gap
+            Constraint::Length(1),          // 3 — tagline
+            Constraint::Length(1),          // 4 — gap
+            Constraint::Length(7),          // 5 — steps panel
+            Constraint::Length(1),          // 6 — gap
+            Constraint::Length(3),          // 7 — token input box
+            Constraint::Length(1),          // 8 — model selector
+            Constraint::Length(1),          // 9 — gap
+            Constraint::Length(1),          // 10 — footer
+            Constraint::Length(1),          // 11 — error line
+            Constraint::Min(0),             // 12 — remaining
+        ])
+        .split(col_area);
+
+    // ── 1. Logo ────────────────────────────────────────────────────
+    let title_spans = pulsing_title(animation_tick, theme);
+    frame.render_widget(
+        Paragraph::new(Line::from(title_spans))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(theme.bg)),
+        chunks[1],
+    );
+
+    // ── 3. Tagline ─────────────────────────────────────────────────
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Terminal coding agent · powered by DeepSeek web",
+            Style::default().fg(theme.text_dim).bg(theme.bg),
+        )))
+        .alignment(Alignment::Center),
+        chunks[3],
+    );
+
+    // ── 5. Steps panel ────────────────────────────────────────────
+    // 7 rows total: border-top(1) + 3 step lines(3) + 2 blank rows(2) + border-bottom(1).
+    // We use a Block with a title and render paragraphs inside.
+    let steps_block = Block::default()
+        .title(" Getting started ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border).bg(theme.bg))
+        .style(Style::default().bg(theme.bg));
+    let steps_inner = steps_block.inner(chunks[5]);
+    frame.render_widget(steps_block, chunks[5]);
+
+    let steps = [
+        ("1.", "Log in at chat.deepseek.com in your browser"),
+        ("2.", "DevTools (F12) → Application → Local Storage → copy userToken"),
+        ("3.", "Paste it below and press Enter"),
+    ];
+    let step_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(steps_inner);
+    for (i, (num, text)) in steps.iter().enumerate() {
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{num} "),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+            ),
+            Span::styled(*text, Style::default().fg(theme.text_soft).bg(theme.bg)),
+        ]);
+        frame.render_widget(Paragraph::new(line), step_chunks[i]);
+    }
+
+    // ── 7. Token input box ────────────────────────────────────────
+    let input_block = Block::default()
+        .title(" DeepSeek token ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focus).bg(theme.input_bg))
+        .style(Style::default().bg(theme.input_bg));
+    let input_inner = input_block.inner(chunks[7]);
+    frame.render_widget(input_block, chunks[7]);
+
+    // Clip the visible portion so the cursor stays in view: show the tail end.
+    let box_w = input_inner.width as usize;
+    let input_chars: Vec<char> = ob.input.chars().collect();
+    let total_chars = input_chars.len();
+    // cursor is clamped to [0, total_chars]
+    let cursor = ob.cursor.min(total_chars);
+    // How many chars fit before the cursor (clipped from the left).
+    let visible_start = if cursor >= box_w { cursor - (box_w - 1) } else { 0 };
+    let visible_chars: String = input_chars[visible_start..total_chars].iter().collect();
+    // Truncate to box width using char-aware slicing (never byte-slice — invariant).
+    let display: String = visible_chars.chars().take(box_w).collect();
+    let cursor_col = (cursor - visible_start) as u16;
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            display,
+            Style::default().fg(theme.fg).bg(theme.input_bg),
+        )))
+        .style(Style::default().bg(theme.input_bg)),
+        input_inner,
+    );
+    // Place block cursor at the right terminal cell.
+    cursor_cell.set(Some((input_inner.x + cursor_col, input_inner.y)));
+
+    // ── 8. Model selector ────────────────────────────────────────
+    let (chat_style, reasoner_style, chat_dot, reasoner_dot) = if ob.model_reasoner {
+        (
+            Style::default().fg(theme.text_dim).bg(theme.bg),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+            "○",
+            "●",
+        )
+    } else {
+        (
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+            Style::default().fg(theme.text_dim).bg(theme.bg),
+            "●",
+            "○",
+        )
+    };
+    let model_line = Line::from(vec![
+        Span::styled("Model:  ", Style::default().fg(theme.text_dim).bg(theme.bg)),
+        Span::styled(format!("{chat_dot} deepseek-chat"), chat_style),
+        Span::styled("   ", Style::default().bg(theme.bg)),
+        Span::styled(format!("{reasoner_dot} deepseek-reasoner"), reasoner_style),
+        Span::styled("   (Tab to switch)", Style::default().fg(theme.text_dim).bg(theme.bg)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(model_line).alignment(Alignment::Center),
+        chunks[8],
+    );
+
+    // ── 10. Footer hints ──────────────────────────────────────────
+    let footer = Line::from(vec![
+        Span::styled(
+            "Enter",
+            Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD).bg(theme.bg),
+        ),
+        Span::styled(" — save & start    ", Style::default().fg(theme.text_dim).bg(theme.bg)),
+        Span::styled(
+            "Ctrl+C",
+            Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD).bg(theme.bg),
+        ),
+        Span::styled(" — quit", Style::default().fg(theme.text_dim).bg(theme.bg)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[10],
+    );
+
+    // ── 11. Error line ────────────────────────────────────────────
+    if let Some(msg) = ob.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(theme.error).bg(theme.bg),
+            )))
+            .alignment(Alignment::Center),
+            chunks[11],
+        );
+    }
+}
+
+/// Animated pulsing logo shared by the landing and onboarding screens.
+fn pulsing_title(animation_tick: u64, theme: &Theme) -> Vec<Span<'static>> {
     let text = "POOPRUSTEEK";
     text.chars()
         .enumerate()
         .map(|(index, ch)| {
-            let pulse = ((state.focused().generation.animation_tick as usize / 5) + index) % 6;
+            let pulse = ((animation_tick as usize / 5) + index) % 6;
             let color = match pulse {
                 0 | 1 => theme.accent_soft,
                 2 | 3 => theme.accent,
@@ -1592,10 +1837,7 @@ fn bigger_title(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
             };
             Span::styled(
                 ch.to_string(),
-                Style::default()
-                    .fg(color)
-                    .bg(theme.bg)
-                    .add_modifier(bright),
+                Style::default().fg(color).bg(theme.bg).add_modifier(bright),
             )
         })
         .collect()

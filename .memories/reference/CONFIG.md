@@ -1,6 +1,6 @@
 # REFERENCE: Config, Storage & Sessions
 > Where everything lives on disk. Source: `src/config/mod.rs`, `src/session.rs`.
-> Last updated: 2026-06-30
+> Last updated: 2026-07-02
 
 ## FILE LOCATIONS (`config/mod.rs:100`)
 
@@ -63,9 +63,11 @@ paths = []                 # extra skill search dirs
 - **Special tags**: `__goal_system__` (GOAL evaluator sessions, hidden from `/sessions`), `Imported` (`/import`).
 - **History file** `{data}/history.json` (:165): JSON array of input strings, capped at **500**, consecutive dups deduped.
 
-## ONBOARDING (`src/cli/onboarding.rs`)
+## ONBOARDING (`View::Onboarding`)
 
-First launch (no config): prompts for DeepSeek token + model (`1`=deepseek-chat default, `2`=deepseek-reasoner), writes config, waits for keypress. Triggered from `main.rs` before building `App`.
+First launch (no config, or after `/logout`/`/wipe`): in-TUI full-screen onboarding (`View::Onboarding`). The former CLI prompt (`src/cli/onboarding.rs`) is **deleted**. Shows an animated `pulsing_title` logo (shared with the landing screen), a steps panel, a token input field, and a deepseek-chat/reasoner selector. Keys handled by `handle_onboarding_key` (`src/app/keys.rs`), rendered by `render_onboarding` (`src/tui/render.rs`). State tracked in `OnboardingState` (`src/app/events.rs`). On submit: saves config, hot-creates `DeepseekProvider` (init failure shows an error on-screen — does not proceed), then calls `Conversation::fresh_main` to swap in a new main conversation.
+
+`/logout` clears `provider.token`, saves config, and transitions to `View::Onboarding` via `reset_to_onboarding`. `/wipe` factory-resets all app-owned paths (config-file parent dir + data dir, via `wipe_roots()`, deduped) plus in-memory state, then transitions to onboarding. Neither command touches foreign configs (`~/.claude`, `~/.cursor`, VS Code, etc.).
 
 ## ERRORS & LOGGING
 

@@ -21,8 +21,8 @@ use crate::tools::registry::ToolRegistry;
 use crate::commands::CommandSuggestion;
 use crate::skills::{discovery::discover_all_skills, SkillDefinition};
 use events::{
-    AppEvent, GoalStage, Modal, PendingInteraction, QuestionRequest, QuestionState,
-    ToolApprovalRequest, View,
+    AppEvent, ConfirmAction, GoalStage, Modal, OnboardingState, PendingInteraction, QuestionRequest,
+    QuestionState, ToolApprovalRequest, View,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -110,6 +110,7 @@ pub struct AppState {
     pub pending_interactions: std::collections::VecDeque<PendingInteraction>,
     pub autocomplete: AutocompleteState,
     pub view: View,
+    pub onboarding: OnboardingState,
     pub mcp_status: mcp_status::McpStatus,
     pub workspace_path: String,
     pub show_stats_panel: bool,
@@ -185,18 +186,7 @@ impl App {
         tools.update_skills(skills.clone());
 
         let has_provider = provider.is_some();
-        let main_conversation = conversation::Conversation {
-            id: conversation::ConversationId::next(),
-            kind: conversation::ConversationKind::Main,
-            parent: None,
-            title: String::new(),
-            session_id: crate::session::create_session_id(),
-            session_started_at: chrono::Utc::now().to_rfc3339(),
-            messages: Vec::new(),
-            provider,
-            generation: generation::GenerationState::default(),
-            agent_task: None,
-        };
+        let main_conversation = conversation::Conversation::fresh_main(provider);
 
         let mut state = AppState {
             conversations: conversation::Conversations::new(main_conversation),
@@ -212,7 +202,8 @@ impl App {
             pending_question: None,
             pending_interactions: std::collections::VecDeque::new(),
             autocomplete: AutocompleteState::default(),
-            view: View::Chat,
+            view: if has_provider { View::Chat } else { View::Onboarding },
+            onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
             show_stats_panel: true,
             workspace_path: std::env::current_dir()
@@ -405,7 +396,8 @@ impl App {
     /// animate while any conversation is streaming; the landing logo animates
     /// while the chat is empty and no modal covers it.
     fn tick_is_visual(&self) -> bool {
-        self.state.conversations.iter().any(|c| c.is_streaming())
+        self.state.view == View::Onboarding
+            || self.state.conversations.iter().any(|c| c.is_streaming())
             || (self.state.focused().messages.is_empty() && self.state.modal.is_none())
     }
 
@@ -533,8 +525,12 @@ impl App {
                 }
             }
             AppEvent::Tick => {
-                if self.state.focused_mut().generation.active || (self.state.focused_mut().messages.is_empty() && self.state.modal.is_none()) {
-                    self.state.focused_mut().generation.animation_tick = self.state.focused_mut().generation.animation_tick.wrapping_add(1);
+                if self.state.view == View::Onboarding
+                    || self.state.focused_mut().generation.active
+                    || (self.state.focused_mut().messages.is_empty() && self.state.modal.is_none())
+                {
+                    self.state.focused_mut().generation.animation_tick =
+                        self.state.focused_mut().generation.animation_tick.wrapping_add(1);
                 }
             }
             AppEvent::GoalEvaluationDone(outcome) => {
@@ -961,6 +957,86 @@ impl App {
         )));
     }
 
+    /// Open the generic confirm modal for `/logout` or `/wipe`.
+    pub(crate) fn open_confirm(&mut self, action: ConfirmAction) {
+        use events::{ConfirmState};
+        let cs = match action {
+            ConfirmAction::Logout => ConfirmState::logout(),
+            ConfirmAction::Wipe => ConfirmState::wipe(),
+        };
+        self.state.modal = Some(Modal::Confirm(cs));
+    }
+
+    /// Cancel every conversation's in-flight turn (focused + all background).
+    async fn cancel_all_turns(&mut self) {
+        kill_foreground_child();
+        for conv in self.state.conversations.iter_mut() {
+            if let Some(handle) = conv.agent_task.take() {
+                handle.abort();
+            }
+            conv.generation.active = false;
+        }
+        if let Some(req) = self.state.pending_tool_approval.take() {
+            req.resolve(false).await;
+        }
+        if let Some(req) = self.state.pending_question.take() {
+            req.resolve(String::new()).await;
+        }
+        self.state.pending_interactions.clear();
+    }
+
+    /// Execute `/logout`: clear token from config+disk, return to onboarding.
+    pub(crate) async fn execute_logout(&mut self) {
+        self.cancel_all_turns().await;
+        self.config.provider.token = String::new();
+        if let Err(e) = crate::config::save(&self.config) {
+            tracing::warn!("Logout: failed to save config: {e}");
+        }
+        self.reset_to_onboarding("Logged out".to_string());
+    }
+
+    /// Execute `/wipe`: delete all app-owned data dirs, factory-reset in memory.
+    pub(crate) async fn execute_wipe(&mut self) {
+        self.cancel_all_turns().await;
+        let roots = wipe_roots();
+        let mut errors: Vec<String> = Vec::new();
+        for root in &roots {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => errors.push(format!("{}: {e}", root.display())),
+            }
+        }
+        self.config = crate::config::Config::default();
+        self.state.approved_tools.clear();
+        self.state.input.history.clear();
+        if errors.is_empty() {
+            self.reset_to_onboarding("All local data wiped".to_string());
+        } else {
+            // Chat messages are invisible on the onboarding view — surface via status.
+            tracing::warn!("Wipe errors: {}", errors.join("; "));
+            self.reset_to_onboarding(format!(
+                "Wiped with errors — {} path(s) failed, see log",
+                errors.len()
+            ));
+        }
+    }
+
+    /// Drop provider, swap to a single fresh empty conversation, land on onboarding.
+    fn reset_to_onboarding(&mut self, status: String) {
+        self.state.conversations =
+            conversation::Conversations::new(conversation::Conversation::fresh_main(None));
+        self.state.onboarding = OnboardingState::default();
+        self.state.modal = None;
+        self.state.view = View::Onboarding;
+        self.state.status_message = status;
+        self.state.scroll_offset = 0;
+        self.state.input.buffer.clear();
+        self.state.input.cursor = 0;
+        self.state.input.selection_anchor = None;
+        self.state.autocomplete = AutocompleteState::default();
+    }
+
     /// Perform a confirmed `/delete`. Local files are removed synchronously
     /// (fast fs ops); remote deletions run in a spawned batch that reports
     /// back via `SessionsDeleted`. The scope decides WHERE ids are deleted:
@@ -1322,6 +1398,35 @@ impl App {
         }
 
         result
+    }
+}
+
+/// Returns the deduplicated list of directories that own all app-owned data.
+/// On Windows config and data typically live in the same parent; on Linux they
+/// may differ (XDG_CONFIG_HOME vs XDG_DATA_HOME).
+fn wipe_roots() -> Vec<std::path::PathBuf> {
+    let config_dir = crate::config::Config::path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(crate::config::Config::path);
+    let mut roots = vec![config_dir, crate::config::Config::data_dir()];
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::wipe_roots;
+
+    #[test]
+    fn wipe_roots_no_duplicates() {
+        let roots = wipe_roots();
+        let mut deduped = roots.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(roots.len(), deduped.len(), "wipe_roots must return deduped paths");
+        assert!(!roots.is_empty());
     }
 }
 

@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     debug_log::init(args.debug_log)?;
-    let mut config: Config = match config::load() {
+    let config: Config = match config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Warning: failed to load config, using defaults: {e}");
@@ -55,10 +55,6 @@ async fn main() -> Result<()> {
 
     if args.acp {
         return run_acp_server(&config);
-    }
-
-    if cli::should_run_onboarding(&config) {
-        config = cli::onboarding::run_onboarding()?;
     }
 
     let mut app = app::App::new(config).await?;

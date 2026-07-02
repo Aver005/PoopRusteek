@@ -52,6 +52,8 @@ pub enum CommandResult {
         scope: crate::app::events::SessionScope,
         session_id: Option<String>,
     },
+    /// `/logout` and `/wipe` — open the generic confirmation modal.
+    OpenConfirm(crate::app::events::ConfirmAction),
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +129,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::agent::AgentsCommand));
         self.register(Box::new(defs::delete::DeleteCommand));
         self.register(Box::new(defs::delete::DeleteLocalCommand));
+        self.register(Box::new(defs::logout::LogoutCommand));
+        self.register(Box::new(defs::wipe::WipeCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

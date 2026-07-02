@@ -1,13 +1,13 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-02 (post stability/perf overhaul — all 7 audit criticals fixed, clippy 0)
+> Last updated: 2026-07-02 (in-TUI onboarding rework, /logout, /wipe — tests 209, clippy 0)
 
 ## PHASE COMPLETION
 
 | Phase | Status | What |
 |-------|--------|------|
 | 1 Core | `[DONE]` | TUI, provider trait, DeepSeek client, agent loop, tools, MCP types, PoW, streaming |
-| 2 Features | `[DONE]` | Onboarding, sessions, 25 slash commands, markdown+syntect, compaction, @file, tool approval, input history |
+| 2 Features | `[DONE]` | In-TUI onboarding (`View::Onboarding`), sessions, 27 slash commands, markdown+syntect, compaction, @file, tool approval, input history |
 | 3 Integration | `[DONE]` | MCP stdio/HTTP/SSE, 8-source auto-discovery, manager+caching, JSON-RPC, ACP server mode |
 | 3.5 Agentic | `[DONE]` | GOAL mode (2-agent iterative loop), background/interactive PTY jobs, `/jobs` `/ps`, skills system |
 | 3.6 Multi-chat | `[DONE]` | `Conversation`/`Conversations` model, provider `fork()`, event tagging by `ConversationId`, parallel sessions (`/new` `/chats` + Tab), `/btw` sidechat, sub-agents (model `task` tool + `/agent`/`/agents`, fg+bg) |
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **189 passing** (`cargo test --bin pooprusteek`), was 84 before the 2026-07-02 session |
+| Tests | **209 passing** (`cargo test --bin pooprusteek`), was 189 before this session |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
@@ -72,6 +72,7 @@
 | 2026-06-30 | `.memories` deeply enriched: added ARCHITECTURE/GLOSSARY/CONVENTIONS + `reference/`; corrected drift (commands 22→25, MCP sources 5→8, agent defaults 25/50→256/10) |
 | 2026-06-30 | **Big refactor + features wave**: provider split (prompt/sse/fake `42f6164`/`f783a87`); god-object decomposition (input/mcp_status/generation/goal/shell-unify/view-model/background-split `b252567`…`5205be4`); GOAL overhaul `c0d4280`; `parent_message_id` fix `183712e`; provider `fork()` + conversations `20c90ca`; `/btw` `438e60d`; `/chats` `6c04774`; sub-agents `38ce06f`; goal+multichat extract `92163cb`; **controllers** — conversation mgmt `4efe8cb`, AgentRuntime `c24c7a8`, system_prompt `24e6b00`, background_stats `391c6e4` |
 | 2026-07-02 | **Full-codebase audit** (`reference/AUDIT-2026-07-02.md`) → same-day **3-wave refactor**: streaming/MCP/GOAL/ACP/render/stdio criticals + ~30 majors + dead-code sweep, committed as `bad8011`. 54 files, +4056/−1291. Tests 84→189, clippy ~220→0. |
+| 2026-07-02 | **In-TUI onboarding + /logout + /wipe**: `cli/onboarding.rs` deleted; `View::Onboarding` full-screen rework (`OnboardingState`, `handle_onboarding_key`, `render_onboarding`, `Conversation::fresh_main`); generic `Modal::Confirm(ConfirmState)` + `ConfirmAction`; `/logout` (confirm → cancel turns → clear token → `reset_to_onboarding`) and `/wipe` (confirm → cancel turns → `remove_dir_all` over `wipe_roots()` → factory reset → onboarding). Tests 189→209, clippy 0. |
 
 ## FACTS CORRECTED THIS PASS (were wrong in older memory)
 

@@ -233,6 +233,163 @@ pub enum PendingInteraction {
 pub enum View {
     Chat,
     Mcp,
+    Onboarding,
+}
+
+/// Pure state for the in-TUI onboarding screen. No app deps — fully testable.
+#[derive(Debug, Clone, Default)]
+pub struct OnboardingState {
+    pub input: String,
+    /// Char-indexed cursor (not byte offset).
+    pub cursor: usize,
+    /// When true the model selector shows deepseek-reasoner as active.
+    pub model_reasoner: bool,
+    /// Set after a failed submit; cleared on the next keypress.
+    pub error: Option<&'static str>,
+}
+
+impl OnboardingState {
+    /// Insert a char at the cursor position, advancing the cursor.
+    pub fn insert(&mut self, ch: char) {
+        self.error = None;
+        let byte_pos = self
+            .input
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len());
+        self.input.insert(byte_pos, ch);
+        self.cursor += 1;
+    }
+
+    /// Delete the char immediately before the cursor (Backspace).
+    pub fn backspace(&mut self) {
+        self.error = None;
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        let byte_pos = self
+            .input
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len());
+        self.input.remove(byte_pos);
+    }
+
+    /// Toggle the model selector between deepseek-chat and deepseek-reasoner.
+    pub fn toggle_model(&mut self) {
+        self.model_reasoner = !self.model_reasoner;
+    }
+
+    /// Returns the model string for the selected option.
+    pub fn model_str(&self) -> &'static str {
+        if self.model_reasoner { "deepseek-reasoner" } else { "deepseek-chat" }
+    }
+
+    /// Validate and return the trimmed token, or set the error and return None.
+    pub fn submit(&mut self) -> Option<String> {
+        let token = self.input.trim().to_string();
+        if token.is_empty() {
+            self.error = Some("Token can't be empty — paste your userToken");
+            None
+        } else {
+            Some(token)
+        }
+    }
+}
+
+#[cfg(test)]
+mod onboarding_tests {
+    use super::*;
+
+    #[test]
+    fn insert_and_backspace_ascii() {
+        let mut s = OnboardingState::default();
+        s.insert('a');
+        s.insert('b');
+        s.insert('c');
+        assert_eq!(s.input, "abc");
+        assert_eq!(s.cursor, 3);
+        s.backspace();
+        assert_eq!(s.input, "ab");
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn insert_multibyte_emoji_boundary() {
+        let mut s = OnboardingState::default();
+        s.insert('🔑'); // 4 bytes
+        s.insert('x');
+        assert_eq!(s.input, "🔑x");
+        assert_eq!(s.cursor, 2); // 2 chars
+        s.backspace(); // removes 'x'
+        assert_eq!(s.input, "🔑");
+        assert_eq!(s.cursor, 1);
+        s.backspace(); // removes emoji
+        assert_eq!(s.input, "");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn backspace_at_start_is_noop() {
+        let mut s = OnboardingState::default();
+        s.backspace();
+        assert_eq!(s.input, "");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn toggle_model() {
+        let mut s = OnboardingState::default();
+        assert!(!s.model_reasoner);
+        assert_eq!(s.model_str(), "deepseek-chat");
+        s.toggle_model();
+        assert!(s.model_reasoner);
+        assert_eq!(s.model_str(), "deepseek-reasoner");
+        s.toggle_model();
+        assert!(!s.model_reasoner);
+    }
+
+    #[test]
+    fn submit_empty_sets_error() {
+        let mut s = OnboardingState::default();
+        assert!(s.submit().is_none());
+        assert!(s.error.is_some());
+    }
+
+    #[test]
+    fn submit_trims_whitespace() {
+        let mut s = OnboardingState::default();
+        for c in "  tok123  \n".chars() {
+            s.insert(c);
+        }
+        let result = s.submit();
+        assert_eq!(result.as_deref(), Some("tok123"));
+    }
+
+    #[test]
+    fn error_cleared_on_insert() {
+        let mut s = OnboardingState::default();
+        s.submit(); // sets error
+        assert!(s.error.is_some());
+        s.insert('x');
+        assert!(s.error.is_none());
+    }
+
+    #[test]
+    fn error_cleared_on_backspace() {
+        let mut s = OnboardingState::default();
+        s.insert('x');
+        s.submit(); // won't error (non-empty), so force it
+        // Re-test with the actual empty path
+        let mut s2 = OnboardingState::default();
+        s2.submit();
+        assert!(s2.error.is_some());
+        s2.backspace(); // noop on content but still clears error
+        assert!(s2.error.is_none());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +578,69 @@ pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCod
     }
 }
 
+// ─── Generic confirm modal ─────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmAction {
+    Logout,
+    Wipe,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmLineKind {
+    Normal,
+    Soft,
+    Dim,
+    Danger,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfirmLine {
+    pub text: String,
+    pub kind: ConfirmLineKind,
+}
+
+impl ConfirmLine {
+    pub fn normal(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Normal } }
+    pub fn soft(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Soft } }
+    pub fn dim(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Dim } }
+    pub fn danger(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Danger } }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfirmState {
+    pub title: String,
+    pub lines: Vec<ConfirmLine>,
+    pub action: ConfirmAction,
+}
+
+impl ConfirmState {
+    pub fn logout() -> Self {
+        Self {
+            title: "Log out".to_string(),
+            lines: vec![
+                ConfirmLine::normal("Your DeepSeek token will be removed from config.toml."),
+                ConfirmLine::dim("Local sessions, history and settings stay on disk."),
+            ],
+            action: ConfirmAction::Logout,
+        }
+    }
+
+    pub fn wipe() -> Self {
+        Self {
+            title: "Wipe all local data".to_string(),
+            lines: vec![
+                ConfirmLine::normal("This deletes ALL Pooprusteek data on this machine:"),
+                ConfirmLine::soft("  config.toml (incl. token) \u{00B7} sessions/ \u{00B7} history.json"),
+                ConfirmLine::soft("  mcp.json \u{00B7} whitelist.json"),
+                ConfirmLine::dim("Foreign configs (.claude, .cursor, VS Code\u{2026}) are not touched."),
+                ConfirmLine::danger("This action is irreversible."),
+            ],
+            action: ConfirmAction::Wipe,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     ToolApproval {
@@ -432,6 +652,7 @@ pub enum Modal {
     Picker(PickerState),
     Question(QuestionState),
     DeleteSessions(DeleteSessionsState),
+    Confirm(ConfirmState),
 }
 
 // ─── /delete — session deletion picker ────────────────────────────
@@ -918,5 +1139,29 @@ mod delete_picker_tests {
     fn escape_closes_from_selecting() {
         let mut s = state(SessionScope::All);
         assert_eq!(handle_delete_sessions_key(&mut s, KeyCode::Esc), DeleteAction::Close);
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+
+    #[test]
+    fn logout_confirm_state() {
+        let cs = ConfirmState::logout();
+        assert_eq!(cs.title, "Log out");
+        assert_eq!(cs.action, ConfirmAction::Logout);
+        assert_eq!(cs.lines.len(), 2);
+        assert_eq!(cs.lines[0].kind, ConfirmLineKind::Normal);
+        assert_eq!(cs.lines[1].kind, ConfirmLineKind::Dim);
+    }
+
+    #[test]
+    fn wipe_confirm_state() {
+        let cs = ConfirmState::wipe();
+        assert_eq!(cs.title, "Wipe all local data");
+        assert_eq!(cs.action, ConfirmAction::Wipe);
+        assert!(cs.lines.iter().any(|l| l.kind == ConfirmLineKind::Danger));
+        assert_eq!(cs.lines[0].kind, ConfirmLineKind::Normal);
     }
 }

@@ -26,3 +26,5 @@ pub mod btw;
 pub mod chats;
 pub mod agent;
 pub mod delete;
+pub mod logout;
+pub mod wipe;

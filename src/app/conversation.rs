@@ -65,6 +65,23 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// Fresh, message-less main conversation — the state right after launch
+    /// (and after `/logout` / `/wipe` or an onboarding submit).
+    pub fn fresh_main(provider: Option<Arc<dyn LLMProvider>>) -> Self {
+        Self {
+            id: ConversationId::next(),
+            kind: ConversationKind::Main,
+            parent: None,
+            title: String::new(),
+            session_id: crate::session::create_session_id(),
+            session_started_at: chrono::Utc::now().to_rfc3339(),
+            messages: Vec::new(),
+            provider,
+            generation: GenerationState::default(),
+            agent_task: None,
+        }
+    }
+
     /// Is this conversation's agent turn currently in flight?
     pub fn is_streaming(&self) -> bool {
         self.generation.active
