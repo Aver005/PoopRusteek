@@ -36,6 +36,8 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 
 ## RESOLVED / MOOT
 
+- ✅ `~~Every turn ends with "stream ended early…" warning; final answers abort as AgentError~~` — the strict-stop pass wrongly assumed DeepSeek ends its SSE with `data: [DONE]`; the live protocol just closes the connection (0 `[DONE]` in a full session log). Clean EOF is now a normal stop in both `complete`/`complete_stream`; explicit finish signals (`[DONE]` ±space, `FINISHED` status patch, terminal BATCH) recognized in `process_stream_line`; unrecognized SSE lines now logged (`completion.*.skipped`). Fixed 2026-07-03 evening — see `JOURNAL/2026-07-03.md`. Watch item: one zero-content stream (metadata only, instant close) remains unexplained; skipped-line logging will identify it if it recurs.
+
 - ✅ **2026-07-03 follow-ups** — ephemeral remote-session leak fixed: `LLMProvider::discard_remote_session` wired into sidechat/sub-agent finalize, stop, foreground `task` forks, and (bounded, 3s) app exit; user-facing `/delete [id]` + `/delete-local [id]` added (shared multi-select picker, All/Local/Remote filter = deletion scope, confirm step, background remote fetch/delete via `RemoteSessionsListed`/`SessionsDeleted` events); `deepseek.rs` split into `deepseek/{mod,http,session,stream,endpoints}.rs`; deps bumped (reqwest 0.13, ratatui 0.30, crossterm 0.29, pulldown-cmark 0.13, toml 1.x); PoW wasm embedded via `include_bytes!`.
 
 - ✅ **2026-07-02 refactor session** — see `reference/AUDIT-2026-07-02.md` for full detail; `JOURNAL/2026-07-02.md` for the session narrative. One line per subsystem:

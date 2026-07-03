@@ -104,7 +104,6 @@ impl LLMProvider for DeepseekProvider {
         let mut stream = response.bytes_stream();
         let mut sse = super::sse::SseLineBuffer::new();
         let mut content = String::new();
-        let mut finish_reason = None;
         let mut parent_message_id = None;
 
         while let Some(chunk) = stream.next().await {
@@ -114,49 +113,70 @@ impl LLMProvider for DeepseekProvider {
                     // Persist the thread id before bailing so an interrupted
                     // collection doesn't fork the conversation on the next turn.
                     let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    debug_log::log(
+                        "completion.collect.error",
+                        format!("stream_read_error={error} parent_message_id={parent_message_id:?}"),
+                    );
                     return Err(error.into());
                 }
             };
 
             for line in sse.push_bytes(&chunk) {
-                let trimmed = line.trim();
-                if trimmed == "data: [DONE]" {
-                    finish_reason = Some("stop".to_string());
-                    debug_log::log("completion.collect.done", "received [DONE]");
+                let Some(event) = stream::process_stream_line(&line) else {
+                    // Unrecognized lines are logged so protocol changes stay
+                    // visible instead of silently dropping server events.
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        debug_log::log("completion.collect.skipped", trimmed);
+                    }
+                    continue;
+                };
+
+                debug_log::log("completion.collect.line", line.trim());
+                if event.parent_message_id.is_some() {
+                    parent_message_id = event.parent_message_id;
+                    debug_log::log(
+                        "completion.collect.parent",
+                        format!("parent_message_id={:?}", parent_message_id),
+                    );
+                    // Persist immediately so a cut stream keeps the thread id.
+                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                }
+                if let Some(text) = event.text {
+                    debug_log::log(
+                        "completion.collect.chunk",
+                        format!("text_chunk={}", text),
+                    );
+                    content.push_str(&text);
+                }
+                if event.finished {
+                    debug_log::log("completion.collect.done", "received explicit finish signal");
                     self.mark_session_after_success(&session_id, parent_message_id)?;
                     return Ok(CompletionResponse {
                         content,
-                        finish_reason,
+                        finish_reason: Some("stop".to_string()),
                         usage: None,
                     });
-                }
-
-                if let Some((text_chunk, maybe_parent_id)) = stream::process_stream_line(&line) {
-                    debug_log::log("completion.collect.line", line.trim());
-                    if let Some(text) = text_chunk {
-                        debug_log::log(
-                            "completion.collect.chunk",
-                            format!("text_chunk={}", text),
-                        );
-                        content.push_str(&text);
-                    }
-                    if maybe_parent_id.is_some() {
-                        parent_message_id = maybe_parent_id;
-                        debug_log::log(
-                            "completion.collect.parent",
-                            format!("parent_message_id={:?}", parent_message_id),
-                        );
-                        // Persist immediately so a cut stream keeps the thread id.
-                        let _ = self.mark_session_after_success(&session_id, parent_message_id);
-                    }
                 }
             }
         }
 
         self.mark_session_after_success(&session_id, parent_message_id)?;
+        // DeepSeek's web endpoint routinely finishes a response by just
+        // closing the connection — no `data: [DONE]`, no status event. A
+        // cleanly terminated chunked body is a deliberate server-side close,
+        // so treat it as a normal stop; a severed connection surfaces as a
+        // read error in the loop above, never as clean EOF.
+        debug_log::log(
+            "completion.collect.eof",
+            format!(
+                "clean EOF treated as stop. session_id={session_id} parent_message_id={parent_message_id:?} content_len={}",
+                content.len()
+            ),
+        );
         Ok(CompletionResponse {
             content,
-            finish_reason,
+            finish_reason: Some("stop".to_string()),
             usage: None,
         })
     }
@@ -170,6 +190,7 @@ impl LLMProvider for DeepseekProvider {
         let mut stream = response.bytes_stream();
         let mut sse = super::sse::SseLineBuffer::new();
         let mut parent_message_id = None;
+        let mut streamed_bytes = 0usize;
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -179,14 +200,51 @@ impl LLMProvider for DeepseekProvider {
                     // persist the id we have so the next message threads onto it
                     // instead of forking onto an invisible branch.
                     let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    debug_log::log(
+                        "completion.stream.error",
+                        format!("stream_read_error={error} parent_message_id={parent_message_id:?}"),
+                    );
                     return Err(error.into());
                 }
             };
 
             for line in sse.push_bytes(&chunk) {
-                let trimmed = line.trim();
-                if trimmed == "data: [DONE]" {
-                    debug_log::log("completion.stream.done", "received [DONE]");
+                let Some(event) = stream::process_stream_line(&line) else {
+                    // Unrecognized lines are logged so protocol changes stay
+                    // visible instead of silently dropping server events.
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        debug_log::log("completion.stream.skipped", trimmed);
+                    }
+                    continue;
+                };
+
+                debug_log::log("completion.stream.line", line.trim());
+                if event.parent_message_id.is_some() {
+                    parent_message_id = event.parent_message_id;
+                    debug_log::log(
+                        "completion.stream.parent",
+                        format!("parent_message_id={:?}", parent_message_id),
+                    );
+                    // Persist immediately — if the stream is cut after this,
+                    // the thread id is already saved.
+                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                }
+
+                if let Some(text) = event.text {
+                    debug_log::log(
+                        "completion.stream.chunk",
+                        format!("text_chunk={}", text),
+                    );
+                    streamed_bytes += text.len();
+                    let _ = tx.send(CompletionChunk {
+                        content: text,
+                        finish_reason: None,
+                    });
+                }
+
+                if event.finished {
+                    debug_log::log("completion.stream.done", "received explicit finish signal");
                     self.mark_session_after_success(&session_id, parent_message_id)?;
                     let _ = tx.send(CompletionChunk {
                         content: String::new(),
@@ -194,35 +252,25 @@ impl LLMProvider for DeepseekProvider {
                     });
                     return Ok(());
                 }
-
-                if let Some((text_chunk, maybe_parent_id)) = stream::process_stream_line(&line) {
-                    debug_log::log("completion.stream.line", line.trim());
-                    if maybe_parent_id.is_some() {
-                        parent_message_id = maybe_parent_id;
-                        debug_log::log(
-                            "completion.stream.parent",
-                            format!("parent_message_id={:?}", parent_message_id),
-                        );
-                        // Persist immediately — if the stream is cut after this,
-                        // the thread id is already saved.
-                        let _ = self.mark_session_after_success(&session_id, parent_message_id);
-                    }
-
-                    if let Some(text) = text_chunk {
-                        debug_log::log(
-                            "completion.stream.chunk",
-                            format!("text_chunk={}", text),
-                        );
-                        let _ = tx.send(CompletionChunk {
-                            content: text,
-                            finish_reason: None,
-                        });
-                    }
-                }
             }
         }
 
         self.mark_session_after_success(&session_id, parent_message_id)?;
+        // DeepSeek's web endpoint routinely finishes a response by just
+        // closing the connection — no `data: [DONE]`, no status event. A
+        // cleanly terminated chunked body is a deliberate server-side close,
+        // so treat it as a normal stop; a severed connection surfaces as a
+        // read error in the loop above, never as clean EOF.
+        debug_log::log(
+            "completion.stream.eof",
+            format!(
+                "clean EOF treated as stop. session_id={session_id} parent_message_id={parent_message_id:?} streamed_bytes={streamed_bytes}"
+            ),
+        );
+        let _ = tx.send(CompletionChunk {
+            content: String::new(),
+            finish_reason: Some("stop".to_string()),
+        });
         Ok(())
     }
 

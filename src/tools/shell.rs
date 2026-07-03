@@ -6,6 +6,7 @@
 //! justify the seam; a third shell would be one more `Shell` constructor.
 
 use super::*;
+use crate::debug_log;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -226,6 +227,21 @@ impl Tool for ShellTool {
         let background = if interactive { false } else { background };
 
         let argv = (self.shell.make_args)(command);
+        debug_log::log_json(
+            "shell.execute.request",
+            &json!({
+                "tool": self.shell.name,
+                "display": self.shell.display,
+                "command": command,
+                "argv": argv,
+                "interactive": interactive,
+                "background": background,
+                "forced_interactive": forced_interactive,
+                "wait_seconds": wait_seconds,
+                "persistent": persistent,
+                "ttl_secs": ttl_secs,
+            }),
+        );
 
         if interactive {
             return run_interactive(
@@ -256,21 +272,22 @@ impl Tool for ShellTool {
         // targets, just via a different path.
         cmd.kill_on_drop(true);
 
-        // DETACHED_PROCESS: create child without a console so it cannot corrupt
-        // our TUI's shared console state (Windows-specific). Non-interactive
-        // commands work fine via pipes; interactive commands MUST use
-        // interactive=true.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.as_std_mut().creation_flags(0x00000008);
-        }
-
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::error(&format!("Failed to execute command: {e}")),
         };
         let pid = child.id().unwrap_or(0);
+        debug_log::log_json(
+            "shell.foreground.spawned",
+            &json!({
+                "tool": self.shell.name,
+                "display": self.shell.display,
+                "command": command,
+                "argv": argv,
+                "pid": pid,
+                "creation_flags_detached_process": false,
+            }),
+        );
 
         // Track PID so Escape/Ctrl+C can kill the child process.
         crate::app::FOREGROUND_CHILD_PID.store(pid, Ordering::SeqCst);
@@ -310,7 +327,7 @@ impl Tool for ShellTool {
         };
 
         let exit_status = if timed_out {
-            crate::debug_log::log(
+            debug_log::log(
                 "shell.foreground_timeout",
                 format!("{} pid={pid} exceeded {FOREGROUND_TIMEOUT_SECS}s, killing tree", self.shell.name),
             );
@@ -338,7 +355,6 @@ impl Tool for ShellTool {
         }
 
         crate::app::FOREGROUND_CHILD_PID.store(0, Ordering::SeqCst);
-        crate::app::request_terminal_restore();
 
         let mut stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
@@ -349,6 +365,23 @@ impl Tool for ShellTool {
             // fact that output was dropped.
             stdout.push_str(FOREGROUND_TRUNCATION_MARKER);
         }
+        debug_log::log_json(
+            "shell.foreground.output",
+            &json!({
+                "tool": self.shell.name,
+                "display": self.shell.display,
+                "command": command,
+                "pid": pid,
+                "timed_out": timed_out,
+                "exit_status": exit_status.as_ref().map(|status| status.code()),
+                "exit_success": exit_status.as_ref().map(|status| status.success()),
+                "stdout_chars": stdout.chars().count(),
+                "stderr_chars": stderr.chars().count(),
+                "stdout": stdout,
+                "stderr": stderr,
+                "truncated": truncated.load(Ordering::Relaxed),
+            }),
+        );
 
         if timed_out {
             let mut result = String::new();
@@ -373,6 +406,25 @@ impl Tool for ShellTool {
         match exit_status {
             Some(status) => {
                 if status.success() {
+                    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+                        debug_log::log_json(
+                            "shell.foreground.empty_success",
+                            &json!({
+                                "tool": self.shell.name,
+                                "display": self.shell.display,
+                                "command": command,
+                                "argv": argv,
+                                "pid": pid,
+                                "exit_code": status.code(),
+                                "note": "command exited successfully but produced no stdout/stderr",
+                            }),
+                        );
+                        if self.shell.name == "powershell" {
+                            return ToolResult::error(
+                                "[powershell exited successfully but returned no stdout/stderr; output capture likely failed]",
+                            );
+                        }
+                    }
                     ToolResult::success(&stdout)
                 } else {
                     let mut result = String::new();
@@ -385,10 +437,35 @@ impl Tool for ShellTool {
                         }
                         result.push_str(&stderr);
                     }
+                    debug_log::log_json(
+                        "shell.foreground.nonzero_exit",
+                        &json!({
+                            "tool": self.shell.name,
+                            "display": self.shell.display,
+                            "command": command,
+                            "argv": argv,
+                            "pid": pid,
+                            "exit_code": status.code(),
+                            "result_chars": result.chars().count(),
+                            "result": result,
+                        }),
+                    );
                     ToolResult::error(&result)
                 }
             }
-            None => ToolResult::error("Failed to execute command: could not determine exit status"),
+            None => {
+                debug_log::log_json(
+                    "shell.foreground.missing_exit_status",
+                    &json!({
+                        "tool": self.shell.name,
+                        "display": self.shell.display,
+                        "command": command,
+                        "argv": argv,
+                        "pid": pid,
+                    }),
+                );
+                ToolResult::error("Failed to execute command: could not determine exit status")
+            }
         }
     }
 }
@@ -401,6 +478,17 @@ async fn run_background(
     persistent: bool,
     ttl_secs: Option<u64>,
 ) -> ToolResult {
+    debug_log::log_json(
+        "shell.background.request",
+        &json!({
+            "tool": shell.name,
+            "display": shell.display,
+            "command": command_str,
+            "wait_seconds": wait_seconds,
+            "persistent": persistent,
+            "ttl_secs": ttl_secs,
+        }),
+    );
     let result = background::spawn_background(
         cmd,
         command_str.to_string(),
@@ -413,6 +501,19 @@ async fn run_background(
     crate::app::request_terminal_restore();
     match result {
         Ok(outcome) => {
+            debug_log::log_json(
+                "shell.background.result",
+                &json!({
+                    "tool": shell.name,
+                    "display": shell.display,
+                    "command": command_str,
+                    "job_id": outcome.id,
+                    "persistent": outcome.persistent,
+                    "ttl_secs": outcome.ttl_secs,
+                    "initial_output_chars": outcome.initial_output.chars().count(),
+                    "initial_output": outcome.initial_output,
+                }),
+            );
             let mut msg = format!(
                 "Started {} job #{} ({})",
                 shell.display,
@@ -434,7 +535,18 @@ async fn run_background(
             ));
             ToolResult::success(&msg)
         }
-        Err(e) => ToolResult::error(&e),
+        Err(e) => {
+            debug_log::log_json(
+                "shell.background.error",
+                &json!({
+                    "tool": shell.name,
+                    "display": shell.display,
+                    "command": command_str,
+                    "error": e,
+                }),
+            );
+            ToolResult::error(&e)
+        }
     }
 }
 
@@ -447,6 +559,19 @@ async fn run_interactive(
     persistent: bool,
     ttl_secs: Option<u64>,
 ) -> ToolResult {
+    debug_log::log_json(
+        "shell.interactive.request",
+        &json!({
+            "tool": shell.name,
+            "display": shell.display,
+            "argv": argv,
+            "command": command_str,
+            "wait_seconds": wait_seconds,
+            "forced_interactive": forced_interactive,
+            "persistent": persistent,
+            "ttl_secs": ttl_secs,
+        }),
+    );
     let result = background::spawn_interactive(
         shell.name,
         &argv,
@@ -463,6 +588,19 @@ async fn run_interactive(
     crate::app::request_terminal_restore();
     match result {
         Ok(outcome) => {
+            debug_log::log_json(
+                "shell.interactive.result",
+                &json!({
+                    "tool": shell.name,
+                    "display": shell.display,
+                    "command": command_str,
+                    "job_id": outcome.id,
+                    "persistent": outcome.persistent,
+                    "ttl_secs": outcome.ttl_secs,
+                    "initial_output_chars": outcome.initial_output.chars().count(),
+                    "initial_output": outcome.initial_output,
+                }),
+            );
             let mut msg = String::new();
             if forced_interactive {
                 msg.push_str("Auto-upgraded to interactive PTY.\n");
@@ -487,7 +625,19 @@ async fn run_interactive(
             ));
             ToolResult::success(&msg)
         }
-        Err(e) => ToolResult::error(&e),
+        Err(e) => {
+            debug_log::log_json(
+                "shell.interactive.error",
+                &json!({
+                    "tool": shell.name,
+                    "display": shell.display,
+                    "command": command_str,
+                    "argv": argv,
+                    "error": e,
+                }),
+            );
+            ToolResult::error(&e)
+        }
     }
 }
 

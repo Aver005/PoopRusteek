@@ -1,9 +1,11 @@
 use crate::app::conversation::ConversationId;
 use crate::app::events::{AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo};
+use crate::debug_log;
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider};
 use crate::tools::registry::ToolRegistry;
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -31,7 +33,15 @@ pub async fn run_agent_loop(
     let mut collected_tool_calls = Vec::new();
     let mut messages = messages;
 
-    for _step in 0..max_steps {
+    for step in 0..max_steps {
+        let step_number = step + 1;
+        debug_log::log(
+            "agent.step.start",
+            format!(
+                "conversation={conversation} step={step_number}/{max_steps} message_count={}",
+                messages.len()
+            ),
+        );
         let _ = event_tx.send(AppEvent::BeginAssistantMessage(conversation));
         let mut request_messages = Vec::with_capacity(messages.len() + 1);
         request_messages.push(ChatMessage::system(&system_prompt));
@@ -59,18 +69,34 @@ pub async fn run_agent_loop(
         let mut full_response = String::new();
         let mut streamed_visible = String::new();
         let mut got_stop = false;
+        let mut provider_error_message: Option<String> = None;
         let idle_timeout = std::time::Duration::from_secs(120);
         loop {
             match tokio::time::timeout(idle_timeout, rx.recv()).await {
                 Err(_) => {
                     stream_task.abort();
+                    debug_log::log(
+                        "agent.step.error",
+                        format!(
+                            "conversation={conversation} step={step_number}/{max_steps} reason=stream_timeout"
+                        ),
+                    );
                     let _ = event_tx.send(AppEvent::AgentError(
                         conversation,
                         "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
                     ));
                     return;
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    debug_log::log(
+                        "agent.step.stream_closed",
+                        format!(
+                            "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} collected_bytes={}",
+                            full_response.len()
+                        ),
+                    );
+                    break;
+                }
                 Ok(Some(chunk)) => {
                     if !chunk.content.is_empty() {
                         full_response.push_str(&chunk.content);
@@ -98,34 +124,127 @@ pub async fn run_agent_loop(
         // A closed channel without a "stop" chunk means the provider bailed
         // mid-stream — surface its error instead of treating it as end-of-turn.
         match stream_task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+            Ok(Ok(())) => {
                 if !got_stop {
-                    let _ = event_tx.send(AppEvent::AgentError(conversation, error.to_string()));
-                    return;
+                    let message = format!(
+                        "Stream ended without stop signal. conversation={conversation} step={step_number}/{max_steps} response_bytes={}",
+                        full_response.len()
+                    );
+                    debug_log::log("agent.step.error", &message);
+                    provider_error_message = Some(message);
+                }
+                if provider_error_message.is_none() {
+                    debug_log::log(
+                        "agent.step.provider_ok",
+                        format!(
+                            "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} response_bytes={}",
+                            full_response.len()
+                        ),
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                debug_log::log(
+                    "agent.step.error",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} reason=provider_error error={message}"
+                    ),
+                );
+                if !got_stop {
+                    provider_error_message = Some(message);
                 }
             }
             Err(join_error) => {
+                let message = format!("Stream task failed: {join_error}");
+                debug_log::log(
+                    "agent.step.error",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} reason=stream_task_join_error error={join_error}"
+                    ),
+                );
                 if !got_stop {
-                    let _ = event_tx.send(AppEvent::AgentError(
-                        conversation,
-                        format!("Stream task failed: {join_error}"),
-                    ));
-                    return;
+                    provider_error_message = Some(message);
                 }
             }
         }
 
         let tool_calls = parse_tool_calls(&full_response);
         let visible_text = strip_tool_calls(&full_response);
+        debug_log::log(
+            "agent.step.parsed",
+            format!(
+                "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} visible_chars={} tool_calls={}",
+                visible_text.chars().count(),
+                tool_calls.len()
+            ),
+        );
+        let tool_calls_for_log = tool_calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+            })
+            .collect::<Vec<_>>();
+        debug_log::log_json(
+            "agent.step.parsed.payload",
+            &json!({
+                "conversation": conversation.0,
+                "step": step_number,
+                "max_steps": max_steps,
+                "got_stop": got_stop,
+                "provider_error": provider_error_message,
+                "full_response_chars": full_response.chars().count(),
+                "full_response": full_response,
+                "visible_text_chars": visible_text.chars().count(),
+                "visible_text": visible_text,
+                "tool_calls": tool_calls_for_log,
+            }),
+        );
+        if let Some(error) = provider_error_message.take() {
+            if !tool_calls.is_empty() {
+                debug_log::log(
+                    "agent.step.salvaged",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} reason=provider_error_with_complete_tool_call error={error} tool_calls={}",
+                        tool_calls.len()
+                    ),
+                );
+                let _ = event_tx.send(AppEvent::AddMessage(
+                    conversation,
+                    ChatMessage::system(
+                        "Warning: stream ended early, but a complete tool call was recovered. Continuing.",
+                    ),
+                ));
+            } else {
+                let _ = event_tx.send(AppEvent::AgentError(conversation, error));
+                return;
+            }
+        }
 
         if tool_calls.is_empty() {
             if !visible_text.is_empty() {
                 messages.push(ChatMessage::assistant(&visible_text));
             } else {
+                debug_log::log(
+                    "agent.step.empty_assistant",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} reason=empty_response_without_tool_calls"
+                    ),
+                );
                 let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage(conversation));
             }
 
+            debug_log::log(
+                "agent.turn.done",
+                format!(
+                    "conversation={conversation} step={step_number}/{max_steps} status=success text_chars={} tool_calls_total={}",
+                    visible_text.chars().count(),
+                    collected_tool_calls.len()
+                ),
+            );
             let _ = event_tx.send(AppEvent::AgentDone(conversation, AgentResult {
                 text: visible_text,
                 tool_calls: collected_tool_calls,
@@ -141,6 +260,28 @@ pub async fn run_agent_loop(
         let total_calls = tool_calls.len();
         for (call_index, tool_call) in tool_calls.into_iter().enumerate() {
             let tool_id = uuid::Uuid::new_v4().to_string();
+            let tool_name = tool_call.name.clone();
+            debug_log::log(
+                "agent.tool.call",
+                format!(
+                    "conversation={conversation} step={step_number}/{max_steps} index={}/{} name={}",
+                    call_index + 1,
+                    total_calls,
+                    tool_name
+                ),
+            );
+            debug_log::log_json(
+                "agent.tool.call.payload",
+                &json!({
+                    "conversation": conversation.0,
+                    "step": step_number,
+                    "max_steps": max_steps,
+                    "tool_name": tool_name,
+                    "call_index": call_index + 1,
+                    "total_calls": total_calls,
+                    "arguments": tool_call.arguments,
+                }),
+            );
 
             // Calls beyond the per-step limit still get a tool_result — the
             // model must learn they were skipped, not reason from phantom
@@ -159,6 +300,13 @@ pub async fn run_agent_loop(
                 );
                 messages.push(tool_message.clone());
                 let _ = event_tx.send(AppEvent::AddMessage(conversation, tool_message));
+                debug_log::log(
+                    "agent.tool.skipped",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} name={} reason=max_tools_per_step",
+                        tool_name
+                    ),
+                );
                 continue;
             }
 
@@ -319,17 +467,40 @@ pub async fn run_agent_loop(
 
             let preview = summarize_tool_result(&tool_result);
             let display = preview.clone();
+            debug_log::log(
+                "agent.tool.result",
+                format!(
+                    "conversation={conversation} step={step_number}/{max_steps} name={} is_error={} result_chars={} preview={}",
+                    tool_name,
+                    is_error,
+                    tool_result.chars().count(),
+                    preview
+                ),
+            );
+            debug_log::log_json(
+                "agent.tool.result.payload",
+                &json!({
+                    "conversation": conversation.0,
+                    "step": step_number,
+                    "max_steps": max_steps,
+                    "tool_name": tool_name,
+                    "is_error": is_error,
+                    "result_chars": tool_result.chars().count(),
+                    "result": tool_result,
+                    "preview": preview,
+                }),
+            );
 
             let tool_message = ChatMessage::tool_with_display(
                 &tool_id,
-                &tool_call.name,
+                &tool_name,
                 &tool_result,
                 &display,
                 is_error,
             );
             messages.push(tool_message.clone());
             collected_tool_calls.push(ToolCallInfo {
-                name: tool_call.name.clone(),
+                name: tool_name.clone(),
                 arguments: tool_call.arguments.clone(),
                 result: Some(tool_result.clone()),
             });
@@ -349,6 +520,13 @@ pub async fn run_agent_loop(
         }
     }
 
+    debug_log::log(
+        "agent.turn.error",
+        format!(
+            "conversation={conversation} status=max_steps_exceeded max_steps={max_steps} tool_calls_total={}",
+            collected_tool_calls.len()
+        ),
+    );
     let _ = event_tx.send(AppEvent::AgentError(
         conversation,
         "Reached max agent steps before producing a final answer".to_string(),
@@ -428,6 +606,90 @@ mod tests {
             .expect("agent loop should finish with AgentDone");
         assert_eq!(done.text, "Hello, world!");
         assert!(done.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_loop_reports_error_when_stream_ends_without_stop() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response("partial").chunked(2).abrupt_eof());
+        let tools = Arc::new(ToolRegistry::new());
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+
+        run_agent_loop(
+            cid,
+            provider,
+            tools,
+            mcp,
+            vec![ChatMessage::user("hi")],
+            "system".to_string(),
+            "fake".to_string(),
+            0.0,
+            128,
+            4,
+            4,
+            false,
+            event_tx,
+        )
+        .await;
+
+        let mut saw_done = false;
+        let mut saw_error = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                AppEvent::AgentDone(_, _) => saw_done = true,
+                AppEvent::AgentError(id, message) if id == cid => saw_error = Some(message),
+                _ => {}
+            }
+        }
+
+        assert!(!saw_done, "abrupt EOF must not look like a successful turn");
+        let error = saw_error.expect("abrupt EOF should surface as AgentError");
+        assert!(error.contains("without stop"));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_salvages_complete_tool_call_when_stream_ends_early() {
+        let response = r#"<tool_use><name>question</name><arguments>{"question":"q","options":[],"allow_custom":false}</arguments></tool_use>"#;
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response(response).abrupt_eof());
+        let tools = Arc::new(ToolRegistry::new());
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+
+        run_agent_loop(
+            cid,
+            provider,
+            tools,
+            mcp,
+            vec![ChatMessage::user("hi")],
+            "system".to_string(),
+            "fake".to_string(),
+            0.0,
+            128,
+            4,
+            4,
+            true,
+            event_tx,
+        )
+        .await;
+
+        let mut saw_done = None;
+        let mut saw_error = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                AppEvent::AgentDone(id, result) if id == cid => saw_done = Some(result),
+                AppEvent::AgentError(id, message) if id == cid => saw_error = Some(message),
+                _ => {}
+            }
+        }
+
+        assert!(saw_error.is_none(), "complete tool call should be salvaged");
+        let done = saw_done.expect("salvaged tool call should still finish the turn");
+        assert_eq!(done.tool_calls.len(), 1);
+        assert_eq!(done.tool_calls[0].name, "question");
     }
 
     #[test]

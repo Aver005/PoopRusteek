@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-02 (in-TUI onboarding rework, /logout, /wipe — tests 209, clippy 0)
+> Last updated: 2026-07-03 (DeepSeek SSE finish-signal fix: clean EOF = stop, "stream ended early" warning gone — tests 219, clippy 0)
 
 ## PHASE COMPLETION
 
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **209 passing** (`cargo test --bin pooprusteek`), was 189 before this session |
+| Tests | **219 passing** (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS

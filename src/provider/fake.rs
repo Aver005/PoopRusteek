@@ -20,6 +20,11 @@ pub struct FakeProvider {
     /// Number of chunks each streamed body is split into (to exercise the
     /// runner's incremental delta handling). Always at least 1.
     chunk_count: usize,
+    /// When true, `complete_stream` closes the channel without sending a final
+    /// stop chunk, simulating a provider that ends the stream abruptly. The
+    /// count is decremented per streamed call, so tests can model "fail once,
+    /// recover next call" flows.
+    abrupt_eof_remaining: Mutex<usize>,
 }
 
 impl FakeProvider {
@@ -34,12 +39,20 @@ impl FakeProvider {
             model: "fake".to_string(),
             responses: Mutex::new(responses.into_iter().collect()),
             chunk_count: 1,
+            abrupt_eof_remaining: Mutex::new(0),
         }
     }
 
     /// Split each streamed body into `n` chunks instead of one.
     pub fn chunked(mut self, n: usize) -> Self {
         self.chunk_count = n.max(1);
+        self
+    }
+
+    /// Simulate a streaming provider that drops the channel without sending
+    /// the terminal stop chunk.
+    pub fn abrupt_eof(mut self) -> Self {
+        *self.abrupt_eof_remaining.get_mut().unwrap() = 1;
         self
     }
 
@@ -70,6 +83,18 @@ impl LLMProvider for FakeProvider {
                 content: piece.iter().collect(),
                 finish_reason: None,
             });
+        }
+        let should_abrupt = {
+            let mut remaining = self.abrupt_eof_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_abrupt {
+            return Ok(());
         }
         // Terminal chunk carries the stop signal, mirroring the real provider.
         let _ = tx.send(CompletionChunk {

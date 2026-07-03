@@ -419,15 +419,67 @@ pub(super) fn extract_parent_message_id(event: &Value) -> Option<i64> {
     None
 }
 
-pub(super) fn process_stream_line(line: &str) -> Option<(Option<String>, Option<i64>)> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("data:") {
+/// One recognized `data:` line from the completion SSE stream.
+pub(super) struct StreamEvent {
+    pub text: Option<String>,
+    pub parent_message_id: Option<i64>,
+    /// The server explicitly marked the response complete: `[DONE]` or a
+    /// FINISHED status patch.
+    pub finished: bool,
+}
+
+/// True when a single patch object sets the response status to FINISHED,
+/// e.g. `{"p":"response/status","v":"FINISHED"}` or a bare `{"v":"FINISHED"}`.
+fn patch_signals_finished(patch: &Value) -> bool {
+    let Some(object) = patch.as_object() else {
+        return false;
+    };
+    if object.get("v").and_then(Value::as_str) != Some("FINISHED") {
+        return false;
+    }
+    match object.get("p").and_then(Value::as_str) {
+        Some(path) => path.ends_with("status"),
+        None => true,
+    }
+}
+
+/// True when an event marks the end of the response: a status patch, a
+/// terminal `{"o":"BATCH","v":[patches...]}` containing one, or a full
+/// response object whose `status` is FINISHED.
+fn event_signals_finished(event: &Value) -> bool {
+    if patch_signals_finished(event) {
+        return true;
+    }
+    if let Some(object) = event.as_object()
+        && object.get("o").and_then(Value::as_str) == Some("BATCH")
+        && let Some(patches) = object.get("v").and_then(Value::as_array)
+        && patches.iter().any(patch_signals_finished)
+    {
+        return true;
+    }
+    get_value_by_path(
+        event,
+        &[
+            PathSegment::Key("v"),
+            PathSegment::Key("response"),
+            PathSegment::Key("status"),
+        ],
+    )
+    .and_then(Value::as_str)
+        == Some("FINISHED")
+}
+
+pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
+    let payload = line.trim().strip_prefix("data:")?.trim();
+    if payload.is_empty() {
         return None;
     }
-
-    let payload = trimmed[5..].trim();
-    if payload.is_empty() || payload == "[DONE]" {
-        return None;
+    if payload == "[DONE]" {
+        return Some(StreamEvent {
+            text: None,
+            parent_message_id: None,
+            finished: true,
+        });
     }
 
     let parsed = serde_json::from_str::<Value>(payload)
@@ -438,6 +490,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<(Option<String>, Option<
     } else {
         None
     };
+    let finished = event_signals_finished(&normalized);
 
     let mut text_chunk = extract_text_from_event(&normalized);
     if text_chunk.is_empty() {
@@ -448,16 +501,89 @@ pub(super) fn process_stream_line(line: &str) -> Option<(Option<String>, Option<
         }
     }
 
-    if text_chunk.is_empty() && parent_message_id.is_none() {
+    if text_chunk.is_empty() && parent_message_id.is_none() && !finished {
         return None;
     }
 
-    Some((
-        if text_chunk.is_empty() {
+    Some(StreamEvent {
+        text: if text_chunk.is_empty() {
             None
         } else {
             Some(text_chunk)
         },
         parent_message_id,
-    ))
+        finished,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn done_marker_finishes_with_or_without_space() {
+        for line in ["data: [DONE]", "data:[DONE]"] {
+            let event = process_stream_line(line).expect("[DONE] must be recognized");
+            assert!(event.finished);
+            assert!(event.text.is_none());
+        }
+    }
+
+    #[test]
+    fn status_finished_patch_finishes_without_text() {
+        let event = process_stream_line(r#"data: {"p":"response/status","v":"FINISHED"}"#)
+            .expect("status patch must be recognized");
+        assert!(event.finished);
+        assert!(event.text.is_none());
+    }
+
+    #[test]
+    fn bare_finished_value_finishes() {
+        let event = process_stream_line(r#"data: {"v":"FINISHED"}"#)
+            .expect("bare FINISHED must be recognized");
+        assert!(event.finished);
+        assert!(event.text.is_none());
+    }
+
+    #[test]
+    fn terminal_batch_patch_finishes() {
+        let line = r#"data: {"p":"response","o":"BATCH","v":[{"p":"status","v":"FINISHED"},{"p":"accumulated_token_usage","v":42}]}"#;
+        let event = process_stream_line(line).expect("terminal batch must be recognized");
+        assert!(event.finished);
+    }
+
+    #[test]
+    fn content_append_is_text_not_finish() {
+        let event = process_stream_line(
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"hello"}"#,
+        )
+        .expect("content append must be recognized");
+        assert_eq!(event.text.as_deref(), Some("hello"));
+        assert!(!event.finished);
+    }
+
+    #[test]
+    fn bare_v_chunk_is_text() {
+        let event = process_stream_line(r#"data: {"v":" Length"}"#).unwrap();
+        assert_eq!(event.text.as_deref(), Some(" Length"));
+        assert!(!event.finished);
+    }
+
+    #[test]
+    fn metadata_line_yields_parent_id_only() {
+        let event = process_stream_line(
+            r#"data: {"request_message_id":23,"response_message_id":24,"model_type":"default"}"#,
+        )
+        .unwrap();
+        assert_eq!(event.parent_message_id, Some(24));
+        assert!(event.text.is_none());
+        assert!(!event.finished);
+    }
+
+    #[test]
+    fn non_data_lines_are_ignored() {
+        assert!(process_stream_line(": keep-alive").is_none());
+        assert!(process_stream_line("event: message").is_none());
+        assert!(process_stream_line("").is_none());
+    }
 }
