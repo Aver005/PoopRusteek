@@ -558,6 +558,9 @@ impl App {
                     }
                 }
             }
+            AppEvent::ModelsListed { result, switch_to } => {
+                self.handle_models_listed(result, switch_to);
+            }
             AppEvent::SessionsDeleted { deleted, failed } => {
                 let mut message = format!(
                     "🗑 Deleted {deleted} session cop{}",

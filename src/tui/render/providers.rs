@@ -32,6 +32,7 @@ pub(super) fn render_providers_view(
         .borders(Borders::ALL)
         .title(" Providers ")
         .border_style(Style::default().fg(theme.accent));
+    let header_inner = header.inner(chunks[0]);
     frame.render_widget(header, chunks[0]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -39,7 +40,7 @@ pub(super) fn render_providers_view(
             Style::default().fg(theme.text_dim),
         )))
         .alignment(Alignment::Center),
-        chunks[0],
+        header_inner,
     );
 
     // Body: one row per provider.
@@ -86,19 +87,22 @@ pub(super) fn render_providers_view(
         );
     }
 
-    // Footer with keybindings
+    // Footer with keybindings. Block first, hints into its inner row — the
+    // other order paints the hint text onto the border row and the block's
+    // top border then overdraws it.
     let footer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border));
+    let footer_inner = footer.inner(chunks[2]);
+    frame.render_widget(footer, chunks[2]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "  j/k ↑↓ navigate  Enter/Space activate  a add  d remove  Esc/q back  ",
             Style::default().fg(theme.text_dim),
         )))
         .alignment(Alignment::Center),
-        chunks[2],
+        footer_inner,
     );
-    frame.render_widget(footer, chunks[2]);
 }
 
 pub(super) fn render_provider_add(

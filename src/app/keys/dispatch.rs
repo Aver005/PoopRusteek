@@ -142,6 +142,12 @@ impl App {
             CommandResult::Error(err) => {
                 self.state.push_system(&err);
             }
+            CommandResult::OpenModels => {
+                self.request_models(None);
+            }
+            CommandResult::SwitchModel(id) => {
+                self.request_models(Some(id));
+            }
             CommandResult::OpenProviders => {
                 self.state.view = View::Providers;
                 self.state.providers_view.selected = 0;

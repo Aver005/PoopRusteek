@@ -256,6 +256,15 @@ impl App {
                     self.stop_background(target);
                 }
             }
+            events::PickerKind::Models => {
+                if let Some(model) = indices
+                    .first()
+                    .and_then(|&i| picker.items.get(i))
+                    .map(|item| item.value.clone())
+                {
+                    self.apply_model_switch(&model);
+                }
+            }
             _ => {
                 if let Some(idx) = indices.first()
                     && let Some(item) = picker.items.get(*idx) {

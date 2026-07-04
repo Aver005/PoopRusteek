@@ -69,6 +69,11 @@ pub enum CommandResult {
     /// `<name> <base_url> [model] [api_key]` form and falls back to the
     /// wizard on parse failure.
     OpenProviderAdd(Option<String>),
+    /// `/models` — fetch the active provider's models and open the picker.
+    OpenModels,
+    /// `/models <id>` — validate the id against the provider's model list
+    /// and switch to it (404-style error when it doesn't exist).
+    SwitchModel(String),
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +161,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::retry::RetryCommand));
         self.register(Box::new(defs::mcp::McpCommand));
         self.register(Box::new(defs::providers::ProvidersCommand));
+        self.register(Box::new(defs::models::ModelsCommand));
         self.register(Box::new(defs::tools::ToolsCommand));
         self.register(Box::new(defs::whitelist::WhitelistCommand));
         self.register(Box::new(defs::skills::SkillsCommand));

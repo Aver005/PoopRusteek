@@ -15,6 +15,7 @@ pub mod rate;
 pub mod retry;
 pub mod mcp;
 pub mod providers;
+pub mod models;
 pub mod tools;
 pub mod whitelist;
 pub mod skills;

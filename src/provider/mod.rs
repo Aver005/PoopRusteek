@@ -283,6 +283,15 @@ pub trait LLMProvider: Send + Sync {
     ) -> crate::error::AppResult<()>;
     fn model(&self) -> &str;
 
+    /// The model ids this provider can serve (for `/models`). OpenAI-style
+    /// providers answer from `GET /models`; DeepSeek's web API has a fixed
+    /// pair. Default: unsupported.
+    async fn list_models(&self) -> crate::error::AppResult<Vec<String>> {
+        Err(crate::error::AppError::Custom(
+            "Model listing not supported by this provider".to_string(),
+        ))
+    }
+
     /// Create a sibling instance that shares this provider's configuration
     /// (and connection) but starts a **fresh session** — no shared
     /// `parent_message_id`/`session_id`. Each parallel conversation and

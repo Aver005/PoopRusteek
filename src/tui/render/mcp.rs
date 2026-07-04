@@ -25,6 +25,7 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
         .borders(Borders::ALL)
         .title(if mcp.auth_mode { " MCP Authorization " } else { " MCP Server Management " })
         .border_style(Style::default().fg(theme.accent));
+    let header_inner = header.inner(chunks[0]);
     frame.render_widget(header, chunks[0]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -36,7 +37,7 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
             Style::default().fg(theme.text_dim),
         )))
         .alignment(Alignment::Center),
-        chunks[0],
+        header_inner,
     );
 
     // Body
@@ -47,7 +48,9 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
         render_mcp_list(frame, body_area, mcp, theme);
     }
 
-    // Footer with keybindings
+    // Footer with keybindings. Block first, hints into its inner row — the
+    // old order painted the hint text onto the border row and the block's
+    // top border then overdrew it, leaving the legend invisible.
     let footer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border));
@@ -58,12 +61,13 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
     } else {
         "  j/k ↑↓ navigate  Space toggle  r reconnect  d remove  Enter details  Esc/q back  "
     };
+    let footer_inner = footer.inner(chunks[2]);
+    frame.render_widget(footer, chunks[2]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(theme.text_dim))))
             .alignment(Alignment::Center),
-        chunks[2],
+        footer_inner,
     );
-    frame.render_widget(footer, chunks[2]);
 }
 
 fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {

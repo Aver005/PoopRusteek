@@ -125,6 +125,20 @@ impl LLMProvider for OpenAiCompatProvider {
         Ok(())
     }
 
+    async fn list_models(&self) -> AppResult<Vec<String>> {
+        let mut http_request = self.client.get(format!("{}/models", self.base_url));
+        if let Some(key) = &self.api_key {
+            http_request = http_request.bearer_auth(key);
+        }
+        let response = http_request.send().await.map_err(AppError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::Provider(format!("GET /models failed: {status}")));
+        }
+        let list: openai_compat::ModelList = response.json().await.map_err(AppError::Http)?;
+        Ok(list.data.into_iter().map(|model| model.id).collect())
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

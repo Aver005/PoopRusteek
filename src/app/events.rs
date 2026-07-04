@@ -169,6 +169,14 @@ pub enum AppEvent {
     RemoteSessionsListed {
         result: Result<Vec<crate::provider::RemoteSessionInfo>, String>,
     },
+    /// Result of a background `LLMProvider::list_models` fetch (started by
+    /// `/models`). With `switch_to: Some(id)` the id is validated against
+    /// the list and applied (or rejected, 404-style); with `None` the model
+    /// picker opens.
+    ModelsListed {
+        result: Result<Vec<String>, String>,
+        switch_to: Option<String>,
+    },
     /// A background session-deletion batch finished.
     SessionsDeleted { deleted: usize, failed: Vec<String> },
 }
@@ -443,6 +451,8 @@ pub enum PickerKind {
     Skills,
     Chats,
     Agents,
+    /// `/models` — switch the active provider's model.
+    Models,
 }
 
 #[derive(Debug, Clone)]

@@ -111,6 +111,13 @@ impl DeepseekProvider {
 
 #[async_trait]
 impl LLMProvider for DeepseekProvider {
+    async fn list_models(&self) -> AppResult<Vec<String>> {
+        // The web API has no model-listing endpoint; these are the two
+        // model types the completion endpoint accepts (see prompt.rs's
+        // `resolve_model_type`).
+        Ok(vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()])
+    }
+
     async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
         let (response, session_id) = self.send_request(&request).await?;
         let mut stream = response.bytes_stream();

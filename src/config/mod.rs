@@ -172,6 +172,21 @@ impl Config {
             .unwrap_or(&self.provider.model)
     }
 
+    /// Display name of the active provider: the `/providers` entry's name,
+    /// or the built-in provider's kind label. Shared by the status bar,
+    /// landing screen, and stats panel.
+    pub fn active_provider_name(&self) -> String {
+        if let Some(entry) = self.active_provider_entry() {
+            return entry.name.clone();
+        }
+        match self.provider.kind {
+            ProviderKind::Deepseek => "DeepSeek",
+            ProviderKind::Openai => "OpenAI",
+            ProviderKind::Custom => "Custom",
+        }
+        .to_string()
+    }
+
     pub fn path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))

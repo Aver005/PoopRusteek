@@ -43,6 +43,7 @@
 - ~~Single provider~~ FIXED 2026-07-05: `/providers` manages OpenAI-compatible endpoints (LM Studio, Ollama `/v1`, vLLM, …) — `OpenAiCompatProvider` (`provider/openai_client.rs`) + `provider::build_provider` factory + `Config.providers`/`active_provider`. The old `ProviderKind::Openai/Custom` enum variants are now purely decorative (selection goes through `/providers` entries, not `provider.kind`) — candidates for removal.
 - No schema validation on MCP tool arguments. `→ src/mcp/client.rs`
 - DeepSeek streaming never reports token usage (`usage` always None).
+- `/models` switching: model id is validated against `LLMProvider::list_models()` (GET /models for compat providers, fixed pair for DeepSeek).
 - Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`
 - No persistent RAG / codebase search.
 - Foreground child PID tracking is a single global slot, not per-conversation (also an upward `tools`→`app` dependency).

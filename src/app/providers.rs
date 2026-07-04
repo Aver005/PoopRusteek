@@ -180,6 +180,100 @@ pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, Stri
     })
 }
 
+impl crate::app::App {
+    /// `/models` entry point: fetch the active provider's model list off
+    /// the event loop and report back via `AppEvent::ModelsListed`. With
+    /// `switch_to: Some(id)` the handler validates and switches instead of
+    /// opening the picker.
+    pub(crate) fn request_models(&mut self, switch_to: Option<String>) {
+        let Some(provider) = self.state.focused().provider.clone() else {
+            self.state.push_system("No active provider — configure one via /providers first.");
+            return;
+        };
+        self.state.status_message = "Fetching models...".to_string();
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = provider.list_models().await.map_err(|error| error.to_string());
+            let _ = event_tx.send(crate::app::events::AppEvent::ModelsListed { result, switch_to });
+        });
+    }
+
+    /// Apply a `ModelsListed` result: validate-and-switch, or open the
+    /// model picker with the current model marked.
+    pub(crate) fn handle_models_listed(
+        &mut self,
+        result: Result<Vec<String>, String>,
+        switch_to: Option<String>,
+    ) {
+        use crate::app::events::{Modal, PickerItem, PickerKind, PickerMode, PickerState};
+
+        let models = match result {
+            Ok(models) if models.is_empty() => {
+                self.state.push_system("The provider reported no models.");
+                return;
+            }
+            Ok(models) => models,
+            Err(error) => {
+                self.state.push_system(&format!("Failed to list models: {error}"));
+                return;
+            }
+        };
+
+        if let Some(target) = switch_to {
+            if models.iter().any(|model| model == &target) {
+                self.apply_model_switch(&target);
+            } else {
+                self.state.push_system(&format!(
+                    "Model '{target}' not found on the active provider (404). Available: {}",
+                    models.join(", "),
+                ));
+            }
+            return;
+        }
+
+        let current = self.config.active_model().to_string();
+        let items: Vec<PickerItem> = models
+            .into_iter()
+            .map(|model| {
+                let marker = if model == current { "\u{25CF}" } else { " " };
+                PickerItem::new(format!("{marker} {model}"), model.clone())
+            })
+            .collect();
+        self.state.status_message.clear();
+        self.state.modal = Some(Modal::Picker(PickerState::new_with_kind(
+            " Models (Enter to switch)",
+            items,
+            PickerMode::Single,
+            PickerKind::Models,
+        )));
+    }
+
+    /// Switch the active provider's model: the active `/providers` entry's
+    /// `model` field, or `[provider].model` for the built-in DeepSeek.
+    pub(crate) fn apply_model_switch(&mut self, model: &str) {
+        let active_name = self.config.active_provider_entry().map(|entry| entry.name.clone());
+        match active_name {
+            Some(name) => {
+                if let Some(entry) = self.config.providers.iter_mut().find(|entry| entry.name == name) {
+                    entry.model = model.to_string();
+                }
+            }
+            None => {
+                self.config.provider.model = model.to_string();
+            }
+        }
+        match crate::config::save(&self.config) {
+            Ok(()) => {
+                self.rebuild_provider();
+                self.state.push_system(&format!("Model switched to {model}."));
+            }
+            Err(error) => {
+                self.state.push_system(&format!("Failed to save config: {error}"));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

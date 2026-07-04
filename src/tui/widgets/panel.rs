@@ -75,7 +75,8 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 
     // ── Model ──
     section_header(&mut lines, "Model", panel_w, theme);
-    data_row(&mut lines, "Model", &config.provider.model, theme);
+    data_row(&mut lines, "Model", config.active_model(), theme);
+    data_row(&mut lines, "Provider", &config.active_provider_name(), theme);
     let sid = &state.focused().session_id;
     let short_sid = if sid.len() > 17 {
         format!("{}..", crate::util::truncate_at_char_boundary(sid, 17))
