@@ -28,7 +28,7 @@
 | `/attach` | — | `<path1> [path2]…` | Attach files to the NEXT message (supports quoted paths) | `defs/attach.rs` |
 | `/export` | — | `[path]` | Export chat to Markdown (default `{data}/exports/{session_id}.md`) | `defs/export.rs` |
 | `/import` | — | `<path.md>` | Import chat from Markdown; session tagged `Imported` | `defs/import.rs` |
-| `/sessions` | — | — | List local sessions (hides `__goal_system__`-tagged) | `defs/session_list.rs` |
+| `/sessions` | — | — | List local sessions (hides `__goal_system__`-tagged); sessions with a confirmed-dead remote link show a ⚠ prefix and render yellow (`PickerItem::warn`) | `defs/session_list.rs` |
 | `/session` | — | — | Show current session info (stats, tokens, model) | `defs/session_info.rs` |
 | `/load` | — | `<session_id>` | Load session by ID (local, or DeepSeek remote) | `defs/load.rs` |
 | `/last` | — | — | Open most recent session, or start fresh | `defs/last.rs` |

@@ -298,4 +298,33 @@ pub trait LLMProvider: Send + Sync {
             "Remote session fetching not supported by this provider".to_string(),
         ))
     }
+
+    /// This provider's live server-side session identity (session id + last
+    /// known parent message id), if a turn has established one since the
+    /// last `reset()`. Read synchronously (in-memory only, no network) so
+    /// it can be sampled on every auto-save without blocking. `None` before
+    /// the first turn of a session, or right after a reset.
+    fn session_identity(&self) -> Option<(String, Option<i64>)> {
+        None
+    }
+
+    /// Best-effort check that a previously-established server-side session
+    /// id is still reachable (hasn't been deleted or expired upstream).
+    /// `false` covers both "confirmed gone" and "couldn't tell" — callers
+    /// must not keep threading onto a session they can't verify.
+    async fn session_is_alive(&self, _session_id: &str) -> bool {
+        false
+    }
+
+    /// Adopt a previously-known server-side session id + parent message id
+    /// as this provider's active thread, so the next turn continues it
+    /// instead of creating a new remote session. Callers should confirm the
+    /// session is still alive (`session_is_alive`) first.
+    async fn adopt_session(
+        &self,
+        _session_id: &str,
+        _parent_message_id: Option<i64>,
+    ) -> crate::error::AppResult<()> {
+        Ok(())
+    }
 }

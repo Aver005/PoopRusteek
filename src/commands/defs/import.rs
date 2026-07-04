@@ -55,6 +55,9 @@ impl Command for ImportCommand {
             model_type: config.provider.model.clone(),
             messages: messages.clone(),
             tag: Some("Imported".to_string()),
+            provider_session_id: None,
+            provider_parent_message_id: None,
+            broken: false,
         };
 
         if let Err(e) = crate::session::save_local(&session, config) {
@@ -63,6 +66,12 @@ impl Command for ImportCommand {
 
         state.focused_mut().messages = messages;
         state.focused_mut().session_id = session_id.clone();
+        // Without this, the very next auto-save (on the user's first reply in
+        // this session) would silently overwrite the file's tag back to
+        // `None` — `auto_save_session` only ever persists what's mirrored on
+        // the live `Conversation`, not what's already on disk.
+        state.focused_mut().tag = session.tag.clone();
+        state.focused_mut().broken = false;
         state.scroll_offset = 0;
         state.input.buffer.clear();
         state.input.cursor = 0;

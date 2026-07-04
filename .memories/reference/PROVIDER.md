@@ -1,6 +1,6 @@
 # REFERENCE: DeepSeek Provider
 > The LLM backend. Reverse-engineered DeepSeek **web** API (chat.deepseek.com), not the public API key product.
-> Source: `src/provider/`. Last updated: 2026-07-04 (constructor gained `rate_limit_per_minute`; see note below on file split)
+> Source: `src/provider/`. Last updated: 2026-07-04 (constructor gained `rate_limit_per_minute`; trait gained `session_identity`/`session_is_alive`/`adopt_session` for cross-restart session resume — see `reference/CONFIG.md`'s "Remote session resume" section for the full flow)
 
 > Line numbers below (`deepseek.rs:NNN`) predate the module split into
 > `src/provider/deepseek/{mod,http,session,stream,endpoints}.rs` — treat them as
@@ -17,6 +17,9 @@
 | `reset` | `async () -> AppResult<()>` | Reset session state (default no-op; DeepSeek impl clears `SessionState`) |
 | `fetch_remote_session_messages` | `async (session_id) -> AppResult<Vec<ChatMessage>>` | Pull a remote DeepSeek session (default: error) |
 | `fork` | `() -> Arc<dyn LLMProvider>` (:211) | Fresh-session sibling sharing config/token. DeepSeek rebuilds via `fork_session()` (:144) with a new `SessionState`; `FakeProvider` returns a new instance. Tested for session independence (`deepseek.rs:1773`). |
+| `session_identity` | `() -> Option<(String, Option<i64>)>` | Sync (no I/O) read of the live `(session_id, parent_message_id)`. Default `None`; DeepSeek locks `session_state` and clones. Sampled by `App::auto_save_session` every turn to persist resumable identity. |
+| `session_is_alive` | `async (session_id) -> bool` | Best-effort existence check. Default `false`; DeepSeek delegates to `fetch_remote_history` (`chat/history`) — any error (deleted/expired/network) reads as not-alive. |
+| `adopt_session` | `async (session_id, parent_message_id) -> AppResult<()>` | Resume a previously-known remote session instead of creating a new one. Default no-op; DeepSeek sets `SessionState{session_id, parent_message_id, system_sent_for_session: true}` directly, skipping `chat_session/create`. |
 
 `DeepseekProvider` is the only real impl; `FakeProvider` (`provider/fake.rs`, `#[cfg(test)]`) is the test double. `provider` is `Option<Arc<dyn LLMProvider>>` and lives **per `Conversation`** (each gets its own via `fork()`) — `None` when token is empty.
 

@@ -452,13 +452,16 @@ impl App {
         };
 
         let save_eval_session = |this: &Self| {
-            let _ = crate::session::save_session_with_tag(
+            let _ = crate::session::save_session(
                 &this.state.goal.agent2_session_id,
                 &this.state.focused().session_started_at,
                 &eval_messages,
                 &this.config,
                 &this.state.workspace_path,
-                Some("__goal_system__".to_string()),
+                &crate::session::SessionMeta {
+                    tag: Some("__goal_system__".to_string()),
+                    ..Default::default()
+                },
             );
         };
 

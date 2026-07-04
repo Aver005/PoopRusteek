@@ -92,6 +92,8 @@ impl App {
             provider: Some(provider),
             generation,
             agent_task: Some(handle),
+            tag: None,
+            broken: false,
         });
         Ok(())
     }
@@ -263,6 +265,8 @@ impl App {
             provider,
             generation: generation::GenerationState::default(),
             agent_task: None,
+            tag: None,
+            broken: false,
         });
         self.state.scroll_offset = 0;
         self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();

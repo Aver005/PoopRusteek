@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-04 (`/rate` per-minute cap + confirmation messages, `/debug [on|off]` runtime toggle, stats-panel Rate row, input-history-after-submit fix — tests 223, clippy 0)
+> Last updated: 2026-07-04 (remote session resume on `/load` — see BUGS.md RESOLVED; also this session: PowerShell empty-output false-positive fix, multi-line system-message render fix — tests 227, clippy 0)
 
 ## PHASE COMPLETION
 
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **223 passing** (`cargo test --bin pooprusteek`) |
+| Tests | **227 passing** (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS

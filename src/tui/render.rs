@@ -1142,10 +1142,16 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
             if is_cursor { "\u{25B6} " } else { "  " }
         };
 
-        let bg = if is_cursor { theme.selection } else { theme.panel };
-        let fg = if is_cursor { theme.fg } else { theme.text_soft };
-
         let item = &picker.items[i];
+        let bg = if is_cursor { theme.selection } else { theme.panel };
+        let fg = if is_cursor {
+            theme.fg
+        } else if item.warn {
+            theme.warning
+        } else {
+            theme.text_soft
+        };
+
         let text = truncate(&item.text, inner_w.saturating_sub(6));
 
         let row_style = Style::default().fg(fg).bg(bg);

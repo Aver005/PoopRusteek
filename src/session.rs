@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SESSION_VERSION: i32 = 1;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub version: i32,
     pub id: String,
@@ -16,6 +16,35 @@ pub struct Session {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tag: Option<String>,
+    /// The DeepSeek-side (remote) session id this local file last
+    /// successfully synced with, so a future load can try to continue the
+    /// same server-side thread instead of silently starting a new one.
+    /// `None` if no turn has completed yet, or after the remote side was
+    /// confirmed gone (see `broken`).
+    #[serde(default)]
+    pub provider_session_id: Option<String>,
+    /// Last known DeepSeek `parent_message_id` for `provider_session_id`,
+    /// needed to keep replies attached to the right thread branch on resume.
+    #[serde(default)]
+    pub provider_parent_message_id: Option<i64>,
+    /// Set once a previously-linked remote session is confirmed unreachable
+    /// (deleted/expired upstream). Surfaced in `/sessions` as a flagged
+    /// entry; loading it again replays local history into a fresh remote
+    /// session rather than re-checking a link already known dead.
+    #[serde(default)]
+    pub broken: bool,
+}
+
+/// Non-identity fields of [`Session`] that `save_session` needs but doesn't
+/// derive from its other arguments — bundled so that function doesn't grow a
+/// new positional parameter (and every call site) each time one more of
+/// these is added.
+#[derive(Debug, Clone, Default)]
+pub struct SessionMeta {
+    pub tag: Option<String>,
+    pub broken: bool,
+    pub provider_session_id: Option<String>,
+    pub provider_parent_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +58,8 @@ pub struct SessionSummary {
     pub model_type: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tag: Option<String>,
+    #[serde(default)]
+    pub broken: bool,
 }
 
 pub fn create_session_id() -> String {
@@ -45,17 +76,7 @@ pub fn save_session(
     messages: &[ChatMessage],
     config: &Config,
     workspace_root: &str,
-) -> AppResult<()> {
-    save_session_with_tag(id, created_at, messages, config, workspace_root, None)
-}
-
-pub fn save_session_with_tag(
-    id: &str,
-    created_at: &str,
-    messages: &[ChatMessage],
-    config: &Config,
-    workspace_root: &str,
-    tag: Option<String>,
+    meta: &SessionMeta,
 ) -> AppResult<()> {
     let dir = Config::sessions_dir();
     std::fs::create_dir_all(&dir)?;
@@ -69,7 +90,10 @@ pub fn save_session_with_tag(
         workspace_root: workspace_root.to_string(),
         model_type: config.provider.model.clone(),
         messages: messages.to_vec(),
-        tag,
+        tag: meta.tag.clone(),
+        provider_session_id: meta.provider_session_id.clone(),
+        provider_parent_message_id: meta.provider_parent_message_id,
+        broken: meta.broken,
     };
 
     let path = dir.join(format!("{id}.json"));
@@ -132,6 +156,7 @@ pub fn list_sessions(_config: &Config) -> AppResult<Vec<SessionSummary>> {
             title,
             model_type: session.model_type,
             tag: session.tag,
+            broken: session.broken,
         });
     }
 
@@ -277,6 +302,37 @@ mod tests {
         let session = result.expect("session at the current version must load");
         assert_eq!(session.version, SESSION_VERSION);
         assert_eq!(session.id, id);
+        // The JSON above predates provider_session_id/broken — `#[serde(default)]`
+        // must fill them in rather than fail to parse, or every session file
+        // written before this feature would become unloadable.
+        assert_eq!(session.provider_session_id, None);
+        assert_eq!(session.provider_parent_message_id, None);
+        assert!(!session.broken);
+    }
+
+    #[test]
+    fn save_session_round_trips_provider_identity_and_broken_flag() {
+        let id = "pooprusteek_test_session_meta_roundtrip";
+        let config = Config::default();
+        let meta = SessionMeta {
+            tag: Some("Imported".to_string()),
+            broken: true,
+            provider_session_id: Some("remote-123".to_string()),
+            provider_parent_message_id: Some(9),
+        };
+
+        save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &meta)
+            .expect("save_session should succeed");
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+
+        let loaded = load_local(id, &config);
+        cleanup(&path);
+
+        let session = loaded.expect("just-saved session must load back");
+        assert_eq!(session.tag.as_deref(), Some("Imported"));
+        assert!(session.broken);
+        assert_eq!(session.provider_session_id.as_deref(), Some("remote-123"));
+        assert_eq!(session.provider_parent_message_id, Some(9));
     }
 
     #[test]

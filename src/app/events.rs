@@ -146,6 +146,16 @@ pub enum AppEvent {
         result: Result<Vec<ChatMessage>, String>,
     },
 
+    /// Result of a background check (started by `/load`) of whether a local
+    /// session's previously-linked remote DeepSeek session is still alive.
+    SessionAvailabilityChecked {
+        conversation: ConversationId,
+        session: crate::session::Session,
+        remote_id: String,
+        parent_message_id: Option<i64>,
+        alive: bool,
+    },
+
     /// A detached MCP admin operation (reload / toggle / reconnect) finished.
     McpOperationDone { message: String },
 
@@ -396,11 +406,19 @@ mod onboarding_tests {
 pub struct PickerItem {
     pub text: String,
     pub value: String,
+    /// Render this row flagged (e.g. yellow) — used by `/sessions` to mark
+    /// sessions whose remote link was found dead.
+    pub warn: bool,
 }
 
 impl PickerItem {
     pub fn new(text: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { text: text.into(), value: value.into() }
+        Self { text: text.into(), value: value.into(), warn: false }
+    }
+
+    pub fn warn(mut self, on: bool) -> Self {
+        self.warn = on;
+        self
     }
 }
 

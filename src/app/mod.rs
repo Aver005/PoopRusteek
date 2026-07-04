@@ -19,6 +19,7 @@ use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::provider::estimate_tokens;
 use crate::tools::registry::ToolRegistry;
 use crate::commands::CommandSuggestion;
+use crate::session;
 use crate::skills::{discovery::discover_all_skills, SkillDefinition};
 use events::{
     AppEvent, ConfirmAction, GoalStage, Modal, OnboardingState, PendingInteraction, QuestionRequest,
@@ -543,6 +544,9 @@ impl App {
             AppEvent::SessionFetched { conversation, session_id, result } => {
                 self.apply_fetched_session(conversation, &session_id, result).await;
             }
+            AppEvent::SessionAvailabilityChecked { conversation, session, remote_id, parent_message_id, alive } => {
+                self.apply_session_availability(conversation, session, remote_id, parent_message_id, alive).await;
+            }
             AppEvent::RemoteSessionsListed { result } => {
                 if let Some(Modal::DeleteSessions(st)) = self.state.modal.as_mut() {
                     match result {
@@ -746,13 +750,13 @@ impl App {
 
 
     async fn handle_load_session(&mut self, session_id: &str) -> AppResult<()> {
-        use crate::session;
-
         match session::load_local(session_id, &self.config) {
             Ok(s) => {
-                self.state.focused_mut().messages = s.messages;
+                self.state.focused_mut().messages = s.messages.clone();
                 self.state.attached_files.clear();
-                self.state.focused_mut().session_id = s.id;
+                self.state.focused_mut().session_id = s.id.clone();
+                self.state.focused_mut().tag = s.tag.clone();
+                self.state.focused_mut().broken = s.broken;
                 self.state.scroll_offset = 0;
                 self.state.input.buffer.clear();
                 self.state.input.cursor = 0;
@@ -763,14 +767,52 @@ impl App {
                     handle.abort();
                 }
 
-                if let Some(provider) = &self.state.focused().provider {
-                    let _ = provider.reset().await;
-                }
-
-                let count = self.state.focused_mut().messages.len();
+                let count = s.messages.len();
                 self.state.status_message = format!(
                     "Loaded local session {session_id} ({count} messages)"
                 );
+
+                if s.broken {
+                    self.state.focused_mut().messages.push(ChatMessage::system(
+                        "This session's remote DeepSeek link was already found unreachable — \
+                        a fresh remote session will be created and your full local history \
+                        sent as context with your next message.",
+                    ));
+                }
+
+                let provider = self.state.focused().provider.clone();
+                let conversation = self.state.conversations.focused_id();
+
+                match (provider, s.provider_session_id.clone()) {
+                    (Some(provider), Some(remote_id)) => {
+                        // Verify off the event loop: a slow/hung network check
+                        // here must not freeze the whole TUI. `s` (messages +
+                        // metadata) rides along so the result handler can
+                        // persist a "confirmed broken" session without
+                        // re-reading the file.
+                        let parent_message_id = s.provider_parent_message_id;
+                        let event_tx = self.event_tx.clone();
+                        tokio::spawn(async move {
+                            let alive = provider.session_is_alive(&remote_id).await;
+                            let _ = event_tx.send(AppEvent::SessionAvailabilityChecked {
+                                conversation,
+                                session: s,
+                                remote_id,
+                                parent_message_id,
+                                alive,
+                            });
+                        });
+                    }
+                    (Some(provider), None) => {
+                        // No remote link to verify (never established, or
+                        // already cleared by an earlier broken-session
+                        // recovery) — just ensure a clean slate so the next
+                        // message starts a fresh remote session with local
+                        // history replayed as one prompt (default behavior).
+                        let _ = provider.reset().await;
+                    }
+                    (None, _) => {}
+                }
             }
             Err(_) => {
                 let remote_provider = self.state.focused().provider.clone();
@@ -803,6 +845,69 @@ impl App {
         Ok(())
     }
 
+    /// Apply the result of a background aliveness check (started by
+    /// `handle_load_session`) of a local session's linked remote DeepSeek
+    /// session.
+    async fn apply_session_availability(
+        &mut self,
+        conversation: conversation::ConversationId,
+        session: session::Session,
+        remote_id: String,
+        parent_message_id: Option<i64>,
+        alive: bool,
+    ) {
+        let Some(conv) = self.state.conversations.get(conversation) else {
+            return;
+        };
+        // The user loaded a different session (or this one again) while the
+        // check was in flight — the result no longer applies.
+        if conv.session_id != session.id {
+            return;
+        }
+        let provider = conv.provider.clone();
+
+        if alive {
+            if let Some(provider) = provider {
+                let _ = provider.adopt_session(&remote_id, parent_message_id).await;
+            }
+            return;
+        }
+
+        if let Some(provider) = provider {
+            let _ = provider.reset().await;
+        }
+        self.finalize_broken_session(conversation, session);
+    }
+
+    /// Flag a session's remote link as confirmed dead: persist `broken` +
+    /// a cleared provider identity to disk, mirror it on the live
+    /// `Conversation`, and notify the user. Shared by the "just discovered
+    /// broken" path (`apply_session_availability`) — there's no "already
+    /// known broken" path calling this because `handle_load_session` skips
+    /// the network check entirely once a session has no remote id left to
+    /// verify.
+    fn finalize_broken_session(&mut self, conversation: conversation::ConversationId, mut session: session::Session) {
+        session.broken = true;
+        session.provider_session_id = None;
+        session.provider_parent_message_id = None;
+        if let Err(e) = session::save_local(&session, &self.config) {
+            tracing::warn!("Failed to persist broken-session flag: {e}");
+        }
+
+        let Some(conv) = self.state.conversations.get_mut(conversation) else {
+            return;
+        };
+        if conv.session_id != session.id {
+            return;
+        }
+        conv.broken = true;
+        conv.messages.push(ChatMessage::system(
+            "This session's remote DeepSeek link is no longer reachable — a fresh remote \
+            session will be created and your full local history sent as context with your \
+            next message.",
+        ));
+    }
+
     /// Apply a remote-session fetch result delivered by `SessionFetched`.
     async fn apply_fetched_session(
         &mut self,
@@ -810,8 +915,6 @@ impl App {
         session_id: &str,
         result: Result<Vec<ChatMessage>, String>,
     ) {
-        use crate::session;
-
         let messages = match result {
             Ok(m) if m.is_empty() => {
                 if let Some(conv) = self.state.conversations.get_mut(conversation) {
@@ -842,6 +945,10 @@ impl App {
         };
         conv.messages = messages;
         conv.session_id = session_id.to_string();
+        // A freshly imported remote session has no known-broken history and
+        // (see the save below) no locally-confirmed provider identity yet.
+        conv.tag = None;
+        conv.broken = false;
         conv.generation.active = false;
         if let Some(handle) = conv.agent_task.take() {
             handle.abort();
@@ -876,6 +983,16 @@ impl App {
                 model_type: self.config.provider.model.clone(),
                 messages: snapshot,
                 tag: None,
+                // Not wired to resume yet: `fetch_remote_history` (the only
+                // existing endpoint for this path) doesn't parse a message id
+                // out of `chat/history`'s items, so there's no reliable
+                // `parent_message_id` to adopt. Falls back to the default
+                // fresh-session behavior (full local history replayed as one
+                // prompt on the next message) — same as any other session
+                // with no known provider identity.
+                provider_session_id: None,
+                provider_parent_message_id: None,
+                broken: false,
             },
             &self.config,
         ) {
@@ -1130,16 +1247,37 @@ impl App {
             }
     }
 
-    fn auto_save_session(&self) {
-        use crate::session;
-        let id = &self.state.focused().session_id;
-        let messages = &self.state.focused().messages;
-        if messages.is_empty() {
+    fn auto_save_session(&mut self) {
+        let conv = self.state.focused();
+        if conv.messages.is_empty() {
             return;
         }
+
+        // A provider that currently reports an identity just completed a
+        // turn successfully — that's live proof the remote link works again,
+        // so a previously-broken conversation is un-flagged here rather than
+        // staying permanently yellow after it's actually recovered.
+        let identity = conv.provider.as_ref().and_then(|p| p.session_identity());
+        let broken = if identity.is_some() { false } else { conv.broken };
+        let meta = session::SessionMeta {
+            tag: conv.tag.clone(),
+            broken,
+            provider_session_id: identity.as_ref().map(|(id, _)| id.clone()),
+            provider_parent_message_id: identity.and_then(|(_, pm)| pm),
+        };
+
         let now = session::timestamp_now();
-        let ws = &self.state.workspace_path;
-        if let Err(e) = session::save_session(id, &now, messages, &self.config, ws) {
+        let result = session::save_session(
+            &conv.session_id,
+            &now,
+            &conv.messages,
+            &self.config,
+            &self.state.workspace_path,
+            &meta,
+        );
+
+        self.state.focused_mut().broken = broken;
+        if let Err(e) = result {
             tracing::warn!("Failed to auto-save session: {e}");
         }
     }

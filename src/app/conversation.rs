@@ -62,6 +62,15 @@ pub struct Conversation {
     pub provider: Option<Arc<dyn LLMProvider>>,
     pub generation: GenerationState,
     pub agent_task: Option<tokio::task::JoinHandle<()>>,
+    /// Mirrors the on-disk `Session.tag` so `auto_save_session` can round-trip
+    /// it — without this, every autosave after a load/import silently wiped
+    /// the tag back to `None` since it only ever wrote a fresh default.
+    pub tag: Option<String>,
+    /// Mirrors the on-disk `Session.broken` flag: true once this
+    /// conversation's remote DeepSeek session was found unreachable. Drives
+    /// the yellow flag in `/sessions` and is cleared again once a fresh
+    /// remote session is established (see `App::auto_save_session`).
+    pub broken: bool,
 }
 
 impl Conversation {
@@ -79,6 +88,8 @@ impl Conversation {
             provider,
             generation: GenerationState::default(),
             agent_task: None,
+            tag: None,
+            broken: false,
         }
     }
 

@@ -332,6 +332,37 @@ impl LLMProvider for DeepseekProvider {
         self.fetch_remote_history(session_id).await
     }
 
+    fn session_identity(&self) -> Option<(String, Option<i64>)> {
+        let state = self.session_state.lock().ok()?;
+        state.session_id.clone().map(|id| (id, state.parent_message_id))
+    }
+
+    async fn session_is_alive(&self, session_id: &str) -> bool {
+        // `chat/history` is the cheapest existing endpoint that touches a
+        // specific session id; a non-2xx (deleted/expired/not-yours session)
+        // surfaces as `Err` here. A transient network error also reads as
+        // "not alive" — callers treat "couldn't verify" the same as "gone"
+        // rather than risk threading onto a session that silently vanished.
+        self.fetch_remote_history(session_id).await.is_ok()
+    }
+
+    async fn adopt_session(&self, session_id: &str, parent_message_id: Option<i64>) -> AppResult<()> {
+        let mut state = self
+            .session_state
+            .lock()
+            .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+        state.session_id = Some(session_id.to_string());
+        state.parent_message_id = parent_message_id;
+        // The remote thread already has the system prompt/history from
+        // whatever session created it — resending it would duplicate context.
+        state.system_sent_for_session = true;
+        debug_log::log(
+            "session.adopt",
+            format!("resumed session_id={session_id} parent_message_id={parent_message_id:?}"),
+        );
+        Ok(())
+    }
+
     async fn list_remote_sessions(&self) -> AppResult<Vec<RemoteSessionInfo>> {
         let sessions = self.fetch_remote_sessions(None).await?;
         Ok(sessions
@@ -432,5 +463,31 @@ mod tests {
         // the current session's thread id.
         p.mark_session_after_success("old-session", Some(999)).unwrap();
         assert_eq!(p.session_state.lock().unwrap().parent_message_id, Some(7));
+    }
+
+    #[test]
+    fn session_identity_none_before_any_turn() {
+        let p = provider();
+        assert_eq!(p.session_identity(), None);
+    }
+
+    #[test]
+    fn session_identity_reflects_live_session_state() {
+        let p = provider();
+        p.session_state.lock().unwrap().session_id = Some("sess-1".to_string());
+        p.mark_session_after_success("sess-1", Some(42)).unwrap();
+        assert_eq!(p.session_identity(), Some(("sess-1".to_string(), Some(42))));
+    }
+
+    #[tokio::test]
+    async fn adopt_session_sets_identity_and_skips_resending_history() {
+        let p = provider();
+        p.adopt_session("resumed-sess", Some(17)).await.unwrap();
+        let s = p.session_state.lock().unwrap();
+        assert_eq!(s.session_id.as_deref(), Some("resumed-sess"));
+        assert_eq!(s.parent_message_id, Some(17));
+        // Must be true — otherwise the next turn would resend the system
+        // prompt + local history into a thread that already has them.
+        assert!(s.system_sent_for_session);
     }
 }
