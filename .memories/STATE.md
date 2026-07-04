@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-04 (`/mcp add` — paste-JSON/wizard/quick-inline server add — tests 262, clippy 0. Also this session: MCP OAuth authorization (`/mcp auth`/`/mcp oauth`), remote session resume on `/load`, PowerShell empty-output false-positive fix, multi-line system-message render fix)
+> Last updated: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs` — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
 
 ## PHASE COMPLETION
 
@@ -27,6 +27,7 @@
 
 ## CURRENT FOCUS
 
+0. Cleanup audit 2026-07-04 (`reference/AUDIT-2026-07-04-CLEANUP.md`): god-file split DONE (`tui/render/` layered modules + `app/sessions.rs`/`app/pickers.rs`). Remaining from that audit, roughly in order: reliability trio (poison-unsafe `.lock().unwrap()` in `deepseek/http.rs::enforce_rate_limit`, PoW `spawn_blocking`, stream-size cap), mechanical dedup (command arg-parsing helper, `post_void` endpoint migration, MCP config-loader helper, `apply_connect_outcome` loop hoist), runner/sub_agent shared stream helper, owner decisions on `#[expect(dead_code)]` scaffolding (events.rs payloads, types.rs parity structs, `ProviderKind::Openai/Custom`).
 1. Stability/perf overhaul (2026-07-02) is done — all 7 audit criticals + ~30 majors fixed, dead code swept, clippy clean. See `reference/AUDIT-2026-07-02.md`.
 2. Next candidates (in rough priority order):
    - `keys.rs` decomposition: key→intent + intent→effect split (testable without a live `App`). Not started.

@@ -14,7 +14,9 @@
 ## APP LAYER (Application) — decomposed from the old ~2.4k god-file into cohesive modules
 | File | Purpose | Lines |
 |------|---------|-------|
-| `src/app/mod.rs` | Coordinator: `App` + `AppState`, event loop (`run_loop` — drains ≤256 events then renders once behind a dirty flag), `handle_event`, `send_focused_turn`, `FOREGROUND_CHILD_PID`, autocomplete/session helpers, `PendingInteraction` queue, `purge_interactions_for`. No longer a god-file. | ~1100 (grew this session: interaction queue, ui_only routing, shutdown_all wiring) |
+| `src/app/mod.rs` | Coordinator: `App` + `AppState`, event loop (`run_loop` — drains ≤256 events then renders once behind a dirty flag), `handle_event`, `send_focused_turn`, `FOREGROUND_CHILD_PID`, `PendingInteraction` queue, onboarding/logout/wipe, `format_size`/`format_duration_secs`/`format_tool_definition`. Re-slimmed 2026-07-04 (1659→~990) by extracting `sessions.rs` + `pickers.rs`. | ~990 |
+| `src/app/sessions.rs` | Session lifecycle controller (extracted 2026-07-04): `handle_load_session`, `apply_session_availability`, `finalize_broken_session`, `apply_fetched_session`, `open_delete_sessions`, `execute_delete_sessions`, `auto_save_session` — network work spawned, results via `AppEvent` | ~450 |
+| `src/app/pickers.rs` | Registry-inspection UI glue (extracted 2026-07-04): whitelist/skills pickers, `toggle_skill`, `/tools` + `/ps` markdown display builders | ~240 |
 | `src/app/conversation.rs` | `ConversationId`, `ConversationKind` (Main/Session/Sidechat/SubAgent), `Conversation` (owns messages/provider/generation/agent_task) with unified reducer methods (`begin_assistant_message`/`append_chunk`/`discard_empty_assistant`/`finish_turn`), `Conversations` store (`focused()/focused_mut()/open()/add_background()/remove()/iter()`…), `Conversation::fresh_main` (shared constructor used by `App::new` and `reset_to_onboarding`) | ~230 |
 | `src/app/runtime.rs` | `AgentRuntime` controller — owns `tools`/`mcp`/`event_tx`; `spawn(TurnSpec)` is the one place agent turns launch | ~65 |
 | `src/app/system_prompt.rs` | `build(prompts, skills, tools, mcp, workspace)` — system-prompt assembly with explicit narrow deps (was god-method on `&self`) | ~80 |
@@ -72,7 +74,7 @@
 | File | Purpose | Lines |
 |------|---------|-------|
 | `src/tui/mod.rs` | Terminal init/restore | — |
-| `src/tui/render.rs` | All views: landing, chat, MCP, modals (`render_confirm` for `Modal::Confirm`), status bar; `render_onboarding` (`View::Onboarding` — animated `pulsing_title`, steps panel, token input, model selector, mini-status); landing-session and stats-panel disk reads now cached (3s/5s) instead of re-parsing every frame/tick; MCP panel gap-underflow crash fixed | ~1450 |
+| `src/tui/render/` | Split from the old 2160-line `render.rs` (2026-07-04) into layers: `mod.rs` (~130, `render()` dispatch only), `util.rs` (~215, pure helpers: truncate/format_date/centered_h/status_bar_gap/highlight_json + tests), `popup.rs` (~105, shared modal skeleton: `center_popup`/`modal_block`/`separator_line`/`fill_panel_space`/`push_text_box_lines` — deduped from 4–7 copies each), `status.rs` (~205, mini status bar/separators/attach bar), `landing.rs` (~210, landing + TTL'd session cache), `onboarding.rs` (~220, onboarding + `pulsing_title`), `mcp.rs` (~350, MCP view + `/mcp add` modal), `modals.rs` (~755, tool-approval/confirm/picker/question/delete-sessions/autocomplete) | ~2200 total |
 | `src/tui/theme.rs` | Catppuccin Mocha palette (`Theme`) — unused color fields removed | — |
 | `src/tui/markdown.rs` | Markdown + syntect highlight renderer; bold/italic/strikethrough now actually apply their style (were previously no-ops) | ~300 |
 | `src/tui/widgets/input.rs` | Multi-line input, cursor, selection, wrapping | ~270 |
