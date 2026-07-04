@@ -298,29 +298,66 @@ fn build_http_client() -> AppResult<reqwest::Client> {
         .build()?)
 }
 
+/// Attach the sticky `MCP-Session-Id` (if one was captured from an earlier
+/// response) plus any static per-server headers from config. Shared by every
+/// `send_request`/`send_raw` on both `HttpTransport` and `SseTransport` — the
+/// two previously each duplicated this arm-for-arm across all four methods.
+fn apply_common_headers(
+    mut req: reqwest::RequestBuilder,
+    session_id: &Mutex<Option<String>>,
+    headers: &HashMap<String, String>,
+) -> reqwest::RequestBuilder {
+    if let Some(sid) = session_id.lock().unwrap().as_ref() {
+        req = req.header("MCP-Session-Id", sid);
+    }
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    req
+}
+
+/// If `resp` is a 401, turn it into `AppError::McpAuthRequired` carrying the
+/// `WWW-Authenticate` header (if any). `Ok(())` for every other status —
+/// callers still handle non-2xx/non-401 statuses themselves, since
+/// `HttpTransport` and `SseTransport` react to those differently (the former
+/// falls through to body-sniffing, the latter treats any non-2xx as a hard
+/// error before even looking at the body).
+fn auth_required_error(resp: &reqwest::Response) -> Option<crate::error::AppError> {
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let www_authenticate = resp.headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    Some(crate::error::AppError::McpAuthRequired { www_authenticate })
+}
+
+/// Capture a fresh `MCP-Session-Id` response header into `session_id`, if
+/// present. Shared by both transports' `send_request`.
+fn capture_session_id(resp: &reqwest::Response, session_id: &Mutex<Option<String>>, url: &str) {
+    if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        *session_id.lock().unwrap() = Some(sid.to_string());
+        tracing::debug!("{url} acquired session via MCP-Session-Id header");
+    }
+}
+
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse> {
-        let mut req = self.client.post(&self.url)
+        let req = self.client.post(&self.url)
             .json(request)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
-
-        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
-            req = req.header("MCP-Session-Id", sid);
-        }
-
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
+        let req = apply_common_headers(req, &self.session_id, &self.headers);
 
         let resp = req.send().await?;
         let status = resp.status();
 
-        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-            *self.session_id.lock().unwrap() = Some(sid.to_string());
-            tracing::debug!("{} acquired session via MCP-Session-Id header", self.url);
+        if let Some(err) = auth_required_error(&resp) {
+            return Err(err);
         }
+        capture_session_id(&resp, &self.session_id, &self.url);
 
         let body = resp.text().await.map_err(|e| {
             crate::error::AppError::Mcp(format!("Failed to read HTTP response body at {}: {e}", self.url))
@@ -349,18 +386,11 @@ impl Transport for HttpTransport {
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
-        let mut req = self.client.post(&self.url)
+        let req = self.client.post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(data.to_vec());
-
-        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
-            req = req.header("MCP-Session-Id", sid);
-        }
-
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
+        let req = apply_common_headers(req, &self.session_id, &self.headers);
 
         req.send().await?;
         Ok(())
@@ -460,26 +490,19 @@ impl SseTransport {
 #[async_trait]
 impl Transport for SseTransport {
     async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse> {
-        let mut req = self.client.post(&self.url)
+        let req = self.client.post(&self.url)
             .json(request)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
-
-        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
-            req = req.header("MCP-Session-Id", sid);
-        }
-
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
+        let req = apply_common_headers(req, &self.session_id, &self.headers);
 
         let resp = req.send().await?;
         let status = resp.status();
 
-        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-            *self.session_id.lock().unwrap() = Some(sid.to_string());
-            tracing::debug!("{} acquired session via MCP-Session-Id header", self.url);
+        if let Some(err) = auth_required_error(&resp) {
+            return Err(err);
         }
+        capture_session_id(&resp, &self.session_id, &self.url);
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_else(|_| format!("(failed to read body, status={status})"));
@@ -522,18 +545,11 @@ impl Transport for SseTransport {
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
-        let mut req = self.client.post(&self.url)
+        let req = self.client.post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .body(data.to_vec());
-
-        if let Some(sid) = self.session_id.lock().unwrap().as_ref() {
-            req = req.header("MCP-Session-Id", sid);
-        }
-
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
+        let req = apply_common_headers(req, &self.session_id, &self.headers);
 
         req.send().await?;
         Ok(())

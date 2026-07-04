@@ -501,6 +501,18 @@ impl App {
                                         });
                                     });
                                 }
+                                CommandResult::OpenMcpAuth => {
+                                    self.state.view = View::Mcp;
+                                    if self.state.mcp_status.view.servers.is_empty() {
+                                        let mcp = self.mcp.lock().await;
+                                        self.state.mcp_status.view.servers = mcp.get_servers_info();
+                                    }
+                                    self.state.mcp_status.view.active = true;
+                                    self.state.mcp_status.view.auth_mode = true;
+                                    self.state.mcp_status.view.details_server = None;
+                                    self.state.mcp_status.view.selected = 0;
+                                    self.state.mcp_status.view.scroll_offset = 0;
+                                }
                                 CommandResult::ShowTools => {
                                     let tools_text = self.build_tools_display().await;
                                     self.state.focused_mut().messages.push(ChatMessage::system(&tools_text));
@@ -722,6 +734,10 @@ impl App {
             self.state.mcp_status.view.servers = mcp.get_servers_info();
         }
 
+        if self.state.mcp_status.view.auth_mode {
+            return self.handle_mcp_auth_key(key).await;
+        }
+
         let details_open = self.state.mcp_status.view.details_server.is_some();
 
         match key.code {
@@ -807,6 +823,67 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') if details_open => {
                 self.state.mcp_status.view.scroll_offset += 1;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Key handling for `/mcp auth`'s picker: only servers with `needs_auth`
+    /// are navigable (`McpViewState::visible_indices`), and Enter starts the
+    /// OAuth flow for the selected one instead of opening the details panel.
+    pub(crate) async fn handle_mcp_auth_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+        use crossterm::event::KeyCode;
+
+        let visible = self.state.mcp_status.view.visible_indices();
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.state.mcp_status.view.active = false;
+                self.state.mcp_status.view.auth_mode = false;
+                self.state.view = View::Chat;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = visible.len().saturating_sub(1);
+                self.state.mcp_status.view.selected = (self.state.mcp_status.view.selected + 1).min(max);
+            }
+            KeyCode::Enter => {
+                let selected = self.state.mcp_status.view.selected;
+                let Some(name) = visible.get(selected)
+                    .and_then(|&idx| self.state.mcp_status.view.servers.get(idx))
+                    .map(|info| info.name.clone())
+                else {
+                    return Ok(false);
+                };
+
+                let context = { self.mcp.lock().await.oauth_context(&name) };
+                let Some((config, hint)) = context else {
+                    self.state.mcp_status.view.status_message = format!("{name} no longer requires authorization");
+                    return Ok(false);
+                };
+
+                let base_url = match config {
+                    crate::mcp::types::MCPServerConfig::Http { url, .. } => url,
+                    crate::mcp::types::MCPServerConfig::Sse { url, .. } => url,
+                    crate::mcp::types::MCPServerConfig::Stdio { .. } => {
+                        self.state.mcp_status.view.status_message = "stdio servers don't use OAuth".to_string();
+                        return Ok(false);
+                    }
+                };
+
+                self.state.mcp_status.view.status_message = format!("Opening browser for {name}...");
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let result = match crate::mcp::oauth::run_flow(&base_url, hint).await {
+                        Ok(tokens) => crate::mcp::oauth_store::save(&name, &tokens).await
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = event_tx.send(events::AppEvent::McpOAuthResult { server: name, result });
+                });
             }
             _ => {}
         }

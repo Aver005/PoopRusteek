@@ -31,6 +31,9 @@ pub enum CommandResult {
     Error(String),
     TtlUpdate(u64),
     ReloadMcp,
+    /// `/mcp auth` / `/mcp oauth` — open the authorization picker (servers
+    /// currently `AuthRequired`).
+    OpenMcpAuth,
     ShowTools,
     Jobs(JobCommandAction),
     OpenWhitelist,

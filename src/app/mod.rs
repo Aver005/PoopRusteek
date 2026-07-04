@@ -582,6 +582,29 @@ impl App {
                 self.state.mcp_status.view.servers.clear();
                 self.state.mcp_status.last_stats_update = None;
             }
+            AppEvent::McpOAuthResult { server, result } => {
+                match result {
+                    Ok(()) => {
+                        self.state.mcp_status.view.status_message = format!("{server} authorized, reconnecting...");
+                        // The token is already persisted (oauth_store::save) —
+                        // reconnect picks it up via `build_client`'s
+                        // `with_bearer_header` call and reports its own
+                        // outcome through the existing `McpOperationDone`.
+                        let mcp = Arc::clone(&self.mcp);
+                        let event_tx = self.event_tx.clone();
+                        tokio::spawn(async move {
+                            let message = match mcp.lock().await.reconnect_server(&server).await {
+                                Err(e) => format!("Reconnect after authorization failed: {e}"),
+                                Ok(_) => format!("{server} authorized and reconnected"),
+                            };
+                            let _ = event_tx.send(AppEvent::McpOperationDone { message });
+                        });
+                    }
+                    Err(e) => {
+                        self.state.mcp_status.view.status_message = format!("Authorization failed: {e}");
+                    }
+                }
+            }
             _ => {}
         }
         Ok(false)

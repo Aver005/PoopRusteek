@@ -20,6 +20,9 @@ pub enum AppError {
     #[error("MCP error: {0}")]
     Mcp(String),
 
+    #[error("MCP server requires authorization")]
+    McpAuthRequired { www_authenticate: Option<String> },
+
     #[error("Task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 

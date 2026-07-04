@@ -159,6 +159,12 @@ pub enum AppEvent {
     /// A detached MCP admin operation (reload / toggle / reconnect) finished.
     McpOperationDone { message: String },
 
+    /// An OAuth authorization flow started from `/mcp auth` finished. On
+    /// `Ok`, the token is already persisted and the handler kicks off a
+    /// `reconnect_server` for `server` itself — that reconnect's own
+    /// `McpOperationDone` reports the final connect outcome.
+    McpOAuthResult { server: String, result: Result<(), String> },
+
     /// Background fetch of the remote session list for the `/delete` picker.
     RemoteSessionsListed {
         result: Result<Vec<crate::provider::RemoteSessionInfo>, String>,

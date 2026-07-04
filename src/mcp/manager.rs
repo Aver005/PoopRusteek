@@ -117,6 +117,11 @@ async fn connect_one(
     };
 
     if let Err(e) = client.initialize().await {
+        if let crate::error::AppError::McpAuthRequired { www_authenticate } = &e {
+            let hint = www_authenticate.as_deref().and_then(super::oauth::extract_resource_metadata);
+            tracing::info!("MCP '{name}' requires authorization");
+            return empty(MCPServerStatus::AuthRequired(hint));
+        }
         tracing::warn!("MCP '{name}' initialize failed: {e}");
         return empty(MCPServerStatus::Error(e.to_string()));
     }
@@ -268,39 +273,11 @@ impl MCPManager {
             self.servers.insert(name, entry);
             return;
         }
-        let client = match &config {
-            MCPServerConfig::Stdio { command, args, env, cwd } => {
-                match MCPClient::from_stdio(
-                    &name,
-                    command,
-                    args,
-                    env.as_ref(),
-                    cwd.as_deref(),
-                ).await {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        tracing::warn!("Failed to create MCP client for '{name}': {e}");
-                        None
-                    }
-                }
-            }
-            MCPServerConfig::Http { url, headers } => {
-                match MCPClient::from_http(&name, url, headers.clone()).await {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        tracing::warn!("Failed to create MCP client for '{name}': {e}");
-                        None
-                    }
-                }
-            }
-            MCPServerConfig::Sse { url, headers } => {
-                match MCPClient::from_sse(&name, url, headers.clone()).await {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        tracing::warn!("Failed to create MCP client for '{name}': {e}");
-                        None
-                    }
-                }
+        let client = match build_client(&name, &config).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!("Failed to create MCP client for '{name}': {e}");
+                None
             }
         };
 
@@ -515,16 +492,29 @@ impl MCPManager {
                     MCPServerStatus::Pending => "pending".to_string(),
                     MCPServerStatus::Connecting => "connecting".to_string(),
                     MCPServerStatus::Connected => "connected".to_string(),
+                    MCPServerStatus::AuthRequired(_) => "auth required".to_string(),
                     MCPServerStatus::Error(e) => format!("error: {e}"),
                     MCPServerStatus::Disabled => "disabled".to_string(),
                 },
                 tool_count: entry.tools.len(),
                 resource_count: entry.resources.len(),
                 enabled: entry.enabled,
+                needs_auth: matches!(entry.status, MCPServerStatus::AuthRequired(_)),
             }
         }).collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         list
+    }
+
+    /// The config + discovery hint needed to start an OAuth flow for `name`
+    /// (`/mcp auth`'s Enter handler) — `None` if the server isn't known or
+    /// isn't currently `AuthRequired`.
+    pub fn oauth_context(&self, name: &str) -> Option<(MCPServerConfig, Option<String>)> {
+        let entry = self.servers.get(name)?;
+        match &entry.status {
+            MCPServerStatus::AuthRequired(hint) => Some((entry.config.clone(), hint.clone())),
+            _ => None,
+        }
     }
 
     pub async fn toggle_server(&mut self, name: &str) -> AppResult<()> {
@@ -637,20 +627,28 @@ impl MCPManager {
 }
 
 /// Build a fresh `MCPClient` for `config`, dispatching to the right
-/// transport constructor. Shared by `toggle_server` (re-enabling) and
-/// `reconnect_server` — previously each duplicated this match arm-for-arm,
-/// which is exactly the kind of duplication that made it easy to fix a bug
-/// (like the missing close-before-replace) in one copy and miss the other.
+/// transport constructor. Shared by `add_server` (initial connect),
+/// `toggle_server` (re-enabling), and `reconnect_server` — previously each
+/// duplicated the `Http`/`Sse` arms verbatim, which is exactly the kind of
+/// duplication that made it easy to fix a bug in one copy and miss the
+/// others.
+///
+/// For `Http`/`Sse`, merges in a stored OAuth `Authorization: Bearer` header
+/// (`oauth_store::with_bearer_header`) if `/mcp auth` has ever completed a
+/// flow for this server — best-effort and a no-op when there's no stored
+/// token, so this is safe to call unconditionally for every server.
 async fn build_client(name: &str, config: &MCPServerConfig) -> AppResult<MCPClient> {
     match config {
         MCPServerConfig::Stdio { command, args, env, cwd } => {
             MCPClient::from_stdio(name, command, args, env.as_ref(), cwd.as_deref()).await
         }
         MCPServerConfig::Http { url, headers } => {
-            MCPClient::from_http(name, url, headers.clone()).await
+            let headers = super::oauth_store::with_bearer_header(name, headers.clone()).await;
+            MCPClient::from_http(name, url, headers).await
         }
         MCPServerConfig::Sse { url, headers } => {
-            MCPClient::from_sse(name, url, headers.clone()).await
+            let headers = super::oauth_store::with_bearer_header(name, headers.clone()).await;
+            MCPClient::from_sse(name, url, headers).await
         }
     }
 }

@@ -10,11 +10,11 @@ impl Command for McpCommand {
     }
 
     fn description(&self) -> &str {
-        "Open MCP server management, set cache TTL, or reload all servers"
+        "Open MCP server management, set cache TTL, reload, or authorize a server"
     }
 
     fn usage(&self) -> &str {
-        "/mcp — open management view\n/mcp ttl <secs> — set cache TTL (default: 300s)\n/mcp reload — force reload all servers"
+        "/mcp — open management view\n/mcp ttl <secs> — set cache TTL (default: 300s)\n/mcp reload — force reload all servers\n/mcp auth (or /mcp oauth) — list servers requiring authorization"
     }
 
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
@@ -29,12 +29,17 @@ impl Command for McpCommand {
                 details_server: None,
                 servers: Vec::new(),
                 status_message: String::new(),
+                auth_mode: false,
             };
             return CommandResult::Handled;
         }
 
         if args == "reload" {
             return CommandResult::ReloadMcp;
+        }
+
+        if args == "auth" || args == "oauth" {
+            return CommandResult::OpenMcpAuth;
         }
 
         if let Some(ttl_str) = args.strip_prefix("ttl ") {

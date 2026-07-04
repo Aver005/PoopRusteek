@@ -20,7 +20,7 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 
 # HTTP
-reqwest = { version = "0.13", features = ["json", "stream", "cookies", "rustls", "multipart"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "stream", "cookies", "rustls", "multipart", "form"], default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -58,8 +58,32 @@ base64 = "0.22"
 regex = "1"
 wasmtime = "27"
 
+# MCP OAuth: encrypted token storage, browser launch, PKCE challenge
+keyring = "4"
+# `keyring` 4.1.3's own default-store auto-init (`v1::Entry::new`) has a
+# logic bug (`AtomicBool::compare_exchange(false, true, ..) == Ok(true)` can
+# never be true on the success path — CAS success from `false` always
+# returns `Ok(false)`) that leaves no store registered, so every `Entry::new`
+# fails with `NoDefaultStore`. `oauth_store.rs` works around it by doing the
+# same one-time init itself via `keyring-core::set_default_store` — these
+# are the same backend crates `keyring`'s own `v1` feature already pulls in
+# per target (see the `[target...]` tables below), just named directly so we
+# can call the setter ourselves.
+keyring-core = "1"
+open = "5"
+sha2 = "0.10"
+
 # PTY for interactive CLI tools (arrow-key menus, REPLs)
 portable-pty = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [profile.release]
 opt-level = 3

@@ -513,12 +513,16 @@ fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
     // Header
     let header = Block::default()
         .borders(Borders::ALL)
-        .title(" MCP Server Management ")
+        .title(if mcp.auth_mode { " MCP Authorization " } else { " MCP Server Management " })
         .border_style(Style::default().fg(theme.accent));
     frame.render_widget(header, chunks[0]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "Manage your MCP servers — toggle, reconnect, or remove",
+            if mcp.auth_mode {
+                "Servers requiring authorization — Enter to authorize"
+            } else {
+                "Manage your MCP servers — toggle, reconnect, or remove"
+            },
             Style::default().fg(theme.text_dim),
         )))
         .alignment(Alignment::Center),
@@ -537,7 +541,9 @@ fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
     let footer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border));
-    let hints = if mcp.details_server.is_some() {
+    let hints = if mcp.auth_mode {
+        "  j/k ↑↓ navigate  Enter authorize  Esc/q back  "
+    } else if mcp.details_server.is_some() {
         "  j/k ↑↓ scroll  Enter back  Esc/q close  "
     } else {
         "  j/k ↑↓ navigate  Space toggle  r reconnect  d remove  Enter details  Esc/q back  "
@@ -551,8 +557,24 @@ fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
 }
 
 fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
+    // Identity (`0..servers.len()`) outside `auth_mode`; filtered to
+    // `needs_auth` servers inside it — see `McpViewState::visible_indices`.
+    let visible_indices = mcp.visible_indices();
+
+    if mcp.auth_mode && visible_indices.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No servers currently require authorization",
+                Style::default().fg(theme.text_dim),
+            )))
+            .alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+
     let list_height = area.height.saturating_sub(1) as usize;
-    let visible = mcp.servers.len().min(list_height);
+    let visible = visible_indices.len().min(list_height);
 
     let header_line = Line::from(vec![
         Span::styled("  STATUS  ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
@@ -566,18 +588,20 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
 
     let start = mcp.scroll_offset;
     for i in 0..visible {
-        let idx = start + i;
-        if idx >= mcp.servers.len() {
+        let pos = start + i;
+        if pos >= visible_indices.len() {
             break;
         }
+        let idx = visible_indices[pos];
         let server = &mcp.servers[idx];
-        let selected = idx == mcp.selected;
+        let selected = pos == mcp.selected;
         let bg = if selected { theme.accent_dim } else { theme.bg };
 
         let status_icon = match server.status.as_str() {
             "disabled" => " ○ ",
             _ if server.status.starts_with("error") => " ✗ ",
             "connected" => " ● ",
+            "auth required" => " ⚿ ",
             "pending" | "connecting" => " ◌ ",
             _ => " ? ",
         };
@@ -585,6 +609,7 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
             "disabled" => theme.text_dim,
             _ if server.status.starts_with("error") => theme.error,
             "connected" => theme.success,
+            "auth required" => theme.warning,
             "pending" | "connecting" => theme.warning,
             _ => theme.fg,
         };
@@ -592,6 +617,7 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
             s if s.starts_with("error") => "ERR ",
             "disabled" => "OFF ",
             "connected" => "ON  ",
+            "auth required" => "AUTH",
             "pending" => "WAIT",
             "connecting" => "CONN",
             _ => "?   ",
