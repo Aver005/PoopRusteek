@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **265 passing** (`cargo test --bin pooprusteek`) |
+| Tests | **267 passing** (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
@@ -30,7 +30,7 @@
 0. Cleanup audit 2026-07-04 (`reference/AUDIT-2026-07-04-CLEANUP.md`): god-file split DONE (`tui/render/` layered modules + `app/sessions.rs`/`app/pickers.rs`); runner/sub_agent shared stream helper DONE (`agent/stream.rs::collect_stream` + `QUESTION_TOOL_NAME`/`TASK_TOOL_NAME`/`MCP_TOOL_PREFIX` constants); reliability trio DONE (poison-safe rate-limit lock, PoW on `spawn_blocking`, 8 MiB stream cap w/ tests); mechanical dedup DONE (`with_args`/`save_config_then`/`clear_chat_view`/`push_system` adoption in commands, `post_void`+`pow_auth_headers` endpoint migration, MCP `load_from_path`/`merge_parsed`, `apply_connect_outcome` hoist, `list_sessions()` dead param dropped). Remaining: owner decisions on `#[expect(dead_code)]` scaffolding (events.rs payloads, types.rs parity structs, `ProviderKind::Openai/Custom`).
 1. Stability/perf overhaul (2026-07-02) is done — all 7 audit criticals + ~30 majors fixed, dead code swept, clippy clean. See `reference/AUDIT-2026-07-02.md`.
 2. Next candidates (in rough priority order):
-   - `keys.rs` decomposition: key→intent + intent→effect split (testable without a live `App`). Not started.
+   - ~~keys.rs decomposition~~ DONE 2026-07-05: `app/keys/` — mod (dispatch) / chat / modal / dispatch (CommandResult interpreter) / mcp / onboarding / autocomplete; pure `approval_key`/`confirm_key` decoders w/ tests; per-keystroke `Modal` clone removed.
    - ~~deepseek.rs split~~ DONE 2026-07-03: `provider/deepseek/{mod,http,session,stream,endpoints}.rs`, 8/26 wrappers deduped onto `post_biz`/`get_biz`.
    - ~~Dependency bumps~~ DONE 2026-07-03: reqwest 0.13 (`rustls-tls`→`rustls` feature), ratatui 0.30 + crossterm 0.29, pulldown-cmark 0.13, toml 1.x — zero source changes forced.
    - ~~PoW wasm embed~~ DONE 2026-07-03: `include_bytes!` with a disk-file override for dev drop-ins. Native SHA-3 reimpl remains REJECTED by owner; stretch: fetch the server-referenced wasm at runtime (real rotation-resilience).
@@ -45,7 +45,6 @@
 - DeepSeek streaming never reports token usage (`usage` always None).
 - Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`
 - No persistent RAG / codebase search.
-- `keys.rs` decomposition (key→intent/intent→effect) planned, not started.
 - Foreground child PID tracking is a single global slot, not per-conversation (also an upward `tools`→`app` dependency).
 - PoW challenge solved once per request, not re-solved per retry attempt (deliberately left as-is 2026-07-04 — changing it changes the request pattern against DeepSeek). The solve itself now runs on `spawn_blocking` (fixed 2026-07-04).
 - `"model"` field is hardcoded `"deepseek-chat"` in the request body, ignoring user config.

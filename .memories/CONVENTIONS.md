@@ -29,6 +29,21 @@
 - Prefer **controllers** that own *dependencies* with a narrow API over methods that take `&mut self` (all of `App`) just to touch a few fields/deps: `AgentRuntime` (turn launching), `system_prompt::build(...)` (explicit deps), `BackgroundCounters` (registry sync). New cross-cutting behavior should follow this shape, not grow `mod.rs`.
 - `impl App` may still be split across files (`keys.rs`, `multichat.rs`, `goal.rs`) — that's organizational; the *architectural* win is narrow deps + cohesive state.
 
+### File-size rule (agreed 2026-07-04)
+- **Line count is a trigger, not a verdict.** ~500+ lines of *non-test* code
+  (inline `#[cfg(test)]` modules don't count — never punish a file for being
+  well-tested) prompts the question: *does this file have more than one
+  reason to change?* If yes — split **by responsibility**; if no (homogeneous
+  catalogs like endpoint wrappers, transport impls of one trait, per-modal
+  renderers on a shared kit) — leave it, whatever the length.
+- Never split mechanically by line count: a split that forces widening
+  visibility (`pub(super)` fields/helpers that existed only for the split) or
+  makes readers jump between files to follow one flow has made the code
+  worse, not better.
+- Hard smells regardless of file length: a single function > ~150 lines; a
+  file mixing abstraction layers (e.g. key decoding interleaved with app
+  effects); helpers made `pub(crate)` purely so a split could compile.
+
 ## NAMING
 - Error binding spelled out: `|error|` / `|e|` both appear; prefer `error` in new code (dominant style).
 - Full words over abbreviations in public APIs. Tool names are lowercase snake (`shell_output`).
