@@ -57,6 +57,11 @@ async fn main() -> Result<()> {
         return run_acp_server(&config);
     }
 
+    // TUI-only (never in --acp mode, where stdout is the JSON-RPC channel):
+    // name the window before the slow parts of startup (MCP connects) run;
+    // the render loop takes over the title from the first frame on.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("Starting..."));
+
     let mut app = app::App::new(config).await?;
     app.run().await?;
 

@@ -26,11 +26,69 @@ use crate::tui::widgets;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::Paragraph;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+const BRAND_TITLE: &str = "PoopRusteek \u{1F9FB}";
+
+thread_local! {
+    /// Last title written to the terminal — OSC title changes are emitted
+    /// only on change, not on every frame.
+    static LAST_WINDOW_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// The window title for the current app state: the brand on the landing /
+/// onboarding / management screens, a truncated chat title (from the
+/// chat's first real message) once a conversation has content.
+fn window_title(state: &AppState) -> String {
+    if state.view != View::Chat {
+        return BRAND_TITLE.to_string();
+    }
+    let title = state
+        .focused()
+        .messages
+        .iter()
+        .find(|message| {
+            !message.ui_only
+                && matches!(
+                    message.role,
+                    crate::provider::Role::User | crate::provider::Role::Assistant
+                )
+                && !message.visible_content().trim().is_empty()
+        })
+        .map(|message| {
+            let first_line = message
+                .visible_content()
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            util::truncate(&first_line, 40)
+        });
+    match title {
+        Some(title) if !title.is_empty() => title,
+        _ => BRAND_TITLE.to_string(),
+    }
+}
+
+fn sync_window_title(terminal: &mut TuiTerminal, state: &AppState) {
+    let title = window_title(state);
+    LAST_WINDOW_TITLE.with(|last| {
+        let mut last = last.borrow_mut();
+        if *last != title {
+            let _ = crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::SetTitle(&title)
+            );
+            *last = title;
+        }
+    });
+}
 
 pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> crate::error::AppResult<()> {
     let theme = Theme::default_dark();
     let cursor_cell = Cell::new(None);
+    sync_window_title(terminal, state);
     terminal.draw(|frame| {
         let area = frame.area();
         frame.render_widget(
