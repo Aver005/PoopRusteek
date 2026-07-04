@@ -76,7 +76,7 @@ impl Command for HelpCommand {
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         let help_text = self.build_help_text();
-        state.focused_mut().messages.push(crate::provider::ChatMessage::system(&help_text));
+        state.push_system(&help_text);
         CommandResult::Handled
     }
 }

@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{with_args, Command, CommandResult};
 use crate::config::Config;
 
 pub struct LoadCommand;
@@ -18,10 +18,8 @@ impl Command for LoadCommand {
     }
 
     fn execute(&self, args: &str, _state: &mut AppState, _config: &Config) -> CommandResult {
-        let id = args.trim();
-        if id.is_empty() {
-            return CommandResult::Error("Usage: /load <session_id>".to_string());
-        }
-        CommandResult::LoadSession(id.to_string())
+        with_args(args, "/load <session_id>", |id| {
+            CommandResult::LoadSession(id.to_string())
+        })
     }
 }

@@ -145,6 +145,15 @@ impl AppState {
     pub fn push_system(&mut self, content: &str) {
         self.focused_mut().messages.push(ChatMessage::system(content));
     }
+
+    /// Reset the focused conversation's chat view: wipe its messages and
+    /// clear the scroll / autocomplete state. Shared by `/clear`, `/home`,
+    /// and `/reset`.
+    pub fn clear_chat_view(&mut self) {
+        self.focused_mut().messages.clear();
+        self.scroll_offset = 0;
+        self.autocomplete = AutocompleteState::default();
+    }
 }
 
 #[derive(Debug, Clone, Default)]

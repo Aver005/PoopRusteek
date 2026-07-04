@@ -67,9 +67,6 @@ pub struct JsonRpcNotification {
     pub _meta: Option<Value>,
 }
 
-impl JsonRpcNotification {
-}
-
 /// Canonical equality between a request id (`u64`, always numeric — we mint
 /// our own request ids) and a response's `id` field (`Option<Value>`, which
 /// may be numeric, a string, or absent/null).

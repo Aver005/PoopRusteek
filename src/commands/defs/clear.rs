@@ -18,10 +18,8 @@ impl Command for ClearCommand {
     }
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        state.focused_mut().messages.clear();
+        state.clear_chat_view();
         state.attached_files.clear();
-        state.scroll_offset = 0;
-        state.autocomplete = Default::default();
         CommandResult::Handled
     }
 }

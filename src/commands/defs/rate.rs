@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{save_config_then, Command, CommandResult};
 use crate::config::Config;
 
 pub struct RateCommand;
@@ -27,10 +27,7 @@ impl Command for RateCommand {
                 config.agent.rate_limit_display(),
                 USAGE
             );
-            state
-                .focused_mut()
-                .messages
-                .push(crate::provider::ChatMessage::system(&message));
+            state.push_system(&message);
             return CommandResult::Handled;
         }
 
@@ -56,15 +53,12 @@ impl Command for RateCommand {
             cfg.agent.rate_limit_ms = ms;
         }
 
-        if let Err(e) = crate::config::save(&cfg) {
-            return CommandResult::Error(format!("Failed to save config: {e}"));
-        }
-
-        state.focused_mut().messages.push(crate::provider::ChatMessage::system(&format!(
-            "Rate limit updated: {}",
-            cfg.agent.rate_limit_display()
-        )));
-
-        CommandResult::ResetProvider
+        save_config_then(&cfg, || {
+            state.push_system(&format!(
+                "Rate limit updated: {}",
+                cfg.agent.rate_limit_display()
+            ));
+            CommandResult::ResetProvider
+        })
     }
 }

@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{with_args, Command, CommandResult};
 use crate::config::Config;
 use crate::provider::AttachedFile;
 
@@ -19,76 +19,67 @@ impl Command for AttachCommand {
     }
 
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        let args = args.trim();
-        if args.is_empty() {
-            return CommandResult::Error("Usage: /attach <path1> [path2] ...".to_string());
-        }
+        with_args(args, "/attach <path1> [path2] ...", |args| {
+            let paths = parse_paths(args);
+            let mut attached = 0u32;
 
-        let paths = parse_paths(args);
-        let mut attached = 0u32;
+            for raw_path in &paths {
+                let path = std::path::Path::new(raw_path);
+                let resolved = if path.is_relative() {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    cwd.join(path)
+                } else {
+                    path.to_path_buf()
+                };
 
-        for raw_path in &paths {
-            let path = std::path::Path::new(raw_path);
-            let resolved = if path.is_relative() {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                cwd.join(path)
-            } else {
-                path.to_path_buf()
-            };
-
-            if !resolved.exists() {
-                state.focused_mut().messages.push(crate::provider::ChatMessage::system(
-                    &format!("File not found: {raw_path}"),
-                ));
-                continue;
-            }
-            if !resolved.is_file() {
-                state.focused_mut().messages.push(crate::provider::ChatMessage::system(
-                    &format!("Not a file: {raw_path}"),
-                ));
-                continue;
-            }
-
-            let metadata = match resolved.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    state.focused_mut().messages.push(crate::provider::ChatMessage::system(
-                        &format!("Cannot read {raw_path}: {e}"),
-                    ));
+                if !resolved.exists() {
+                    state.push_system(&format!("File not found: {raw_path}"));
                     continue;
                 }
-            };
+                if !resolved.is_file() {
+                    state.push_system(&format!("Not a file: {raw_path}"));
+                    continue;
+                }
 
-            let display_name = resolved
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(raw_path)
-                .to_string();
+                let metadata = match resolved.metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        state.push_system(&format!("Cannot read {raw_path}: {e}"));
+                        continue;
+                    }
+                };
 
-            let ext = resolved.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg");
+                let display_name = resolved
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(raw_path)
+                    .to_string();
 
-            state.attached_files.push(AttachedFile {
-                display_name,
-                path: resolved.to_string_lossy().to_string(),
-                size: metadata.len(),
-                is_image,
-            });
-            attached += 1;
-        }
+                let ext = resolved.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg");
 
-        if attached > 0 {
-            if state.attached_files.len() == 1 {
-                state.status_message = "1 file attached".to_string();
-            } else {
-                state.status_message = format!("{} files attached", state.attached_files.len());
+                state.attached_files.push(AttachedFile {
+                    display_name,
+                    path: resolved.to_string_lossy().to_string(),
+                    size: metadata.len(),
+                    is_image,
+                });
+                attached += 1;
             }
-        }
 
-        CommandResult::Handled
+            if attached > 0 {
+                if state.attached_files.len() == 1 {
+                    state.status_message = "1 file attached".to_string();
+                } else {
+                    state.status_message = format!("{} files attached", state.attached_files.len());
+                }
+            }
+
+            CommandResult::Handled
+        })
     }
 }
 

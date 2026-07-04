@@ -18,9 +18,7 @@ impl Command for HomeCommand {
     }
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        state.focused_mut().messages.clear();
-        state.scroll_offset = 0;
-        state.autocomplete = Default::default();
+        state.clear_chat_view();
         CommandResult::Handled
     }
 }

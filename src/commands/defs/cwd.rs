@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{with_args, Command, CommandResult};
 use crate::config::Config;
 
 fn strip_verbatim(path: &str) -> String {
@@ -30,32 +30,27 @@ impl Command for CwdCommand {
     }
 
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        let path = args.trim();
-        if path.is_empty() {
-            return CommandResult::Error("Usage: /cwd <path>".to_string());
-        }
+        with_args(args, "/cwd <path>", |path| {
+            let target = crate::util::expand_tilde(path);
 
-        let target = crate::util::expand_tilde(path);
+            // Convert to absolute without requiring existence (Rust 1.79+)
+            let absolute = std::path::absolute(&target)
+                .unwrap_or_else(|_| target.clone());
 
-        // Convert to absolute without requiring existence (Rust 1.79+)
-        let absolute = std::path::absolute(&target)
-            .unwrap_or_else(|_| target.clone());
-
-        match std::env::set_current_dir(&absolute) {
-            Ok(()) => {
-                let cwd = std::env::current_dir()
-                    .map(|p| strip_verbatim(&p.to_string_lossy()))
-                    .unwrap_or_else(|_| absolute.to_string_lossy().to_string());
-                state.focused_mut().messages.push(crate::provider::ChatMessage::system(
-                    &format!("Changed directory to {cwd}"),
-                ));
-                state.workspace_path = cwd.clone();
-                CommandResult::Handled
+            match std::env::set_current_dir(&absolute) {
+                Ok(()) => {
+                    let cwd = std::env::current_dir()
+                        .map(|p| strip_verbatim(&p.to_string_lossy()))
+                        .unwrap_or_else(|_| absolute.to_string_lossy().to_string());
+                    state.push_system(&format!("Changed directory to {cwd}"));
+                    state.workspace_path = cwd.clone();
+                    CommandResult::Handled
+                }
+                Err(e) => CommandResult::Error(format!(
+                    "Cannot change to {}: {e}",
+                    absolute.display()
+                )),
             }
-            Err(e) => CommandResult::Error(format!(
-                "Cannot change to {}: {e}",
-                absolute.display()
-            )),
-        }
+        })
     }
 }

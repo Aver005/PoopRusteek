@@ -35,10 +35,7 @@ impl Command for DebugCommand {
         } else {
             "Debug logging disabled"
         };
-        state
-            .focused_mut()
-            .messages
-            .push(crate::provider::ChatMessage::system(message));
+        state.push_system(message);
 
         CommandResult::Handled
     }

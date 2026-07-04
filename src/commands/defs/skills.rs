@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{with_args, Command, CommandResult};
 use crate::config::Config;
 
 pub struct SkillsCommand;
@@ -27,16 +27,11 @@ impl Command for SkillsCommand {
         let parts: Vec<&str> = args.splitn(2, ' ').collect();
         match parts[0] {
             "list" => CommandResult::ShowSkills,
-            "enable" | "disable" => {
-                let name = parts.get(1).unwrap_or(&"").trim().to_string();
-                if name.is_empty() {
-                    return CommandResult::Error(
-                        "Usage: /skills enable <name> or /skills disable <name>".to_string(),
-                    );
-                }
-                let enable = parts[0] == "enable";
-                CommandResult::ToggleSkill(name, enable)
-            }
+            "enable" | "disable" => with_args(
+                parts.get(1).unwrap_or(&""),
+                "/skills enable <name> or /skills disable <name>",
+                |name| CommandResult::ToggleSkill(name.to_string(), parts[0] == "enable"),
+            ),
             _ => CommandResult::Error(format!(
                 "Unknown subcommand: {}. Usage:\n  /skills — open skill picker\n  /skills list — list all skills\n  /skills enable <name> — enable a skill\n  /skills disable <name> — disable a skill",
                 parts[0]

@@ -164,13 +164,18 @@
 
 ## SUGGESTED EXECUTION ORDER
 
-1. **Reliability trio** (http.rs unwrap, PoW `spawn_blocking`, stream cap) —
-   small diffs, test-covered area, do first and alone.
-2. **Mechanical dedup helpers** (TUI modal helpers, command helpers,
-   `post_void` migration, MCP config-loader helper, `apply_connect_outcome`
-   hoist, strays deletion) — low-risk, parallelizable, big LOC win.
-3. **Structural splits** (`render.rs` → 5 modules; `app/mod.rs` →
-   `sessions.rs`; runner/sub_agent stream extraction; meta-tool constants) —
-   behavior-preserving moves, one subsystem per PR, tests after each.
-4. **Decisions needed from owner**: events.rs dead payloads, types.rs parity
-   structs, Openai/Custom scaffolding, `Connecting` variant.
+1. `[DONE 2026-07-04]` **Reliability trio** (http.rs unwrap, PoW
+   `spawn_blocking`, stream cap).
+2. `[DONE 2026-07-04]` **Mechanical dedup helpers** — TUI modal helpers
+   (`render/popup.rs`), command helpers (`with_args`/`save_config_then`/
+   `clear_chat_view`/`push_system` adoption), `post_void`+`pow_auth_headers`
+   endpoint migration (15 wrappers), MCP config-loader
+   `load_from_path`/`merge_parsed`, `apply_connect_outcome` hoist, strays
+   (`_count`, empty `impl`, `list_sessions` dead param). Note: the
+   "~14 command files repeat the usage prologue" claim was an overcount —
+   only 5 sites genuinely match; the rest differ semantically.
+3. `[DONE 2026-07-04]` **Structural splits** — `render.rs` → 8-module
+   `tui/render/`; `app/mod.rs` → `sessions.rs`+`pickers.rs`;
+   `agent/stream.rs::collect_stream`; meta-tool constants.
+4. **Decisions needed from owner** (still open): events.rs dead payloads,
+   types.rs parity structs, Openai/Custom scaffolding, `Connecting` variant.

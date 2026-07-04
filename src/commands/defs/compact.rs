@@ -19,7 +19,7 @@ impl Command for CompactCommand {
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         if state.focused_mut().messages.is_empty() {
-            state.focused_mut().messages.push(crate::provider::ChatMessage::system("Nothing to compact."));
+            state.push_system("Nothing to compact.");
             return CommandResult::Handled;
         }
 

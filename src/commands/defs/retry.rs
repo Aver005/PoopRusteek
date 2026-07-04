@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{save_config_then, Command, CommandResult};
 use crate::config::Config;
 
 pub struct RetryCommand;
@@ -33,9 +33,6 @@ impl Command for RetryCommand {
         };
         let mut cfg = config.clone();
         cfg.agent.max_retries = n;
-        if let Err(e) = crate::config::save(&cfg) {
-            return CommandResult::Error(format!("Failed to save config: {e}"));
-        }
-        CommandResult::ResetProvider
+        save_config_then(&cfg, || CommandResult::ResetProvider)
     }
 }

@@ -13,7 +13,7 @@
 use super::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A minimal per-name override persisted for a *foreign* server (see module
 /// docs): its enabled/disabled state only, never its command/args/env. This
@@ -158,20 +158,47 @@ pub fn save_mcp_config(
         .map_err(|e| crate::error::AppError::Config(e.to_string()))
 }
 
+/// Shared skeleton for the per-source loaders below: if `path` exists, read
+/// it, run `parse` over the contents, and merge the result via
+/// `merge_parsed`. Read and parse failures are silently skipped, exactly as
+/// each loader previously did inline. Returns whether the path existed at
+/// all, so loaders that probe an ordered candidate list (claude-cli) can
+/// stop at the first file found even when it fails to parse.
+fn load_from_path(
+    path: &Path,
+    parse: fn(&str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error>,
+    configs: &mut HashMap<String, MCPServerConfig>,
+) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    if let Ok(content) = std::fs::read_to_string(path)
+        && let Ok(parsed) = parse(&content) {
+            merge_parsed(parsed, configs);
+        }
+    true
+}
+
+/// Merge freshly parsed servers into the accumulated map.
+/// `entry().or_insert` means the first source to claim a name wins —
+/// precedence is purely the call order in `load_mcp_config`.
+fn merge_parsed(
+    parsed: HashMap<String, MCPServerConfig>,
+    configs: &mut HashMap<String, MCPServerConfig>,
+) {
+    for (name, config) in parsed {
+        configs.entry(name).or_insert(config);
+    }
+}
+
 fn load_workspace_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let paths = vec![
+    let paths = [
         PathBuf::from("mcp.config.json"),
         PathBuf::from(".vscode/mcp.json"),
     ];
 
-    for path in paths {
-        if path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(mut workspace_configs) = parse_mcp_json(&content) {
-                    for (name, config) in workspace_configs.drain() {
-                        configs.entry(name).or_insert(config);
-                    }
-                }
+    for path in &paths {
+        load_from_path(path, parse_mcp_json, configs);
     }
 }
 
@@ -181,87 +208,90 @@ fn load_global_config(configs: &mut HashMap<String, MCPServerConfig>) {
         .join("pooprusteek")
         .join("mcp.config.json");
 
-    if config_dir.exists()
-        && let Ok(content) = std::fs::read_to_string(&config_dir)
-            && let Ok(mut global_configs) = parse_mcp_json(&content) {
-                for (name, config) in global_configs.drain() {
-                    configs.entry(name).or_insert(config);
-                }
-            }
+    load_from_path(&config_dir, parse_mcp_json, configs);
 }
 
 fn load_claude_desktop_config(configs: &mut HashMap<String, MCPServerConfig>) {
     let config_path = if cfg!(target_os = "macos") {
         dirs::home_dir()
             .map(|h| h.join("Library/Application Support/Claude/claude_desktop_config.json"))
-    } else if cfg!(target_os = "windows") {
-        dirs::config_dir()
-            .map(|c| c.join("Claude/claude_desktop_config.json"))
     } else {
+        // Windows and Linux both keep it under the platform config dir.
         dirs::config_dir()
             .map(|c| c.join("Claude/claude_desktop_config.json"))
     };
 
-    if let Some(path) = config_path
-        && path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(desktop_config) = serde_json::from_str::<ClaudeDesktopConfig>(&content) {
-                    for (name, server) in desktop_config.mcp_servers {
-                        let config = MCPServerConfig::Stdio {
-                            command: server.command,
-                            args: server.args,
-                            env: server.env,
-                            cwd: None,
-                        };
-                        configs.entry(name).or_insert(config);
-                    }
-                }
+    if let Some(path) = config_path {
+        load_from_path(&path, parse_claude_desktop_json, configs);
+    }
+}
+
+/// Parse Claude Desktop's `claude_desktop_config.json` shape — always stdio
+/// (`command`/`args`/`env`, no url variant) under an `mcpServers` key.
+fn parse_claude_desktop_json(content: &str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
+    let desktop_config: ClaudeDesktopConfig = serde_json::from_str(content)?;
+    Ok(desktop_config.mcp_servers.into_iter()
+        .map(|(name, server)| {
+            let config = MCPServerConfig::Stdio {
+                command: server.command,
+                args: server.args,
+                env: server.env,
+                cwd: None,
+            };
+            (name, config)
+        })
+        .collect())
 }
 
 fn load_vscode_config(configs: &mut HashMap<String, MCPServerConfig>) {
     let settings_path = dirs::config_dir()
         .map(|c| c.join("Code/User/settings.json"));
 
-    if let Some(path) = settings_path
-        && path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content)
-                    && let Some(mcp) = settings.get("mcp")
-                        && let Some(servers) = mcp.get("servers")
-                            && let Some(obj) = servers.as_object() {
-                                for (name, server_value) in obj {
-                                    if let Ok(server) = serde_json::from_value::<VSCodeMCPServer>(server_value.clone()) {
-                                        let config = if let Some(url) = &server.url {
-                                            MCPServerConfig::Http {
-                                                url: url.clone(),
-                                                headers: server.headers.unwrap_or_default(),
-                                            }
-                                        } else {
-                                            MCPServerConfig::Stdio {
-                                                command: server.command,
-                                                args: server.args,
-                                                env: server.env,
-                                                cwd: None,
-                                            }
-                                        };
-                                        configs.entry(name.clone()).or_insert(config);
-                                    }
-                                }
+    if let Some(path) = settings_path {
+        load_from_path(&path, parse_vscode_settings, configs);
+    }
+}
+
+/// Parse the `mcp.servers` section of VS Code's `settings.json`. Servers
+/// with a `url` become HTTP, otherwise stdio; entries that don't match the
+/// expected shape are skipped individually rather than failing the file.
+fn parse_vscode_settings(content: &str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
+    let settings: serde_json::Value = serde_json::from_str(content)?;
+    let mut configs = HashMap::new();
+
+    if let Some(mcp) = settings.get("mcp")
+        && let Some(servers) = mcp.get("servers")
+            && let Some(obj) = servers.as_object() {
+                for (name, server_value) in obj {
+                    if let Ok(server) = serde_json::from_value::<VSCodeMCPServer>(server_value.clone()) {
+                        let config = if let Some(url) = &server.url {
+                            MCPServerConfig::Http {
+                                url: url.clone(),
+                                headers: server.headers.unwrap_or_default(),
                             }
+                        } else {
+                            MCPServerConfig::Stdio {
+                                command: server.command,
+                                args: server.args,
+                                env: server.env,
+                                cwd: None,
+                            }
+                        };
+                        configs.insert(name.clone(), config);
+                    }
+                }
+            }
+
+    Ok(configs)
 }
 
 fn load_cursor_config(configs: &mut HashMap<String, MCPServerConfig>) {
     let cursor_path = dirs::home_dir()
         .map(|h| h.join(".cursor/mcp.json"));
 
-    if let Some(path) = cursor_path
-        && path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(mut cursor_configs) = parse_mcp_json(&content) {
-                    for (name, config) in cursor_configs.drain() {
-                        configs.entry(name).or_insert(config);
-                    }
-                }
+    if let Some(path) = cursor_path {
+        load_from_path(&path, parse_mcp_json, configs);
+    }
 }
 
 fn load_opencode_config(configs: &mut HashMap<String, MCPServerConfig>) {
@@ -277,6 +307,9 @@ fn load_opencode_config(configs: &mut HashMap<String, MCPServerConfig>) {
         base.join("opencode.mcp.json"),
     ];
 
+    // Quirk that keeps this loader off `load_from_path`: the first existing
+    // candidate is tried with *two* parsers, so the file is read once here
+    // and only the merge step is shared.
     for path in &candidates {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
@@ -287,18 +320,14 @@ fn load_opencode_config(configs: &mut HashMap<String, MCPServerConfig>) {
                     .unwrap_or(false);
 
                 if is_opencode
-                    && let Ok(mut parsed) = parse_opencode_json(&content) {
-                        for (name, config) in parsed.drain() {
-                            configs.entry(name).or_insert(config);
-                        }
+                    && let Ok(parsed) = parse_opencode_json(&content) {
+                        merge_parsed(parsed, configs);
                         return;
                     }
                     // fall through to standard parser if opencode format fails
 
-                if let Ok(mut parsed) = parse_mcp_json(&content) {
-                    for (name, config) in parsed.drain() {
-                        configs.entry(name).or_insert(config);
-                    }
+                if let Ok(parsed) = parse_mcp_json(&content) {
+                    merge_parsed(parsed, configs);
                 }
             }
             return;
@@ -364,13 +393,7 @@ fn load_claude_cli_config(configs: &mut HashMap<String, MCPServerConfig>) {
     ];
 
     for candidate in candidates.iter().flatten() {
-        if candidate.exists() {
-            if let Ok(content) = std::fs::read_to_string(candidate)
-                && let Ok(mut claude_configs) = parse_mcp_json(&content) {
-                    for (name, config) in claude_configs.drain() {
-                        configs.entry(name).or_insert(config);
-                    }
-                }
+        if load_from_path(candidate, parse_mcp_json, configs) {
             // take the first found file only
             return;
         }

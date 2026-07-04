@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{save_config_then, Command, CommandResult};
 use crate::config::{self, Config};
 
 pub struct McpCommand;
@@ -58,10 +58,7 @@ impl Command for McpCommand {
                         Err(_) => return CommandResult::Error("Failed to load config".to_string()),
                     };
                     config.mcp.cache_ttl = ttl;
-                    if let Err(e) = config::save(&config) {
-                        return CommandResult::Error(format!("Failed to save config: {e}"));
-                    }
-                    CommandResult::TtlUpdate(ttl)
+                    save_config_then(&config, || CommandResult::TtlUpdate(ttl))
                 }
                 Ok(_) => CommandResult::Error("TTL must be between 1 and 86400 seconds".to_string()),
                 Err(_) => CommandResult::Error(

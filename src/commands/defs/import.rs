@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{Command, CommandResult};
+use crate::commands::{with_args, Command, CommandResult};
 use crate::config::Config;
 use crate::provider::{ChatMessage, Role};
 use crate::session::SESSION_VERSION;
@@ -20,71 +20,68 @@ impl Command for ImportCommand {
     }
 
     fn execute(&self, args: &str, state: &mut AppState, config: &Config) -> CommandResult {
-        let path = args.trim();
-        if path.is_empty() {
-            return CommandResult::Error("Usage: /import <path-to-file.md>".to_string());
-        }
+        with_args(args, "/import <path-to-file.md>", |path| {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => return CommandResult::Error(format!("Failed to read file: {e}")),
+            };
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => return CommandResult::Error(format!("Failed to read file: {e}")),
-        };
+            let messages = match parse_markdown_export(&content) {
+                Ok(msgs) => msgs,
+                Err(e) => return CommandResult::Error(format!("Failed to parse export: {e}")),
+            };
 
-        let messages = match parse_markdown_export(&content) {
-            Ok(msgs) => msgs,
-            Err(e) => return CommandResult::Error(format!("Failed to parse export: {e}")),
-        };
+            if messages.is_empty() {
+                return CommandResult::Error("No messages found in export file".to_string());
+            }
 
-        if messages.is_empty() {
-            return CommandResult::Error("No messages found in export file".to_string());
-        }
+            let now = chrono::Utc::now().to_rfc3339();
+            let session_id = crate::session::create_session_id();
+            let workspace_root = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
 
-        let now = chrono::Utc::now().to_rfc3339();
-        let session_id = crate::session::create_session_id();
-        let workspace_root = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+            let session = crate::session::Session {
+                version: SESSION_VERSION,
+                id: session_id.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+                workspace_root,
+                model_type: config.provider.model.clone(),
+                messages: messages.clone(),
+                tag: Some("Imported".to_string()),
+                provider_session_id: None,
+                provider_parent_message_id: None,
+                broken: false,
+            };
 
-        let session = crate::session::Session {
-            version: SESSION_VERSION,
-            id: session_id.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-            workspace_root,
-            model_type: config.provider.model.clone(),
-            messages: messages.clone(),
-            tag: Some("Imported".to_string()),
-            provider_session_id: None,
-            provider_parent_message_id: None,
-            broken: false,
-        };
+            if let Err(e) = crate::session::save_local(&session, config) {
+                return CommandResult::Error(format!("Failed to save imported session: {e}"));
+            }
 
-        if let Err(e) = crate::session::save_local(&session, config) {
-            return CommandResult::Error(format!("Failed to save imported session: {e}"));
-        }
+            state.focused_mut().messages = messages;
+            state.focused_mut().session_id = session_id.clone();
+            // Without this, the very next auto-save (on the user's first reply in
+            // this session) would silently overwrite the file's tag back to
+            // `None` — `auto_save_session` only ever persists what's mirrored on
+            // the live `Conversation`, not what's already on disk.
+            state.focused_mut().tag = session.tag.clone();
+            state.focused_mut().broken = false;
+            state.scroll_offset = 0;
+            state.input.buffer.clear();
+            state.input.cursor = 0;
+            state.input.selection_anchor = None;
+            state.focused_mut().generation.active = false;
 
-        state.focused_mut().messages = messages;
-        state.focused_mut().session_id = session_id.clone();
-        // Without this, the very next auto-save (on the user's first reply in
-        // this session) would silently overwrite the file's tag back to
-        // `None` — `auto_save_session` only ever persists what's mirrored on
-        // the live `Conversation`, not what's already on disk.
-        state.focused_mut().tag = session.tag.clone();
-        state.focused_mut().broken = false;
-        state.scroll_offset = 0;
-        state.input.buffer.clear();
-        state.input.cursor = 0;
-        state.input.selection_anchor = None;
-        state.focused_mut().generation.active = false;
+            state.status_message = format!(
+                "Imported session {} ({} messages, tagged Imported)",
+                &session_id[..session_id.len().min(17)],
+                state.focused_mut().messages.len(),
+            );
 
-        state.status_message = format!(
-            "Imported session {} ({} messages, tagged Imported)",
-            &session_id[..session_id.len().min(17)],
-            state.focused_mut().messages.len(),
-        );
-
-        CommandResult::Handled
+            CommandResult::Handled
+        })
     }
 }
 

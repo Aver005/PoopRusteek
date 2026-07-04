@@ -35,14 +35,14 @@ thread_local! {
 
 /// The landing screen's recent-sessions list, refreshed at most once per
 /// [`LANDING_SESSIONS_TTL`] instead of on every animation frame.
-fn landing_sessions_cached(config: &Config) -> Vec<crate::session::SessionSummary> {
+fn landing_sessions_cached() -> Vec<crate::session::SessionSummary> {
     LANDING_SESSIONS_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some((fetched_at, sessions)) = cache.as_ref()
             && fetched_at.elapsed() < LANDING_SESSIONS_TTL {
                 return sessions.clone();
             }
-        let sessions = crate::session::list_sessions(config).unwrap_or_default();
+        let sessions = crate::session::list_sessions().unwrap_or_default();
         *cache = Some((Instant::now(), sessions.clone()));
         sessions
     })
@@ -52,7 +52,7 @@ pub(super) fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, co
     let input_width = area.width.min(76);
     let x = (area.width - input_width) / 2;
 
-    let sessions = landing_sessions_cached(config);
+    let sessions = landing_sessions_cached();
     let session_count = sessions.len();
     let show_sessions = session_count > 0;
 

@@ -303,7 +303,7 @@ impl App {
             return;
         }
 
-        let entries: Vec<DeleteEntry> = crate::session::list_sessions(&self.config)
+        let entries: Vec<DeleteEntry> = crate::session::list_sessions()
             .unwrap_or_default()
             .into_iter()
             .map(|s| DeleteEntry {

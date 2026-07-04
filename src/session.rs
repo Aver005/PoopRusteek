@@ -119,7 +119,7 @@ pub fn load_local(id: &str, _config: &Config) -> AppResult<Session> {
     Ok(session)
 }
 
-pub fn list_sessions(_config: &Config) -> AppResult<Vec<SessionSummary>> {
+pub fn list_sessions() -> AppResult<Vec<SessionSummary>> {
     let dir = Config::sessions_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -341,7 +341,7 @@ mod tests {
         let path = plant_session_file(id, "{ this is not valid json");
 
         let config = Config::default();
-        let result = list_sessions(&config);
+        let result = list_sessions();
 
         cleanup(&path);
 

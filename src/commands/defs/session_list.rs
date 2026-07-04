@@ -20,7 +20,7 @@ impl Command for SessionListCommand {
     }
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        let sessions = match session::list_sessions(_config) {
+        let sessions = match session::list_sessions() {
             Ok(s) => s,
             Err(e) => return CommandResult::Error(format!("Failed to list sessions: {e}")),
         };
@@ -31,9 +31,7 @@ impl Command for SessionListCommand {
             .collect();
 
         if user_sessions.is_empty() {
-            state.focused_mut().messages.push(crate::provider::ChatMessage::system(
-                "No local sessions found.",
-            ));
+            state.push_system("No local sessions found.");
             return CommandResult::Handled;
         }
 

@@ -95,6 +95,32 @@ fn parse_input(input: &str) -> Option<(&str, &str)> {
     Some((name, args))
 }
 
+/// Run `body` with the trimmed, non-empty `args`. If the command was invoked
+/// without an argument, return the canonical `Usage: {usage}` error instead —
+/// the shared prologue for every command that requires one.
+fn with_args(
+    args: &str,
+    usage: &str,
+    body: impl FnOnce(&str) -> CommandResult,
+) -> CommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        return CommandResult::Error(format!("Usage: {usage}"));
+    }
+    body(args)
+}
+
+/// Persist `config`, then run `then` for the success result. `then` only runs
+/// after the save landed, so success-only side effects (confirmation messages,
+/// …) stay gated behind it; a failed write becomes the canonical
+/// "Failed to save config" error.
+fn save_config_then(config: &Config, then: impl FnOnce() -> CommandResult) -> CommandResult {
+    match crate::config::save(config) {
+        Ok(()) => then(),
+        Err(e) => CommandResult::Error(format!("Failed to save config: {e}")),
+    }
+}
+
 impl CommandRegistry {
     pub fn new() -> Self {
         let mut registry = Self {

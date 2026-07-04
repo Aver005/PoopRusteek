@@ -360,20 +360,21 @@ impl MCPManager {
     /// map, tool-list cache (only for a freshly-fetched, non-cached,
     /// successful connect), and the server's own status/tools/resources.
     fn apply_connect_outcome(&mut self, outcome: ConnectOutcome) {
-        if outcome.used_cache {
+        // A cache-served outcome and a fresh successful connect both carry
+        // usable tool entries; a failed connect maps nothing.
+        if outcome.used_cache || matches!(outcome.status, MCPServerStatus::Connected) {
             for (full_name, server_name, tool_name) in &outcome.tool_entries {
                 self.tool_name_map.insert(full_name.clone(), (server_name.clone(), tool_name.clone()));
             }
-        } else if matches!(outcome.status, MCPServerStatus::Connected) {
-            for (full_name, server_name, tool_name) in &outcome.tool_entries {
-                self.tool_name_map.insert(full_name.clone(), (server_name.clone(), tool_name.clone()));
+            // Only a fresh fetch (re)fills the cache — see doc comment above.
+            if !outcome.used_cache {
+                self.cache.insert(outcome.name.clone(), ServerCache {
+                    tools: outcome.tools.clone(),
+                    resources: outcome.resources.clone(),
+                    tool_entries: outcome.tool_entries.clone(),
+                    cached_at: Instant::now(),
+                });
             }
-            self.cache.insert(outcome.name.clone(), ServerCache {
-                tools: outcome.tools.clone(),
-                resources: outcome.resources.clone(),
-                tool_entries: outcome.tool_entries.clone(),
-                cached_at: Instant::now(),
-            });
         }
 
         if let Some(entry) = self.servers.get_mut(&outcome.name) {

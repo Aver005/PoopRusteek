@@ -17,8 +17,8 @@ impl Command for LastCommand {
         "/last"
     }
 
-    fn execute(&self, _args: &str, _state: &mut AppState, config: &Config) -> CommandResult {
-        match crate::session::list_sessions(config) {
+    fn execute(&self, _args: &str, _state: &mut AppState, _config: &Config) -> CommandResult {
+        match crate::session::list_sessions() {
             Ok(sessions) if !sessions.is_empty() => {
                 CommandResult::LoadSession(sessions[0].id.clone())
             }
