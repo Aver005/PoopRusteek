@@ -517,6 +517,37 @@ impl MCPManager {
         }
     }
 
+    /// Whether a server named `name` is already configured — used by
+    /// `/mcp add` to reject a duplicate before even attempting to connect.
+    pub fn has_server(&self, name: &str) -> bool {
+        self.servers.contains_key(name)
+    }
+
+    /// Add one new user-supplied server (from `/mcp add`'s paste-JSON,
+    /// wizard, or quick inline syntax) as `ServerSource::Own`: connects it
+    /// immediately and persists to `mcp.json`. Rejects a duplicate name
+    /// outright rather than silently overwriting an existing server.
+    ///
+    /// Returns the server's status right after connecting — lets the
+    /// caller report something more useful than "added" (e.g. "added, but
+    /// requires authorization" or "added, but failed to connect: ...")
+    /// without a second round trip through `get_servers_info`.
+    pub async fn add_new_server(&mut self, name: String, config: MCPServerConfig) -> AppResult<MCPServerStatus> {
+        if self.servers.contains_key(&name) {
+            return Err(crate::error::AppError::Mcp(format!("Server '{name}' already exists")));
+        }
+        self.add_server(name.clone(), config, true, ServerSource::Own).await;
+        if !self.servers.contains_key(&name) {
+            // `add_server` silently no-ops when `build_client` fails (bad
+            // stdio command, malformed URL, ...) — surface that here instead
+            // of reporting success for a server that was never actually added.
+            return Err(crate::error::AppError::Mcp(format!("Failed to create a client for '{name}'")));
+        }
+        self.connect_server(&name).await;
+        self.persist_config().await;
+        Ok(self.servers.get(&name).map(|e| e.status.clone()).unwrap_or(MCPServerStatus::Pending))
+    }
+
     pub async fn toggle_server(&mut self, name: &str) -> AppResult<()> {
         let enabled = self.servers.get(name).map(|e| !e.enabled).unwrap_or(true);
         if let Some(entry) = self.servers.get_mut(name) {

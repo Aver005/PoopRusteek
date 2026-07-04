@@ -9,7 +9,7 @@
 //! deletion) are testable in isolation.
 
 /// Editable state of the prompt input line.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InputState {
     /// Current text in the prompt.
     pub buffer: String,

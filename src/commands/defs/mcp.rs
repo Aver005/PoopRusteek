@@ -10,11 +10,11 @@ impl Command for McpCommand {
     }
 
     fn description(&self) -> &str {
-        "Open MCP server management, set cache TTL, reload, or authorize a server"
+        "Open MCP server management, set cache TTL, reload, authorize, or add a server"
     }
 
     fn usage(&self) -> &str {
-        "/mcp — open management view\n/mcp ttl <secs> — set cache TTL (default: 300s)\n/mcp reload — force reload all servers\n/mcp auth (or /mcp oauth) — list servers requiring authorization"
+        "/mcp — open management view\n/mcp ttl <secs> — set cache TTL (default: 300s)\n/mcp reload — force reload all servers\n/mcp auth (or /mcp oauth) — list servers requiring authorization\n/mcp add — add a server (paste JSON or step-by-step)\n/mcp add <name> <command> [args...] — quick stdio add\n/mcp add <json> — quick add from a pasted config"
     }
 
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
@@ -42,6 +42,13 @@ impl Command for McpCommand {
             return CommandResult::OpenMcpAuth;
         }
 
+        if args == "add" {
+            return CommandResult::OpenMcpAdd(None);
+        }
+        if let Some(rest) = args.strip_prefix("add ") {
+            return CommandResult::OpenMcpAdd(Some(rest.trim().to_string()));
+        }
+
         if let Some(ttl_str) = args.strip_prefix("ttl ") {
             let trimmed = ttl_str.trim();
             match trimmed.parse::<u64>() {
@@ -63,7 +70,7 @@ impl Command for McpCommand {
             }
         } else {
             CommandResult::Error(
-                "Unknown subcommand. Usage:\n  /mcp — open management view\n  /mcp ttl <secs> — set cache TTL\n  /mcp reload — force reload all servers"
+                "Unknown subcommand. Usage:\n  /mcp — open management view\n  /mcp ttl <secs> — set cache TTL\n  /mcp reload — force reload all servers\n  /mcp auth — list servers requiring authorization\n  /mcp add [args] — add a new server"
                     .to_string(),
             )
         }

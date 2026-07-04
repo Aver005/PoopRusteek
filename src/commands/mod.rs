@@ -34,6 +34,11 @@ pub enum CommandResult {
     /// `/mcp auth` / `/mcp oauth` — open the authorization picker (servers
     /// currently `AuthRequired`).
     OpenMcpAuth,
+    /// `/mcp add [args]` — with no args, opens the method-choice modal
+    /// (paste JSON vs. step-by-step wizard); with args, the handler tries
+    /// `mcp_add::parse_quick_add` first and falls back to the same
+    /// method-choice modal on any parse failure.
+    OpenMcpAdd(Option<String>),
     ShowTools,
     Jobs(JobCommandAction),
     OpenWhitelist,

@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-04 (MCP OAuth authorization — `/mcp auth`/`/mcp oauth` — tests 242, clippy 0. Also this session: remote session resume on `/load`, PowerShell empty-output false-positive fix, multi-line system-message render fix)
+> Last updated: 2026-07-04 (`/mcp add` — paste-JSON/wizard/quick-inline server add — tests 262, clippy 0. Also this session: MCP OAuth authorization (`/mcp auth`/`/mcp oauth`), remote session resume on `/load`, PowerShell empty-output false-positive fix, multi-line system-message render fix)
 
 ## PHASE COMPLETION
 
@@ -8,7 +8,7 @@
 |-------|--------|------|
 | 1 Core | `[DONE]` | TUI, provider trait, DeepSeek client, agent loop, tools, MCP types, PoW, streaming |
 | 2 Features | `[DONE]` | In-TUI onboarding (`View::Onboarding`), sessions, 27 slash commands, markdown+syntect, compaction, @file, tool approval, input history |
-| 3 Integration | `[DONE]` | MCP stdio/HTTP/SSE, 8-source auto-discovery, manager+caching, JSON-RPC, ACP server mode, OAuth authorization (`/mcp auth`/`/mcp oauth`, OS-keyring token storage — 2026-07-04) |
+| 3 Integration | `[DONE]` | MCP stdio/HTTP/SSE, 8-source auto-discovery, manager+caching, JSON-RPC, ACP server mode, OAuth authorization (`/mcp auth`/`/mcp oauth`, OS-keyring token storage), `/mcp add` (paste-JSON/wizard/quick-inline server add — 2026-07-04) |
 | 3.5 Agentic | `[DONE]` | GOAL mode (2-agent iterative loop), background/interactive PTY jobs, `/jobs` `/ps`, skills system |
 | 3.6 Multi-chat | `[DONE]` | `Conversation`/`Conversations` model, provider `fork()`, event tagging by `ConversationId`, parallel sessions (`/new` `/chats` + Tab), `/btw` sidechat, sub-agents (model `task` tool + `/agent`/`/agents`, fg+bg) |
 | 3.7 Architecture | `[DONE]` | God-object `App` decomposed (mod.rs 2.4k→925): sub-state modules + controllers (`AgentRuntime`, `system_prompt::build`, `BackgroundCounters`, `McpStatus`). Provider split (prompt/sse/fake). |
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **242 passing** (`cargo test --bin pooprusteek`) |
+| Tests | **262 passing** (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
@@ -76,6 +76,7 @@
 | 2026-07-02 | **Full-codebase audit** (`reference/AUDIT-2026-07-02.md`) → same-day **3-wave refactor**: streaming/MCP/GOAL/ACP/render/stdio criticals + ~30 majors + dead-code sweep, committed as `bad8011`. 54 files, +4056/−1291. Tests 84→189, clippy ~220→0. |
 | 2026-07-02 | **In-TUI onboarding + /logout + /wipe**: `cli/onboarding.rs` deleted; `View::Onboarding` full-screen rework (`OnboardingState`, `handle_onboarding_key`, `render_onboarding`, `Conversation::fresh_main`); generic `Modal::Confirm(ConfirmState)` + `ConfirmAction`; `/logout` (confirm → cancel turns → clear token → `reset_to_onboarding`) and `/wipe` (confirm → cancel turns → `remove_dir_all` over `wipe_roots()` → factory reset → onboarding). Tests 189→209, clippy 0. |
 | 2026-07-04 | **MCP OAuth authorization**: `/mcp auth`/`/mcp oauth` list+authorize servers in `AuthRequired` status; full RFC 9728/8414/7591 + PKCE flow (`mcp/oauth.rs`), OS-keyring encrypted token storage (`mcp/oauth_store.rs`, `keyring` crate) — first encrypted-at-rest secrets in the repo. `build_client` unified across `add_server`/`toggle_server`/`reconnect_server`; HTTP/SSE 401 detection deduped into shared transport helpers. Tests 227→242, clippy 0. See `reference/MCP.md` AUTHORIZATION. |
+| 2026-07-04 | **`/mcp add`**: paste-JSON, step-by-step wizard, and quick inline (`<name> <command> [args...]` or inline JSON, falling back to the same choice modal on parse failure) — all converge on new `MCPManager::add_new_server`. New `app/mcp_add.rs` (pure state machine + parsers, no crossterm dep), new `Modal::McpAdd`, `app::input::InputState` gained `Clone` (reused for every text-entry step). Tests 242→262, clippy 0. See `reference/MCP.md` ADDING SERVERS. |
 
 ## FACTS CORRECTED THIS PASS (were wrong in older memory)
 

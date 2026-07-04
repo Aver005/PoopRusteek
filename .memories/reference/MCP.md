@@ -1,6 +1,6 @@
 # REFERENCE: MCP (Model Context Protocol)
 > Dynamic external tools/resources. Source: `src/mcp/`.
-> Last updated: 2026-07-04 (added OAuth authorization — see AUTHORIZATION section)
+> Last updated: 2026-07-04 (added OAuth authorization + `/mcp add` — see AUTHORIZATION and ADDING SERVERS sections)
 
 ## OVERVIEW
 
@@ -116,6 +116,76 @@ one (RFC 9728 §5.1).
   was found. This means every path that (re)builds a client — initial
   connect, `toggle_server`, `reconnect_server` — automatically picks up a
   newly stored token with zero other manager changes.
+
+## ADDING SERVERS (`/mcp add`) — added 2026-07-04
+
+Three entry points, all converging on `MCPManager::add_new_server(name, config)`
+(`manager.rs`): rejects a duplicate name, connects immediately via the
+existing `add_server`/`connect_server`, persists via the existing
+`persist_config` (as `ServerSource::Own`, same as everything else this path
+adds), and returns the resulting `MCPServerStatus` so the caller can report
+something better than "added" (e.g. "requires authorization").
+
+1. **`/mcp add`** (no args) → `CommandResult::OpenMcpAdd(None)` →
+   `Modal::McpAdd(McpAddState::ChooseMethod { .. })` — a 2-item choice
+   (paste JSON / step-by-step wizard).
+2. **`/mcp add <name> <command> [args...]`** or **`/mcp add <json>`** →
+   `CommandResult::OpenMcpAdd(Some(args))` → `app/keys.rs`'s handler tries
+   `mcp_add::parse_quick_add(&args)` first (stdio shorthand, or delegates to
+   the JSON parser if `args` starts with `{`); **on any parse failure it
+   falls back to the exact same `ChooseMethod` modal** (per an explicit user
+   request — quick-add is a shortcut, not a dead end), after pushing a
+   system message explaining *why* it fell back (never a silent fallback).
+3. Paste-JSON / wizard `Confirm` step both end by calling
+   `App::spawn_mcp_add` (`keys.rs`) — one task, off the event loop, that
+   calls `add_new_server` per entry and reuses `AppEvent::McpOperationDone`
+   for the result (same plumbing as reload/toggle/reconnect — forces the
+   next `McpStatus::update_stats` poll to re-pull the server list).
+
+**State machine** (`src/app/mcp_add.rs` — pure logic, no crossterm/ratatui
+dependency, fully unit-tested) + `app/keys.rs::handle_mcp_add_key` (the only
+place that touches crossterm `KeyEvent`s and `self.mcp`):
+- `McpAddState::ChooseMethod { selected }` → `PasteJson { input: InputState, error }`
+  or `Wizard(Box<WizardState>)` (boxed — clippy `large_enum_variant`; a
+  `WizardState` with 3 `InputState` fields is ~376 bytes, more than 10x the
+  other two variants).
+- `WizardState.step: WizardStep` walks `Name → Transport → Primary → Extra →
+  Confirm`; Esc always steps back one (Esc on `Name` abandons the wizard
+  back to `ChooseMethod`, matching `PasteJson`'s Esc). Each step validates
+  on Enter (empty name / duplicate name via `MCPManager::has_server` / bad
+  command line / bad URL / malformed `KEY=VALUE`-or-`Name: value` lines)
+  before advancing — `wiz.error` shows inline, step doesn't change.
+- Free-text entry (JSON paste, name, command/URL, env/headers) reuses the
+  existing chat-input type, **`app::input::InputState`** (now `Clone` —
+  added for this, previously only `Debug + Default`, since `Modal` is
+  cloned wholesale in `handle_key` before matching). `keys.rs`'s
+  `apply_text_key` free function applies the shared editing keys
+  (insert/backspace/delete/cursor movement, Shift+Enter for newline where
+  `allow_newline` is set) so each step's own match only adds its Enter/Esc
+  transition — mirrors the main chat input's own Shift+Enter-for-newline
+  convention.
+- Parsing (`mcp_add.rs`): `parse_pasted_json` accepts either the
+  Claude-Desktop-style `{"mcpServers": {"name": {...}}}` wrapper (adds
+  every entry — one paste, multiple servers) or a bare object with a
+  `"name"` field bolted onto the usual `MCPServerConfig` shape;
+  `split_command_line` (whitespace-only, no quoting — deliberately simple);
+  `parse_env_lines`/`parse_header_lines` (`KEY=VALUE` / `Name: value`,
+  blank lines ignored, empty input = empty map since both are optional).
+- Rendering: `tui/render.rs::render_mcp_add` + shared helper
+  `push_text_box_lines` (converts an `InputState`'s char-index cursor into
+  (row, col) by walking the buffer once counting `\n`s, splits on raw
+  `'\n'` rather than `.lines()` since the latter drops a trailing empty
+  line — matters when the cursor sits on one after a trailing newline).
+
+### ADDING SERVERS GOTCHAS
+
+- Quick-add's `<name> <command> [args...]` shorthand only covers `stdio`
+  (by far the common case); http/sse or servers needing env/headers need
+  the wizard or a JSON paste.
+- `split_command_line` does no shell-style quoting/escaping — an arg with
+  embedded spaces (rare for MCP install snippets) isn't expressible via the
+  quick shorthand or the wizard's single-line command field; paste JSON
+  instead (`args` as a proper JSON array) if that's ever needed.
 
 ### AUTHORIZATION GOTCHAS
 

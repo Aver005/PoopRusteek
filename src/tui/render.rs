@@ -840,7 +840,206 @@ fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
         Modal::Question(qs) => render_question(frame, area, qs, theme),
         Modal::DeleteSessions(st) => render_delete_sessions(frame, area, st, theme),
         Modal::Confirm(cs) => render_confirm(frame, area, cs, theme),
+        Modal::McpAdd(state) => render_mcp_add(frame, area, state, theme),
     }
+}
+
+/// Render one row of a text box, splitting `buffer` on raw `'\n'` (not
+/// `.lines()` — that drops a trailing empty line, which matters when the
+/// cursor sits on one) and highlighting the cursor's character in reverse
+/// video, same visual treatment as `render_question`'s custom-input mode.
+fn push_text_box_lines(lines: &mut Vec<Line<'static>>, buffer: &str, cursor_chars: usize, theme: &Theme, max_rows: usize) {
+    let rows: Vec<&str> = buffer.split('\n').collect();
+
+    // Walk the whole buffer once, tracking (row, col) as a char-index
+    // counter reaches `cursor_chars` — `\n` both advances the row and
+    // resets the column, everything else advances the column.
+    let (mut cursor_row, mut cursor_col) = (0usize, 0usize);
+    for (i, ch) in buffer.chars().enumerate() {
+        if i == cursor_chars {
+            break;
+        }
+        if ch == '\n' {
+            cursor_row += 1;
+            cursor_col = 0;
+        } else {
+            cursor_col += 1;
+        }
+    }
+
+    let max_rows = max_rows.max(1);
+    let start = cursor_row.saturating_sub(max_rows.saturating_sub(1));
+    let end = (start + max_rows).min(rows.len());
+
+    for (i, row_text) in rows.iter().enumerate() {
+        if i < start || i >= end {
+            continue;
+        }
+        if i == cursor_row {
+            let chars: Vec<char> = row_text.chars().collect();
+            let before: String = chars.iter().take(cursor_col).collect();
+            if cursor_col < chars.len() {
+                let cursor_ch = chars[cursor_col].to_string();
+                let after: String = chars.iter().skip(cursor_col + 1).collect();
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(theme.fg)),
+                    Span::styled(before, Style::default().fg(theme.fg).bg(theme.input_bg)),
+                    Span::styled(cursor_ch, Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::REVERSED)),
+                    Span::styled(after, Style::default().fg(theme.fg).bg(theme.input_bg)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(theme.fg)),
+                    Span::styled(before, Style::default().fg(theme.fg).bg(theme.input_bg)),
+                    Span::styled(" ", Style::default().fg(theme.fg).bg(theme.accent).add_modifier(Modifier::REVERSED)),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme.fg)),
+                Span::styled(row_text.to_string(), Style::default().fg(theme.fg).bg(theme.input_bg)),
+            ]));
+        }
+    }
+}
+
+fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::mcp_add::McpAddState, theme: &Theme) {
+    use crate::app::mcp_add::{McpAddState, TransportChoice, WizardStep};
+
+    let popup_width = area.width.clamp(52, 76);
+    let popup_h = 16u16.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" Add MCP Server ")
+        .title_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(theme.panel));
+    let inner = block.inner(popup_area);
+    let inner_w = inner.width as usize;
+    let max_rows = inner.height.saturating_sub(6) as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let hint: &str = match state {
+        McpAddState::ChooseMethod { selected } => {
+            lines.push(Line::from(Span::styled("  Pick a method:", Style::default().fg(theme.text_dim))));
+            lines.push(Line::from(""));
+            for (i, opt) in ["Paste a JSON config", "Step-by-step wizard"].iter().enumerate() {
+                let is_cursor = i == *selected;
+                let indicator = if is_cursor { "\u{25B6} " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(theme.fg)),
+                    Span::styled(indicator, Style::default().fg(if is_cursor { theme.accent } else { theme.text_dim })),
+                    Span::styled(
+                        opt.to_string(),
+                        if is_cursor {
+                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text_soft)
+                        },
+                    ),
+                ]));
+            }
+            " \u{2191}\u{2193} navigate    Enter select    Esc cancel "
+        }
+        McpAddState::PasteJson { input, error } => {
+            lines.push(Line::from(Span::styled(
+                "  Paste a server config JSON (single object, or {\"mcpServers\": {...}}):",
+                Style::default().fg(theme.text_dim),
+            )));
+            lines.push(Line::from(""));
+            push_text_box_lines(&mut lines, &input.buffer, input.cursor, theme, max_rows);
+            if let Some(err) = error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(format!("  \u{26A0} {err}"), Style::default().fg(theme.error))));
+            }
+            " Enter add    Shift+Enter newline    Esc back "
+        }
+        McpAddState::Wizard(wiz) => {
+            let (step_num, step_label) = match wiz.step {
+                WizardStep::Name => (1, "Server name".to_string()),
+                WizardStep::Transport => (2, "Transport".to_string()),
+                WizardStep::Primary => (3, wiz.transport.map(TransportChoice::primary_label).unwrap_or("Value").to_string()),
+                WizardStep::Extra => (4, wiz.transport.map(TransportChoice::extra_label).unwrap_or("Extra").to_string()),
+                WizardStep::Confirm => (5, "Confirm".to_string()),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  Step {step_num}/5 \u{2014} "), Style::default().fg(theme.text_dim)),
+                Span::styled(step_label, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+            ]));
+            lines.push(Line::from(""));
+
+            match wiz.step {
+                WizardStep::Name => push_text_box_lines(&mut lines, &wiz.name.buffer, wiz.name.cursor, theme, max_rows),
+                WizardStep::Transport => {
+                    for (i, choice) in TransportChoice::ALL.iter().enumerate() {
+                        let is_cursor = i == wiz.transport_selected;
+                        let indicator = if is_cursor { "\u{25B6} " } else { "  " };
+                        lines.push(Line::from(vec![
+                            Span::styled("  ", Style::default().fg(theme.fg)),
+                            Span::styled(indicator, Style::default().fg(if is_cursor { theme.accent } else { theme.text_dim })),
+                            Span::styled(
+                                choice.label(),
+                                if is_cursor {
+                                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme.text_soft)
+                                },
+                            ),
+                        ]));
+                    }
+                }
+                WizardStep::Primary => push_text_box_lines(&mut lines, &wiz.primary.buffer, wiz.primary.cursor, theme, max_rows),
+                WizardStep::Extra => push_text_box_lines(&mut lines, &wiz.extra.buffer, wiz.extra.cursor, theme, max_rows),
+                WizardStep::Confirm => {
+                    lines.push(Line::from(Span::styled(
+                        format!("  Name:      {}", wiz.name.buffer.trim()),
+                        Style::default().fg(theme.fg),
+                    )));
+                    if let Some(t) = wiz.transport {
+                        lines.push(Line::from(Span::styled(
+                            format!("  Transport: {}", t.label()),
+                            Style::default().fg(theme.fg),
+                        )));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", wiz.primary.buffer.trim()),
+                        Style::default().fg(theme.text_soft),
+                    )));
+                    if !wiz.extra.buffer.trim().is_empty() {
+                        lines.push(Line::from(Span::styled("  (+ extra env/headers)", Style::default().fg(theme.text_dim))));
+                    }
+                }
+            }
+
+            if let Some(err) = &wiz.error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(format!("  \u{26A0} {err}"), Style::default().fg(theme.error))));
+            }
+
+            match wiz.step {
+                WizardStep::Name | WizardStep::Primary => " Enter next    Esc back ",
+                WizardStep::Extra => " Enter next (blank = skip)    Shift+Enter newline    Esc back ",
+                WizardStep::Transport => " \u{2191}\u{2193} navigate    Enter select    Esc back ",
+                WizardStep::Confirm => " Enter add server    Esc back ",
+            }
+        }
+    };
+
+    while lines.len() < inner.height.saturating_sub(2) as usize {
+        lines.push(Line::from(""));
+    }
+    let sep = "\u{2500}".repeat(inner_w.saturating_sub(4));
+    lines.push(Line::from(Span::styled(format!("  {sep}"), Style::default().fg(theme.border))));
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(theme.text_dim))));
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.panel)), inner);
 }
 
 fn render_delete_sessions(

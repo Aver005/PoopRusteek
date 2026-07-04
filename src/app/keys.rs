@@ -2,12 +2,44 @@
 //! These are `App` methods split out of `app/mod.rs`. Pure relocation.
 
 use super::events::{self, GoalStage, Modal, View};
+use super::input::InputState;
+use super::mcp_add::{self, McpAddState, TransportChoice, WizardStep};
 use super::{conversation, format_size, App, AutocompleteState, AUTOCOMPLETE_VISIBLE};
 use crate::commands::{CommandResult, CommandSuggestion};
 use crate::error::AppResult;
+use crate::mcp::types::MCPServerConfig;
 use crate::provider::{ChatMessage, LLMProvider};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Apply a standard text-editing keystroke to `input`; returns whether the
+/// key was consumed. Shared by every `/mcp add` text-entry step (JSON
+/// paste, name, command/URL, env/headers) so each step's own handler only
+/// needs to add its Enter/Esc transition on top. `allow_newline` gates
+/// Shift+Enter — off for single-line fields (name, command/URL) so plain
+/// Enter always means "submit" there, mirroring the main chat input's
+/// Shift+Enter-for-newline convention (`handle_key`, `KeyCode::Enter if
+/// SHIFT`).
+fn apply_text_key(input: &mut InputState, key: crossterm::event::KeyEvent, allow_newline: bool) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Enter if allow_newline && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            input.insert_newline();
+            true
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.insert_char(c);
+            true
+        }
+        KeyCode::Backspace => { input.backspace(); true }
+        KeyCode::Delete => { input.delete_forward(); true }
+        KeyCode::Left => { input.move_left(false, key.modifiers.contains(KeyModifiers::CONTROL)); true }
+        KeyCode::Right => { input.move_right(false, key.modifiers.contains(KeyModifiers::CONTROL)); true }
+        KeyCode::Home => { input.move_home(false); true }
+        KeyCode::End => { input.move_end(false); true }
+        _ => false,
+    }
+}
 
 impl App {
     pub(crate) async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
@@ -283,6 +315,9 @@ impl App {
                     }
                     return Ok(false);
                 }
+                Modal::McpAdd(state) => {
+                    return self.handle_mcp_add_key(key, state).await;
+                }
             }
         }
 
@@ -512,6 +547,29 @@ impl App {
                                     self.state.mcp_status.view.details_server = None;
                                     self.state.mcp_status.view.selected = 0;
                                     self.state.mcp_status.view.scroll_offset = 0;
+                                }
+                                CommandResult::OpenMcpAdd(args) => {
+                                    match args {
+                                        None => {
+                                            self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
+                                        }
+                                        Some(raw) => {
+                                            match mcp_add::parse_quick_add(&raw) {
+                                                Ok(entries) => {
+                                                    self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                                                        &format!("Adding {} MCP server(s)...", entries.len()),
+                                                    ));
+                                                    self.spawn_mcp_add(entries);
+                                                }
+                                                Err(reason) => {
+                                                    self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                                                        &format!("Couldn't parse \"/mcp add {raw}\" as a quick config ({reason}) \u{2014} pick a method:"),
+                                                    ));
+                                                    self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 CommandResult::ShowTools => {
                                     let tools_text = self.build_tools_display().await;
@@ -886,6 +944,191 @@ impl App {
                 });
             }
             _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Send `entries` to `MCPManager::add_new_server` one at a time, off the
+    /// event loop (each add connects a fresh client, which can take a
+    /// while). Reuses `AppEvent::McpOperationDone` for the result — same
+    /// handling as reload/toggle/reconnect (refreshes the cached server
+    /// list on the next poll).
+    pub(crate) fn spawn_mcp_add(&self, entries: Vec<(String, MCPServerConfig)>) {
+        let mcp = Arc::clone(&self.mcp);
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = Vec::with_capacity(entries.len());
+            for (name, config) in entries {
+                let outcome = mcp.lock().await.add_new_server(name.clone(), config).await;
+                lines.push(match outcome {
+                    Ok(status) => format!("{name}: added ({})", mcp_add::status_label(&status)),
+                    Err(e) => format!("{name}: {e}"),
+                });
+            }
+            let _ = event_tx.send(events::AppEvent::McpOperationDone { message: lines.join("\n") });
+        });
+    }
+
+    /// Key handling for every step of `/mcp add`'s modal: the method-choice
+    /// screen, the JSON paste box, and the step-by-step wizard. Each
+    /// text-entry step shares `apply_text_key` for the common editing keys
+    /// and only adds its own Enter/Esc transition on top.
+    pub(crate) async fn handle_mcp_add_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        state: McpAddState,
+    ) -> AppResult<bool> {
+        use crossterm::event::KeyCode;
+
+        match state {
+            McpAddState::ChooseMethod { mut selected } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state.modal = None;
+                        return Ok(false);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(1),
+                    KeyCode::Enter => {
+                        let next = if selected == 0 {
+                            McpAddState::PasteJson { input: InputState::default(), error: None }
+                        } else {
+                            McpAddState::Wizard(Box::new(mcp_add::WizardState::new()))
+                        };
+                        self.state.modal = Some(Modal::McpAdd(next));
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+                self.state.modal = Some(Modal::McpAdd(McpAddState::ChooseMethod { selected }));
+            }
+            McpAddState::PasteJson { mut input, mut error } => {
+                if !apply_text_key(&mut input, key, true) {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
+                            return Ok(false);
+                        }
+                        KeyCode::Enter => match mcp_add::parse_pasted_json(&input.buffer) {
+                            Ok(entries) => {
+                                self.state.modal = None;
+                                self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                                    &format!("Adding {} MCP server(s)...", entries.len()),
+                                ));
+                                self.spawn_mcp_add(entries);
+                                return Ok(false);
+                            }
+                            Err(reason) => error = Some(reason),
+                        },
+                        _ => {}
+                    }
+                }
+                self.state.modal = Some(Modal::McpAdd(McpAddState::PasteJson { input, error }));
+            }
+            McpAddState::Wizard(mut wiz) => {
+                let handled_as_text = match wiz.step {
+                    WizardStep::Name => apply_text_key(&mut wiz.name, key, false),
+                    WizardStep::Primary => apply_text_key(&mut wiz.primary, key, false),
+                    WizardStep::Extra => apply_text_key(&mut wiz.extra, key, true),
+                    WizardStep::Transport | WizardStep::Confirm => false,
+                };
+
+                if !handled_as_text {
+                    match key.code {
+                        KeyCode::Esc => {
+                            match wiz.step {
+                                WizardStep::Name => {
+                                    self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
+                                    return Ok(false);
+                                }
+                                WizardStep::Transport => wiz.step = WizardStep::Name,
+                                WizardStep::Primary => wiz.step = WizardStep::Transport,
+                                WizardStep::Extra => wiz.step = WizardStep::Primary,
+                                WizardStep::Confirm => wiz.step = WizardStep::Extra,
+                            }
+                            wiz.error = None;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if wiz.step == WizardStep::Transport => {
+                            wiz.transport_selected = wiz.transport_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if wiz.step == WizardStep::Transport => {
+                            wiz.transport_selected =
+                                (wiz.transport_selected + 1).min(TransportChoice::ALL.len() - 1);
+                        }
+                        KeyCode::Enter => match wiz.step {
+                            WizardStep::Name => {
+                                let name = wiz.name.buffer.trim().to_string();
+                                if name.is_empty() {
+                                    wiz.error = Some("name can't be empty".to_string());
+                                } else if self.mcp.lock().await.has_server(&name) {
+                                    wiz.error = Some(format!("'{name}' already exists"));
+                                } else {
+                                    wiz.error = None;
+                                    wiz.step = WizardStep::Transport;
+                                }
+                            }
+                            WizardStep::Transport => {
+                                wiz.transport = Some(TransportChoice::ALL[wiz.transport_selected]);
+                                wiz.error = None;
+                                wiz.step = WizardStep::Primary;
+                            }
+                            WizardStep::Primary => {
+                                let result: Result<(), String> = match wiz.transport {
+                                    Some(TransportChoice::Stdio) => {
+                                        mcp_add::split_command_line(wiz.primary.buffer.trim()).map(|_| ())
+                                    }
+                                    _ => {
+                                        let url = wiz.primary.buffer.trim();
+                                        if url.is_empty() {
+                                            Err("URL can't be empty".to_string())
+                                        } else {
+                                            reqwest::Url::parse(url)
+                                                .map(|_| ())
+                                                .map_err(|e| format!("invalid URL: {e}"))
+                                        }
+                                    }
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        wiz.error = None;
+                                        wiz.step = WizardStep::Extra;
+                                    }
+                                    Err(e) => wiz.error = Some(e),
+                                }
+                            }
+                            WizardStep::Extra => {
+                                let result = match wiz.transport {
+                                    Some(TransportChoice::Stdio) => {
+                                        mcp_add::parse_env_lines(&wiz.extra.buffer).map(|_| ())
+                                    }
+                                    _ => mcp_add::parse_header_lines(&wiz.extra.buffer).map(|_| ()),
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        wiz.error = None;
+                                        wiz.step = WizardStep::Confirm;
+                                    }
+                                    Err(e) => wiz.error = Some(e),
+                                }
+                            }
+                            WizardStep::Confirm => match wiz.build_config() {
+                                Ok(config) => {
+                                    let name = wiz.name.buffer.trim().to_string();
+                                    self.state.modal = None;
+                                    self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                                        &format!("Adding {name}..."),
+                                    ));
+                                    self.spawn_mcp_add(vec![(name, config)]);
+                                    return Ok(false);
+                                }
+                                Err(e) => wiz.error = Some(e),
+                            },
+                        },
+                        _ => {}
+                    }
+                }
+                self.state.modal = Some(Modal::McpAdd(McpAddState::Wizard(wiz)));
+            }
         }
         Ok(false)
     }

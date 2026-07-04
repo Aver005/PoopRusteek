@@ -677,6 +677,9 @@ pub enum Modal {
     Question(QuestionState),
     DeleteSessions(DeleteSessionsState),
     Confirm(ConfirmState),
+    /// `/mcp add` — paste-JSON / step-by-step wizard for adding a new MCP
+    /// server. State lives in `app::mcp_add` (its own module — see there).
+    McpAdd(crate::app::mcp_add::McpAddState),
 }
 
 // ─── /delete — session deletion picker ────────────────────────────

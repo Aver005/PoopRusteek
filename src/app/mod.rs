@@ -5,6 +5,7 @@ pub mod generation;
 mod goal;
 pub mod input;
 mod keys;
+pub mod mcp_add;
 pub mod mcp_status;
 mod multichat;
 mod runtime;
