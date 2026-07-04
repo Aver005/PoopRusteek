@@ -44,8 +44,9 @@
 ## AGENT (Domain)
 | File | Purpose | Lines |
 |------|---------|-------|
-| `src/agent/runner.rs` | `run_agent_loop` — multi-step LLM↔tool loop; `complete_stream` now spawned as its own task so the idle guard races live network I/O; streaming, approval, summarize; all events tagged with `ConversationId`; `task` tool special-cased (fg: fork+`run_sub_agent`; bg: emit `SpawnSubAgent`); `max_tools_per_step` overflow now returns explicit "Skipped:" `tool_result`s instead of silently dropping calls | ~460 |
-| `src/agent/sub_agent.rs` | `run_sub_agent` — headless isolated agent run (own forked provider, auto-approval), streaming also spawned as a task, returns final text | ~175 |
+| `src/agent/runner.rs` | `run_agent_loop` — multi-step LLM↔tool loop; streaming via shared `stream::collect_stream` (visible deltas through its progress callback), approval, summarize; all events tagged with `ConversationId`; `task` tool special-cased (fg: fork+`run_sub_agent`; bg: emit `SpawnSubAgent`); meta-tool dispatch uses `QUESTION_TOOL_NAME`/`TASK_TOOL_NAME`/`MCP_TOOL_PREFIX` constants, not string literals; `max_tools_per_step` overflow returns explicit "Skipped:" `tool_result`s | ~700 |
+| `src/agent/stream.rs` | `collect_stream(provider, request, on_progress) -> StreamOutcome{text, got_stop, end: StreamEnd}` — the once-duplicated spawn-stream + 120s-idle-guard + post-mortem block shared by runner and sub_agent (extracted 2026-07-04). Reports what happened; callers interpret (runner treats Completed-without-stop as error w/ salvage, sub_agent doesn't) | ~90 |
+| `src/agent/sub_agent.rs` | `run_sub_agent` — headless isolated agent run (own forked provider, auto-approval), streams via `stream::collect_stream` with a no-op progress callback, returns final text | ~155 |
 | `src/agent/tool_parser.rs` | Parse/strip tool calls (XML / `[TOOL:]` / JSON), stream-visible text. Still truncates visible text at the first bare `<` and the legacy regex still can't parse nested-brace JSON (both open, see BUGS.md) | ~175 |
 
 ## TOOLS (Domain)

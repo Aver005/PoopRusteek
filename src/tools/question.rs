@@ -7,7 +7,7 @@ pub struct QuestionTool;
 impl Tool for QuestionTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "question".to_string(),
+            name: crate::tools::QUESTION_TOOL_NAME.to_string(),
             description: "Ask the user a question. Use yes_no for simple Y/N confirmation, or multiple_choice for selecting from a list of options with optional custom input.".to_string(),
             parameters: json!({
                 "type": "object",

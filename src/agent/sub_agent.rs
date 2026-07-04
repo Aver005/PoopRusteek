@@ -6,12 +6,13 @@
 //! (no user is watching), and `task`/`question` are refused so a sub-agent
 //! can't spawn sub-agents or block on a prompt (depth limit of 1).
 
+use crate::agent::stream::{collect_stream, StreamEnd};
 use crate::agent::tool_parser::{parse_tool_calls, strip_tool_calls};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::tools::registry::ToolRegistry;
+use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sub_agent(
@@ -41,43 +42,21 @@ pub async fn run_sub_agent(
             stream: true,
         };
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        // Same shape as the main agent loop: the stream runs in its own task
-        // so the idle timeout races the network instead of a buffered channel.
-        let stream_provider = Arc::clone(&provider);
-        let stream_task = tokio::spawn(async move {
-            stream_provider.complete_stream(request, tx).await
-        });
-
-        let mut full = String::new();
-        let mut got_stop = false;
-        let idle = std::time::Duration::from_secs(120);
-        loop {
-            match tokio::time::timeout(idle, rx.recv()).await {
-                Err(_) => {
-                    stream_task.abort();
-                    return Err("sub-agent stream timed out".to_string());
-                }
-                Ok(None) => break,
-                Ok(Some(chunk)) => {
-                    full.push_str(&chunk.content);
-                    if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
-                        got_stop = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        match stream_task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if !got_stop => return Err(error.to_string()),
-            Ok(Err(_)) => {}
-            Err(join_error) if !got_stop => {
+        // Headless: no progress callback — nothing streams to a UI.
+        let outcome = collect_stream(&provider, request, |_| {}).await;
+        // Unlike the main loop, a completed-but-stopless stream is not
+        // treated as an error here — the parent only cares about final text.
+        match outcome.end {
+            StreamEnd::IdleTimeout => return Err("sub-agent stream timed out".to_string()),
+            StreamEnd::Completed => {}
+            StreamEnd::ProviderError(error) if !outcome.got_stop => return Err(error),
+            StreamEnd::ProviderError(_) => {}
+            StreamEnd::TaskFailed(join_error) if !outcome.got_stop => {
                 return Err(format!("sub-agent stream task failed: {join_error}"));
             }
-            Err(_) => {}
+            StreamEnd::TaskFailed(_) => {}
         }
+        let full = outcome.text;
 
         let tool_calls = parse_tool_calls(&full);
         let visible = strip_tool_calls(&full);
@@ -102,9 +81,9 @@ pub async fn run_sub_agent(
                 ));
                 continue;
             }
-            let result = if tool_call.name == "task" || tool_call.name == "question" {
+            let result = if tool_call.name == TASK_TOOL_NAME || tool_call.name == QUESTION_TOOL_NAME {
                 format!("'{}' is not available inside a sub-agent.", tool_call.name)
-            } else if tool_call.name.starts_with("mcp__") {
+            } else if tool_call.name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
                 // Same lock discipline as the main loop: never hold the
                 // manager mutex across the network await.
                 let client = { mcp.lock().await.client_for(&tool_call.name) };

@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs` — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
+> Last updated: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
 
 ## PHASE COMPLETION
 
@@ -27,7 +27,7 @@
 
 ## CURRENT FOCUS
 
-0. Cleanup audit 2026-07-04 (`reference/AUDIT-2026-07-04-CLEANUP.md`): god-file split DONE (`tui/render/` layered modules + `app/sessions.rs`/`app/pickers.rs`). Remaining from that audit, roughly in order: reliability trio (poison-unsafe `.lock().unwrap()` in `deepseek/http.rs::enforce_rate_limit`, PoW `spawn_blocking`, stream-size cap), mechanical dedup (command arg-parsing helper, `post_void` endpoint migration, MCP config-loader helper, `apply_connect_outcome` loop hoist), runner/sub_agent shared stream helper, owner decisions on `#[expect(dead_code)]` scaffolding (events.rs payloads, types.rs parity structs, `ProviderKind::Openai/Custom`).
+0. Cleanup audit 2026-07-04 (`reference/AUDIT-2026-07-04-CLEANUP.md`): god-file split DONE (`tui/render/` layered modules + `app/sessions.rs`/`app/pickers.rs`); runner/sub_agent shared stream helper DONE (`agent/stream.rs::collect_stream` + `QUESTION_TOOL_NAME`/`TASK_TOOL_NAME`/`MCP_TOOL_PREFIX` constants). Remaining, roughly in order: reliability trio (poison-unsafe `.lock().unwrap()` in `deepseek/http.rs::enforce_rate_limit`, PoW `spawn_blocking`, stream-size cap — natural home now `agent/stream.rs`), mechanical dedup (command arg-parsing helper, `post_void` endpoint migration, MCP config-loader helper, `apply_connect_outcome` loop hoist), owner decisions on `#[expect(dead_code)]` scaffolding (events.rs payloads, types.rs parity structs, `ProviderKind::Openai/Custom`).
 1. Stability/perf overhaul (2026-07-02) is done — all 7 audit criticals + ~30 majors fixed, dead code swept, clippy clean. See `reference/AUDIT-2026-07-02.md`.
 2. Next candidates (in rough priority order):
    - `keys.rs` decomposition: key→intent + intent→effect split (testable without a live `App`). Not started.

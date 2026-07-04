@@ -4,6 +4,8 @@ use crate::debug_log;
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider};
 use crate::tools::registry::ToolRegistry;
+use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
+use crate::agent::stream::{collect_stream, StreamEnd};
 use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
 use serde_json::json;
 use std::sync::Arc;
@@ -55,76 +57,58 @@ pub async fn run_agent_loop(
             stream: true,
         };
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        // The stream runs in its own task so chunks render live and the idle
-        // timeout below actually races the network. Awaiting `complete_stream`
-        // inline would buffer the whole response before the first chunk was
-        // read — no visible streaming, and a stalled connection (open socket,
-        // no bytes) would hang the turn with the timeout never firing.
-        let stream_provider = Arc::clone(&provider);
-        let stream_task = tokio::spawn(async move {
-            stream_provider.complete_stream(request, tx).await
-        });
-
-        let mut full_response = String::new();
+        // Visible-delta emission rides the collector's progress callback:
+        // strip tool-call syntax from the accumulated text and stream only
+        // the newly-appended visible suffix.
         let mut streamed_visible = String::new();
-        let mut got_stop = false;
-        let mut provider_error_message: Option<String> = None;
-        let idle_timeout = std::time::Duration::from_secs(120);
-        loop {
-            match tokio::time::timeout(idle_timeout, rx.recv()).await {
-                Err(_) => {
-                    stream_task.abort();
-                    debug_log::log(
-                        "agent.step.error",
-                        format!(
-                            "conversation={conversation} step={step_number}/{max_steps} reason=stream_timeout"
-                        ),
-                    );
-                    let _ = event_tx.send(AppEvent::AgentError(
-                        conversation,
-                        "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
-                    ));
-                    return;
+        let progress_tx = event_tx.clone();
+        let outcome = collect_stream(&provider, request, |full_response| {
+            let next_visible = stream_visible_text(full_response);
+            if next_visible.starts_with(&streamed_visible) {
+                let delta = &next_visible[streamed_visible.len()..];
+                if !delta.is_empty() {
+                    let _ = progress_tx.send(AppEvent::AgentChunk(conversation, delta.to_string()));
                 }
-                Ok(None) => {
-                    debug_log::log(
-                        "agent.step.stream_closed",
-                        format!(
-                            "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} collected_bytes={}",
-                            full_response.len()
-                        ),
-                    );
-                    break;
-                }
-                Ok(Some(chunk)) => {
-                    if !chunk.content.is_empty() {
-                        full_response.push_str(&chunk.content);
-                        let next_visible = stream_visible_text(&full_response);
-                        if next_visible.starts_with(&streamed_visible) {
-                            let delta = &next_visible[streamed_visible.len()..];
-                            if !delta.is_empty() {
-                                let _ = event_tx.send(AppEvent::AgentChunk(conversation, delta.to_string()));
-                            }
-                        } else if !next_visible.is_empty() {
-                            let _ = event_tx.send(AppEvent::AddMessage(conversation, ChatMessage::system(
-                                "⚠ Streaming sync issue — agent will continue",
-                            )));
-                        }
-                        streamed_visible = next_visible;
-                    }
-                    if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
-                        got_stop = true;
-                        break;
-                    }
-                }
+            } else if !next_visible.is_empty() {
+                let _ = progress_tx.send(AppEvent::AddMessage(conversation, ChatMessage::system(
+                    "⚠ Streaming sync issue — agent will continue",
+                )));
             }
+            streamed_visible = next_visible;
+        })
+        .await;
+
+        let full_response = outcome.text;
+        let got_stop = outcome.got_stop;
+        if matches!(outcome.end, StreamEnd::IdleTimeout) {
+            debug_log::log(
+                "agent.step.error",
+                format!(
+                    "conversation={conversation} step={step_number}/{max_steps} reason=stream_timeout"
+                ),
+            );
+            let _ = event_tx.send(AppEvent::AgentError(
+                conversation,
+                "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
+            ));
+            return;
+        }
+        if !got_stop {
+            debug_log::log(
+                "agent.step.stream_closed",
+                format!(
+                    "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} collected_bytes={}",
+                    full_response.len()
+                ),
+            );
         }
 
         // A closed channel without a "stop" chunk means the provider bailed
         // mid-stream — surface its error instead of treating it as end-of-turn.
-        match stream_task.await {
-            Ok(Ok(())) => {
+        let mut provider_error_message: Option<String> = None;
+        match outcome.end {
+            StreamEnd::IdleTimeout => unreachable!("handled above"),
+            StreamEnd::Completed => {
                 if !got_stop {
                     let message = format!(
                         "Stream ended without stop signal. conversation={conversation} step={step_number}/{max_steps} response_bytes={}",
@@ -132,8 +116,7 @@ pub async fn run_agent_loop(
                     );
                     debug_log::log("agent.step.error", &message);
                     provider_error_message = Some(message);
-                }
-                if provider_error_message.is_none() {
+                } else {
                     debug_log::log(
                         "agent.step.provider_ok",
                         format!(
@@ -143,8 +126,7 @@ pub async fn run_agent_loop(
                     );
                 }
             }
-            Ok(Err(error)) => {
-                let message = error.to_string();
+            StreamEnd::ProviderError(message) => {
                 debug_log::log(
                     "agent.step.error",
                     format!(
@@ -155,8 +137,7 @@ pub async fn run_agent_loop(
                     provider_error_message = Some(message);
                 }
             }
-            Err(join_error) => {
-                let message = format!("Stream task failed: {join_error}");
+            StreamEnd::TaskFailed(join_error) => {
                 debug_log::log(
                     "agent.step.error",
                     format!(
@@ -164,7 +145,7 @@ pub async fn run_agent_loop(
                     ),
                 );
                 if !got_stop {
-                    provider_error_message = Some(message);
+                    provider_error_message = Some(format!("Stream task failed: {join_error}"));
                 }
             }
         }
@@ -310,7 +291,7 @@ pub async fn run_agent_loop(
                 continue;
             }
 
-            let (tool_result, is_error) = if tool_call.name == "question" {
+            let (tool_result, is_error) = if tool_call.name == QUESTION_TOOL_NAME {
                 // Background turns (auto_approve) have no user to answer.
                 if auto_approve {
                     ("Cannot ask the user from a background agent.".to_string(), true)
@@ -353,7 +334,7 @@ pub async fn run_agent_loop(
                     }
                 }
                 }
-            } else if tool_call.name == "task" {
+            } else if tool_call.name == TASK_TOOL_NAME {
                 // Only the foreground (interactive) loop may spawn sub-agents;
                 // sidechats / sub-agents (auto_approve) cannot — depth limit 1.
                 if auto_approve {
@@ -378,7 +359,7 @@ pub async fn run_agent_loop(
                     } else {
                         let _ = event_tx.send(AppEvent::ToolStarted {
                             conversation,
-                            name: "task".to_string(),
+                            name: TASK_TOOL_NAME.to_string(),
                         });
                         let sub_provider = provider.fork();
                         let session_cleanup = Arc::clone(&sub_provider);
@@ -429,7 +410,7 @@ pub async fn run_agent_loop(
                         conversation,
                         name: tool_call.name.clone(),
                     });
-                    if tool_call.name.starts_with("mcp__") {
+                    if tool_call.name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
                         // Resolve the client under a short-lived lock, then
                         // call on the owned handle. Holding the manager mutex
                         // across the network await froze the whole UI — the

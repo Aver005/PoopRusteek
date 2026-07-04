@@ -159,7 +159,7 @@ async fn connect_one(
 
     let mut tool_entries = Vec::new();
     for tool in &tools {
-        let full_name = format!("mcp__{}__{}", name, tool.name);
+        let full_name = format!("{}{}__{}", crate::mcp::MCP_TOOL_PREFIX, name, tool.name);
         tool_entries.push((full_name, name.clone(), tool.name.clone()));
     }
 
