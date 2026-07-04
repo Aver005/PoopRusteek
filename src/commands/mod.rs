@@ -62,6 +62,13 @@ pub enum CommandResult {
     },
     /// `/logout` and `/wipe` — open the generic confirmation modal.
     OpenConfirm(crate::app::events::ConfirmAction),
+    /// `/providers` — open the provider-management panel.
+    OpenProviders,
+    /// `/providers add [args]` — with no args, open the step-by-step
+    /// wizard; with args, the handler tries the quick
+    /// `<name> <base_url> [model] [api_key]` form and falls back to the
+    /// wizard on parse failure.
+    OpenProviderAdd(Option<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +155,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::rate::RateCommand));
         self.register(Box::new(defs::retry::RetryCommand));
         self.register(Box::new(defs::mcp::McpCommand));
+        self.register(Box::new(defs::providers::ProvidersCommand));
         self.register(Box::new(defs::tools::ToolsCommand));
         self.register(Box::new(defs::whitelist::WhitelistCommand));
         self.register(Box::new(defs::skills::SkillsCommand));

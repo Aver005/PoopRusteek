@@ -22,6 +22,7 @@ mod dispatch;
 mod mcp;
 mod modal;
 mod onboarding;
+mod providers;
 
 use crate::app::events::View;
 use crate::app::input::InputState;
@@ -75,6 +76,10 @@ impl App {
 
         if self.state.view == View::Mcp {
             return self.handle_mcp_key(key).await;
+        }
+
+        if self.state.view == View::Providers {
+            return self.handle_providers_key(key).await;
         }
 
         self.handle_chat_key(key).await

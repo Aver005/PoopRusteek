@@ -36,7 +36,7 @@ pub(super) fn render_input_border(frame: &mut Frame, area: Rect, theme: &Theme) 
 
 pub(super) fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &Config, theme: &Theme) {
     let provider_name = provider_label(config);
-    let model = &config.provider.model;
+    let model = config.active_model();
     let msg_count = state.focused().messages.len();
     let total_tokens = view_model::assistant_token_total(&state.focused().messages);
 

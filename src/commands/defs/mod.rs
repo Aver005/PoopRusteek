@@ -14,6 +14,7 @@ pub mod session_list;
 pub mod rate;
 pub mod retry;
 pub mod mcp;
+pub mod providers;
 pub mod tools;
 pub mod whitelist;
 pub mod skills;

@@ -39,12 +39,16 @@ pub(super) fn status_bar_gap(left: &str, center: &str, right: &str, width: u16) 
     width.saturating_sub(segments_width as u16).max(1) as usize
 }
 
-pub(super) fn provider_label(config: &Config) -> &'static str {
+pub(super) fn provider_label(config: &Config) -> String {
+    if let Some(entry) = config.active_provider_entry() {
+        return entry.name.clone();
+    }
     match config.provider.kind {
         crate::config::ProviderKind::Deepseek => "DeepSeek",
         crate::config::ProviderKind::Openai => "OpenAI",
         crate::config::ProviderKind::Custom => "Custom",
     }
+    .to_string()
 }
 
 pub(super) fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {

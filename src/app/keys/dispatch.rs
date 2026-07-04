@@ -9,7 +9,7 @@ use crate::app::mcp_add::{self, McpAddState};
 use crate::app::App;
 use crate::commands::CommandResult;
 use crate::error::AppResult;
-use crate::provider::{ChatMessage, LLMProvider};
+use crate::provider::ChatMessage;
 use std::sync::Arc;
 
 impl App {
@@ -29,18 +29,7 @@ impl App {
                 if let Ok(config) = crate::config::load() {
                     self.config = config;
                 }
-                self.state.focused_mut().provider = if self.config.provider.token.is_empty() {
-                    None
-                } else {
-                    crate::provider::deepseek::DeepseekProvider::new(
-                        &self.config.provider,
-                        self.config.agent.rate_limit_ms,
-                        self.config.agent.rate_limit_per_minute,
-                        self.config.agent.max_retries,
-                    ).ok().map(|ds| Arc::new(ds) as Arc<dyn LLMProvider>)
-                };
-                self.state.focused_mut().session_id =
-                    crate::session::create_session_id();
+                self.rebuild_provider();
             }
             CommandResult::TtlUpdate(ttl) => {
                 self.config.mcp.cache_ttl = ttl;
@@ -153,6 +142,47 @@ impl App {
             CommandResult::Error(err) => {
                 self.state.push_system(&err);
             }
+            CommandResult::OpenProviders => {
+                self.state.view = View::Providers;
+                self.state.providers_view.selected = 0;
+                self.state.providers_view.status_message.clear();
+            }
+            CommandResult::OpenProviderAdd(args) => match args {
+                None => {
+                    self.state.modal = Some(Modal::ProviderAdd(Box::new(
+                        crate::app::providers::ProviderAddState::new(),
+                    )));
+                }
+                Some(raw) => {
+                    match crate::app::providers::parse_quick_add(&raw, &self.config) {
+                        Ok(entry) => {
+                            let name = entry.name.clone();
+                            self.config.providers.push(entry);
+                            match crate::config::save(&self.config) {
+                                Ok(()) => {
+                                    self.state.push_system(&format!(
+                                        "Provider '{name}' added. Open /providers and press Enter on it to activate."
+                                    ));
+                                }
+                                Err(error) => {
+                                    self.config.providers.pop();
+                                    self.state.push_system(&format!(
+                                        "Failed to save config: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                        Err(reason) => {
+                            self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                                &format!("Couldn't parse \"/providers add {raw}\" ({reason}) \u{2014} opening the wizard:"),
+                            ));
+                            self.state.modal = Some(Modal::ProviderAdd(Box::new(
+                                crate::app::providers::ProviderAddState::new(),
+                            )));
+                        }
+                    }
+                }
+            },
         }
         Ok(false)
     }

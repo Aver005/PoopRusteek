@@ -9,6 +9,7 @@ pub mod mcp_add;
 pub mod mcp_status;
 mod multichat;
 mod pickers;
+pub mod providers;
 mod runtime;
 mod sessions;
 mod system_prompt;
@@ -114,6 +115,7 @@ pub struct AppState {
     pub view: View,
     pub onboarding: OnboardingState,
     pub mcp_status: mcp_status::McpStatus,
+    pub providers_view: providers::ProvidersViewState,
     pub workspace_path: String,
     pub show_stats_panel: bool,
     pub attached_files: Vec<crate::provider::AttachedFile>,
@@ -171,17 +173,7 @@ impl App {
     pub async fn new(config: Config) -> AppResult<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        let provider: Option<Arc<dyn LLMProvider>> = if config.provider.token.is_empty() {
-            None
-        } else {
-            let ds = crate::provider::deepseek::DeepseekProvider::new(
-                &config.provider,
-                config.agent.rate_limit_ms,
-                config.agent.rate_limit_per_minute,
-                config.agent.max_retries,
-            )?;
-            Some(Arc::new(ds))
-        };
+        let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
 
         let mut mcp_manager = MCPManager::new();
         let mcp_init_ok = mcp_manager.initialize().await.is_ok();
@@ -217,6 +209,7 @@ impl App {
             view: if has_provider { View::Chat } else { View::Onboarding },
             onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
+            providers_view: providers::ProvidersViewState::default(),
             show_stats_panel: true,
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -858,6 +851,15 @@ impl App {
         self.state.input.cursor = 0;
         self.state.input.selection_anchor = None;
         self.state.autocomplete = AutocompleteState::default();
+    }
+
+    /// Rebuild the focused conversation's provider from the current config
+    /// (used after config edits and `/providers` switches) and start a
+    /// fresh session id so the next turn can't thread onto state that
+    /// belonged to the previous provider.
+    pub(crate) fn rebuild_provider(&mut self) {
+        self.state.focused_mut().provider = crate::provider::build_provider(&self.config);
+        self.state.focused_mut().session_id = crate::session::create_session_id();
     }
 
     fn record_gen_stats(&mut self) {

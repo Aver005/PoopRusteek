@@ -1,11 +1,44 @@
 pub mod deepseek;
 #[cfg(test)]
 pub mod fake;
+pub mod openai_client;
 pub mod openai_compat;
 pub mod prompt;
 pub mod pow;
 pub mod sse;
 pub mod types;
+
+/// Build the provider selected by the config: the active `/providers`
+/// entry (an OpenAI-compatible endpoint) when one is set, otherwise the
+/// built-in DeepSeek web client — or `None` when neither is usable (no
+/// entry active and no DeepSeek token). The single construction point
+/// behind `App::new`, provider resets, and onboarding.
+pub fn build_provider(config: &crate::config::Config) -> Option<std::sync::Arc<dyn LLMProvider>> {
+    if let Some(entry) = config.active_provider_entry() {
+        return match openai_client::OpenAiCompatProvider::new(entry) {
+            Ok(provider) => Some(std::sync::Arc::new(provider)),
+            Err(error) => {
+                tracing::warn!("Failed to initialize provider '{}': {error}", entry.name);
+                None
+            }
+        };
+    }
+    if config.provider.token.is_empty() {
+        return None;
+    }
+    match deepseek::DeepseekProvider::new(
+        &config.provider,
+        config.agent.rate_limit_ms,
+        config.agent.rate_limit_per_minute,
+        config.agent.max_retries,
+    ) {
+        Ok(provider) => Some(std::sync::Arc::new(provider)),
+        Err(error) => {
+            tracing::warn!("Failed to initialize DeepSeek provider: {error}");
+            None
+        }
+    }
+}
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -211,11 +244,9 @@ pub struct CompletionRequest {
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
-    // Populated at every call site (true for streaming turns, false for the
-    // ACP and goal-evaluator one-shots) but the provider picks streaming vs.
-    // non-streaming by which trait method the caller invokes
-    // (`complete`/`complete_stream`), not by reading this back.
-    #[expect(dead_code, reason = "streaming choice is made by which trait method is called, not this flag")]
+    // Providers pick streaming vs. non-streaming by which trait method the
+    // caller invokes (`complete`/`complete_stream`); this flag only rides
+    // into the OpenAI-compatible wire format (`request_to_openai`).
     pub stream: bool,
 }
 
@@ -228,11 +259,10 @@ pub struct CompletionChunk {
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub content: String,
-    // Populated by every `complete()` implementation but no caller
-    // (src/acp/server.rs, app/goal.rs) reads past `.content`.
-    #[expect(dead_code, reason = "no caller of complete() reads finish_reason/usage yet")]
+    // The TUI callers of `complete()` (src/acp/server.rs, app/goal.rs) only
+    // read `.content`; `finish_reason`/`usage` ride through the
+    // OpenAI-compatible boundary (`openai_compat::response_to_openai`).
     pub finish_reason: Option<String>,
-    #[expect(dead_code, reason = "no caller of complete() reads finish_reason/usage yet")]
     pub usage: Option<Usage>,
 }
 

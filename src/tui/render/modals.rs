@@ -24,6 +24,7 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
         Modal::DeleteSessions(st) => render_delete_sessions(frame, area, st, theme),
         Modal::Confirm(cs) => render_confirm(frame, area, cs, theme),
         Modal::McpAdd(state) => super::mcp::render_mcp_add(frame, area, state, theme),
+        Modal::ProviderAdd(state) => super::providers::render_provider_add(frame, area, state, theme),
     }
 }
 

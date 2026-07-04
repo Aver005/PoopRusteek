@@ -5,8 +5,6 @@
 use crate::app::events::View;
 use crate::app::{conversation, App};
 use crate::error::AppResult;
-use crate::provider::LLMProvider;
-use std::sync::Arc;
 
 impl App {
     pub(super) async fn handle_onboarding_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
@@ -38,19 +36,11 @@ impl App {
                     }
 
                     // Hot-create the provider so the app works without restart.
-                    let provider = match crate::provider::deepseek::DeepseekProvider::new(
-                        &self.config.provider,
-                        self.config.agent.rate_limit_ms,
-                        self.config.agent.rate_limit_per_minute,
-                        self.config.agent.max_retries,
-                    ) {
-                        Ok(ds) => Arc::new(ds) as Arc<dyn LLMProvider>,
-                        Err(e) => {
-                            tracing::warn!("Onboarding: provider init failed: {e}");
-                            self.state.onboarding.error =
-                                Some("Failed to initialize provider — see log");
-                            return Ok(false);
-                        }
+                    let Some(provider) = crate::provider::build_provider(&self.config) else {
+                        // build_provider logged the cause via tracing.
+                        self.state.onboarding.error =
+                            Some("Failed to initialize provider — see log");
+                        return Ok(false);
                     };
 
                     // Swap in a fresh main conversation carrying the provider —

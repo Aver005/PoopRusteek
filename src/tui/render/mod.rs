@@ -13,6 +13,7 @@ mod mcp;
 mod modals;
 mod onboarding;
 mod popup;
+mod providers;
 mod status;
 mod util;
 
@@ -46,6 +47,8 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             }
         } else if state.view == View::Mcp {
             mcp::render_mcp_view(frame, area, &state.mcp_status.view, &theme);
+        } else if state.view == View::Providers {
+            providers::render_providers_view(frame, area, &state.providers_view, config, &theme);
         } else if state.focused().messages.is_empty() && !state.focused().generation.active {
             landing::render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
@@ -120,7 +123,11 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         use crossterm::cursor::MoveTo;
         crossterm::execute!(terminal.backend_mut(), MoveTo(cx, cy))?;
     }
-    if state.modal.is_some() || state.focused().generation.active || state.view == View::Mcp {
+    if state.modal.is_some()
+        || state.focused().generation.active
+        || state.view == View::Mcp
+        || state.view == View::Providers
+    {
         terminal.hide_cursor()?;
     } else {
         // For the onboarding view the cursor is positioned by render_onboarding

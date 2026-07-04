@@ -194,6 +194,7 @@ impl App {
                 Ok(false)
             }
             Modal::McpAdd(state) => self.handle_mcp_add_key(key, state).await,
+            Modal::ProviderAdd(state) => self.handle_provider_add_key(key, state).await,
         }
     }
 

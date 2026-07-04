@@ -10,6 +10,17 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Additional OpenAI-compatible providers (LM Studio, Ollama, vLLM,
+    /// OpenRouter, …) managed via `/providers`. The DeepSeek web client
+    /// configured by `[provider]` above is the implicit built-in entry and
+    /// never appears in this list.
+    #[serde(default)]
+    pub providers: Vec<ProviderEntry>,
+    /// Name of the entry in `providers` that is currently active. `None`
+    /// (or a name that no longer exists) means the built-in DeepSeek
+    /// provider.
+    #[serde(default)]
+    pub active_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +40,26 @@ pub enum ProviderKind {
     Openai,
     Custom,
 }
+
+/// One `/providers`-managed OpenAI-compatible endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderEntry {
+    /// Unique display name; also the `active_provider` key. The name
+    /// `"deepseek"` is reserved for the built-in provider.
+    pub name: String,
+    /// API base, usually ending in `/v1` (e.g. `http://localhost:11434/v1`
+    /// for Ollama, `http://localhost:1234/v1` for LM Studio).
+    pub base_url: String,
+    /// Bearer token, if the endpoint needs one (local servers usually don't).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Model id sent with every request.
+    pub model: String,
+}
+
+/// The reserved name of the built-in DeepSeek web provider in `/providers`
+/// listings and `active_provider`.
+pub const BUILTIN_PROVIDER_NAME: &str = "deepseek";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
@@ -115,11 +146,32 @@ impl Default for Config {
             },
             mcp: McpConfig::default(),
             skills: SkillsConfig::default(),
+            providers: Vec::new(),
+            active_provider: None,
         }
     }
 }
 
 impl Config {
+    /// The `/providers` entry currently selected, or `None` when the
+    /// built-in DeepSeek provider is active (default, explicit
+    /// `"deepseek"`, or a stale name that no longer exists).
+    pub fn active_provider_entry(&self) -> Option<&ProviderEntry> {
+        let name = self.active_provider.as_deref()?;
+        if name == BUILTIN_PROVIDER_NAME {
+            return None;
+        }
+        self.providers.iter().find(|entry| entry.name == name)
+    }
+
+    /// The model the active provider will send — the entry's model for a
+    /// custom provider, `[provider].model` for the built-in one.
+    pub fn active_model(&self) -> &str {
+        self.active_provider_entry()
+            .map(|entry| entry.model.as_str())
+            .unwrap_or(&self.provider.model)
+    }
+
     pub fn path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -198,5 +250,44 @@ mod tests {
     #[test]
     fn rate_limit_display_both_set() {
         assert_eq!(agent_with(500, 10).rate_limit_display(), "500ms, 10/min");
+    }
+
+    #[test]
+    fn config_without_provider_entries_still_loads() {
+        // A pre-/providers config.toml has no `providers` array and no
+        // `active_provider` — both must default instead of failing the parse.
+        let old = toml::to_string_pretty(&{
+            let mut config = Config::default();
+            config.provider.token = "t".to_string();
+            config
+        })
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains("active_provider") && !line.contains("[[providers]]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let parsed: Config = toml::from_str(&old).unwrap();
+        assert!(parsed.providers.is_empty());
+        assert!(parsed.active_provider.is_none());
+        assert!(parsed.active_provider_entry().is_none());
+        assert_eq!(parsed.active_model(), "deepseek-chat");
+    }
+
+    #[test]
+    fn active_model_prefers_active_entry() {
+        let mut config = Config::default();
+        config.providers.push(ProviderEntry {
+            name: "lmstudio".to_string(),
+            base_url: "http://localhost:1234/v1".to_string(),
+            api_key: None,
+            model: "qwen".to_string(),
+        });
+        assert_eq!(config.active_model(), "deepseek-chat");
+        config.active_provider = Some("lmstudio".to_string());
+        assert_eq!(config.active_model(), "qwen");
+        // The reserved built-in name behaves like None.
+        config.active_provider = Some(BUILTIN_PROVIDER_NAME.to_string());
+        assert_eq!(config.active_model(), "deepseek-chat");
     }
 }

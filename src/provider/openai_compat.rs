@@ -327,6 +327,7 @@ pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
         "messages": messages,
         "temperature": request.temperature,
         "max_tokens": request.max_tokens,
+        "stream": request.stream,
     })
 }
 
@@ -346,9 +347,11 @@ pub fn estimated_usage(prompt_texts: &[&str], completion: &str) -> Usage {
     }
 }
 
+/// `fallback_usage` (usually [`estimated_usage`]) is reported only when the
+/// provider didn't supply real numbers of its own.
 pub fn response_to_openai(
     response: &CompletionResponse,
-    usage: Usage,
+    fallback_usage: Usage,
     meta: &CompletionMeta,
 ) -> ChatCompletionResponse {
     ChatCompletionResponse {
@@ -368,7 +371,7 @@ pub fn response_to_openai(
                 response.finish_reason.clone().unwrap_or_else(|| "stop".to_string()),
             ),
         }],
-        usage,
+        usage: response.usage.clone().unwrap_or(fallback_usage),
     }
 }
 

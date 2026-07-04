@@ -114,7 +114,7 @@ pub(super) fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, co
     // Shortcuts line
     let info_area = centered_h(chunks[ci], input_width);
     ci += 1;
-    let model = format!("{} · {}", provider_label(config), config.provider.model);
+    let model = format!("{} · {}", provider_label(config), config.active_model());
     let mut shortcut_spans = vec![
         Span::styled(model, Style::default().fg(theme.text_soft).bg(theme.bg)),
         Span::styled("  ", Style::default().bg(theme.bg)),
