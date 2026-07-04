@@ -22,12 +22,12 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **262 passing** (`cargo test --bin pooprusteek`) |
+| Tests | **265 passing** (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
 
-0. Cleanup audit 2026-07-04 (`reference/AUDIT-2026-07-04-CLEANUP.md`): god-file split DONE (`tui/render/` layered modules + `app/sessions.rs`/`app/pickers.rs`); runner/sub_agent shared stream helper DONE (`agent/stream.rs::collect_stream` + `QUESTION_TOOL_NAME`/`TASK_TOOL_NAME`/`MCP_TOOL_PREFIX` constants). Remaining, roughly in order: reliability trio (poison-unsafe `.lock().unwrap()` in `deepseek/http.rs::enforce_rate_limit`, PoW `spawn_blocking`, stream-size cap — natural home now `agent/stream.rs`), mechanical dedup (command arg-parsing helper, `post_void` endpoint migration, MCP config-loader helper, `apply_connect_outcome` loop hoist), owner decisions on `#[expect(dead_code)]` scaffolding (events.rs payloads, types.rs parity structs, `ProviderKind::Openai/Custom`).
+0. Cleanup audit 2026-07-04 (`reference/AUDIT-2026-07-04-CLEANUP.md`): god-file split DONE (`tui/render/` layered modules + `app/sessions.rs`/`app/pickers.rs`); runner/sub_agent shared stream helper DONE (`agent/stream.rs::collect_stream` + `QUESTION_TOOL_NAME`/`TASK_TOOL_NAME`/`MCP_TOOL_PREFIX` constants); reliability trio DONE (poison-safe rate-limit lock, PoW on `spawn_blocking`, 8 MiB stream cap w/ tests). Remaining: mechanical dedup (command arg-parsing helper, `post_void` endpoint migration, MCP config-loader helper, `apply_connect_outcome` loop hoist), owner decisions on `#[expect(dead_code)]` scaffolding (events.rs payloads, types.rs parity structs, `ProviderKind::Openai/Custom`).
 1. Stability/perf overhaul (2026-07-02) is done — all 7 audit criticals + ~30 majors fixed, dead code swept, clippy clean. See `reference/AUDIT-2026-07-02.md`.
 2. Next candidates (in rough priority order):
    - `keys.rs` decomposition: key→intent + intent→effect split (testable without a live `App`). Not started.
@@ -47,7 +47,7 @@
 - No persistent RAG / codebase search.
 - `keys.rs` decomposition (key→intent/intent→effect) planned, not started.
 - Foreground child PID tracking is a single global slot, not per-conversation (also an upward `tools`→`app` dependency).
-- PoW challenge solved once per request, not re-solved per retry attempt; solve runs on the async task rather than `spawn_blocking`.
+- PoW challenge solved once per request, not re-solved per retry attempt (deliberately left as-is 2026-07-04 — changing it changes the request pattern against DeepSeek). The solve itself now runs on `spawn_blocking` (fixed 2026-07-04).
 - `"model"` field is hardcoded `"deepseek-chat"` in the request body, ignoring user config.
 - `tool_parser` truncates visible streamed text at the first bare `<`; legacy `[TOOL:]` regex can't parse nested-brace JSON; fenced code-block tool-call syntax can be executed as real calls during auto-approve turns.
 - `mcp__` name separator (`__`) can collide with a server/tool name containing `__`.

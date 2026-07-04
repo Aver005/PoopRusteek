@@ -113,7 +113,12 @@ impl DeepseekProvider {
             let window = Duration::from_secs(60);
             loop {
                 let wait = {
-                    let mut history = self.request_history.lock().unwrap();
+                    // Poison-safe like every other lock in the provider: a
+                    // panicked writer must degrade to "skip rate limiting",
+                    // not take down the whole TUI.
+                    let Ok(mut history) = self.request_history.lock() else {
+                        break;
+                    };
                     let now = std::time::Instant::now();
                     while let Some(&oldest) = history.front() {
                         if now.duration_since(oldest) >= window {

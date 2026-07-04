@@ -11,17 +11,17 @@
 
 ## RELIABILITY (fix while cleaning — small, high blast radius)
 
-- `[VERIFIED]` `enforce_rate_limit` uses `.lock().unwrap()` on `request_history`
-  while every other lock in the provider uses the poison-safe `.lock().map(...)`
-  pattern — one inconsistent panic vector. `→ src/provider/deepseek/http.rs`
-- `[VERIFIED]` PoW solve still runs synchronously on the async runtime (no
-  `spawn_blocking`) and a retry reuses the once-solved (possibly stale)
-  challenge — both already tracked in STATE.md KNOWN GAPS; note: PoW is NOT
-  re-solved per retry (a sweep claimed so — false; headers are built once
-  before the retry loop). `→ src/provider/pow.rs`, `deepseek/stream.rs`
-- `[REPORTED]` Streaming accumulators `full_response`/`full` are unbounded —
-  no size cap analogous to the shell tool's 1MiB cap. `→ src/agent/runner.rs`,
-  `src/agent/sub_agent.rs`
+- `[FIXED 2026-07-04]` `enforce_rate_limit` used `.lock().unwrap()` on
+  `request_history` — now poison-safe (`let Ok(...) else { break }`, degrades
+  to skipping rate limiting). `→ src/provider/deepseek/http.rs`
+- `[FIXED 2026-07-04]` PoW solve now runs on `spawn_blocking` (wrapped at its
+  single funnel point `solve_pow_challenge`). Retry still reuses the
+  once-solved challenge — deliberately left as-is (changing it changes the
+  request pattern against DeepSeek); note: PoW is NOT re-solved per retry (a
+  sweep claimed so — false). `→ src/provider/deepseek/stream.rs`
+- `[FIXED 2026-07-04]` Streaming accumulator now capped at 8 MiB in the shared
+  `collect_stream` (created in the same session) — overflow aborts the stream
+  task and surfaces as `StreamEnd::ProviderError`. `→ src/agent/stream.rs`
 
 ## DUPLICATION
 

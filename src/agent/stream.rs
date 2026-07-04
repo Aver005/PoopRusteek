@@ -19,6 +19,12 @@ use tokio::sync::mpsc;
 /// How long a stream may stay silent before the turn is cancelled.
 pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Hard cap on the accumulated stream text. Real turns are bounded by
+/// `max_tokens` (tens of KB); this only exists so a broken or hostile
+/// provider looping forever can't grow the buffer without bound (the
+/// foreground shell tool has the same kind of cap at 1 MiB).
+pub const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+
 /// How the spawned `complete_stream` task ended.
 pub enum StreamEnd {
     /// No chunk arrived within [`STREAM_IDLE_TIMEOUT`]; the stream task was
@@ -69,6 +75,17 @@ pub async fn collect_stream(
             Ok(Some(chunk)) => {
                 if !chunk.content.is_empty() {
                     text.push_str(&chunk.content);
+                    if text.len() > MAX_STREAM_BYTES {
+                        stream_task.abort();
+                        return StreamOutcome {
+                            text,
+                            got_stop,
+                            end: StreamEnd::ProviderError(format!(
+                                "stream exceeded {} MiB without finishing — aborted",
+                                MAX_STREAM_BYTES / (1024 * 1024)
+                            )),
+                        };
+                    }
                     on_progress(&text);
                 }
                 if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
@@ -87,4 +104,62 @@ pub async fn collect_stream(
         Err(join_error) => StreamEnd::TaskFailed(join_error.to_string()),
     };
     StreamOutcome { text, got_stop, end }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ChatMessage, fake::FakeProvider};
+
+    fn request() -> CompletionRequest {
+        CompletionRequest {
+            messages: vec![ChatMessage::user("hi")],
+            model: "fake".to_string(),
+            temperature: 0.0,
+            max_tokens: 128,
+            stream: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn collects_full_text_and_stop() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response("Hello, world!").chunked(3));
+        let mut progress_calls = 0usize;
+        let outcome = collect_stream(&provider, request(), |_| progress_calls += 1).await;
+
+        assert_eq!(outcome.text, "Hello, world!");
+        assert!(outcome.got_stop);
+        assert!(matches!(outcome.end, StreamEnd::Completed));
+        assert_eq!(progress_calls, 3, "one progress call per non-empty chunk");
+    }
+
+    #[tokio::test]
+    async fn abrupt_eof_reports_completed_without_stop() {
+        // The channel closing without a stop chunk is NOT an error at this
+        // layer — callers decide (the main loop treats it as one, a
+        // sub-agent doesn't).
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response("partial").abrupt_eof());
+        let outcome = collect_stream(&provider, request(), |_| {}).await;
+
+        assert_eq!(outcome.text, "partial");
+        assert!(!outcome.got_stop);
+        assert!(matches!(outcome.end, StreamEnd::Completed));
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_is_aborted() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response("x".repeat(MAX_STREAM_BYTES + 1)));
+        let outcome = collect_stream(&provider, request(), |_| {}).await;
+
+        assert!(!outcome.got_stop);
+        match outcome.end {
+            StreamEnd::ProviderError(message) => {
+                assert!(message.contains("exceeded"), "unexpected message: {message}");
+            }
+            _ => panic!("oversized stream must surface as a provider error"),
+        }
+    }
 }

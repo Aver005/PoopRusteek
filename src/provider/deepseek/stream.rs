@@ -73,7 +73,12 @@ impl DeepseekProvider {
         })?;
         debug_log::log_json("pow.challenge.response", &raw);
         let challenge = raw.data.biz_data.challenge;
-        let solution = super::pow::solve_pow(&challenge)
+        // The solve is a synchronous CPU-bound wasm hash loop (tens to
+        // hundreds of ms) — run it on the blocking pool so it can't stall
+        // the async workers that drive the UI and other conversations.
+        let solution = tokio::task::spawn_blocking(move || super::pow::solve_pow(&challenge))
+            .await
+            .map_err(|e| AppError::Provider(format!("PoW solver task failed: {e}")))?
             .ok_or_else(|| AppError::Provider("Failed to solve PoW challenge".to_string()))?;
         debug_log::log_json("pow.challenge.solution", &solution);
         super::pow::encode_solution(&solution)
