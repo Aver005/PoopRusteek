@@ -54,7 +54,6 @@ pub(super) fn render_providers_view(
         let bg = if selected { theme.accent_dim } else { theme.bg };
         let marker = if row.active { " ● " } else { " ○ " };
         let marker_color = if row.active { theme.success } else { theme.text_dim };
-        let tag = if row.builtin { "[built-in]" } else { "[openai-compat]" };
 
         let line = Line::from(vec![
             Span::styled(marker, Style::default().fg(marker_color).bg(bg)),
@@ -66,7 +65,10 @@ pub(super) fn render_providers_view(
                     Style::default().fg(theme.fg).bg(bg)
                 },
             ),
-            Span::styled(format!("{tag:<16} "), Style::default().fg(theme.accent_soft).bg(bg)),
+            Span::styled(
+                format!("{:<18} ", format!("[{}]", row.tag)),
+                Style::default().fg(theme.accent_soft).bg(bg),
+            ),
             Span::styled(row.detail.clone(), Style::default().fg(theme.text_dim).bg(bg)),
         ]);
         frame.render_widget(
@@ -124,7 +126,7 @@ pub(super) fn render_provider_add(
 
     lines.push(Line::from(vec![
         Span::styled(
-            format!("  Step {}/5 \u{2014} ", wizard.step.number()),
+            format!("  Step {}/6 \u{2014} ", wizard.step.number()),
             Style::default().fg(theme.text_dim),
         ),
         Span::styled(
@@ -137,6 +139,24 @@ pub(super) fn render_provider_add(
     match wizard.step {
         ProviderWizardStep::Name => {
             push_text_box_lines(&mut lines, &wizard.name.buffer, wizard.name.cursor, theme, max_rows)
+        }
+        ProviderWizardStep::Protocol => {
+            for (i, protocol) in crate::app::providers::PROTOCOL_CHOICES.iter().enumerate() {
+                let is_cursor = i == wizard.protocol_selected;
+                let indicator = if is_cursor { "\u{25B6} " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(theme.fg)),
+                    Span::styled(indicator, Style::default().fg(if is_cursor { theme.accent } else { theme.text_dim })),
+                    Span::styled(
+                        crate::app::providers::protocol_choice_label(*protocol),
+                        if is_cursor {
+                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text_soft)
+                        },
+                    ),
+                ]));
+            }
         }
         ProviderWizardStep::BaseUrl => {
             push_text_box_lines(&mut lines, &wizard.base_url.buffer, wizard.base_url.cursor, theme, max_rows)
@@ -152,6 +172,10 @@ pub(super) fn render_provider_add(
         ProviderWizardStep::Confirm => {
             lines.push(Line::from(Span::styled(
                 format!("  Name:     {}", wizard.name.buffer.trim()),
+                Style::default().fg(theme.fg),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  Protocol: {}", wizard.protocol().label()),
                 Style::default().fg(theme.fg),
             )));
             lines.push(Line::from(Span::styled(
@@ -181,6 +205,7 @@ pub(super) fn render_provider_add(
     }
 
     let hint = match wizard.step {
+        ProviderWizardStep::Protocol => " \u{2191}\u{2193} choose    Enter next    Esc back ",
         ProviderWizardStep::ApiKey => " Enter next (blank = none)    Esc back ",
         ProviderWizardStep::Confirm => " Enter add provider    Esc back ",
         _ => " Enter next    Esc back ",

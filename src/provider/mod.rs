@@ -1,3 +1,5 @@
+pub mod anthropic_client;
+pub mod anthropic_compat;
 pub mod deepseek;
 #[cfg(test)]
 pub mod fake;
@@ -15,8 +17,18 @@ pub mod types;
 /// behind `App::new`, provider resets, and onboarding.
 pub fn build_provider(config: &crate::config::Config) -> Option<std::sync::Arc<dyn LLMProvider>> {
     if let Some(entry) = config.active_provider_entry() {
-        return match openai_client::OpenAiCompatProvider::new(entry) {
-            Ok(provider) => Some(std::sync::Arc::new(provider)),
+        let built: crate::error::AppResult<std::sync::Arc<dyn LLMProvider>> = match entry.protocol {
+            crate::config::ProviderProtocol::Openai => {
+                openai_client::OpenAiCompatProvider::new(entry)
+                    .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
+            }
+            crate::config::ProviderProtocol::Anthropic => {
+                anthropic_client::AnthropicCompatProvider::new(entry)
+                    .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
+            }
+        };
+        return match built {
+            Ok(provider) => Some(provider),
             Err(error) => {
                 tracing::warn!("Failed to initialize provider '{}': {error}", entry.name);
                 None

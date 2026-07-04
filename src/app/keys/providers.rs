@@ -115,7 +115,7 @@ impl App {
             ProviderWizardStep::BaseUrl => apply_text_key(&mut wizard.base_url, key, false),
             ProviderWizardStep::ApiKey => apply_text_key(&mut wizard.api_key, key, false),
             ProviderWizardStep::Model => apply_text_key(&mut wizard.model, key, false),
-            ProviderWizardStep::Confirm => false,
+            ProviderWizardStep::Protocol | ProviderWizardStep::Confirm => false,
         };
 
         if !handled_as_text {
@@ -126,12 +126,20 @@ impl App {
                             self.state.modal = None;
                             return Ok(false);
                         }
-                        ProviderWizardStep::BaseUrl => wizard.step = ProviderWizardStep::Name,
+                        ProviderWizardStep::Protocol => wizard.step = ProviderWizardStep::Name,
+                        ProviderWizardStep::BaseUrl => wizard.step = ProviderWizardStep::Protocol,
                         ProviderWizardStep::ApiKey => wizard.step = ProviderWizardStep::BaseUrl,
                         ProviderWizardStep::Model => wizard.step = ProviderWizardStep::ApiKey,
                         ProviderWizardStep::Confirm => wizard.step = ProviderWizardStep::Model,
                     }
                     wizard.error = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') if wizard.step == ProviderWizardStep::Protocol => {
+                    wizard.protocol_selected = wizard.protocol_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if wizard.step == ProviderWizardStep::Protocol => {
+                    wizard.protocol_selected = (wizard.protocol_selected + 1)
+                        .min(crate::app::providers::PROTOCOL_CHOICES.len() - 1);
                 }
                 KeyCode::Enter => match wizard.step {
                     ProviderWizardStep::Name => {
@@ -141,10 +149,14 @@ impl App {
                         ) {
                             Ok(()) => {
                                 wizard.error = None;
-                                wizard.step = ProviderWizardStep::BaseUrl;
+                                wizard.step = ProviderWizardStep::Protocol;
                             }
                             Err(error) => wizard.error = Some(error),
                         }
+                    }
+                    ProviderWizardStep::Protocol => {
+                        wizard.error = None;
+                        wizard.step = ProviderWizardStep::BaseUrl;
                     }
                     ProviderWizardStep::BaseUrl => {
                         match crate::app::providers::validate_base_url(

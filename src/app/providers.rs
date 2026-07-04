@@ -7,7 +7,7 @@
 //! cohesive instead of scattered across the key handlers.
 
 use crate::app::input::InputState;
-use crate::config::{Config, ProviderEntry, BUILTIN_PROVIDER_NAME};
+use crate::config::{Config, ProviderEntry, ProviderProtocol, BUILTIN_PROVIDER_NAME};
 
 /// Live state of the `/providers` full-screen panel.
 #[derive(Debug, Clone, Default)]
@@ -21,6 +21,9 @@ pub struct ProvidersViewState {
 #[derive(Debug, Clone)]
 pub struct ProviderRow {
     pub name: String,
+    /// Bracketed protocol tag shown in the panel ("built-in",
+    /// "openai-compat", "anthropic-compat").
+    pub tag: &'static str,
     pub detail: String,
     pub active: bool,
     pub builtin: bool,
@@ -30,6 +33,7 @@ pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
     let custom_active = config.active_provider_entry().map(|entry| entry.name.clone());
     let mut rows = vec![ProviderRow {
         name: BUILTIN_PROVIDER_NAME.to_string(),
+        tag: "built-in",
         detail: format!(
             "built-in DeepSeek web · {} · {}",
             config.provider.model,
@@ -41,6 +45,7 @@ pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
     for entry in &config.providers {
         rows.push(ProviderRow {
             name: entry.name.clone(),
+            tag: entry.protocol.label(),
             detail: format!(
                 "{} · {}{}",
                 entry.base_url,
@@ -57,26 +62,41 @@ pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderWizardStep {
     Name,
+    Protocol,
     BaseUrl,
     ApiKey,
     Model,
     Confirm,
 }
 
+/// Wizard order of the protocol choices (`protocol_selected` indexes this).
+pub const PROTOCOL_CHOICES: [ProviderProtocol; 2] =
+    [ProviderProtocol::Openai, ProviderProtocol::Anthropic];
+
+/// Human description for the wizard's protocol list.
+pub fn protocol_choice_label(protocol: ProviderProtocol) -> &'static str {
+    match protocol {
+        ProviderProtocol::Openai => "OpenAI Chat Completions (LM Studio, Ollama /v1, vLLM, OpenRouter)",
+        ProviderProtocol::Anthropic => "Anthropic Messages (Anthropic API, Claude-compatible proxies)",
+    }
+}
+
 impl ProviderWizardStep {
     pub fn number(self) -> usize {
         match self {
             ProviderWizardStep::Name => 1,
-            ProviderWizardStep::BaseUrl => 2,
-            ProviderWizardStep::ApiKey => 3,
-            ProviderWizardStep::Model => 4,
-            ProviderWizardStep::Confirm => 5,
+            ProviderWizardStep::Protocol => 2,
+            ProviderWizardStep::BaseUrl => 3,
+            ProviderWizardStep::ApiKey => 4,
+            ProviderWizardStep::Model => 5,
+            ProviderWizardStep::Confirm => 6,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             ProviderWizardStep::Name => "Name",
+            ProviderWizardStep::Protocol => "Protocol",
             ProviderWizardStep::BaseUrl => "Base URL (usually ends with /v1)",
             ProviderWizardStep::ApiKey => "API key (blank = none)",
             ProviderWizardStep::Model => "Model id",
@@ -91,6 +111,8 @@ impl ProviderWizardStep {
 pub struct ProviderAddState {
     pub step: ProviderWizardStep,
     pub name: InputState,
+    /// Index into [`PROTOCOL_CHOICES`].
+    pub protocol_selected: usize,
     pub base_url: InputState,
     pub api_key: InputState,
     pub model: InputState,
@@ -102,6 +124,7 @@ impl ProviderAddState {
         Self {
             step: ProviderWizardStep::Name,
             name: InputState::default(),
+            protocol_selected: 0,
             base_url: InputState::default(),
             api_key: InputState::default(),
             model: InputState::default(),
@@ -113,6 +136,10 @@ impl ProviderAddState {
     /// advance, so failures here mean the two validations disagree — kept
     /// fallible rather than assumed-infallible (same stance as
     /// `mcp_add::WizardState::build_config`).
+    pub fn protocol(&self) -> ProviderProtocol {
+        PROTOCOL_CHOICES[self.protocol_selected.min(PROTOCOL_CHOICES.len() - 1)]
+    }
+
     pub fn build_entry(&self, config: &Config) -> Result<ProviderEntry, String> {
         let name = self.name.buffer.trim().to_string();
         validate_name(&name, config)?;
@@ -127,6 +154,7 @@ impl ProviderAddState {
             base_url,
             api_key: (!api_key.is_empty()).then(|| api_key.to_string()),
             model,
+            protocol: self.protocol(),
         })
     }
 }
@@ -156,18 +184,32 @@ pub fn validate_base_url(url: &str) -> Result<String, String> {
     Ok(url.trim_end_matches('/').to_string())
 }
 
-/// Parse the quick command form: `<name> <base_url> [model] [api_key]`.
-/// Model defaults to `"default"` (fine for LM Studio, which serves its
-/// loaded model regardless; Ollama needs a real model id — use the wizard
-/// or pass it explicitly).
+/// Parse the quick command form:
+/// `<name> [openai|anthropic] <base_url> [model] [api_key]`.
+/// Protocol defaults to OpenAI-compatible. Model defaults to `"default"`
+/// (fine for LM Studio, which serves its loaded model regardless; Ollama
+/// and Anthropic need a real model id — use the wizard or pass it
+/// explicitly).
 pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, String> {
-    let mut tokens = raw.split_whitespace();
-    let name = tokens.next().ok_or_else(|| "expected: <name> <base_url> [model] [api_key]".to_string())?;
+    const FORM: &str = "<name> [openai|anthropic] <base_url> [model] [api_key]";
+    let mut tokens = raw.split_whitespace().peekable();
+    let name = tokens.next().ok_or_else(|| format!("expected: {FORM}"))?;
+    let protocol = match tokens.peek() {
+        Some(&"openai") => {
+            tokens.next();
+            ProviderProtocol::Openai
+        }
+        Some(&"anthropic") => {
+            tokens.next();
+            ProviderProtocol::Anthropic
+        }
+        _ => ProviderProtocol::Openai,
+    };
     let base_url = tokens.next().ok_or_else(|| "expected a base URL after the name".to_string())?;
     let model = tokens.next().unwrap_or("default");
     let api_key = tokens.next();
     if tokens.next().is_some() {
-        return Err("too many arguments — expected: <name> <base_url> [model] [api_key]".to_string());
+        return Err(format!("too many arguments — expected: {FORM}"));
     }
 
     validate_name(name, config)?;
@@ -177,6 +219,7 @@ pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, Stri
         base_url,
         api_key: api_key.map(str::to_string),
         model: model.to_string(),
+        protocol,
     })
 }
 
@@ -291,6 +334,7 @@ mod tests {
             base_url: "http://localhost:1234/v1".to_string(),
             api_key: None,
             model: "default".to_string(),
+            protocol: ProviderProtocol::default(),
         }
     }
 
@@ -329,6 +373,23 @@ mod tests {
         let parsed = parse_quick_add("lmstudio http://localhost:1234/v1/", &Config::default()).unwrap();
         assert_eq!(parsed.model, "default");
         assert_eq!(parsed.base_url, "http://localhost:1234/v1");
+        assert_eq!(parsed.protocol, ProviderProtocol::Openai);
+    }
+
+    #[test]
+    fn quick_add_accepts_protocol_token() {
+        let parsed = parse_quick_add(
+            "claude anthropic https://api.anthropic.com/v1 claude-sonnet-4-5 sk-ant-x",
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(parsed.protocol, ProviderProtocol::Anthropic);
+        assert_eq!(parsed.model, "claude-sonnet-4-5");
+        assert_eq!(parsed.api_key.as_deref(), Some("sk-ant-x"));
+
+        // Explicit "openai" token is also accepted (and not eaten as a URL).
+        let parsed = parse_quick_add("lm openai http://localhost:1234/v1", &Config::default()).unwrap();
+        assert_eq!(parsed.protocol, ProviderProtocol::Openai);
     }
 
     #[test]

@@ -41,20 +41,48 @@ pub enum ProviderKind {
     Custom,
 }
 
-/// One `/providers`-managed OpenAI-compatible endpoint.
+/// Which wire protocol a `/providers` entry speaks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderProtocol {
+    /// OpenAI Chat Completions (`POST {base}/chat/completions`) — LM
+    /// Studio, Ollama's `/v1`, vLLM, OpenRouter, … The default, so entries
+    /// written before this field existed keep working.
+    #[default]
+    Openai,
+    /// Anthropic Messages (`POST {base}/messages`, `x-api-key` +
+    /// `anthropic-version` headers) — the Anthropic API and
+    /// Claude-compatible endpoints/proxies.
+    Anthropic,
+}
+
+impl ProviderProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProviderProtocol::Openai => "openai-compat",
+            ProviderProtocol::Anthropic => "anthropic-compat",
+        }
+    }
+}
+
+/// One `/providers`-managed endpoint (OpenAI- or Anthropic-compatible).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderEntry {
     /// Unique display name; also the `active_provider` key. The name
     /// `"deepseek"` is reserved for the built-in provider.
     pub name: String,
     /// API base, usually ending in `/v1` (e.g. `http://localhost:11434/v1`
-    /// for Ollama, `http://localhost:1234/v1` for LM Studio).
+    /// for Ollama, `http://localhost:1234/v1` for LM Studio,
+    /// `https://api.anthropic.com/v1` for Anthropic).
     pub base_url: String,
-    /// Bearer token, if the endpoint needs one (local servers usually don't).
+    /// Bearer token / `x-api-key`, if the endpoint needs one (local
+    /// servers usually don't).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Model id sent with every request.
     pub model: String,
+    #[serde(default)]
+    pub protocol: ProviderProtocol,
 }
 
 /// The reserved name of the built-in DeepSeek web provider in `/providers`
@@ -297,6 +325,7 @@ mod tests {
             base_url: "http://localhost:1234/v1".to_string(),
             api_key: None,
             model: "qwen".to_string(),
+            protocol: ProviderProtocol::default(),
         });
         assert_eq!(config.active_model(), "deepseek-chat");
         config.active_provider = Some("lmstudio".to_string());

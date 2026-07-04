@@ -4,7 +4,7 @@ use crate::config::Config;
 
 pub struct ProvidersCommand;
 
-const USAGE: &str = "/providers | /providers add | /providers add <name> <base_url> [model] [api_key]";
+const USAGE: &str = "/providers | /providers add | /providers add <name> [openai|anthropic] <base_url> [model] [api_key]";
 
 impl Command for ProvidersCommand {
     fn name(&self) -> &str {
