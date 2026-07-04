@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **267 passing** (`cargo test --bin pooprusteek`) |
+| Tests | **277 passing** (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
@@ -40,7 +40,7 @@
 ## KNOWN GAPS
 
 - **`.memories/` is not auto-loaded** by the agent (verified: nothing in `src/` reads it). The "Integrate memories" commit only created the docs; `CLAUDE.md` at the repo root now bridges into it for Claude Code specifically.
-- Single provider (DeepSeek only); `openai`/`custom` kinds declared but unimplemented. (`FakeProvider` exists for tests only.)
+- Single provider (DeepSeek only); `openai`/`custom` kinds declared but unimplemented. (`FakeProvider` exists for tests only.) The OpenAI-compat protocol layer (`provider/openai_compat.rs`, 2026-07-05) now provides the wire types + conversions an `openai` client provider would need — transport still missing.
 - No schema validation on MCP tool arguments. `→ src/mcp/client.rs`
 - DeepSeek streaming never reports token usage (`usage` always None).
 - Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`

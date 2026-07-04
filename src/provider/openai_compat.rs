@@ -1,0 +1,645 @@
+//! OpenAI-compatible wire format ⇄ internal provider types.
+//!
+//! This is the protocol boundary for two planned features that share one
+//! vocabulary (see `PLANS.md`):
+//!
+//! 1. **Server mode**: pooprusteek exposes `POST /v1/chat/completions` (+
+//!    `GET /v1/models`) so existing OpenAI-speaking tools can use it as a
+//!    backend while it internally talks to whatever provider it has (today:
+//!    the reverse-engineered DeepSeek web API). Inbound direction:
+//!    [`ChatCompletionRequest`] → [`to_internal_request`] → run → outbound
+//!    via [`response_to_openai`] / [`delta_chunk`]+[`final_chunk`].
+//! 2. **OpenAI-compatible client providers**: a future `LLMProvider` impl
+//!    that talks to any OpenAI-compatible endpoint reuses the same types in
+//!    the opposite direction ([`request_to_openai`],
+//!    [`response_from_openai`], [`chunk_from_openai`]).
+//!
+//! Scope (v1): plain chat — messages, temperature/max_tokens, streaming,
+//! finish_reason, usage. Deliberately NOT translated yet: structured
+//! tool-calling (`tools`/`tool_calls`) — pooprusteek's tool calls are
+//! prompt-encoded text parsed by `agent/tool_parser`, and mapping that onto
+//! OpenAI's structured tool protocol is its own design task. Inbound
+//! `tools` are captured (not dropped by serde) so the future server can
+//! *warn* rather than silently ignore; multimodal content parts are
+//! flattened to their text parts.
+//!
+//! Everything here is pure data mapping — no I/O, no `App`, no network.
+
+// No production call sites until the server mode / OpenAI-client provider
+// land (PLANS.md) — the module is exercised by its tests. `allow`, not
+// `expect`: under `cargo test` the items ARE used, so an `expect` would be
+// unfulfilled in that build.
+#![allow(dead_code, reason = "protocol layer for the planned OpenAI-compatible server mode; test-covered")]
+
+use crate::provider::{estimate_tokens, ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, Role, Usage};
+use serde::{Deserialize, Serialize};
+
+// ── Wire types: request ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<ChatCompletionMessage>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Legacy name, still what most tools send.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Current OpenAI name; wins over `max_tokens` when both are present.
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    /// Captured (not silently swallowed by serde) so a server can tell the
+    /// caller that structured tool-calling is not translated yet.
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionMessage {
+    pub role: String,
+    pub content: MessageContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// OpenAI message content: a plain string, or an array of typed parts
+/// (multimodal). Non-text parts are dropped at conversion — text-only
+/// backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl MessageContent {
+    /// Flatten to plain text: string as-is; part arrays joined from their
+    /// `text` fields (image/audio parts contribute nothing).
+    pub fn into_text(self) -> String {
+        match self {
+            MessageContent::Text(text) => text,
+            MessageContent::Parts(parts) => parts
+                .into_iter()
+                .filter_map(|part| part.text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+// ── Wire types: response / chunk / models / error ──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    /// Always `"chat.completion"`.
+    pub object: String,
+    /// Unix seconds.
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<Choice>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Choice {
+    pub index: u32,
+    pub message: ChatCompletionMessage,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    /// Always `"chat.completion.chunk"`.
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkChoice {
+    pub index: u32,
+    pub delta: Delta,
+    pub finish_reason: Option<String>,
+}
+
+/// Streaming delta. Per the OpenAI protocol the first chunk of a turn
+/// carries `role: "assistant"`, content chunks carry `content`, and the
+/// terminal chunk carries neither — only a `finish_reason` on its choice.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Delta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelList {
+    /// Always `"list"`.
+    pub object: String,
+    pub data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Always `"model"`.
+    pub object: String,
+    pub created: u64,
+    pub owned_by: String,
+}
+
+/// The OpenAI error envelope (`{"error": {...}}`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub error: ErrorBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl ErrorResponse {
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                message: message.into(),
+                kind: "invalid_request_error".to_string(),
+                code: None,
+            },
+        }
+    }
+
+    pub fn server_error(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                message: message.into(),
+                kind: "server_error".to_string(),
+                code: None,
+            },
+        }
+    }
+}
+
+// ── Completion identity ────────────────────────────────────────────────
+
+/// The `id`/`created`/`model` triple stamped onto every response and every
+/// chunk of one completion. Generated once per turn so all chunks of a
+/// stream agree, and injectable in tests.
+#[derive(Debug, Clone)]
+pub struct CompletionMeta {
+    pub id: String,
+    pub created: u64,
+    pub model: String,
+}
+
+impl CompletionMeta {
+    pub fn generate(model: &str) -> Self {
+        Self {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            created: chrono::Utc::now().timestamp().max(0) as u64,
+            model: model.to_string(),
+        }
+    }
+}
+
+// ── Defaults for fields the wire request may omit ──────────────────────
+
+/// Fill-ins for optional request fields, supplied by the embedding side
+/// (the server will feed these from `Config`).
+#[derive(Debug, Clone)]
+pub struct RequestDefaults {
+    pub temperature: f32,
+    pub max_tokens: u32,
+}
+
+// ── Inbound: OpenAI request → internal ─────────────────────────────────
+
+fn role_from_openai(role: &str) -> Result<Role, String> {
+    match role {
+        // "developer" is OpenAI's newer alias for the system role.
+        "system" | "developer" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        // "function" is the pre-tools deprecated spelling of "tool".
+        "tool" | "function" => Ok(Role::Tool),
+        other => Err(format!("unsupported message role: {other:?}")),
+    }
+}
+
+fn role_to_openai(role: &Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+/// Convert an inbound OpenAI-format request into the internal
+/// [`CompletionRequest`]. Fails (with an `ErrorResponse`-ready message) on
+/// roles the internal model has no equivalent for.
+pub fn to_internal_request(
+    request: ChatCompletionRequest,
+    defaults: &RequestDefaults,
+) -> Result<CompletionRequest, String> {
+    let stream = request.stream.unwrap_or(false);
+    let mut messages = Vec::with_capacity(request.messages.len());
+    for message in request.messages {
+        messages.push(message_to_internal(message)?);
+    }
+    Ok(CompletionRequest {
+        messages,
+        model: request.model,
+        temperature: request.temperature.unwrap_or(defaults.temperature),
+        max_tokens: request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .unwrap_or(defaults.max_tokens),
+        stream,
+    })
+}
+
+fn message_to_internal(message: ChatCompletionMessage) -> Result<ChatMessage, String> {
+    let role = role_from_openai(&message.role)?;
+    let text = message.content.into_text();
+    let mut converted = match role {
+        Role::System => ChatMessage::system(&text),
+        Role::User => ChatMessage::user(&text),
+        Role::Assistant => ChatMessage::assistant(&text),
+        Role::Tool => ChatMessage::tool(
+            message.tool_call_id.as_deref().unwrap_or_default(),
+            &text,
+        ),
+    };
+    converted.name = message.name;
+    Ok(converted)
+}
+
+// ── Outbound: internal → OpenAI request (future client providers) ──────
+
+/// Convert an internal request into the OpenAI wire shape — the sending
+/// half of a future OpenAI-compatible `LLMProvider`. `ui_only` messages
+/// are filtered out here for the same reason `provider/prompt.rs` filters
+/// them: UI chrome must never reach a model.
+pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
+    let messages: Vec<serde_json::Value> = request
+        .messages
+        .iter()
+        .filter(|message| !message.ui_only)
+        .map(|message| {
+            let mut object = serde_json::json!({
+                "role": role_to_openai(&message.role),
+                "content": message.content,
+            });
+            if let Some(name) = &message.name {
+                object["name"] = serde_json::json!(name);
+            }
+            if message.role == Role::Tool
+                && let Some(id) = &message.tool_call_id {
+                    object["tool_call_id"] = serde_json::json!(id);
+                }
+            object
+        })
+        .collect();
+    serde_json::json!({
+        "model": request.model,
+        "messages": messages,
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+    })
+}
+
+// ── Outbound: internal result → OpenAI response / chunks ───────────────
+
+/// Usage with estimated counts (the DeepSeek web API never reports real
+/// ones — see STATE.md KNOWN GAPS) — same `estimate_tokens` heuristic the
+/// TUI stats use. Real usage, when a provider has it, should be passed to
+/// [`response_to_openai`] instead.
+pub fn estimated_usage(prompt_texts: &[&str], completion: &str) -> Usage {
+    let prompt_tokens: u32 = prompt_texts.iter().map(|text| estimate_tokens(text)).sum();
+    let completion_tokens = estimate_tokens(completion);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    }
+}
+
+pub fn response_to_openai(
+    response: &CompletionResponse,
+    usage: Usage,
+    meta: &CompletionMeta,
+) -> ChatCompletionResponse {
+    ChatCompletionResponse {
+        id: meta.id.clone(),
+        object: "chat.completion".to_string(),
+        created: meta.created,
+        model: meta.model.clone(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatCompletionMessage {
+                role: "assistant".to_string(),
+                content: MessageContent::Text(response.content.clone()),
+                name: None,
+                tool_call_id: None,
+            },
+            finish_reason: Some(
+                response.finish_reason.clone().unwrap_or_else(|| "stop".to_string()),
+            ),
+        }],
+        usage,
+    }
+}
+
+/// A streamed content delta. `first` marks the opening chunk of the turn,
+/// which per the OpenAI protocol also announces `role: "assistant"`.
+pub fn delta_chunk(content: &str, first: bool, meta: &CompletionMeta) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: meta.id.clone(),
+        object: "chat.completion.chunk".to_string(),
+        created: meta.created,
+        model: meta.model.clone(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: first.then(|| "assistant".to_string()),
+                content: Some(content.to_string()),
+            },
+            finish_reason: None,
+        }],
+    }
+}
+
+/// The terminal chunk: empty delta, `finish_reason` set. The transport
+/// layer follows it with the literal `data: [DONE]` SSE line.
+pub fn final_chunk(finish_reason: &str, meta: &CompletionMeta) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: meta.id.clone(),
+        object: "chat.completion.chunk".to_string(),
+        created: meta.created,
+        model: meta.model.clone(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta::default(),
+            finish_reason: Some(finish_reason.to_string()),
+        }],
+    }
+}
+
+// ── Inbound: OpenAI response / chunk → internal (future client) ────────
+
+/// First-choice extraction for a future OpenAI-compatible client provider.
+pub fn response_from_openai(response: ChatCompletionResponse) -> CompletionResponse {
+    let (content, finish_reason) = response
+        .choices
+        .into_iter()
+        .next()
+        .map(|choice| (choice.message.content.into_text(), choice.finish_reason))
+        .unwrap_or_default();
+    CompletionResponse {
+        content,
+        finish_reason,
+        usage: Some(response.usage),
+    }
+}
+
+pub fn chunk_from_openai(chunk: ChatCompletionChunk) -> CompletionChunk {
+    let (content, finish_reason) = chunk
+        .choices
+        .into_iter()
+        .next()
+        .map(|choice| (choice.delta.content.unwrap_or_default(), choice.finish_reason))
+        .unwrap_or_default();
+    CompletionChunk { content, finish_reason }
+}
+
+// ── Models listing ──────────────────────────────────────────────────────
+
+/// `GET /v1/models` payload for a fixed model catalog.
+pub fn model_list(ids: &[&str], owned_by: &str, created: u64) -> ModelList {
+    ModelList {
+        object: "list".to_string(),
+        data: ids
+            .iter()
+            .map(|id| ModelInfo {
+                id: id.to_string(),
+                object: "model".to_string(),
+                created,
+                owned_by: owned_by.to_string(),
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> RequestDefaults {
+        RequestDefaults { temperature: 0.7, max_tokens: 4096 }
+    }
+
+    fn meta() -> CompletionMeta {
+        CompletionMeta {
+            id: "chatcmpl-test".to_string(),
+            created: 1_700_000_000,
+            model: "deepseek-chat".to_string(),
+        }
+    }
+
+    #[test]
+    fn request_with_string_content_parses_and_converts() {
+        let raw = r#"{
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"}
+            ],
+            "stream": true,
+            "some_future_field": {"ignored": true}
+        }"#;
+        let request: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+        let internal = to_internal_request(request, &defaults()).unwrap();
+
+        assert_eq!(internal.model, "deepseek-chat");
+        assert_eq!(internal.messages.len(), 2);
+        assert_eq!(internal.messages[0].role, Role::System);
+        assert_eq!(internal.messages[0].content, "be terse");
+        assert_eq!(internal.messages[1].role, Role::User);
+        // Omitted optionals fall back to the embedder's defaults.
+        assert_eq!(internal.temperature, 0.7);
+        assert_eq!(internal.max_tokens, 4096);
+    }
+
+    #[test]
+    fn content_parts_flatten_to_text_only() {
+        let raw = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": "data:..."}},
+                {"type": "text", "text": "and this"}
+            ]}]
+        }"#;
+        let request: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+        let internal = to_internal_request(request, &defaults()).unwrap();
+        assert_eq!(internal.messages[0].content, "look at this\nand this");
+    }
+
+    #[test]
+    fn role_aliases_and_unknown_roles() {
+        assert_eq!(role_from_openai("developer").unwrap(), Role::System);
+        assert_eq!(role_from_openai("function").unwrap(), Role::Tool);
+        assert!(role_from_openai("robot").is_err());
+    }
+
+    #[test]
+    fn max_completion_tokens_wins_over_legacy_max_tokens() {
+        let raw = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "max_tokens": 100,
+            "max_completion_tokens": 200
+        }"#;
+        let request: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+        let internal = to_internal_request(request, &defaults()).unwrap();
+        assert_eq!(internal.max_tokens, 200);
+    }
+
+    #[test]
+    fn response_serializes_with_openai_shape() {
+        let response = CompletionResponse {
+            content: "hello".to_string(),
+            finish_reason: None,
+            usage: None,
+        };
+        let openai = response_to_openai(&response, estimated_usage(&["hi"], "hello"), &meta());
+        let json = serde_json::to_value(&openai).unwrap();
+
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["id"], "chatcmpl-test");
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["message"]["content"], "hello");
+        // finish_reason defaults to "stop" when the provider reported none.
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert!(json["usage"]["total_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn stream_protocol_first_delta_and_final_chunk() {
+        let first = delta_chunk("Hel", true, &meta());
+        let middle = delta_chunk("lo", false, &meta());
+        let last = final_chunk("stop", &meta());
+
+        let first_json = serde_json::to_value(&first).unwrap();
+        assert_eq!(first_json["object"], "chat.completion.chunk");
+        assert_eq!(first_json["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(first_json["choices"][0]["delta"]["content"], "Hel");
+
+        let middle_json = serde_json::to_value(&middle).unwrap();
+        assert!(middle_json["choices"][0]["delta"].get("role").is_none());
+
+        let last_json = serde_json::to_value(&last).unwrap();
+        assert_eq!(last_json["choices"][0]["finish_reason"], "stop");
+        assert!(last_json["choices"][0]["delta"].get("content").is_none());
+
+        // All chunks of one completion share the same id.
+        assert_eq!(first.id, last.id);
+    }
+
+    #[test]
+    fn internal_request_round_trips_through_openai_shape() {
+        let mut ui_notice = ChatMessage::system("ui chrome");
+        ui_notice.ui_only = true;
+        let internal = CompletionRequest {
+            messages: vec![
+                ChatMessage::system("sys"),
+                ui_notice,
+                ChatMessage::user("question"),
+                ChatMessage::tool("call_1", "result"),
+            ],
+            model: "deepseek-chat".to_string(),
+            temperature: 0.3,
+            max_tokens: 512,
+            stream: true,
+        };
+
+        let wire = request_to_openai(&internal);
+        // ui_only chrome must not survive the conversion.
+        assert_eq!(wire["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(wire["messages"][2]["role"], "tool");
+        assert_eq!(wire["messages"][2]["tool_call_id"], "call_1");
+
+        // And the wire shape parses back through the inbound path.
+        let raw = serde_json::json!({
+            "model": wire["model"],
+            "messages": wire["messages"],
+            "temperature": wire["temperature"],
+            "max_tokens": wire["max_tokens"],
+        });
+        let reparsed: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        let back = to_internal_request(reparsed, &defaults()).unwrap();
+        assert_eq!(back.messages.len(), 3);
+        assert_eq!(back.messages[0].role, Role::System);
+        assert_eq!(back.messages[2].role, Role::Tool);
+        assert_eq!(back.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(back.temperature, 0.3);
+        assert_eq!(back.max_tokens, 512);
+    }
+
+    #[test]
+    fn openai_chunk_converts_to_internal() {
+        let chunk = ChatCompletionChunk {
+            id: "chatcmpl-x".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "m".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta { role: None, content: Some("tok".to_string()) },
+                finish_reason: Some("stop".to_string()),
+            }],
+        };
+        let internal = chunk_from_openai(chunk);
+        assert_eq!(internal.content, "tok");
+        assert_eq!(internal.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn model_list_shape() {
+        let list = model_list(&["deepseek-chat", "deepseek-reasoner"], "pooprusteek", 1);
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"][0]["id"], "deepseek-chat");
+        assert_eq!(json["data"][1]["object"], "model");
+    }
+
+    #[test]
+    fn error_envelope_shape() {
+        let error = ErrorResponse::invalid_request("bad role");
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["message"], "bad role");
+    }
+}

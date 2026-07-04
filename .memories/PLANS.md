@@ -1,6 +1,6 @@
 # PLANS
 > Roadmap, active priorities, and ideas.
-> Last updated: 2026-06-30 (sub-agents/multichat shipped; god-object refactor mostly done)
+> Last updated: 2026-07-05 (OpenAI-compat protocol layer shipped; keys.rs decomposition done — see JOURNAL)
 
 ## RECENTLY SHIPPED (`[DONE]` — was on this roadmap)
 
@@ -14,7 +14,7 @@
 
 | Priority | What | Why |
 |----------|------|-----|
-| P1 | Decompose `handle_key` (`keys.rs`, 878 lines) into key→intent + intent→effect | Next clean-refactor step; makes key handling testable without a live `App`. Not started. |
+| P1 | **OpenAI-compatible server mode** | Owner request (2026-07-05): pooprusteek should be able to run as a local server that existing OpenAI-speaking tools (aider, Continue, OpenWebUI, …) call via `POST /v1/chat/completions` + `GET /v1/models`, while it internally uses whatever provider it has (today: free DeepSeek web API). The protocol layer is DONE — `provider/openai_compat.rs` (wire types + both-direction conversions + streaming first-delta/final-chunk protocol, test-covered). Remaining: (1) transport — an axum/hyper HTTP listener behind a CLI flag (e.g. `--serve [addr]`), reusing the ACP-mode pattern in `main.rs`; SSE framing = serialize each `ChatCompletionChunk` as a `data:` line + terminal `data: [DONE]`; (2) session strategy — one provider `fork()` per request (stateless, like OpenAI) vs keyed sessions; stateless-per-request + `discard_remote_session` after each call is the natural v1 (no junk chats on the account); (3) auth — optional bearer token check; (4) decide whether server requests bypass the tool loop entirely (plain completion, v1) or run the agent loop (later). Same types also unlock an OpenAI-compatible *client* provider (`ProviderKind::Openai` finally implementable) via `request_to_openai`/`response_from_openai`/`chunk_from_openai`. |
 | P0 | Multi-theme support | Only Catppuccin Mocha; `ui.theme` is currently ignored |
 | P1 | Error recovery polish | Retry/backoff exists but no jitter, no total-time cap, no `Retry-After` |
 | P1 | GOAL hard iteration cap | Prevent infinite agent↔evaluator loops |
