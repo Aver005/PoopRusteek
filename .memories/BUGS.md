@@ -1,6 +1,6 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-07-02 (2026-07-02 refactor session: all CRITICAL/most MEDIUM fixed — see RESOLVED)
+> Last updated: 2026-07-04 (fixed false-positive "output capture likely failed" error on empty-but-successful PowerShell output)
 > Full audit digest: `reference/AUDIT-2026-07-02.md` (2026-07-02)
 
 ## CRITICAL
@@ -36,6 +36,7 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 
 ## RESOLVED / MOOT
 
+- ✅ `~~PowerShell commands with genuinely empty output (e.g. a filter matching nothing) were reported to the agent as "[powershell exited successfully but returned no stdout/stderr; output capture likely failed]" — a ToolResult::error~~` — the 2026-07-03 evening pass added this as a speculative capture-failure guard, but exit-0 + empty stdout/stderr is a normal, common outcome (no matches, silent success like `Set-Content`), not evidence of a bug. The agent read the `is_error` flag and treated a healthy zero-result command as broken. Fixed 2026-07-04: same branch now returns `ToolResult::success("(command completed successfully with no output)")`; the `shell.foreground.empty_success` debug-log event is unchanged for diagnostics if a real capture bug ever surfaces. `→ src/tools/shell.rs`
 - ✅ `~~Every turn ends with "stream ended early…" warning; final answers abort as AgentError~~` — the strict-stop pass wrongly assumed DeepSeek ends its SSE with `data: [DONE]`; the live protocol just closes the connection (0 `[DONE]` in a full session log). Clean EOF is now a normal stop in both `complete`/`complete_stream`; explicit finish signals (`[DONE]` ±space, `FINISHED` status patch, terminal BATCH) recognized in `process_stream_line`; unrecognized SSE lines now logged (`completion.*.skipped`). Fixed 2026-07-03 evening — see `JOURNAL/2026-07-03.md`. Watch item: one zero-content stream (metadata only, instant close) remains unexplained; skipped-line logging will identify it if it recurs.
 
 - ✅ **2026-07-03 follow-ups** — ephemeral remote-session leak fixed: `LLMProvider::discard_remote_session` wired into sidechat/sub-agent finalize, stop, foreground `task` forks, and (bounded, 3s) app exit; user-facing `/delete [id]` + `/delete-local [id]` added (shared multi-select picker, All/Local/Remote filter = deletion scope, confirm step, background remote fetch/delete via `RemoteSessionsListed`/`SessionsDeleted` events); `deepseek.rs` split into `deepseek/{mod,http,session,stream,endpoints}.rs`; deps bumped (reqwest 0.13, ratatui 0.30, crossterm 0.29, pulldown-cmark 0.13, toml 1.x); PoW wasm embedded via `include_bytes!`.

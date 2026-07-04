@@ -420,8 +420,12 @@ impl Tool for ShellTool {
                             }),
                         );
                         if self.shell.name == "powershell" {
-                            return ToolResult::error(
-                                "[powershell exited successfully but returned no stdout/stderr; output capture likely failed]",
+                            // Genuinely empty output (e.g. a filter that matched
+                            // nothing) is common and not a failure — flagging it
+                            // as `ToolResult::error` used to make the agent treat
+                            // a normal zero-result command as broken.
+                            return ToolResult::success(
+                                "(command completed successfully with no output)",
                             );
                         }
                     }
