@@ -278,16 +278,33 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 }
             }
             Role::System => {
-                lines.push(Line::from(vec![
-                    Span::styled(
+                let body = msg.visible_content();
+                let body_lines: Vec<&str> = body.lines().collect();
+                // A `Span`'s text is one terminal row — embedded `\n`s inside
+                // it don't create new rows, they just get glued onto the same
+                // line. Split on lines like `Role::Tool`/`Role::User` do, so
+                // multi-line system messages (e.g. `/rate`'s current-settings
+                // + usage) actually render as separate lines.
+                if body_lines.is_empty() {
+                    lines.push(Line::from(vec![Span::styled(
                         " \u{2139} ",
                         Style::default().fg(theme.warning).bg(theme.bg),
-                    ),
-                    Span::styled(
-                        msg.visible_content(),
-                        Style::default().fg(theme.text_dim).bg(theme.bg),
-                    ),
-                ]));
+                    )]));
+                } else {
+                    for (i, line_text) in body_lines.iter().enumerate() {
+                        let prefix = if i == 0 { " \u{2139} " } else { "   " };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                prefix,
+                                Style::default().fg(theme.warning).bg(theme.bg),
+                            ),
+                            Span::styled(
+                                (*line_text).to_string(),
+                                Style::default().fg(theme.text_dim).bg(theme.bg),
+                            ),
+                        ]));
+                    }
+                }
             }
             Role::Tool => {
                 let tool_name = msg.name.as_deref().unwrap_or("unknown");

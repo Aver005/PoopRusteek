@@ -23,8 +23,9 @@ impl Command for RateCommand {
 
         if trimmed.is_empty() {
             let message = format!(
-                "Current rate limit: {}\n{USAGE}",
-                config.agent.rate_limit_display()
+                "Current rate limit: {}\n\n{}",
+                config.agent.rate_limit_display(),
+                USAGE
             );
             state
                 .focused_mut()
