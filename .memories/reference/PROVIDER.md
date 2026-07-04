@@ -1,6 +1,11 @@
 # REFERENCE: DeepSeek Provider
 > The LLM backend. Reverse-engineered DeepSeek **web** API (chat.deepseek.com), not the public API key product.
-> Source: `src/provider/`. Last updated: 2026-06-30 (added fork() + session-fork fix)
+> Source: `src/provider/`. Last updated: 2026-07-04 (constructor gained `rate_limit_per_minute`; see note below on file split)
+
+> Line numbers below (`deepseek.rs:NNN`) predate the module split into
+> `src/provider/deepseek/{mod,http,session,stream,endpoints}.rs` — treat them as
+> approximate section pointers, not exact; `http.rs` now owns rate limiting and
+> retry/backoff, `mod.rs` owns the type + constructor.
 
 ## LLMProvider TRAIT (`src/provider/mod.rs:192`)
 
@@ -27,7 +32,7 @@
 
 ## DEEPSEEK CLIENT (`src/provider/deepseek.rs`)
 
-- **Constructor** `new(config, rate_limit_ms, max_retries)` (:114). `max_retries`: -1=infinite, 0=none, N=N+1 attempts.
+- **Constructor** `new(config, rate_limit_ms, rate_limit_per_minute, max_retries)` (`deepseek/mod.rs`). `max_retries`: -1=infinite, 0=none, N=N+1 attempts.
 - **Base URL**: `https://chat.deepseek.com/api/v0` (:20).
 - **Auth**: cookie/token session (NOT an API key). `auth_headers()` (:144) sets `Authorization: Bearer {token}` + spoofed Android client headers (`x-client-platform: android`, `x-client-version: 1.8.0`, `x-client-locale: zh_CN`, a Chrome/YaBrowser UA).
 - **`SessionState`** (:84) — `session_id?, parent_message_id?, system_sent_for_session`. Held in a `Mutex`. Tracks DeepSeek-side conversation continuity; system prompt sent once per session.
@@ -75,6 +80,6 @@ DeepSeek web API takes a single `prompt` string, so history is flattened:
 
 ## RESILIENCE
 
-- **Rate limit** (`enforce_rate_limit`, :212): sleeps to honor `rate_limit_ms` (set via `/rate`).
+- **Rate limit** (`enforce_rate_limit`, `deepseek/http.rs`): two independent, composable gates — a min spacing between requests (`rate_limit_ms`) and a sliding 60s-window request cap (`rate_limit_per_minute`, tracked via a `VecDeque<Instant>` in `request_history`); both set via `/rate` and either can be 0 to disable.
 - **Retry/backoff** (`send_json_request`, :225): exponential `min(30s, 1000ms·2^(n-1))` on 5xx/network errors; **no jitter, no `Retry-After` parsing, no total-time cap** → with `max_retries=-1` can hang forever.
 - No request-level timeout set (relies on reqwest defaults). Token usage never tracked (estimated `len/4`).

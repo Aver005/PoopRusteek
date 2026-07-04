@@ -72,6 +72,7 @@ fn run_acp_server(config: &Config) -> Result<()> {
     let provider = crate::provider::deepseek::DeepseekProvider::new(
         &config.provider,
         config.agent.rate_limit_ms,
+        config.agent.rate_limit_per_minute,
         config.agent.max_retries,
     )?;
     let provider = Arc::new(provider);

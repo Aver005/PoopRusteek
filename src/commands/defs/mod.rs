@@ -28,3 +28,4 @@ pub mod agent;
 pub mod delete;
 pub mod logout;
 pub mod wipe;
+pub mod debug;

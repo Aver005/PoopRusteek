@@ -166,6 +166,7 @@ impl App {
             let ds = crate::provider::deepseek::DeepseekProvider::new(
                 &config.provider,
                 config.agent.rate_limit_ms,
+                config.agent.rate_limit_per_minute,
                 config.agent.max_retries,
             )?;
             Some(Arc::new(ds))

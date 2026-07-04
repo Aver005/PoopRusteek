@@ -83,6 +83,7 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
         sid.clone()
     };
     data_row(&mut lines, "Session", &short_sid, theme);
+    data_row(&mut lines, "Rate", &config.agent.rate_limit_display(), theme);
     blank(&mut lines);
 
     // ── Session ──

@@ -131,6 +131,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::delete::DeleteLocalCommand));
         self.register(Box::new(defs::logout::LogoutCommand));
         self.register(Box::new(defs::wipe::WipeCommand));
+        self.register(Box::new(defs::debug::DebugCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

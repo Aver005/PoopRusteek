@@ -1,6 +1,6 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-07-02 (added /logout, /wipe)
+> Last updated: 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
 
 ## HOW COMMANDS WORK
 
@@ -13,7 +13,7 @@
 ### `CommandResult` variants (`src/commands/mod.rs:26`)
 `Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)` · `OpenConfirm(ConfirmAction)`
 
-## FULL COMMAND LIST (32 commands, +2 `/cwd` aliases)
+## FULL COMMAND LIST (33 commands, +2 `/cwd` aliases)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -39,7 +39,7 @@
 | `/tools` | — | — | Show all available tools (built-in + MCP) | `defs/tools.rs` |
 | `/skills` | — | `[list\|enable <name>\|disable <name>]` | Manage skills; no-arg opens picker | `defs/skills.rs` |
 | `/whitelist` | — | — | Open tool auto-approval whitelist manager | `defs/whitelist.rs` |
-| `/rate` | — | `<ms>` | Set min delay between API requests (0 = off) → `config.agent.rate_limit_ms` | `defs/rate.rs` |
+| `/rate` | — | `[<ms>\|<N>/min\|<N>rpm\|off]` | Set min delay between requests (`rate_limit_ms`) and/or max requests per rolling 60s window (`rate_limit_per_minute`) — independent gates, both may be active; `off` zeroes both. No args → prints current settings (`AgentConfig::rate_limit_display`) instead of just a usage error; every change pushes a confirmation system message | `defs/rate.rs` |
 | `/retry` | — | `<N\|on\|off\|-1>` | Set max retries on API failure → `config.agent.max_retries` (-1/on = infinite, 0/off = none) | `defs/retry.rs` |
 | `/btw` | — | `<question>` | One-shot side-question answered in the background (ephemeral `Sidechat` conversation, forked provider) — doesn't disturb the main turn | `defs/btw.rs` |
 | `/new` | — | — | Open a new parallel chat (`Session` conversation, forked provider, fresh session) and switch to it | `defs/chats.rs` (`NewChatCommand`) |
@@ -48,6 +48,7 @@
 | `/agents` | — | — | List and stop running background sub-agents (picker) | `defs/agent.rs` (`AgentsCommand`) |
 | `/logout` | — | — | Confirm → cancel all turns, clear `provider.token`, save config, show onboarding (`reset_to_onboarding`) | `defs/logout.rs` |
 | `/wipe` | — | — | Confirm → cancel all turns, `remove_dir_all` over `wipe_roots()` (config-file parent + data dir, deduped), factory reset to `Config::default`, clear whitelist/history, show onboarding | `defs/wipe.rs` |
+| `/debug` | — | `[on\|off]` | Toggle debug logging at runtime via `debug_log::set_enabled` (no args = flip current state); lazily opens `.dev/debug.log` on first enable | `defs/debug.rs` |
 
 ## NOTES & GOTCHAS
 

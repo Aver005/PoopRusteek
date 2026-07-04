@@ -90,17 +90,51 @@ impl DeepseekProvider {
         );
     }
 
+    /// Applies two independent, composable gates before letting a request
+    /// through: a minimum spacing between consecutive requests
+    /// (`rate_limit_ms`) and a cap on how many requests may fire within any
+    /// rolling 60s window (`rate_limit_per_minute`). Either can be 0 to
+    /// disable it; both can be active at once.
     pub(super) async fn enforce_rate_limit(&self) {
-        let elapsed = self
-            .last_request
-            .lock()
-            .map(|last| last.elapsed())
-            .unwrap_or(Duration::from_secs(60));
-        let min_interval = Duration::from_millis(self.rate_limit_ms);
-        if elapsed < min_interval {
-            sleep(min_interval - elapsed).await;
+        if self.rate_limit_ms > 0 {
+            let elapsed = self
+                .last_request
+                .lock()
+                .map(|last| last.elapsed())
+                .unwrap_or(Duration::from_secs(60));
+            let min_interval = Duration::from_millis(self.rate_limit_ms);
+            if elapsed < min_interval {
+                sleep(min_interval - elapsed).await;
+            }
         }
         let _ = self.last_request.lock().map(|mut last| *last = std::time::Instant::now());
+
+        if self.rate_limit_per_minute > 0 {
+            let window = Duration::from_secs(60);
+            loop {
+                let wait = {
+                    let mut history = self.request_history.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    while let Some(&oldest) = history.front() {
+                        if now.duration_since(oldest) >= window {
+                            history.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    if history.len() < self.rate_limit_per_minute as usize {
+                        history.push_back(now);
+                        None
+                    } else {
+                        Some(window - now.duration_since(history[0]))
+                    }
+                };
+                match wait {
+                    None => break,
+                    Some(duration) => sleep(duration).await,
+                }
+            }
+        }
     }
 
     /// Exponential backoff for retry loops: 1s, 2s, 4s… capped at 30s.

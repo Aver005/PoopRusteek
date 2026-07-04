@@ -10,23 +10,60 @@ impl Command for RateCommand {
     }
 
     fn description(&self) -> &str {
-        "Set rate limit between requests (ms)"
+        "Set rate limit: ms between requests, or max requests/min"
     }
 
     fn usage(&self) -> &str {
-        "/rate <milliseconds>  (0 to disable)"
+        "/rate <ms> | <N>/min | off  (both may be set independently)"
     }
 
-    fn execute(&self, args: &str, _state: &mut AppState, config: &Config) -> CommandResult {
-        let ms: u64 = match args.trim().parse() {
-            Ok(v) => v,
-            Err(_) => return CommandResult::Error("Usage: /rate <milliseconds>".to_string()),
-        };
+    fn execute(&self, args: &str, state: &mut AppState, config: &Config) -> CommandResult {
+        const USAGE: &str = "Usage: /rate <milliseconds> | <N>/min | off";
+        let trimmed = args.trim();
+
+        if trimmed.is_empty() {
+            let message = format!(
+                "Current rate limit: {}\n{USAGE}",
+                config.agent.rate_limit_display()
+            );
+            state
+                .focused_mut()
+                .messages
+                .push(crate::provider::ChatMessage::system(&message));
+            return CommandResult::Handled;
+        }
+
         let mut cfg = config.clone();
-        cfg.agent.rate_limit_ms = ms;
+
+        if trimmed.eq_ignore_ascii_case("off") {
+            cfg.agent.rate_limit_ms = 0;
+            cfg.agent.rate_limit_per_minute = 0;
+        } else if let Some(count) = trimmed
+            .strip_suffix("/min")
+            .or_else(|| trimmed.strip_suffix("rpm"))
+        {
+            let per_minute: u32 = match count.trim().parse() {
+                Ok(v) => v,
+                Err(_) => return CommandResult::Error(USAGE.to_string()),
+            };
+            cfg.agent.rate_limit_per_minute = per_minute;
+        } else {
+            let ms: u64 = match trimmed.parse() {
+                Ok(v) => v,
+                Err(_) => return CommandResult::Error(USAGE.to_string()),
+            };
+            cfg.agent.rate_limit_ms = ms;
+        }
+
         if let Err(e) = crate::config::save(&cfg) {
             return CommandResult::Error(format!("Failed to save config: {e}"));
         }
+
+        state.focused_mut().messages.push(crate::provider::ChatMessage::system(&format!(
+            "Rate limit updated: {}",
+            cfg.agent.rate_limit_display()
+        )));
+
         CommandResult::ResetProvider
     }
 }

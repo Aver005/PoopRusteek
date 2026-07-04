@@ -129,8 +129,9 @@ On first launch, an onboarding flow helps you set your DeepSeek token and model.
 
 | Command | Description |
 |---------|-------------|
-| `/rate <ms>` | Min delay between API requests (0 = off) |
+| `/rate <ms>\|<N>/min\|off` | Rate limit: ms between requests and/or max requests per minute |
 | `/retry <N\|on\|off\|-1>` | Max retries on API failure (-1 = infinite) |
+| `/debug [on\|off]` | Toggle debug logging to `.dev/debug.log` (no args = switch) |
 | `/help` · `/version` · `/quit` | Help · version · exit |
 
 </details>
@@ -156,6 +157,7 @@ max_steps_per_turn = 256
 max_tools_per_step = 10
 max_context_messages = 256
 rate_limit_ms = 0
+rate_limit_per_minute = 0   # max requests per rolling 60s window (0 = off)
 max_retries = 0      # -1 = infinite, 0 = none, N = N+1 attempts
 ```
 

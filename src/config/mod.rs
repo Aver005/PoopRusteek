@@ -45,7 +45,29 @@ pub struct AgentConfig {
     pub max_context_messages: usize,
     pub auto_compact: bool,
     pub rate_limit_ms: u64,
+    /// Max requests allowed in any rolling 60s window (0 = no cap). Applied
+    /// alongside `rate_limit_ms` rather than replacing it — the two catch
+    /// different shapes of abuse (burst vs. steady-state).
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
     pub max_retries: i32,
+}
+
+impl AgentConfig {
+    /// Short human-readable summary of both rate-limit gates, shared by the
+    /// `/rate` command's confirmation message and the stats panel so they
+    /// never drift out of sync (e.g. "500ms, 10/min" or "off").
+    pub fn rate_limit_display(&self) -> String {
+        let ms = (self.rate_limit_ms > 0).then(|| format!("{}ms", self.rate_limit_ms));
+        let per_min = (self.rate_limit_per_minute > 0)
+            .then(|| format!("{}/min", self.rate_limit_per_minute));
+        match (ms, per_min) {
+            (None, None) => "off".to_string(),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (Some(a), Some(b)) => format!("{a}, {b}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +110,7 @@ impl Default for Config {
                 max_context_messages: 256,
                 auto_compact: true,
                 rate_limit_ms: 0,
+                rate_limit_per_minute: 0,
                 max_retries: 0,
             },
             mcp: McpConfig::default(),
@@ -144,4 +167,36 @@ pub fn save(config: &Config) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent_with(rate_limit_ms: u64, rate_limit_per_minute: u32) -> AgentConfig {
+        let mut agent = Config::default().agent;
+        agent.rate_limit_ms = rate_limit_ms;
+        agent.rate_limit_per_minute = rate_limit_per_minute;
+        agent
+    }
+
+    #[test]
+    fn rate_limit_display_both_zero_is_off() {
+        assert_eq!(agent_with(0, 0).rate_limit_display(), "off");
+    }
+
+    #[test]
+    fn rate_limit_display_ms_only() {
+        assert_eq!(agent_with(500, 0).rate_limit_display(), "500ms");
+    }
+
+    #[test]
+    fn rate_limit_display_per_minute_only() {
+        assert_eq!(agent_with(0, 10).rate_limit_display(), "10/min");
+    }
+
+    #[test]
+    fn rate_limit_display_both_set() {
+        assert_eq!(agent_with(500, 10).rate_limit_display(), "500ms, 10/min");
+    }
 }

@@ -379,6 +379,10 @@ impl App {
                                 self.state.autocomplete = AutocompleteState::default();
                                 self.state.input.history_index = None;
                                 crate::session::append_history(&input);
+                                // Keep the in-memory recall list in sync with disk —
+                                // otherwise up-arrow only ever shows what was loaded
+                                // at startup, never anything typed this session.
+                                self.state.input.history = crate::session::load_history();
 
                                 // --- GOAL mode: intercept non-command input ---
                                 if self.state.goal.mode && !input.starts_with('/') {
@@ -465,6 +469,7 @@ impl App {
                                         crate::provider::deepseek::DeepseekProvider::new(
                                             &self.config.provider,
                                             self.config.agent.rate_limit_ms,
+                                            self.config.agent.rate_limit_per_minute,
                                             self.config.agent.max_retries,
                                         ).ok().map(|ds| Arc::new(ds) as Arc<dyn LLMProvider>)
                                     };
@@ -682,6 +687,7 @@ impl App {
                     let provider = match crate::provider::deepseek::DeepseekProvider::new(
                         &self.config.provider,
                         self.config.agent.rate_limit_ms,
+                        self.config.agent.rate_limit_per_minute,
                         self.config.agent.max_retries,
                     ) {
                         Ok(ds) => Arc::new(ds) as Arc<dyn LLMProvider>,

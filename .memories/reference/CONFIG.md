@@ -1,6 +1,6 @@
 # REFERENCE: Config, Storage & Sessions
 > Where everything lives on disk. Source: `src/config/mod.rs`, `src/session.rs`.
-> Last updated: 2026-07-02
+> Last updated: 2026-07-04 (added `agent.rate_limit_per_minute`; debug log is now runtime-toggleable via `/debug`, not just the CLI flag)
 
 ## FILE LOCATIONS (`config/mod.rs:100`)
 
@@ -13,7 +13,7 @@ Paths come from the `dirs` crate, so they are **platform-specific**:
 | Sessions | `{data}/sessions/{id}.json` | … | … | … |
 | History | `{data}/history.json` | … | … | … |
 | MCP own config | `{data}/mcp.json` | … | … | … |
-| Debug log | `.dev/debug.log` (relative to CWD, only if `--debug_log`) | — | — | — |
+| Debug log | `.dev/debug.log` (relative to CWD; enabled by `--debug_log` at startup or toggled at runtime via `/debug`) | — | — | — |
 
 > On this machine (Windows), config + data both resolve under `%APPDATA%\Roaming\pooprusteek\`.
 
@@ -39,7 +39,8 @@ max_steps_per_turn = 256   # agent loop hard cap (NOT 25)
 max_tools_per_step = 10    # tools executed per step (NOT 50)
 max_context_messages = 256
 auto_compact = true
-rate_limit_ms = 0          # set via /rate; 0 = disabled
+rate_limit_ms = 0          # set via /rate <ms>; 0 = disabled
+rate_limit_per_minute = 0  # set via /rate <N>/min; 0 = disabled; #[serde(default)] so old config.toml files without this key still load
 max_retries = 0            # set via /retry; -1 = infinite
 
 [mcp]

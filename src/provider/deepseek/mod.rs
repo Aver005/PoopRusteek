@@ -24,6 +24,7 @@ use crate::error::{AppError, AppResult};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::time::Duration;
@@ -38,12 +39,19 @@ pub struct DeepseekProvider {
     max_tokens: u32,
     session_state: Mutex<SessionState>,
     rate_limit_ms: u64,
+    rate_limit_per_minute: u32,
     max_retries: i32,
     last_request: Mutex<Instant>,
+    request_history: Mutex<VecDeque<Instant>>,
 }
 
 impl DeepseekProvider {
-    pub fn new(config: &ProviderConfig, rate_limit_ms: u64, max_retries: i32) -> AppResult<Self> {
+    pub fn new(
+        config: &ProviderConfig,
+        rate_limit_ms: u64,
+        rate_limit_per_minute: u32,
+        max_retries: i32,
+    ) -> AppResult<Self> {
         // `read_timeout` (not `timeout`) so a stalled connection errors out
         // while a healthy long-lived SSE stream keeps flowing: it bounds the
         // gap *between* bytes, not the whole request.
@@ -60,8 +68,10 @@ impl DeepseekProvider {
             max_tokens: config.max_tokens,
             session_state: Mutex::new(SessionState::default()),
             rate_limit_ms,
+            rate_limit_per_minute,
             max_retries,
             last_request: Mutex::new(Instant::now()),
+            request_history: Mutex::new(VecDeque::new()),
         };
 
         debug_log::log(
@@ -91,8 +101,10 @@ impl DeepseekProvider {
             max_tokens: self.max_tokens,
             session_state: Mutex::new(SessionState::default()),
             rate_limit_ms: self.rate_limit_ms,
+            rate_limit_per_minute: self.rate_limit_per_minute,
             max_retries: self.max_retries,
             last_request: Mutex::new(Instant::now()),
+            request_history: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -361,7 +373,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 128,
         };
-        DeepseekProvider::new(&config, 0, 0).expect("client builds")
+        DeepseekProvider::new(&config, 0, 0, 0).expect("client builds")
     }
 
     #[test]

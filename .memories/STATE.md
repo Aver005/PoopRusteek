@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-03 (DeepSeek SSE finish-signal fix: clean EOF = stop, "stream ended early" warning gone — tests 219, clippy 0)
+> Last updated: 2026-07-04 (`/rate` per-minute cap + confirmation messages, `/debug [on|off]` runtime toggle, stats-panel Rate row, input-history-after-submit fix — tests 223, clippy 0)
 
 ## PHASE COMPLETION
 
@@ -13,7 +13,7 @@
 | 3.6 Multi-chat | `[DONE]` | `Conversation`/`Conversations` model, provider `fork()`, event tagging by `ConversationId`, parallel sessions (`/new` `/chats` + Tab), `/btw` sidechat, sub-agents (model `task` tool + `/agent`/`/agents`, fg+bg) |
 | 3.7 Architecture | `[DONE]` | God-object `App` decomposed (mod.rs 2.4k→925): sub-state modules + controllers (`AgentRuntime`, `system_prompt::build`, `BackgroundCounters`, `McpStatus`). Provider split (prompt/sse/fake). |
 | 3.8 Stability & perf overhaul | `[DONE]` | 2026-07-02: all 7 audit criticals fixed (live streaming, MCP mutex freeze, GOAL evaluator off-loop, `/goal` registration, `--acp` panic, drain+dirty render with markdown/syntect cache, MCP stdio stderr+id-correlation) + ~30 majors (interaction queue, ui_only message split, atomic_write everywhere, CI, shell timeout/cap, background process-group kill, etc.) + dead-code sweep; clippy ~220→0, tests 84→189. See `reference/AUDIT-2026-07-02.md` + `JOURNAL/2026-07-02.md`. |
-| 4 Polish | `[WIP]` | Multi-theme, mouse, copy/paste, error recovery, rate limiting (retry/backoff exists), schema validation |
+| 4 Polish | `[WIP]` | Multi-theme, mouse, copy/paste, error recovery, rate limiting `[DONE]` (ms-interval + per-minute cap, both via `/rate`; retry/backoff exists), schema validation |
 | 5 Distribution | `[WIP]` | CI added (`.github/workflows/ci.yml`, build+test win+linux, clippy advisory); release builds, cross-compile, installers, man page still `[TODO]` |
 
 ## BUILD STATUS
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **219 passing** (`cargo test --bin pooprusteek`) |
+| Tests | **223 passing** (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
