@@ -190,6 +190,24 @@ impl App {
                 }
             },
             CommandResult::Rag(action) => self.apply_rag_action(action),
+            CommandResult::SearchHistory(query) => {
+                self.state.status_message = format!("Searching history for \"{query}\"...");
+                let semantic = Arc::clone(&self.semantic);
+                let event_tx = self.event_tx.clone();
+                let conversation = self.state.conversations.focused_id();
+                tokio::spawn(async move {
+                    let for_search = query.clone();
+                    let results =
+                        tokio::task::spawn_blocking(move || semantic.search_history(&for_search, 8))
+                            .await
+                            .unwrap_or_default();
+                    let text = crate::semantic::render_history_results(&query, &results);
+                    let _ = event_tx.send(events::AppEvent::AddMessage(
+                        conversation,
+                        ChatMessage::ui_system(&text),
+                    ));
+                });
+            }
         }
         Ok(false)
     }
@@ -278,17 +296,21 @@ impl App {
              \n\
              State:   {state}\n\
              Model:   {model}\n\
-             Indexed: {} skills, {} MCP tools ({} known; deferred schemas: {})\n\
+             Indexed: {} skills, {} MCP tools ({} known; deferred schemas: {}), {} history chunks from {} sessions\n\
              Config:  top_k={}, min_dense_score={:.2}, mcp_schemas={:?}\n\
              \n\
              Subcommands:\n\
              \u{2022} /rag on      — enable (downloads the model on first use)\n\
              \u{2022} /rag off     — disable completely; full MCP schemas return to the system prompt\n\
-             \u{2022} /rag reload  — reinitialize: verify/re-download the model, re-embed skills + MCP tools",
+             \u{2022} /rag reload  — reinitialize: verify/re-download the model, re-embed skills, MCP tools and session history\n\
+             \n\
+             Related: /search <query> — search past conversations; the agent has tool_search and history_search.",
             status.skills_indexed,
             status.mcp_indexed,
             status.mcp_known,
             if status.deferred { "on" } else { "off" },
+            status.history_chunks,
+            status.history_sessions,
             self.config.semantic.top_k,
             self.config.semantic.min_dense_score,
             self.config.semantic.mcp_schemas,

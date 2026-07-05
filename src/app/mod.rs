@@ -231,7 +231,7 @@ impl App {
         // degrades to lexical matching over the raw tool list.
         let semantic =
             crate::semantic::SemanticService::start(&config, skills.clone(), event_tx.clone());
-        tools.register_tool_search(Arc::clone(&semantic));
+        tools.register_semantic_tools(Arc::clone(&semantic));
 
         if mcp_init_ok {
             let mgr = mcp.lock().await;

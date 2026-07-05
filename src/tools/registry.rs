@@ -55,10 +55,17 @@ impl ToolRegistry {
         }
     }
 
-    /// Register the semantic-backed `tool_search` tool. One-time, at app
-    /// startup (the service handle itself never changes; its corpora do).
-    pub fn register_tool_search(&self, semantic: std::sync::Arc<crate::semantic::SemanticService>) {
-        self.register(Arc::new(tool_search::ToolSearchTool { semantic }));
+    /// Register the semantic-backed tools (`tool_search`, `history_search`).
+    /// One-time, at app startup (the service handle itself never changes;
+    /// its corpora do).
+    pub fn register_semantic_tools(
+        &self,
+        semantic: std::sync::Arc<crate::semantic::SemanticService>,
+    ) {
+        self.register(Arc::new(tool_search::ToolSearchTool {
+            semantic: std::sync::Arc::clone(&semantic),
+        }));
+        self.register(Arc::new(history_search::HistorySearchTool { semantic }));
     }
 
     pub fn update_skills(&self, skills: Vec<SkillDefinition>) {

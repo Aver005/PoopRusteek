@@ -90,6 +90,9 @@ pub enum CommandResult {
     SwitchModel(String),
     /// `/rag [on|off|reload]` — semantic-matching control.
     Rag(RagAction),
+    /// `/search <query>` — history search; results flush back as a
+    /// UI-only message once the off-loop lookup completes.
+    SearchHistory(String),
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +200,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::wipe::WipeCommand));
         self.register(Box::new(defs::debug::DebugCommand));
         self.register(Box::new(defs::rag::RagCommand));
+        self.register(Box::new(defs::search::SearchCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

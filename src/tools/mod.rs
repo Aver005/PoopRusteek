@@ -6,6 +6,7 @@ pub mod background;
 pub mod shell_control;
 pub mod skill;
 pub mod tool_search;
+pub mod history_search;
 
 use async_trait::async_trait;
 use serde_json::Value;

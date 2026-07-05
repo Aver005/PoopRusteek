@@ -440,8 +440,19 @@ impl App {
         );
 
         self.state.focused_mut().broken = broken;
-        if let Err(e) = result {
-            tracing::warn!("Failed to auto-save session: {e}");
+        match result {
+            Err(e) => tracing::warn!("Failed to auto-save session: {e}"),
+            Ok(()) => {
+                // Session persisted — feed its new messages to the history
+                // index (no-op while semantic matching is off/initializing;
+                // the startup backfill catches up from the file later).
+                let conv = self.state.focused();
+                self.semantic.index_session(
+                    conv.session_id.clone(),
+                    session::derive_title(&conv.messages),
+                    conv.messages.clone(),
+                );
+            }
         }
     }
 }

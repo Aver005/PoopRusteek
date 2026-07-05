@@ -18,6 +18,7 @@
 //! synchronous work — never across an `.await`.
 
 pub mod embedder;
+pub mod history;
 pub mod index;
 pub mod matcher;
 pub mod sparse;
@@ -48,6 +49,8 @@ struct Inner {
     /// unavailable so `tool_search` can fall back to lexical matching,
     /// and so tools that arrive mid-init get embedded once init lands.
     raw_mcp: Vec<FullMCPTool>,
+    /// Persistent message-history index (loaded/backfilled during init).
+    history: Option<history::HistoryStore>,
 }
 
 /// Everything a turn hint can carry: skill suggestions + MCP tool
@@ -74,6 +77,8 @@ pub struct RagStatus {
     pub mcp_indexed: usize,
     pub mcp_known: usize,
     pub deferred: bool,
+    pub history_chunks: usize,
+    pub history_sessions: usize,
 }
 
 pub struct SemanticService {
@@ -137,15 +142,20 @@ impl SemanticService {
             let built = tokio::task::spawn_blocking(move || {
                 let mut emb = embedder::Embedder::init(cache_dir)?;
                 let skill_corpus = SkillCorpus::build(&mut emb, &skills)?;
+                let history_store = history::HistoryStore::open(Self::history_path());
                 // Store under the lock, then embed any MCP tools that
                 // arrived while the model was loading — same thread, same
-                // blocking budget.
+                // blocking budget. The session backfill runs last: it can
+                // be the slowest part (first run embeds every saved
+                // session) and everything else is already usable.
                 {
                     let mut inner = this_blocking.inner.lock().unwrap();
                     inner.embedder = Some(Box::new(emb));
                     inner.skills = Some(skill_corpus);
+                    inner.history = Some(history_store);
                 }
                 this_blocking.rebuild_mcp_corpus();
+                this_blocking.backfill_history();
                 Ok::<usize, String>(this_blocking.inner.lock().unwrap().skills.as_ref().map_or(0, SkillCorpus::len))
             })
             .await;
@@ -211,6 +221,10 @@ impl SemanticService {
             inner.embedder = None;
             inner.skills = None;
             inner.mcp = None;
+            // Dropped from memory only — the persisted file is re-opened by
+            // init (and wiped there if the model stamp no longer matches),
+            // then the session backfill re-indexes anything missing.
+            inner.history = None;
         }
         self.spawn_init(skills, event_tx);
         true
@@ -227,6 +241,8 @@ impl SemanticService {
             mcp_indexed: inner.mcp.as_ref().map_or(0, McpCorpus::len),
             mcp_known: inner.raw_mcp.len(),
             deferred: self.mcp_deferred.load(Ordering::Relaxed),
+            history_chunks: inner.history.as_ref().map_or(0, history::HistoryStore::record_count),
+            history_sessions: inner.history.as_ref().map_or(0, history::HistoryStore::session_count),
         }
     }
 
@@ -268,6 +284,101 @@ impl SemanticService {
     /// config + live tool count; this accessor is for hint rendering.
     pub fn mcp_schemas_deferred(&self) -> bool {
         self.mcp_deferred.load(Ordering::Relaxed)
+    }
+
+    fn history_path() -> std::path::PathBuf {
+        Config::data_dir().join("semantic").join("history.json")
+    }
+
+    /// Index every saved session the history store hasn't fully consumed
+    /// yet. Blocking (embedding + file reads) — runs at the tail of init.
+    /// Sessions whose on-disk message count matches the watermark are
+    /// skipped without loading the file body.
+    fn backfill_history(&self) {
+        let summaries = match crate::session::list_sessions() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("semantic: session list for backfill failed: {e}");
+                return;
+            }
+        };
+        let mut indexed_sessions = 0usize;
+        let mut indexed_chunks = 0usize;
+        for summary in &summaries {
+            {
+                let inner = self.inner.lock().unwrap();
+                let Some(store) = inner.history.as_ref() else { return };
+                if store.watermark(&summary.id) == summary.message_count {
+                    continue;
+                }
+            }
+            // `load_local` doesn't read its config parameter (kept for
+            // signature stability) — a default is fine here.
+            let Ok(session) = crate::session::load_local(&summary.id, &Config::default()) else {
+                continue;
+            };
+            let mut inner = self.inner.lock().unwrap();
+            let Inner { embedder, history, .. } = &mut *inner;
+            let (Some(emb), Some(store)) = (embedder, history) else { return };
+            match store.index_session(emb, &session.id, &summary.title, &session.messages) {
+                Ok(0) => {}
+                Ok(n) => {
+                    indexed_sessions += 1;
+                    indexed_chunks += n;
+                }
+                Err(e) => tracing::warn!("semantic: backfill of {} failed: {e}", session.id),
+            }
+        }
+        if indexed_chunks > 0 {
+            tracing::info!(
+                "semantic: history backfill indexed {indexed_chunks} chunks from {indexed_sessions} sessions"
+            );
+        }
+    }
+
+    /// Index a just-saved session's new messages. Cheap to call from the
+    /// event loop — the work happens on a blocking thread; skipped
+    /// silently while disabled or before init lands (the startup backfill
+    /// catches up later from the session file).
+    pub fn index_session(
+        self: &Arc<Self>,
+        session_id: String,
+        title: String,
+        messages: Vec<crate::provider::ChatMessage>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let mut inner = this.inner.lock().unwrap();
+            let Inner { embedder, history, .. } = &mut *inner;
+            let (Some(emb), Some(store)) = (embedder, history) else { return };
+            if let Err(e) = store.index_session(emb, &session_id, &title, &messages) {
+                tracing::warn!("semantic: indexing session {session_id} failed: {e}");
+            }
+        });
+    }
+
+    /// Search the message-history index. Returns an empty list while
+    /// disabled or before init lands. Blocking — call from
+    /// `spawn_blocking`.
+    pub fn search_history(&self, query: &str, limit: usize) -> Vec<history::HistoryMatch> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { embedder, history, .. } = &mut *inner;
+        let (Some(emb), Some(store)) = (embedder, history) else {
+            return Vec::new();
+        };
+        match store.search(emb, query, limit) {
+            Ok(matches) => matches,
+            Err(e) => {
+                tracing::warn!("semantic: history search failed: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// (Re)embed the MCP corpus from `raw_mcp`. Blocking; holds the inner
@@ -415,4 +526,32 @@ impl SemanticService {
         lines.push("If none of this fits the task, ignore this note.".to_string());
         Some(lines.join("\n"))
     }
+}
+
+/// Render `/search` results for the chat view. Free-standing so the
+/// dispatch task can format without holding the service.
+pub fn render_history_results(query: &str, matches: &[history::HistoryMatch]) -> String {
+    if matches.is_empty() {
+        return format!(
+            "No history matches for \"{query}\". The index may still be building — check /rag."
+        );
+    }
+    let mut lines = vec![format!("History matches for \"{query}\":")];
+    for (i, m) in matches.iter().enumerate() {
+        // Date part is enough for orientation; the full stamp is noise here.
+        let when = m.timestamp.split('T').next().unwrap_or(&m.timestamp);
+        let snippet =
+            crate::util::truncate_with_ellipsis(&m.text.replace(['\n', '\r'], " "), 220);
+        lines.push(format!(
+            "{}. [{}] {} — {}: {}\n   session: {}",
+            i + 1,
+            when,
+            m.title,
+            m.role,
+            snippet,
+            m.session_id,
+        ));
+    }
+    lines.push("Open one with /load <session-id>.".to_string());
+    lines.join("\n")
 }

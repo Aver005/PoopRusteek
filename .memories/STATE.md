@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-05 (semantic matching `src/semantic/`, stages 1+2 — local e5-small + stemmed TF-IDF + RRF over skills AND MCP tools; deferred MCP schemas (`[semantic] mcp_schemas`, auto >12 tools) + `tool_search` builtin; tests 313, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
+> Last updated: 2026-07-05 (semantic matching `src/semantic/`, stages 1–3 — local e5-small + stemmed TF-IDF + RRF over skills, MCP tools AND persistent message history; deferred MCP schemas + `tool_search`/`history_search` builtins; `/rag` control + `/search`; tests 320, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
 
 ## PHASE COMPLETION
 
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **315 passing** + 2 `#[ignore]`d (semantic MRR evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
+| Tests | **320 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
@@ -45,7 +45,7 @@
 - DeepSeek streaming never reports token usage (`usage` always None).
 - `/models` switching: model id is validated against `LLMProvider::list_models()` (GET /models for compat providers, fixed pair for DeepSeek).
 - Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`
-- No persistent RAG / codebase search. Stages 1+2 landed 2026-07-05: `src/semantic/` matches prompts against the *skill catalog* and the *MCP tool catalog* locally (e5-small ONNX + stemmed TF-IDF + RRF), with deferred MCP schemas + `tool_search`. Messages/codebase are still unindexed — history indexing (`/search`, `history_search` tool, RAG context refill) is the agreed stage 3 (see `JOURNAL/2026-07-05.md`).
+- ~~No persistent RAG~~ Stages 1–3 landed 2026-07-05: `src/semantic/` matches prompts against the *skill catalog* and *MCP tool catalog* locally (e5-small ONNX + stemmed TF-IDF + RRF), defers MCP schemas + `tool_search`, and now indexes *message history* persistently (`data_dir/semantic/history.json`, backfilled from session files) behind `/search` + the `history_search` tool. Still open: **codebase search** (files aren't indexed) and the far-goal **RAG context refill** (retrieve past messages instead of truncating when the window overflows) — see `JOURNAL/2026-07-05.md`.
 - Foreground child PID tracking is a single global slot, not per-conversation (also an upward `tools`→`app` dependency).
 - PoW challenge solved once per request, not re-solved per retry attempt (deliberately left as-is 2026-07-04 — changing it changes the request pattern against DeepSeek). The solve itself now runs on `spawn_blocking` (fixed 2026-07-04).
 - `"model"` field is hardcoded `"deepseek-chat"` in the request body, ignoring user config.

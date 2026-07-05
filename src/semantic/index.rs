@@ -70,8 +70,9 @@ impl HybridIndex {
 }
 
 /// Reciprocal Rank Fusion over several score lists (all in corpus order).
-/// Returns one fused score per document.
-fn rrf_fuse(score_lists: &[&Vec<f32>]) -> Vec<f32> {
+/// Returns one fused score per document. Shared with the history store,
+/// which owns its vectors (incremental appends) instead of a `HybridIndex`.
+pub(super) fn rrf_fuse(score_lists: &[&Vec<f32>]) -> Vec<f32> {
     let n = score_lists.first().map_or(0, |l| l.len());
     let mut fused = vec![0.0f32; n];
     for scores in score_lists {

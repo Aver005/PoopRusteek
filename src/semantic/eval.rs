@@ -181,6 +181,63 @@ fn mrr_over_mcp_tool_fixture_is_acceptable() {
     assert!(mrr >= 0.6, "mcp MRR degraded: {mrr:.3}");
 }
 
+/// End-to-end history flow with the real model: index a session, search
+/// it cross-language, persist, reopen, search again.
+#[test]
+#[ignore = "needs the ~120 MB embedding model; run manually with --ignored --nocapture"]
+fn history_index_search_and_persistence_roundtrip() {
+    use crate::provider::ChatMessage;
+    use super::history::HistoryStore;
+
+    let mut embedder = Embedder::init(Config::data_dir().join("models"))
+        .expect("embedder init (model download?) failed");
+    let path = std::env::temp_dir().join(format!(
+        "pooprusteek-history-eval-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let messages = vec![
+        ChatMessage::user("Как починить утечку памяти в tokio-задаче?"),
+        ChatMessage::assistant("Утечка была из-за незакрытого JoinHandle — надо вызывать abort() при дропе."),
+        ChatMessage::user("What linker flags does wasmtime need on Windows?"),
+        ChatMessage::assistant("wasmtime needs no special linker flags; the ittapi native lib is built by its build script."),
+    ];
+    let mut store = HistoryStore::open(path.clone());
+    let added = store
+        .index_session(&mut embedder, "sess-1", "Debugging session", &messages)
+        .expect("index failed");
+    assert_eq!(added, 4);
+    // Re-indexing the same list is a no-op (watermark).
+    assert_eq!(
+        store.index_session(&mut embedder, "sess-1", "Debugging session", &messages).unwrap(),
+        0
+    );
+
+    // Cross-language: an English query must surface the Russian
+    // memory-leak exchange (question or answer) as the top hit.
+    let hits = store.search(&mut embedder, "memory leak fix in async task", 3).unwrap();
+    assert!(
+        hits[0].text.contains("утечку памяти") || hits[0].text.contains("JoinHandle"),
+        "expected the memory-leak exchange on top, got: {:?}",
+        hits.iter().map(|h| &h.text).collect::<Vec<_>>()
+    );
+
+    // Persistence: a fresh open sees the same records and still searches.
+    let reopened = HistoryStore::open(path.clone());
+    assert_eq!(reopened.record_count(), 4);
+    assert_eq!(reopened.watermark("sess-1"), 4);
+    let mut embedder2 = embedder;
+    let hits = reopened.search(&mut embedder2, "флаги линковщика для wasmtime", 2).unwrap();
+    assert!(
+        hits.iter().any(|h| h.text.to_lowercase().contains("wasmtime")),
+        "expected the wasmtime answer, got: {:?}",
+        hits.iter().map(|h| &h.text).collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_file(&path);
+    println!("history roundtrip ok: 4 chunks, cross-language hits in both directions");
+}
+
 /// Sanity check that needs no model: the fixture corpus builds a sparse
 /// index where an exact keyword query wins.
 #[test]

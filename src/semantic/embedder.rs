@@ -8,6 +8,11 @@
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::{Path, PathBuf};
 
+/// Identity of the pinned model — persisted indexes (message history)
+/// stamp these into their header and rebuild when they change.
+pub const MODEL_ID: &str = "intfloat/multilingual-e5-small";
+pub const EMBEDDING_DIM: usize = 384;
+
 pub struct Embedder {
     model: TextEmbedding,
 }

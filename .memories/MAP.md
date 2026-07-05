@@ -110,8 +110,10 @@
 | `src/semantic/sparse.rs` | Stemmed TF-IDF sparse vectors (ru/en Snowball) — lexical half of the hybrid match |
 | `src/semantic/index.rs` | `HybridIndex` — generic dense+sparse ranker with RRF fusion and the dense-floor/lexical-overlap gate |
 | `src/semantic/matcher.rs` | Typed corpora over `HybridIndex`: `SkillCorpus` (skips enabled), `McpCorpus` (carries input_schema in matches) |
-| `src/semantic/eval.rs` | Retrieval eval: skill + MCP fixtures, ru/en queries → MRR (`#[ignore]`, needs the model). Latest: skills 0.927, MCP 0.836 |
+| `src/semantic/history.rs` | `HistoryStore` — persistent message-history index (chunked user/assistant messages of saved sessions; JSON + base64 vectors via `atomic_write`; per-session watermarks; model-stamp wipe; 50k cap) |
+| `src/semantic/eval.rs` | Retrieval eval: skill + MCP fixtures → MRR, history E2E roundtrip (`#[ignore]`, need the model). Latest: skills 0.927, MCP 0.836 |
 | `src/tools/tool_search.rs` | `tool_search` builtin — capability search over MCP tools, returns full definitions; lexical fallback pre-init. The escape hatch for deferred MCP schemas |
+| `src/tools/history_search.rs` | `history_search` builtin — agent-facing search over past sessions (session id + title + date + excerpt per hit) |
 | `src/util.rs` | `atomic_write` (now actually used everywhere), `expand_tilde` (single shared impl), `truncate_at_char_boundary` |
 | `src/cli/onboarding.rs` | **DELETED** — replaced by `View::Onboarding` in-TUI flow | — |
 | `src/cli/file_mentions.rs` | `@file:line` expansion — line-range clamp fixed (was an out-of-bounds slice panic) | ~120 |
