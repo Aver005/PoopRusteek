@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-05 (multi-theme system: `/themes` gallery with whole-frame live preview + step-by-step custom-theme wizard, 10 presets in `tui/theme.rs::PRESETS`, `[[ui.custom_themes]]` config — tests 345, clippy 0. Earlier same day: semantic matching `src/semantic/`, stages 1–3 — local e5-small + stemmed TF-IDF + RRF over skills, MCP tools AND persistent message history; deferred MCP schemas + `tool_search`/`history_search` builtins; `/rag` control + `/search`; tests 320, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
+> Last updated: 2026-07-06 (**API server mode shipped** — `src/server/` {mod,catalog,http,openai}: hyper-1 HTTP listener behind `--serve`/`--server`/`--api` flags + `/serve [on|off|api <d>]` + `/server <port>` (persisted `[server]` config: host/port/api/api_key, default port 7667); OpenAI Chat Completions dialect over EVERY configured provider — built-in DeepSeek (fork-per-request + `discard_remote_session`, no junk chats) and all `/providers` entries via `<entry>/<model>` ids (sub-model override supported); SSE streaming re-framed under one completion id + `data: [DONE]`; optional bearer auth, CORS, `/health`; `ServerApi` enum reserves anthropic/gemini dialect seams (501 until inbound conversions land); lifecycle via generation-tagged `AppEvent::ServerStarted/Failed/Stopped`; E2E socket tests incl. a mock-upstream gateway round-trip — tests 358, clippy 0). Before: 2026-07-05 (multi-theme system: `/themes` gallery with whole-frame live preview + step-by-step custom-theme wizard, 10 presets in `tui/theme.rs::PRESETS`, `[[ui.custom_themes]]` config — tests 345, clippy 0. Earlier same day: semantic matching `src/semantic/`, stages 1–3 — local e5-small + stemmed TF-IDF + RRF over skills, MCP tools AND persistent message history; deferred MCP schemas + `tool_search`/`history_search` builtins; `/rag` control + `/search`; tests 320, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
 
 ## PHASE COMPLETION
 
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **345 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
+| Tests | **358 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS

@@ -24,6 +24,96 @@ pub struct Config {
     /// provider.
     #[serde(default)]
     pub active_provider: Option<String>,
+    /// The local API server (`--serve` / `/serve`) — see `crate::server`.
+    #[serde(default)]
+    pub server: ServerConfig,
+}
+
+/// `[server]` — the local HTTP API gateway (`/serve on`, `--serve`).
+/// Exposes every configured provider (built-in DeepSeek + `/providers`
+/// entries) behind one endpoint speaking `api`'s wire dialect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Bind address. Loopback by default — exposing a keyless gateway to
+    /// paid/authed upstreams on a LAN must be an explicit decision.
+    #[serde(default = "default_server_host")]
+    pub host: String,
+    /// Listen port, persisted by `/server <port>`.
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+    /// Which wire dialect the server speaks — see [`ServerApi`].
+    #[serde(default)]
+    pub api: ServerApi,
+    /// When set, every request must carry `Authorization: Bearer <this>`.
+    /// `None`/empty = no auth (fine on loopback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+fn default_server_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_server_port() -> u16 {
+    ServerConfig::DEFAULT_PORT
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_server_host(),
+            port: default_server_port(),
+            api: ServerApi::default(),
+            api_key: None,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// "poop" on a T9 keypad — memorable and outside every well-known
+    /// local-LLM port (ollama 11434, LM Studio 1234, llama.cpp 8080).
+    pub const DEFAULT_PORT: u16 = 7667;
+}
+
+/// The wire dialect the API server speaks. Only OpenAI Chat Completions is
+/// implemented today; the other two are reserved so a config written for a
+/// future build still parses — requests under them answer 501 until their
+/// inbound conversions land (the outbound halves already exist in
+/// `provider::anthropic_compat` / `provider::gemini_compat`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerApi {
+    /// OpenAI Chat Completions (`POST /v1/chat/completions`, `GET /v1/models`).
+    #[default]
+    Openai,
+    /// Anthropic Messages (`POST /v1/messages`) — planned.
+    Anthropic,
+    /// Google Generative Language (`POST /v1beta/models/{m}:generateContent`) — planned.
+    Gemini,
+}
+
+impl ServerApi {
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerApi::Openai => "openai",
+            ServerApi::Anthropic => "anthropic",
+            ServerApi::Gemini => "gemini",
+        }
+    }
+
+    /// Parse a user-typed dialect name (`/serve api <kind>`).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "openai" | "oai" => Some(ServerApi::Openai),
+            "anthropic" | "claude" => Some(ServerApi::Anthropic),
+            "gemini" | "google" => Some(ServerApi::Gemini),
+            _ => None,
+        }
+    }
+
+    pub fn is_implemented(self) -> bool {
+        matches!(self, ServerApi::Openai)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +360,7 @@ impl Default for Config {
             semantic: SemanticConfig::default(),
             providers: Vec::new(),
             active_provider: None,
+            server: ServerConfig::default(),
         }
     }
 }
@@ -455,6 +546,34 @@ mod tests {
         assert!(parsed.active_provider.is_none());
         assert!(parsed.active_provider_entry().is_none());
         assert_eq!(parsed.active_model(), "deepseek-chat");
+    }
+
+    #[test]
+    fn config_without_server_section_still_loads() {
+        // Pre-server config files carry no [server] table — every field
+        // must default instead of failing the parse.
+        let old = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .lines()
+            .take_while(|line| !line.contains("[server]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed: Config = toml::from_str(&old).unwrap();
+        assert_eq!(parsed.server.port, ServerConfig::DEFAULT_PORT);
+        assert_eq!(parsed.server.host, "127.0.0.1");
+        assert_eq!(parsed.server.api, ServerApi::Openai);
+        assert!(parsed.server.api_key.is_none());
+    }
+
+    #[test]
+    fn server_api_parse_accepts_aliases_and_rejects_junk() {
+        assert_eq!(ServerApi::parse("OpenAI"), Some(ServerApi::Openai));
+        assert_eq!(ServerApi::parse("claude"), Some(ServerApi::Anthropic));
+        assert_eq!(ServerApi::parse("google"), Some(ServerApi::Gemini));
+        assert_eq!(ServerApi::parse("grpc"), None);
+        assert!(ServerApi::Openai.is_implemented());
+        assert!(!ServerApi::Anthropic.is_implemented());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-07-05 (added /themes — theme gallery with live preview + custom-theme wizard; earlier: /rag — semantic-matching status/on/off/reload). Before: 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
+> Last updated: 2026-07-06 (added /serve + /server — API-server control). Before: 2026-07-05 (added /themes — theme gallery with live preview + custom-theme wizard; earlier: /rag — semantic-matching status/on/off/reload); 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
 
 ## HOW COMMANDS WORK
 
@@ -13,7 +13,7 @@
 ### `CommandResult` variants (`src/commands/mod.rs:26`)
 `Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)` · `OpenConfirm(ConfirmAction)`
 
-## FULL COMMAND LIST (36 commands, +2 `/cwd` aliases)
+## FULL COMMAND LIST (38 commands, +2 `/cwd` aliases)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -51,6 +51,8 @@
 | `/debug` | — | `[on\|off]` | Toggle debug logging at runtime via `debug_log::set_enabled` (no args = flip current state); lazily opens `.dev/debug.log` on first enable | `defs/debug.rs` |
 | `/search` | — | `[query]` | Opens the full-screen `View::Search`: query line + sort (`s`: relevance/newest/oldest) + role filter (`r`) + unique-per-session dedup (`u`); Enter on a result loads that session. Lookup runs off-loop (`spawn_history_search` → `AppEvent::HistorySearchDone`, stale replies dropped). Bare `/search` opens with an empty query | `defs/search.rs`, `app/search.rs`, `keys/search.rs`, `tui/render/search.rs` |
 | `/rag` | — | `[on\|off\|reload]` | Semantic matching control. Bare = how-it-works + live status (state/model/indexed counts/config) + subcommand list. `on`/`off` = persist `semantic.enabled` + flip the running `SemanticService` (off → hints stop, full MCP schemas return; on → `spawn_init` if not ready). `reload` = drop model+corpora, re-verify/re-download model, re-embed skills and a freshly-fetched MCP tool list. Effects live in `apply_rag_action` (keys/dispatch.rs) via `CommandResult::Rag(RagAction)` | `defs/rag.rs` |
+| `/serve` | — | `[on\|off\|api <openai\|anthropic\|gemini>]` | API-server control. Bare = status (state/addr/uptime/request counters/auth/exposed models + subcommand list). `on`/`off` = start/stop the hyper listener (`src/server/`). `api <d>` = persist the wire dialect (only `openai` implemented; others rejected with a message). Parsing is pure (`parse_serve_args`); effects live in `app/serve.rs::apply_serve_action` via `CommandResult::Serve(ServeAction)`. Also: `--serve`/`--server`/`--api` CLI flags start the TUI with the server already on | `defs/serve.rs` (`ServeCommand`) |
+| `/server` | — | `<port>` | Set the API server port → `config.server.port` (saved for all future runs); a running server is restarted onto the new port (bind-retry absorbs the listener-close race). Bare `/server` = same status as `/serve`. Port 0 rejected | `defs/serve.rs` (`ServerCommand`) |
 | `/themes` | — | `[new\|<name>]` | Theme gallery (full-screen `View::Themes`): 10 built-in presets + `[[ui.custom_themes]]` entries; moving the cursor redraws the *whole frame* in the highlighted theme (live preview — `ThemesViewState::preview_theme` resolved in `render()`), Enter applies + saves `ui.theme`. `n`/`e`/`d` = new/edit/delete custom themes. `new`/`add`/`create` arg jumps straight into the step-by-step wizard (name → base preset → one step per `theme::ROLES` color role, hex prefilled from the base so Enter-through is fast, Ctrl+S = finish early → confirm saves + applies). `<name>` switches directly (validated against presets+customs). Intents: `OpenThemes`/`OpenThemeWizard`/`SetTheme` | `defs/themes.rs`, `app/themes.rs`, `keys/themes.rs`, `tui/render/themes.rs`, `tui/theme.rs` |
 
 ## NOTES & GOTCHAS

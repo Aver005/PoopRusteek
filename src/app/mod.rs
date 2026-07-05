@@ -12,6 +12,7 @@ mod pickers;
 pub mod providers;
 mod runtime;
 pub mod search;
+mod serve;
 mod sessions;
 mod system_prompt;
 pub mod themes;
@@ -100,6 +101,10 @@ pub struct App {
     /// Launches agent turns (owns the tool registry / MCP / event channel for
     /// execution). The single place the agent loop is spawned.
     runtime: runtime::AgentRuntime,
+    /// The running API server (`/serve on`, `--serve`), if any.
+    server: Option<crate::server::ServerHandle>,
+    /// Monotonic server-launch counter — see `AppEvent::ServerStarted`.
+    server_generation: u64,
 }
 
 pub struct AppState {
@@ -271,6 +276,8 @@ impl App {
             skills,
             semantic,
             runtime,
+            server: None,
+            server_generation: 0,
         })
     }
 
@@ -285,6 +292,11 @@ impl App {
             if let Some(handle) = conv.agent_task.take() {
                 handle.abort();
             }
+        }
+        // The API server dies with the app — nobody is left to receive its
+        // lifecycle events, so a hard abort beats a graceful shutdown here.
+        if let Some(server) = self.server.take() {
+            server.abort();
         }
         // Ephemeral conversations' remote sessions die with them. Bounded —
         // exiting must not hang on a dead network.
@@ -646,6 +658,36 @@ impl App {
             }
             AppEvent::SemanticStatus(message) => {
                 self.state.status_message = message;
+            }
+            AppEvent::ServerStarted { generation, addr } => {
+                if let Some(handle) = &mut self.server
+                    && handle.generation == generation
+                {
+                    handle.bound_addr = Some(addr);
+                    let message = format!(
+                        "API server listening on http://{addr}/v1 ({} dialect).",
+                        handle.api.label()
+                    );
+                    self.state.status_message = message.clone();
+                    self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+                }
+            }
+            AppEvent::ServerFailed { generation, error } => {
+                if self.server.as_ref().is_some_and(|handle| handle.generation == generation) {
+                    self.server = None;
+                }
+                let message = format!("API server failed to start: {error}");
+                self.state.status_message = message.clone();
+                self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+            }
+            AppEvent::ServerStopped { generation } => {
+                // Only the *current* server's stop clears the handle; a
+                // replaced server (port change restart) reports late.
+                if self.server.as_ref().is_some_and(|handle| handle.generation == generation) {
+                    self.server = None;
+                    self.state.status_message = "API server stopped".to_string();
+                    self.state.focused_mut().messages.push(ChatMessage::ui_system("API server stopped."));
+                }
             }
             AppEvent::HistorySearchDone { query, matches } => {
                 let search = &mut self.state.search;

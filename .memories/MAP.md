@@ -98,6 +98,15 @@
 | `src/commands/defs/logout.rs` | `/logout` — confirm → `cancel_all_turns`, clear `provider.token`, `config::save`, `reset_to_onboarding` ("Logged out") |
 | `src/commands/defs/wipe.rs` | `/wipe` — confirm → `cancel_all_turns`, `remove_dir_all` over `wipe_roots()` (deduped config-file parent + data dir; on Linux these differ, on Windows coincide), in-memory `Config::default` + cleared whitelist/history, lands on onboarding; errors go to tracing + status line |
 
+## SERVER (API gateway — 2026-07-06)
+| File | Purpose |
+|------|---------|
+| `src/server/mod.rs` | `ServerSettings::from_config` (config snapshot incl. `DeepseekSeed`), `ServerStats` (atomics), `ServerHandle` (generation, shutdown watch, task), `spawn()` — the one launch point (used by `/serve on` and `--serve`) | ~150 |
+| `src/server/catalog.rs` | Pure model-id → backend resolution: `DEEPSEEK_MODELS`, `ResolvedModel {Deepseek, Entry}`, `resolve_model` (`deepseek-chat`, `<entry>/<model>` sub-model override, bare entry name, bare configured model), `list_model_ids` — fully unit-tested | ~230 |
+| `src/server/http.rs` | Hyper-1 transport: bind w/ retry (absorbs `/server <port>` restart race), accept loop (`JoinSet` + shutdown watch), bearer auth, CORS, `/health`, dialect dispatch (`ServerApi::Openai` → openai.rs; anthropic/gemini → 501). Lifecycle → generation-tagged `AppEvent`s. E2E socket test | ~330 |
+| `src/server/openai.rs` | OpenAI dialect: `GET /[v1/]models`, `POST /[v1/]chat/completions` (16 MiB body cap); fork-per-request, DeepSeek `discard_remote_session` after every call; SSE bridge (`bridge_stream`: delta/final chunks + `data: [DONE]`, client-hangup aborts upstream). Mock-upstream gateway round-trip test | ~300 + tests |
+| `src/app/serve.rs` | `/serve`+`/server` effects on `App`: `apply_serve_action`, `start_server` (pub — `--serve` calls it), restart-on-port/dialect-change, `server_status_text` | ~150 |
+
 ## OTHER
 | File | Purpose |
 |------|---------|

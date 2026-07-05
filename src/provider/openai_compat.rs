@@ -1,35 +1,29 @@
 //! OpenAI-compatible wire format ⇄ internal provider types.
 //!
-//! This is the protocol boundary for two planned features that share one
-//! vocabulary (see `PLANS.md`):
+//! This is the protocol boundary for two features that share one
+//! vocabulary:
 //!
-//! 1. **Server mode**: pooprusteek exposes `POST /v1/chat/completions` (+
-//!    `GET /v1/models`) so existing OpenAI-speaking tools can use it as a
-//!    backend while it internally talks to whatever provider it has (today:
-//!    the reverse-engineered DeepSeek web API). Inbound direction:
+//! 1. **Server mode** (`crate::server`): pooprusteek exposes
+//!    `POST /v1/chat/completions` (+ `GET /v1/models`) so existing
+//!    OpenAI-speaking tools can use it as a backend while it internally
+//!    talks to whatever providers it has. Inbound direction:
 //!    [`ChatCompletionRequest`] → [`to_internal_request`] → run → outbound
 //!    via [`response_to_openai`] / [`delta_chunk`]+[`final_chunk`].
-//! 2. **OpenAI-compatible client providers**: a future `LLMProvider` impl
-//!    that talks to any OpenAI-compatible endpoint reuses the same types in
-//!    the opposite direction ([`request_to_openai`],
-//!    [`response_from_openai`], [`chunk_from_openai`]).
+//! 2. **OpenAI-compatible client providers**
+//!    (`crate::provider::openai_client`): the same types in the opposite
+//!    direction ([`request_to_openai`], [`response_from_openai`],
+//!    [`chunk_from_openai`]).
 //!
 //! Scope (v1): plain chat — messages, temperature/max_tokens, streaming,
 //! finish_reason, usage. Deliberately NOT translated yet: structured
 //! tool-calling (`tools`/`tool_calls`) — pooprusteek's tool calls are
 //! prompt-encoded text parsed by `agent/tool_parser`, and mapping that onto
 //! OpenAI's structured tool protocol is its own design task. Inbound
-//! `tools` are captured (not dropped by serde) so the future server can
-//! *warn* rather than silently ignore; multimodal content parts are
-//! flattened to their text parts.
+//! `tools` are captured (not dropped by serde) so the server can *warn*
+//! rather than silently ignore; multimodal content parts are flattened to
+//! their text parts.
 //!
 //! Everything here is pure data mapping — no I/O, no `App`, no network.
-
-// No production call sites until the server mode / OpenAI-client provider
-// land (PLANS.md) — the module is exercised by its tests. `allow`, not
-// `expect`: under `cargo test` the items ARE used, so an `expect` would be
-// unfulfilled in that build.
-#![allow(dead_code, reason = "protocol layer for the planned OpenAI-compatible server mode; test-covered")]
 
 use crate::provider::{estimate_tokens, ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, Role, Usage};
 use serde::{Deserialize, Serialize};

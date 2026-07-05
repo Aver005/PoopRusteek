@@ -340,7 +340,7 @@ mod tests {
         let id = "pooprusteek_test_session_corrupt";
         let path = plant_session_file(id, "{ this is not valid json");
 
-        let config = Config::default();
+        let _config = Config::default();
         let result = list_sessions();
 
         cleanup(&path);

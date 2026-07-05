@@ -191,13 +191,25 @@ pub enum AppEvent {
         query: String,
         matches: Vec<crate::semantic::history::HistoryMatch>,
     },
+
+    // API server lifecycle (`/serve`, `--serve`). Each event carries the
+    // launch generation so a replaced server's late events can't clobber
+    // the handle of its successor.
+    /// The server task bound its listener and is accepting requests.
+    ServerStarted { generation: u64, addr: std::net::SocketAddr },
+    /// The server task could not start (bind failure).
+    ServerFailed { generation: u64, error: String },
+    /// The server's accept loop exited (shutdown request or handle drop).
+    ServerStopped { generation: u64 },
 }
 
 // Populated at the `AgentDone` send site but every current receiver
 // discards the payload (`AgentDone(_, _)`); goal-mode independently
 // re-derives the same text by scanning the message list instead of reading
-// this. Kept for future use rather than deleted in this pass.
-#[expect(dead_code, reason = "AgentDone payload not read by any current receiver")]
+// this. Kept for future use rather than deleted in this pass. `allow`, not
+// `expect`: under `cargo test` the fields count as read (test-only paths),
+// so an `expect` is unfulfilled in that build.
+#[allow(dead_code, reason = "AgentDone payload not read by any current receiver")]
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     pub text: String,

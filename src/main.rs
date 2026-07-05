@@ -12,6 +12,7 @@ mod session;
 mod cli;
 mod acp;
 mod prompts;
+mod server;
 mod whitelist;
 mod util;
 mod skills;
@@ -31,6 +32,11 @@ struct Args {
 
     #[arg(long)]
     debug_log: bool,
+
+    /// Start the TUI with the API server already running (same as typing
+    /// `/serve on` right away). `--server` and `--api` are aliases.
+    #[arg(long, visible_alias = "server", visible_alias = "api")]
+    serve: bool,
 }
 
 #[tokio::main]
@@ -84,6 +90,9 @@ async fn main() -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("Starting..."));
 
     let mut app = app::App::new(config).await?;
+    if args.serve {
+        app.start_server("--serve flag");
+    }
     app.run().await?;
 
     Ok(())

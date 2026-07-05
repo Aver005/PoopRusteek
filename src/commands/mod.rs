@@ -37,6 +37,23 @@ pub enum RagAction {
     Reload,
 }
 
+/// `/serve` + `/server` intents — interpreted in `app/serve.rs`, which
+/// owns the server handle and the mutable config these effects need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeAction {
+    /// `/serve` — running state, address, counters, exposed models.
+    Status,
+    /// `/serve on` — launch the API server.
+    Start,
+    /// `/serve off` — shut the API server down.
+    Stop,
+    /// `/server <port>` — persist the port; restarts a running server.
+    SetPort(u16),
+    /// `/serve api <dialect>` — persist the wire dialect; restarts a
+    /// running server.
+    SetApi(crate::config::ServerApi),
+}
+
 pub enum CommandResult {
     Handled,
     LoadSession(String),
@@ -100,6 +117,9 @@ pub enum CommandResult {
     /// `/themes <name>` — validate the name against presets + custom
     /// themes and switch to it.
     SetTheme(String),
+    /// `/serve [on|off|api <dialect>]` and `/server <port>` — API-server
+    /// control.
+    Serve(ServeAction),
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +229,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::rag::RagCommand));
         self.register(Box::new(defs::search::SearchCommand));
         self.register(Box::new(defs::themes::ThemesCommand));
+        self.register(Box::new(defs::serve::ServeCommand));
+        self.register(Box::new(defs::serve::ServerCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

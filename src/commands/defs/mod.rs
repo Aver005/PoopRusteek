@@ -33,4 +33,5 @@ pub mod wipe;
 pub mod debug;
 pub mod rag;
 pub mod search;
+pub mod serve;
 pub mod themes;

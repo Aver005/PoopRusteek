@@ -1,6 +1,6 @@
 # REFERENCE: Config, Storage & Sessions
 > Where everything lives on disk. Source: `src/config/mod.rs`, `src/session.rs`.
-> Last updated: 2026-07-04 (added `agent.rate_limit_per_minute`; debug log is now runtime-toggleable via `/debug`, not just the CLI flag)
+> Last updated: 2026-07-06 (added `[server]` — the API-gateway section behind `--serve`/`/serve`/`/server <port>`). Before: 2026-07-04 (added `agent.rate_limit_per_minute`; debug log is now runtime-toggleable via `/debug`, not just the CLI flag)
 
 ## FILE LOCATIONS (`config/mod.rs:100`)
 
@@ -49,6 +49,12 @@ cache_ttl = 300            # MCP tools/list cache TTL secs; set via /mcp ttl
 [skills]
 enabled = []               # list of enabled skill names
 paths = []                 # extra skill search dirs
+
+[server]                   # API gateway (src/server/) — /serve, /server <port>, --serve
+host = "127.0.0.1"         # loopback by default; widen deliberately
+port = 7667                # persisted by /server <port> ("poop" on T9)
+api = "openai"             # openai | anthropic | gemini — wire dialect; only openai implemented (others answer 501)
+# api_key = "…"            # optional; when set every request needs Authorization: Bearer <api_key>
 ```
 
 - `load()` returns `Config::default()` if the file is missing (no crash). `save()` writes pretty TOML, creating parent dirs.

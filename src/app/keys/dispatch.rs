@@ -221,6 +221,9 @@ impl App {
                     ));
                 }
             }
+            CommandResult::Serve(action) => {
+                self.apply_serve_action(action);
+            }
             CommandResult::SearchHistory(query) => {
                 self.state.view = View::Search;
                 self.state.search = crate::app::search::SearchViewState::fresh(&query);

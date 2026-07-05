@@ -19,21 +19,7 @@ pub mod types;
 /// behind `App::new`, provider resets, and onboarding.
 pub fn build_provider(config: &crate::config::Config) -> Option<std::sync::Arc<dyn LLMProvider>> {
     if let Some(entry) = config.active_provider_entry() {
-        let built: crate::error::AppResult<std::sync::Arc<dyn LLMProvider>> = match entry.protocol {
-            crate::config::ProviderProtocol::Openai => {
-                openai_client::OpenAiCompatProvider::new(entry)
-                    .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
-            }
-            crate::config::ProviderProtocol::Anthropic => {
-                anthropic_client::AnthropicCompatProvider::new(entry)
-                    .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
-            }
-            crate::config::ProviderProtocol::Gemini => {
-                gemini_client::GeminiProvider::new(entry)
-                    .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
-            }
-        };
-        return match built {
+        return match build_entry_provider(entry) {
             Ok(provider) => Some(provider),
             Err(error) => {
                 tracing::warn!("Failed to initialize provider '{}': {error}", entry.name);
@@ -55,6 +41,25 @@ pub fn build_provider(config: &crate::config::Config) -> Option<std::sync::Arc<d
             tracing::warn!("Failed to initialize DeepSeek provider: {error}");
             None
         }
+    }
+}
+
+/// Construct the client for one `/providers` entry, dispatching on its wire
+/// protocol. Shared by [`build_provider`] (the TUI's active provider) and
+/// the API server, which builds a per-request instance so a caller-chosen
+/// sub-model (`entry/model` ids) can override the entry's configured one.
+pub fn build_entry_provider(
+    entry: &crate::config::ProviderEntry,
+) -> crate::error::AppResult<std::sync::Arc<dyn LLMProvider>> {
+    match entry.protocol {
+        crate::config::ProviderProtocol::Openai => openai_client::OpenAiCompatProvider::new(entry)
+            .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>),
+        crate::config::ProviderProtocol::Anthropic => {
+            anthropic_client::AnthropicCompatProvider::new(entry)
+                .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
+        }
+        crate::config::ProviderProtocol::Gemini => gemini_client::GeminiProvider::new(entry)
+            .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>),
     }
 }
 

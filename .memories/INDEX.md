@@ -25,7 +25,7 @@
 ### Reference (look up on demand — deep, file:line-cited)
 | File | Covers |
 |------|--------|
-| `reference/COMMANDS.md` | All 36 slash commands + registry (incl. `/themes`, `/btw`, `/new`, `/chats`, `/agent`, `/agents`, `/logout`, `/wipe`) |
+| `reference/COMMANDS.md` | All 38 slash commands + registry (incl. `/serve`, `/server`, `/themes`, `/btw`, `/new`, `/chats`, `/agent`, `/agents`, `/logout`, `/wipe`) |
 | `reference/PROVIDER.md` | DeepSeek API, endpoints, SSE, PoW, auth |
 | `reference/TOOLS.md` | Tool system, agent loop, background PTY |
 | `reference/MCP.md` | MCP clients, transports, 8 config sources |
