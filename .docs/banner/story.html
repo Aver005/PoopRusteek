@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>pooprusteek — stats</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,500;0,700;0,800;1,400&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#04080a;
+    --panel:#071009;
+    --green:#3dff8f;
+    --green-dim:#1f7a4c;
+    --green-faint:#0e3322;
+    --amber:#ffc24b;
+    --text:#c9ffd9;
+    --muted:#5d9c78;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{background:#000}
+  body{
+    width:1080px;height:1920px;
+    font-family:"JetBrains Mono",monospace;
+    color:var(--text);
+    position:relative;
+    overflow:hidden;
+    background:
+      radial-gradient(900px 700px at 50% 12%, rgba(61,255,143,.10), transparent 65%),
+      radial-gradient(1200px 900px at 50% 105%, rgba(255,194,75,.06), transparent 60%),
+      var(--bg);
+  }
+  /* CRT scanlines + vignette */
+  body::before{
+    content:"";position:absolute;inset:0;z-index:40;pointer-events:none;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,.22) 0 2px, transparent 2px 5px);
+    mix-blend-mode:multiply;
+  }
+  body::after{
+    content:"";position:absolute;inset:0;z-index:41;pointer-events:none;
+    background:radial-gradient(120% 100% at 50% 45%, transparent 55%, rgba(0,0,0,.55) 100%);
+  }
+  .frame{
+    position:absolute;inset:28px;z-index:5;
+    border:2px solid var(--green-dim);
+    outline:1px solid var(--green-faint);
+    outline-offset:8px;
+    padding:52px 56px 44px;
+    display:flex;flex-direction:column;
+  }
+  /* corner ticks */
+  .corner{position:absolute;width:26px;height:26px;border-color:var(--green);z-index:6}
+  .corner.tl{top:-2px;left:-2px;border-top:4px solid var(--green);border-left:4px solid var(--green)}
+  .corner.tr{top:-2px;right:-2px;border-top:4px solid var(--green);border-right:4px solid var(--green)}
+  .corner.bl{bottom:-2px;left:-2px;border-bottom:4px solid var(--green);border-left:4px solid var(--green)}
+  .corner.br{bottom:-2px;right:-2px;border-bottom:4px solid var(--green);border-right:4px solid var(--green)}
+
+  .titlebar{
+    display:flex;align-items:center;gap:18px;
+    color:var(--muted);font-size:26px;letter-spacing:.04em;
+    padding-bottom:26px;border-bottom:1px dashed var(--green-faint);
+  }
+  .dots{display:flex;gap:12px}
+  .dots span{width:18px;height:18px;border-radius:50%;border:2px solid var(--green-dim)}
+  .dots span:first-child{background:var(--green);border-color:var(--green);box-shadow:0 0 14px rgba(61,255,143,.8)}
+  .titlebar .path{margin-left:auto}
+
+  .prompt{
+    margin-top:38px;font-size:29px;color:var(--muted);
+  }
+  .prompt b{color:var(--green);font-weight:500}
+  .cursor{display:inline-block;width:16px;height:34px;background:var(--green);vertical-align:-4px;box-shadow:0 0 16px rgba(61,255,143,.9)}
+
+  h1{
+    margin-top:18px;
+    font-size:86px;font-weight:800;letter-spacing:-.03em;line-height:1;
+    color:#eaffee;
+    text-shadow:0 0 34px rgba(61,255,143,.55), 0 0 4px rgba(61,255,143,.9);
+  }
+  .tagline{
+    margin-top:14px;font-size:27px;color:var(--muted);letter-spacing:.02em;white-space:nowrap;
+  }
+  .tagline em{font-style:normal;color:var(--amber)}
+
+  /* HERO */
+  .hero{
+    margin-top:40px;display:flex;align-items:flex-end;gap:44px;
+  }
+  .hero .big{
+    font-size:300px;font-weight:800;line-height:.82;letter-spacing:-.05em;
+    color:var(--green);
+    text-shadow:0 0 90px rgba(61,255,143,.45), 0 0 12px rgba(61,255,143,.9);
+  }
+  .hero .side{padding-bottom:20px}
+  .hero .side .lab{font-size:42px;font-weight:700;color:#eaffee;line-height:1.25}
+  .hero .side .sub{font-size:29px;color:var(--muted);margin-top:12px;line-height:1.4}
+  .hero .side .sub b{color:var(--amber);font-weight:700}
+
+  .barline{
+    margin-top:34px;height:16px;position:relative;flex:0 0 16px;
+    background:var(--green-faint);
+    display:flex;
+  }
+  .barline .fill{
+    width:78%;height:100%;
+    background:linear-gradient(90deg,var(--green-dim),var(--green));
+    box-shadow:0 0 28px rgba(61,255,143,.6);
+  }
+  .barcap{
+    margin-top:14px;text-align:right;font-size:25px;color:var(--muted);
+  }
+
+  /* STAT GRID */
+  .grid{
+    margin-top:34px;
+    display:grid;grid-template-columns:1fr 1fr 1fr;
+    border:1px solid var(--green-faint);
+  }
+  .cell{
+    padding:26px 28px 24px;
+    border-right:1px solid var(--green-faint);
+    border-bottom:1px solid var(--green-faint);
+    background:linear-gradient(180deg, rgba(61,255,143,.045), transparent 70%);
+  }
+  .cell:nth-child(3n){border-right:none}
+  .cell:nth-child(n+4){border-bottom:none}
+  .cell .num{
+    font-size:70px;font-weight:800;letter-spacing:-.03em;color:#eaffee;line-height:1;
+    text-shadow:0 0 26px rgba(61,255,143,.4);
+  }
+  .cell .num small{font-size:40px;font-weight:700;color:var(--muted)}
+  .cell.gold .num{color:var(--amber);text-shadow:0 0 26px rgba(255,194,75,.45)}
+  .cell .cap{margin-top:10px;font-size:25px;color:var(--muted);line-height:1.35}
+
+  /* MECHANICS */
+  .mech{
+    margin-top:40px;flex:1;
+    border:1px solid var(--green-dim);
+    position:relative;
+    padding:46px 40px 30px;
+    background:linear-gradient(180deg, rgba(61,255,143,.05), rgba(61,255,143,0) 40%);
+  }
+  .mech .boxtitle{
+    position:absolute;top:-22px;left:34px;
+    background:var(--bg);padding:4px 20px;
+    font-size:28px;font-weight:700;letter-spacing:.14em;color:var(--green);
+    text-shadow:0 0 18px rgba(61,255,143,.7);
+  }
+  .mech ul{list-style:none;display:grid;grid-template-columns:1fr;gap:24px}
+  .mech li{
+    display:flex;gap:20px;align-items:baseline;
+    font-size:30px;line-height:1.4;color:var(--text);
+  }
+  .mech li .chk{
+    color:var(--green);font-weight:700;flex:0 0 auto;
+    text-shadow:0 0 14px rgba(61,255,143,.8);
+  }
+  .mech li b{color:#ffffff;font-weight:700}
+  .mech li .hl{color:var(--amber);font-weight:700;white-space:nowrap}
+
+  footer{
+    margin-top:30px;padding-top:24px;
+    border-top:1px dashed var(--green-faint);
+    display:flex;align-items:center;justify-content:space-between;
+    font-size:27px;color:var(--muted);letter-spacing:.03em;
+  }
+  footer .rust{color:var(--amber);font-weight:700}
+  footer .ok{color:var(--green);font-weight:700}
+</style>
+</head>
+<body>
+  <div class="frame">
+    <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+
+    <div class="titlebar">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <div>pooprusteek — tty0</div>
+      <div class="path">~/projects/pooprusteek</div>
+    </div>
+
+    <div class="prompt">$ <b>./pooprusteek --stats</b> <span class="cursor"></span></div>
+    <h1>POOPRUSTEEK</h1>
+    <div class="tagline">AI-агент на <em>Rust</em> · свой Claude Code — <em>бесплатно</em></div>
+
+    <div class="hero">
+      <div class="big">90</div>
+      <div class="side">
+        <div class="lab">коммитов<br>за 11 дней</div>
+        <div class="sub">+<b>36 991</b> строка кода<br>написана с нуля</div>
+      </div>
+    </div>
+    <div class="barline"><span class="fill"></span></div>
+    <div class="barcap">спринт: 25.06 → 05.07 · в среднем 8 коммитов/день</div>
+
+    <div class="grid">
+      <div class="cell"><div class="num">31<small>k</small></div><div class="cap">строк Rust</div></div>
+      <div class="cell"><div class="num">146</div><div class="cap">модулей</div></div>
+      <div class="cell"><div class="num">329</div><div class="cap">тестов</div></div>
+      <div class="cell"><div class="num">35</div><div class="cap">slash-команд</div></div>
+      <div class="cell"><div class="num">4</div><div class="cap">протокола LLM</div></div>
+      <div class="cell gold"><div class="num">$0</div><div class="cap">на API-ключи</div></div>
+    </div>
+
+    <div class="mech">
+      <div class="boxtitle">// РЕАЛИЗОВАНО</div>
+      <ul>
+        <li><span class="chk">[✓]</span><span><b>Реверс DeepSeek web-API</b> — без ключа, <span class="hl">SHA-3 proof-of-work</span> локально</span></li>
+        <li><span class="chk">[✓]</span><span><b>Локальный RAG</b> — ONNX-эмбеддинги + TF-IDF + RRF, ноль облаков</span></li>
+        <li><span class="chk">[✓]</span><span><b>Семантический поиск</b> по всей истории чатов</span></li>
+        <li><span class="chk">[✓]</span><span><b>MCP</b> — stdio / HTTP / SSE + <span class="hl">OAuth (PKCE)</span></span></li>
+        <li><span class="chk">[✓]</span><span>DeepSeek · OpenAI · <b>Anthropic</b> · Gemini</span></li>
+        <li><span class="chk">[✓]</span><span><b>Параллельные чаты</b>, суб-агенты, GOAL-цикл</span></li>
+        <li><span class="chk">[✓]</span><span><b>Markdown-скиллы</b> + встроенные инструменты</span></li>
+      </ul>
+    </div>
+
+    <footer>
+      <span>100% <span class="rust">Rust</span> · tokio + ratatui</span>
+      <span class="ok">build: passing ✓</span>
+    </footer>
+  </div>
+</body>
+</html>
