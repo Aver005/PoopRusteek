@@ -56,6 +56,12 @@ impl AnthropicCompatProvider {
         let mut body = anthropic_compat::request_to_anthropic(request);
         body["stream"] = serde_json::json!(stream);
         body["model"] = serde_json::json!(self.model);
+        // Modern Claude models (Opus 4.7+, Sonnet 5, Fable/Mythos 5) return
+        // 400 on any sampling parameter — drop it for those families only.
+        if anthropic_compat::model_rejects_sampling(&self.model)
+            && let Some(object) = body.as_object_mut() {
+                object.remove("temperature");
+            }
 
         let url = format!("{}/messages", self.base_url);
         debug_log::log(

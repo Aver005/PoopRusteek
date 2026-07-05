@@ -106,6 +106,23 @@ pub struct AnthropicUsage {
     pub output_tokens: u32,
 }
 
+/// Model families that reject sampling parameters (`temperature`/`top_p`/
+/// `top_k`) with a 400 — verified against the Anthropic API reference
+/// (2026-07): Opus 4.7+, Sonnet 5, and Fable/Mythos 5 removed them ("use
+/// prompting instead"). Older Claude models and Claude-compatible proxies
+/// still accept them, so the parameter is only dropped for these families.
+pub fn model_rejects_sampling(model: &str) -> bool {
+    [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ]
+    .iter()
+    .any(|family| model.starts_with(family))
+}
+
 /// Map Anthropic stop reasons onto the OpenAI-style vocabulary the rest of
 /// the app speaks ("stop"/"length"); unknown reasons pass through.
 fn map_stop_reason(reason: String) -> String {
@@ -295,6 +312,19 @@ mod tests {
         let parsed: MessagesResponse =
             serde_json::from_str(r#"{"content": [], "stop_reason": "max_tokens"}"#).unwrap();
         assert_eq!(response_from_anthropic(parsed).finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn sampling_rejection_families() {
+        // Families verified (2026-07) to 400 on temperature/top_p/top_k.
+        assert!(model_rejects_sampling("claude-opus-4-8"));
+        assert!(model_rejects_sampling("claude-sonnet-5"));
+        assert!(model_rejects_sampling("claude-fable-5"));
+        // Older models and compat-proxy models keep sampling support.
+        assert!(!model_rejects_sampling("claude-opus-4-6"));
+        assert!(!model_rejects_sampling("claude-haiku-4-5"));
+        assert!(!model_rejects_sampling("claude-sonnet-4-6"));
+        assert!(!model_rejects_sampling("glm-4.7"));
     }
 
     #[test]
