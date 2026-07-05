@@ -16,6 +16,7 @@ mod popup;
 mod providers;
 mod search;
 mod status;
+mod themes;
 mod util;
 
 use crate::app::AppState;
@@ -87,7 +88,15 @@ fn sync_window_title(terminal: &mut TuiTerminal, state: &AppState) {
 }
 
 pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> crate::error::AppResult<()> {
-    let theme = Theme::default_dark();
+    // The active theme comes from config; while the `/themes` screen is
+    // open the *whole frame* is drawn with the highlighted / in-progress
+    // theme instead — that's the live preview, and leaving without applying
+    // restores the saved theme on the next frame for free.
+    let theme = if state.view == View::Themes {
+        state.themes.preview_theme(config)
+    } else {
+        Theme::resolve(&config.ui)
+    };
     let cursor_cell = Cell::new(None);
     sync_window_title(terminal, state);
     terminal.draw(|frame| {
@@ -110,6 +119,8 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             providers::render_providers_view(frame, area, &state.providers_view, config, &theme);
         } else if state.view == View::Search {
             search::render_search_view(frame, area, &state.search, &theme);
+        } else if state.view == View::Themes {
+            themes::render_themes_view(frame, area, &state.themes, config, &theme);
         } else if state.focused().messages.is_empty() && !state.focused().generation.active {
             landing::render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
@@ -190,6 +201,8 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         || state.view == View::Providers
         // Search draws its own block cursor in the query line.
         || state.view == View::Search
+        // The themes wizard draws its own block cursor in its text boxes.
+        || state.view == View::Themes
     {
         terminal.hide_cursor()?;
     } else {

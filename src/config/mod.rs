@@ -100,10 +100,29 @@ pub const BUILTIN_PROVIDER_NAME: &str = "deepseek";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// Active theme: a preset name from `crate::tui::theme::PRESETS` or the
+    /// name of a `custom_themes` entry. Unknown names fall back to the
+    /// default theme — see `Theme::resolve`.
     pub theme: String,
     pub show_status_bar: bool,
     pub show_line_numbers: bool,
     pub max_message_length: usize,
+    /// User-made themes from the `/themes` wizard.
+    #[serde(default)]
+    pub custom_themes: Vec<CustomTheme>,
+}
+
+/// One `/themes`-wizard theme: a preset to inherit from plus per-role
+/// `"#rrggbb"` overrides keyed by `crate::tui::theme::ROLES` keys. Kept as
+/// a string map (not one field per role) so a palette written by a newer
+/// build still loads, minus the roles this build doesn't know.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CustomTheme {
+    pub name: String,
+    #[serde(default)]
+    pub base: String,
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +254,7 @@ impl Default for Config {
                 show_status_bar: true,
                 show_line_numbers: false,
                 max_message_length: 4096,
+                custom_themes: Vec::new(),
             },
             agent: AgentConfig {
                 max_steps_per_turn: 256,
@@ -386,6 +406,33 @@ mod tests {
         let toml_text = "enabled = true\ntop_k = 3\nmin_dense_score = 0.8\n";
         let parsed: SemanticConfig = toml::from_str(toml_text).unwrap();
         assert_eq!(parsed.mcp_schemas, McpSchemaMode::Auto);
+    }
+
+    #[test]
+    fn ui_config_without_custom_themes_still_loads() {
+        // Pre-/themes config files carry [ui] without `custom_themes` —
+        // the field must default instead of failing the parse.
+        let toml_text = "theme = \"default\"\nshow_status_bar = true\nshow_line_numbers = false\nmax_message_length = 4096\n";
+        let parsed: UiConfig = toml::from_str(toml_text).unwrap();
+        assert!(parsed.custom_themes.is_empty());
+    }
+
+    #[test]
+    fn custom_theme_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.ui.theme = "mine".to_string();
+        config.ui.custom_themes.push(CustomTheme {
+            name: "mine".to_string(),
+            base: "nord".to_string(),
+            colors: std::collections::BTreeMap::from([(
+                "accent".to_string(),
+                "#ff8000".to_string(),
+            )]),
+        });
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.ui.custom_themes, config.ui.custom_themes);
+        assert_eq!(parsed.ui.theme, "mine");
     }
 
     #[test]

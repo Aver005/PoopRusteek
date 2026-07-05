@@ -190,6 +190,37 @@ impl App {
                 }
             },
             CommandResult::Rag(action) => self.apply_rag_action(action),
+            CommandResult::OpenThemes => {
+                self.state.view = View::Themes;
+                self.state.themes = crate::app::themes::ThemesViewState::open(&self.config);
+            }
+            CommandResult::OpenThemeWizard => {
+                self.state.view = View::Themes;
+                self.state.themes = crate::app::themes::ThemesViewState::open(&self.config);
+                self.state.themes.wizard =
+                    Some(crate::app::themes::ThemeWizardState::new());
+            }
+            CommandResult::SetTheme(name) => {
+                let known = crate::tui::theme::PRESETS.iter().any(|preset| preset.name == name)
+                    || self.config.ui.custom_themes.iter().any(|theme| theme.name == name);
+                if known {
+                    self.apply_theme(&name);
+                    // apply_theme reports into the themes view; echo the
+                    // outcome into the chat the command was typed in.
+                    let message = std::mem::take(&mut self.state.themes.status_message);
+                    self.state.push_system(&format!("Theme: {message}."));
+                } else {
+                    let available: Vec<&str> = crate::tui::theme::PRESETS
+                        .iter()
+                        .map(|preset| preset.name)
+                        .chain(self.config.ui.custom_themes.iter().map(|theme| theme.name.as_str()))
+                        .collect();
+                    self.state.push_system(&format!(
+                        "Unknown theme '{name}'. Available: {} — or /themes to browse with live preview.",
+                        available.join(", "),
+                    ));
+                }
+            }
             CommandResult::SearchHistory(query) => {
                 self.state.view = View::Search;
                 self.state.search = crate::app::search::SearchViewState::fresh(&query);

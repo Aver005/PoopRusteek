@@ -274,6 +274,8 @@ pub enum View {
     Providers,
     /// `/search` — the history-search screen.
     Search,
+    /// `/themes` — the theme gallery + create wizard.
+    Themes,
 }
 
 /// Pure state for the in-TUI onboarding screen. No app deps — fully testable.

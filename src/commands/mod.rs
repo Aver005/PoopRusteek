@@ -93,6 +93,13 @@ pub enum CommandResult {
     /// `/search <query>` — history search; results flush back as a
     /// UI-only message once the off-loop lookup completes.
     SearchHistory(String),
+    /// `/themes` — open the theme gallery (live preview, instant apply).
+    OpenThemes,
+    /// `/themes new` — open the step-by-step theme-creation wizard.
+    OpenThemeWizard,
+    /// `/themes <name>` — validate the name against presets + custom
+    /// themes and switch to it.
+    SetTheme(String),
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +208,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::debug::DebugCommand));
         self.register(Box::new(defs::rag::RagCommand));
         self.register(Box::new(defs::search::SearchCommand));
+        self.register(Box::new(defs::themes::ThemesCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

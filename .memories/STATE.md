@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-05 (semantic matching `src/semantic/`, stages 1–3 — local e5-small + stemmed TF-IDF + RRF over skills, MCP tools AND persistent message history; deferred MCP schemas + `tool_search`/`history_search` builtins; `/rag` control + `/search`; tests 320, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
+> Last updated: 2026-07-05 (multi-theme system: `/themes` gallery with whole-frame live preview + step-by-step custom-theme wizard, 10 presets in `tui/theme.rs::PRESETS`, `[[ui.custom_themes]]` config — tests 345, clippy 0. Earlier same day: semantic matching `src/semantic/`, stages 1–3 — local e5-small + stemmed TF-IDF + RRF over skills, MCP tools AND persistent message history; deferred MCP schemas + `tool_search`/`history_search` builtins; `/rag` control + `/search`; tests 320, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
 
 ## PHASE COMPLETION
 
@@ -13,7 +13,7 @@
 | 3.6 Multi-chat | `[DONE]` | `Conversation`/`Conversations` model, provider `fork()`, event tagging by `ConversationId`, parallel sessions (`/new` `/chats` + Tab), `/btw` sidechat, sub-agents (model `task` tool + `/agent`/`/agents`, fg+bg) |
 | 3.7 Architecture | `[DONE]` | God-object `App` decomposed (mod.rs 2.4k→925): sub-state modules + controllers (`AgentRuntime`, `system_prompt::build`, `BackgroundCounters`, `McpStatus`). Provider split (prompt/sse/fake). |
 | 3.8 Stability & perf overhaul | `[DONE]` | 2026-07-02: all 7 audit criticals fixed (live streaming, MCP mutex freeze, GOAL evaluator off-loop, `/goal` registration, `--acp` panic, drain+dirty render with markdown/syntect cache, MCP stdio stderr+id-correlation) + ~30 majors (interaction queue, ui_only message split, atomic_write everywhere, CI, shell timeout/cap, background process-group kill, etc.) + dead-code sweep; clippy ~220→0, tests 84→189. See `reference/AUDIT-2026-07-02.md` + `JOURNAL/2026-07-02.md`. |
-| 4 Polish | `[WIP]` | Multi-theme, mouse, copy/paste, error recovery, rate limiting `[DONE]` (ms-interval + per-minute cap, both via `/rate`; retry/backoff exists), schema validation |
+| 4 Polish | `[WIP]` | Multi-theme `[DONE]` (2026-07-05: `/themes` — 10 presets, live preview, custom-theme wizard, `[[ui.custom_themes]]`), mouse, copy/paste, error recovery, rate limiting `[DONE]` (ms-interval + per-minute cap, both via `/rate`; retry/backoff exists), schema validation |
 | 5 Distribution | `[WIP]` | CI added (`.github/workflows/ci.yml`, build+test win+linux, clippy advisory); release builds, cross-compile, installers, man page still `[TODO]` |
 
 ## BUILD STATUS
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **326 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
+| Tests | **345 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
@@ -34,7 +34,7 @@
    - ~~deepseek.rs split~~ DONE 2026-07-03: `provider/deepseek/{mod,http,session,stream,endpoints}.rs`, 8/26 wrappers deduped onto `post_biz`/`get_biz`.
    - ~~Dependency bumps~~ DONE 2026-07-03: reqwest 0.13 (`rustls-tls`→`rustls` feature), ratatui 0.30 + crossterm 0.29, pulldown-cmark 0.13, toml 1.x — zero source changes forced.
    - ~~PoW wasm embed~~ DONE 2026-07-03: `include_bytes!` with a disk-file override for dev drop-ins. Native SHA-3 reimpl remains REJECTED by owner; stretch: fetch the server-referenced wasm at runtime (real rotation-resilience).
-3. Phase-4 polish (multi-theme on hold; mouse, copy/paste, error recovery).
+3. Phase-4 polish (~~multi-theme~~ DONE 2026-07-05 — `/themes`; mouse, copy/paste, error recovery remain).
 4. MCP tool-arg schema validation (still absent).
 
 ## KNOWN GAPS
@@ -44,7 +44,7 @@
 - No schema validation on MCP tool arguments. `→ src/mcp/client.rs`
 - DeepSeek streaming never reports token usage (`usage` always None).
 - `/models` switching: model id is validated against `LLMProvider::list_models()` (GET /models for compat providers, fixed pair for DeepSeek).
-- Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`
+- ~~Theme hardcoded; `ui.theme` ignored~~ FIXED 2026-07-05: `Theme::resolve(&config.ui)` in `render()` honors `ui.theme` — 10 presets (`tui/theme.rs::PRESETS`) + `[[ui.custom_themes]]` (base preset + per-role hex overrides), managed via `/themes` (gallery w/ live preview) and its create/edit wizard.
 - ~~No persistent RAG~~ Stages 1–3 landed 2026-07-05: `src/semantic/` matches prompts against the *skill catalog* and *MCP tool catalog* locally (e5-small ONNX + stemmed TF-IDF + RRF), defers MCP schemas + `tool_search`, and now indexes *message history* persistently (`data_dir/semantic/history.json`, backfilled from session files) behind `/search` + the `history_search` tool. Still open: **codebase search** (files aren't indexed) and the far-goal **RAG context refill** (retrieve past messages instead of truncating when the window overflows) — see `JOURNAL/2026-07-05.md`.
 - Foreground child PID tracking is a single global slot, not per-conversation (also an upward `tools`→`app` dependency).
 - PoW challenge solved once per request, not re-solved per retry attempt (deliberately left as-is 2026-07-04 — changing it changes the request pattern against DeepSeek). The solve itself now runs on `spawn_blocking` (fixed 2026-07-04).

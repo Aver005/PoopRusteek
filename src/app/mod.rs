@@ -14,6 +14,7 @@ mod runtime;
 pub mod search;
 mod sessions;
 mod system_prompt;
+pub mod themes;
 
 use crate::commands::CommandRegistry;
 use crate::config::Config;
@@ -122,6 +123,7 @@ pub struct AppState {
     pub mcp_status: mcp_status::McpStatus,
     pub providers_view: providers::ProvidersViewState,
     pub search: search::SearchViewState,
+    pub themes: themes::ThemesViewState,
     pub workspace_path: String,
     pub show_stats_panel: bool,
     pub attached_files: Vec<crate::provider::AttachedFile>,
@@ -217,6 +219,7 @@ impl App {
             mcp_status: mcp_status::McpStatus::default(),
             providers_view: providers::ProvidersViewState::default(),
             search: search::SearchViewState::default(),
+            themes: themes::ThemesViewState::default(),
             show_stats_panel: true,
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
