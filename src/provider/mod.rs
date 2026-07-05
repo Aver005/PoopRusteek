@@ -1,6 +1,8 @@
 pub mod anthropic_client;
 pub mod anthropic_compat;
 pub mod deepseek;
+pub mod gemini_client;
+pub mod gemini_compat;
 #[cfg(test)]
 pub mod fake;
 pub mod openai_client;
@@ -24,6 +26,10 @@ pub fn build_provider(config: &crate::config::Config) -> Option<std::sync::Arc<d
             }
             crate::config::ProviderProtocol::Anthropic => {
                 anthropic_client::AnthropicCompatProvider::new(entry)
+                    .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
+            }
+            crate::config::ProviderProtocol::Gemini => {
+                gemini_client::GeminiProvider::new(entry)
                     .map(|provider| std::sync::Arc::new(provider) as std::sync::Arc<dyn LLMProvider>)
             }
         };

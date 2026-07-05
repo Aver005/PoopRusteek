@@ -159,6 +159,11 @@ pub(super) fn render_provider_add(
             }
         }
         ProviderWizardStep::BaseUrl => {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", crate::app::providers::base_url_example(wizard.protocol())),
+                Style::default().fg(theme.text_dim),
+            )));
+            lines.push(Line::from(""));
             push_text_box_lines(&mut lines, &wizard.base_url.buffer, wizard.base_url.cursor, theme, max_rows)
         }
         ProviderWizardStep::ApiKey => {

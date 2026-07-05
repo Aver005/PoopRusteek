@@ -70,14 +70,24 @@ pub enum ProviderWizardStep {
 }
 
 /// Wizard order of the protocol choices (`protocol_selected` indexes this).
-pub const PROTOCOL_CHOICES: [ProviderProtocol; 2] =
-    [ProviderProtocol::Openai, ProviderProtocol::Anthropic];
+pub const PROTOCOL_CHOICES: [ProviderProtocol; 3] =
+    [ProviderProtocol::Openai, ProviderProtocol::Anthropic, ProviderProtocol::Gemini];
 
 /// Human description for the wizard's protocol list.
 pub fn protocol_choice_label(protocol: ProviderProtocol) -> &'static str {
     match protocol {
-        ProviderProtocol::Openai => "OpenAI Chat Completions (LM Studio, Ollama /v1, vLLM, OpenRouter)",
+        ProviderProtocol::Openai => "OpenAI Chat Completions (LM Studio, Ollama /v1, vLLM, xAI/Grok, OpenRouter)",
         ProviderProtocol::Anthropic => "Anthropic Messages (Anthropic API, Claude-compatible proxies)",
+        ProviderProtocol::Gemini => "Google Generative Language (Gemini)",
+    }
+}
+
+/// Example base URL shown under the wizard's Base URL step.
+pub fn base_url_example(protocol: ProviderProtocol) -> &'static str {
+    match protocol {
+        ProviderProtocol::Openai => "e.g. http://localhost:1234/v1 (LM Studio), http://localhost:11434/v1 (Ollama), https://api.x.ai/v1 (Grok)",
+        ProviderProtocol::Anthropic => "e.g. https://api.anthropic.com/v1",
+        ProviderProtocol::Gemini => "e.g. https://generativelanguage.googleapis.com/v1beta",
     }
 }
 
@@ -191,7 +201,7 @@ pub fn validate_base_url(url: &str) -> Result<String, String> {
 /// and Anthropic need a real model id — use the wizard or pass it
 /// explicitly).
 pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, String> {
-    const FORM: &str = "<name> [openai|anthropic] <base_url> [model] [api_key]";
+    const FORM: &str = "<name> [openai|anthropic|gemini] <base_url> [model] [api_key]";
     let mut tokens = raw.split_whitespace().peekable();
     let name = tokens.next().ok_or_else(|| format!("expected: {FORM}"))?;
     let protocol = match tokens.peek() {
@@ -202,6 +212,10 @@ pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, Stri
         Some(&"anthropic") => {
             tokens.next();
             ProviderProtocol::Anthropic
+        }
+        Some(&"gemini") => {
+            tokens.next();
+            ProviderProtocol::Gemini
         }
         _ => ProviderProtocol::Openai,
     };

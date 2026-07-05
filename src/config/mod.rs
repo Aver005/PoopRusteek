@@ -54,6 +54,11 @@ pub enum ProviderProtocol {
     /// `anthropic-version` headers) — the Anthropic API and
     /// Claude-compatible endpoints/proxies.
     Anthropic,
+    /// Google Generative Language API (`POST
+    /// {base}/models/{model}:generateContent`, `x-goog-api-key` header) —
+    /// Gemini. Note Google also exposes an OpenAI-compatible layer under
+    /// `{base}/openai`, but the native protocol is the first-class one.
+    Gemini,
 }
 
 impl ProviderProtocol {
@@ -61,6 +66,7 @@ impl ProviderProtocol {
         match self {
             ProviderProtocol::Openai => "openai-compat",
             ProviderProtocol::Anthropic => "anthropic-compat",
+            ProviderProtocol::Gemini => "gemini",
         }
     }
 }
