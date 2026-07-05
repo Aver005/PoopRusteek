@@ -148,7 +148,7 @@ impl App {
         } else {
             lines.push(format!("\n### Built-in tools ({})", builtin.len()));
             for tool in &builtin {
-                lines.push(super::format_tool_definition(&tool.name, &tool.description, &tool.parameters));
+                lines.push(crate::util::format_tool_definition(&tool.name, &tool.description, &tool.parameters));
             }
         }
 
@@ -173,7 +173,7 @@ impl App {
                     "  *Server: `{}` ({status})*",
                     server_name
                 ));
-                lines.push(super::format_tool_definition(
+                lines.push(crate::util::format_tool_definition(
                     &full.full_name,
                     &full.tool.description,
                     &full.tool.input_schema,

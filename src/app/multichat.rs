@@ -61,6 +61,7 @@ impl App {
             &self.skills,
             &self.tools,
             &self.mcp,
+            self.effective_mcp_schema_mode(),
             &self.state.workspace_path,
         )
         .await;

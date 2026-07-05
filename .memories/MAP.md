@@ -105,11 +105,13 @@
 | `src/acp/types.rs` | ACP request/response/content types |
 | `src/skills/mod.rs` | `SkillDefinition`, `SkillSource`, frontmatter parse — now keeps repeated keys instead of only the first occurrence |
 | `src/skills/discovery.rs` | Skill discovery (many dirs), formats; tilde expansion fixed via `util::expand_tilde` | ~280 |
-| `src/semantic/mod.rs` | `SemanticService` — off-loop init handle for local skill matching (Disabled/Initializing/Ready/Failed; blocking `match_skills`, `render_hint`) |
+| `src/semantic/mod.rs` | `SemanticService` — off-loop init handle over both corpora (skills + MCP tools); `match_prompt` (one query embedding, both corpora), `update_mcp_tools` (re-embed on server changes), `search_tools` (semantic → lexical fallback), `render_hint` |
 | `src/semantic/embedder.rs` | fastembed wrapper pinned to multilingual-e5-small; e5 `query:`/`passage:` prefix contract, L2-normalized outputs; model cache `Config::data_dir()/models` |
 | `src/semantic/sparse.rs` | Stemmed TF-IDF sparse vectors (ru/en Snowball) — lexical half of the hybrid match |
-| `src/semantic/matcher.rs` | `SkillMatcher` — dense+sparse RRF fusion, dense-floor/lexical-overlap gate, top-k |
-| `src/semantic/eval.rs` | Retrieval eval: fixture corpus + 16 ru/en queries → MRR (`#[ignore]`, needs the model) |
+| `src/semantic/index.rs` | `HybridIndex` — generic dense+sparse ranker with RRF fusion and the dense-floor/lexical-overlap gate |
+| `src/semantic/matcher.rs` | Typed corpora over `HybridIndex`: `SkillCorpus` (skips enabled), `McpCorpus` (carries input_schema in matches) |
+| `src/semantic/eval.rs` | Retrieval eval: skill + MCP fixtures, ru/en queries → MRR (`#[ignore]`, needs the model). Latest: skills 0.927, MCP 0.836 |
+| `src/tools/tool_search.rs` | `tool_search` builtin — capability search over MCP tools, returns full definitions; lexical fallback pre-init. The escape hatch for deferred MCP schemas |
 | `src/util.rs` | `atomic_write` (now actually used everywhere), `expand_tilde` (single shared impl), `truncate_at_char_boundary` |
 | `src/cli/onboarding.rs` | **DELETED** — replaced by `View::Onboarding` in-TUI flow | — |
 | `src/cli/file_mentions.rs` | `@file:line` expansion — line-range clamp fixed (was an out-of-bounds slice panic) | ~120 |

@@ -87,3 +87,52 @@ mod tests {
         assert_eq!(expand_tilde("rel/path"), std::path::PathBuf::from("rel/path"));
     }
 }
+
+/// Render one tool definition (name, description, parameter list from a
+/// JSON schema) as the markdown-ish block used in the system prompt, the
+/// `/tools` listing, and semantic tool hints. Required params sort first.
+pub fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Value) -> String {
+    let mut result = format!("- `{name}`: {description}");
+
+    if let Some(props) = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        && !props.is_empty() {
+            result.push_str("\n  Parameters:");
+            let required = schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
+            let mut params: Vec<(&String, &serde_json::Value)> = props.iter().collect();
+            params.sort_by(|a, b| {
+                let a_req = required.contains(a.0);
+                let b_req = required.contains(b.0);
+                b_req.cmp(&a_req).then(a.0.cmp(b.0))
+            });
+            for (param_name, param_info) in params {
+                let param_type = param_info
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("any");
+                let param_desc = param_info
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                let req_str = if required.contains(param_name) {
+                    "required"
+                } else {
+                    "optional"
+                };
+                result.push_str(&format!(
+                    "\n    \u{2022} `{param_name}` ({param_type}, {req_str}): {param_desc}"
+                ));
+            }
+        }
+
+    result
+}

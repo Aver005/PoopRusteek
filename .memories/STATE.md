@@ -1,6 +1,6 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
-> Last updated: 2026-07-05 (semantic skill matching `src/semantic/` — local e5-small + stemmed TF-IDF + RRF hints into every turn; tests 310, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
+> Last updated: 2026-07-05 (semantic matching `src/semantic/`, stages 1+2 — local e5-small + stemmed TF-IDF + RRF over skills AND MCP tools; deferred MCP schemas (`[semantic] mcp_schemas`, auto >12 tools) + `tool_search` builtin; tests 313, clippy 0). Before that: 2026-07-04 (cleanup audit `reference/AUDIT-2026-07-04-CLEANUP.md` + god-file split: `tui/render.rs` 2160→8-module `tui/render/` with shared popup kit; `app/mod.rs` 1659→~990 via new `app/sessions.rs`+`app/pickers.rs`; shared `agent/stream.rs::collect_stream` replacing the runner/sub_agent copy-paste + meta-tool name constants — tests 262, clippy 0. Earlier same day: `/mcp add`, MCP OAuth, remote session resume)
 
 ## PHASE COMPLETION
 
@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **310 passing** + 1 `#[ignore]`d (semantic eval, needs the ~120 MB model) (`cargo test --bin pooprusteek`) |
+| Tests | **313 passing** + 2 `#[ignore]`d (semantic MRR evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS
@@ -45,7 +45,7 @@
 - DeepSeek streaming never reports token usage (`usage` always None).
 - `/models` switching: model id is validated against `LLMProvider::list_models()` (GET /models for compat providers, fixed pair for DeepSeek).
 - Theme hardcoded (Catppuccin Mocha); `ui.theme` ignored. `→ src/tui/theme.rs`
-- No persistent RAG / codebase search. First step landed 2026-07-05: `src/semantic/` matches prompts against the *skill catalog* locally (e5-small ONNX + stemmed TF-IDF + RRF) — but messages/codebase are still unindexed; MCP-tool matching and history search are the agreed next stages (see `JOURNAL/2026-07-05.md`).
+- No persistent RAG / codebase search. Stages 1+2 landed 2026-07-05: `src/semantic/` matches prompts against the *skill catalog* and the *MCP tool catalog* locally (e5-small ONNX + stemmed TF-IDF + RRF), with deferred MCP schemas + `tool_search`. Messages/codebase are still unindexed — history indexing (`/search`, `history_search` tool, RAG context refill) is the agreed stage 3 (see `JOURNAL/2026-07-05.md`).
 - Foreground child PID tracking is a single global slot, not per-conversation (also an upward `tools`→`app` dependency).
 - PoW challenge solved once per request, not re-solved per retry attempt (deliberately left as-is 2026-07-04 — changing it changes the request pattern against DeepSeek). The solve itself now runs on `spawn_blocking` (fixed 2026-07-04).
 - `"model"` field is hardcoded `"deepseek-chat"` in the request body, ignoring user config.
@@ -77,7 +77,7 @@
 | 2026-07-02 | **Full-codebase audit** (`reference/AUDIT-2026-07-02.md`) → same-day **3-wave refactor**: streaming/MCP/GOAL/ACP/render/stdio criticals + ~30 majors + dead-code sweep, committed as `bad8011`. 54 files, +4056/−1291. Tests 84→189, clippy ~220→0. |
 | 2026-07-02 | **In-TUI onboarding + /logout + /wipe**: `cli/onboarding.rs` deleted; `View::Onboarding` full-screen rework (`OnboardingState`, `handle_onboarding_key`, `render_onboarding`, `Conversation::fresh_main`); generic `Modal::Confirm(ConfirmState)` + `ConfirmAction`; `/logout` (confirm → cancel turns → clear token → `reset_to_onboarding`) and `/wipe` (confirm → cancel turns → `remove_dir_all` over `wipe_roots()` → factory reset → onboarding). Tests 189→209, clippy 0. |
 | 2026-07-04 | **MCP OAuth authorization**: `/mcp auth`/`/mcp oauth` list+authorize servers in `AuthRequired` status; full RFC 9728/8414/7591 + PKCE flow (`mcp/oauth.rs`), OS-keyring encrypted token storage (`mcp/oauth_store.rs`, `keyring` crate) — first encrypted-at-rest secrets in the repo. `build_client` unified across `add_server`/`toggle_server`/`reconnect_server`; HTTP/SSE 401 detection deduped into shared transport helpers. Tests 227→242, clippy 0. See `reference/MCP.md` AUTHORIZATION. |
-| 2026-07-05 | **Semantic skill matching** (`src/semantic/`): local hybrid RAG-lite over the skill catalog — fastembed `MultilingualE5Small` (one-time ~120 MB download into `data_dir/models`, offline after) + Snowball-stemmed TF-IDF + RRF; every turn gets an ephemeral advisory note pointing at the `skill` tool. `SemanticService` background-init off-loop, hints injected in `run_agent_loop` via `AgentRuntime`. `[semantic]` config, eval harness with MRR (`--ignored`). |
+| 2026-07-05 | **Semantic matching, stages 1+2** (`src/semantic/`): local hybrid RAG-lite — fastembed `MultilingualE5Small` (one-time ~120 MB download into `data_dir/models`, offline after) + Snowball-stemmed TF-IDF + RRF (`HybridIndex`) over TWO corpora: skills and MCP tools. Every turn gets an ephemeral advisory hint (skills → `skill` tool; MCP tools inline full defs in deferred mode). **Deferred MCP schemas**: `[semantic] mcp_schemas = auto\|full\|deferred` (auto defers >12 tools) turns the system-prompt MCP section into name+one-liner rows; full definitions come from per-turn hints or the new **`tool_search`** builtin (semantic search with lexical fallback — never bricks). MCP corpus re-embeds on server changes via `McpOperationDone`. Evals: skills MRR 0.927, MCP 0.836. |
 | 2026-07-04 | **`/mcp add`**: paste-JSON, step-by-step wizard, and quick inline (`<name> <command> [args...]` or inline JSON, falling back to the same choice modal on parse failure) — all converge on new `MCPManager::add_new_server`. New `app/mcp_add.rs` (pure state machine + parsers, no crossterm dep), new `Modal::McpAdd`, `app::input::InputState` gained `Clone` (reused for every text-entry step). Tests 242→262, clippy 0. See `reference/MCP.md` ADDING SERVERS. |
 
 ## FACTS CORRECTED THIS PASS (were wrong in older memory)

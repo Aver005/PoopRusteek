@@ -91,6 +91,10 @@ pub struct App {
     tools: Arc<ToolRegistry>,
     prompts: PromptFiles,
     skills: Vec<SkillDefinition>,
+    /// Local semantic matcher over skills + MCP tools (also backs the
+    /// `tool_search` builtin). The app refreshes its MCP corpus whenever
+    /// the server set changes.
+    semantic: Arc<crate::semantic::SemanticService>,
     /// Launches agent turns (owns the tool registry / MCP / event channel for
     /// execution). The single place the agent loop is spawned.
     runtime: runtime::AgentRuntime,
@@ -221,6 +225,14 @@ impl App {
             background: background_stats::BackgroundCounters::default(),
         };
 
+        // Semantic matcher: background init (first run downloads the
+        // embedding model); turns get skill/MCP-tool hints once it's ready.
+        // `tool_search` is registered unconditionally — before readiness it
+        // degrades to lexical matching over the raw tool list.
+        let semantic =
+            crate::semantic::SemanticService::start(&config, skills.clone(), event_tx.clone());
+        tools.register_tool_search(Arc::clone(&semantic));
+
         if mcp_init_ok {
             let mgr = mcp.lock().await;
             let servers = mgr.get_servers_info();
@@ -231,17 +243,13 @@ impl App {
                 .count();
             state.mcp_status.view.servers = servers;
             state.mcp_status.last_stats_update = Some(std::time::Instant::now());
+            semantic.update_mcp_tools(mgr.get_all_tools());
         }
-
-        // Semantic skill matcher: background init (first run downloads the
-        // embedding model); turns get skill hints once it's ready.
-        let semantic =
-            crate::semantic::SemanticService::start(&config, skills.clone(), event_tx.clone());
 
         let runtime = runtime::AgentRuntime::new(
             Arc::clone(&tools),
             Arc::clone(&mcp),
-            semantic,
+            Arc::clone(&semantic),
             event_tx.clone(),
         );
 
@@ -255,6 +263,7 @@ impl App {
             tools,
             prompts,
             skills,
+            semantic,
             runtime,
         })
     }
@@ -596,6 +605,15 @@ impl App {
                 // Force the next loop iteration to re-pull fresh server info.
                 self.state.mcp_status.view.servers.clear();
                 self.state.mcp_status.last_stats_update = None;
+                // The tool set likely changed (add/reload/toggle/reconnect
+                // all funnel through this event) — re-embed the MCP corpus.
+                // Fetch under a short-lived lock off the event loop.
+                let mcp = Arc::clone(&self.mcp);
+                let semantic = Arc::clone(&self.semantic);
+                tokio::spawn(async move {
+                    let tools = mcp.lock().await.get_all_tools();
+                    semantic.update_mcp_tools(tools);
+                });
             }
             AppEvent::McpOAuthResult { server, result } => {
                 match result {
@@ -764,6 +782,7 @@ impl App {
             &self.skills,
             &self.tools,
             &self.mcp,
+            self.effective_mcp_schema_mode(),
             &self.state.workspace_path,
         )
         .await;
@@ -786,6 +805,18 @@ impl App {
         self.state.focused_mut().agent_task = Some(handle);
 
         Ok(())
+    }
+
+    /// MCP schema mode as the system prompt should see it. Without
+    /// semantic matching there is no `tool_search` worth relying on, so
+    /// deferring schemas would leave the model with no good path to them —
+    /// force full inlining in that case.
+    fn effective_mcp_schema_mode(&self) -> crate::config::McpSchemaMode {
+        if self.config.semantic.enabled {
+            self.config.semantic.mcp_schemas
+        } else {
+            crate::config::McpSchemaMode::Full
+        }
     }
 
     /// Open the generic confirm modal for `/logout` or `/wipe`.
@@ -968,50 +999,4 @@ pub fn format_duration_secs(seconds: u64) -> String {
         3600..=86_399 => format!("{}h", seconds / 3600),
         _ => format!("{}d", seconds / 86_400),
     }
-}
-
-fn format_tool_definition(name: &str, description: &str, schema: &serde_json::Value) -> String {
-    let mut result = format!("- `{name}`: {description}");
-
-    if let Some(props) = schema
-        .get("properties")
-        .and_then(|p| p.as_object())
-        && !props.is_empty() {
-            result.push_str("\n  Parameters:");
-            let required = schema
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect::<std::collections::HashSet<_>>()
-                })
-                .unwrap_or_default();
-            let mut params: Vec<(&String, &serde_json::Value)> = props.iter().collect();
-            params.sort_by(|a, b| {
-                let a_req = required.contains(a.0);
-                let b_req = required.contains(b.0);
-                b_req.cmp(&a_req).then(a.0.cmp(b.0))
-            });
-            for (param_name, param_info) in params {
-                let param_type = param_info
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("any");
-                let param_desc = param_info
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-                let req_str = if required.contains(param_name) {
-                    "required"
-                } else {
-                    "optional"
-                };
-                result.push_str(&format!(
-                    "\n    \u{2022} `{param_name}` ({param_type}, {req_str}): {param_desc}"
-                ));
-            }
-        }
-
-    result
 }

@@ -1,19 +1,24 @@
-//! Local semantic matching ("RAG-lite") over the skill catalog.
+//! Local semantic matching ("RAG-lite") over the skill catalog and the MCP
+//! tool catalog.
 //!
-//! Embeds every discovered skill's name/description with a local ONNX
-//! model (multilingual-e5-small via fastembed — downloaded once into
-//! `Config::data_dir()/models`, fully offline afterwards) and matches each
-//! outgoing user prompt against the corpus with a dense+sparse hybrid.
-//! Matches surface as an advisory note appended to the turn, pointing the
-//! model at the `skill` tool — the model stays in control; nothing is
-//! auto-loaded.
+//! Embeds both corpora with a local ONNX model (multilingual-e5-small via
+//! fastembed — downloaded once into `Config::data_dir()/models`, fully
+//! offline afterwards) and matches each outgoing user prompt against them
+//! with a dense+sparse hybrid. Matches surface as an advisory note
+//! appended to the turn — the model stays in control; nothing is
+//! auto-loaded. The same index also backs the `tool_search` builtin tool,
+//! which is what makes deferred MCP schemas (compact tool list in the
+//! system prompt, full definitions on demand) safe: a tool the matcher
+//! didn't volunteer can still be looked up explicitly.
 //!
 //! Threading contract: initialization and inference are CPU/IO-bound and
 //! only ever run on `spawn_blocking` threads. `SemanticService` itself is a
-//! cheap shared handle that answers instantly (with no matches) until the
-//! background init completes.
+//! cheap shared handle that answers instantly (with nothing) until the
+//! background init completes. The inner mutex is only ever held across
+//! synchronous work — never across an `.await`.
 
 pub mod embedder;
+pub mod index;
 pub mod matcher;
 pub mod sparse;
 
@@ -21,27 +26,52 @@ pub mod sparse;
 mod eval;
 
 use crate::app::events::AppEvent;
-use crate::config::Config;
+use crate::config::{Config, SemanticConfig};
+use crate::mcp::manager::FullMCPTool;
 use crate::skills::SkillDefinition;
-use matcher::{SkillMatch, SkillMatcher};
+use matcher::{McpCorpus, McpToolMatch, SkillCorpus, SkillMatch};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-enum MatcherState {
-    /// Disabled by config or no skills discovered — stays inert forever.
-    Disabled,
-    /// Background init (model download / load + corpus embedding) running.
-    Initializing,
-    /// Boxed: the matcher (ONNX session + corpus vectors) dwarfs the other
-    /// variants and clippy rightly objects to carrying that inline.
-    Ready(Box<SkillMatcher>),
-    Failed,
+/// Readiness is implicit: `inner.embedder.is_some()` means embeddings are
+/// live. Before that (still initializing, init failed, or disabled by
+/// config) every matching entry point degrades gracefully — empty matches,
+/// lexical `tool_search` fallback — so no explicit phase tracking is
+/// needed.
+#[derive(Default)]
+struct Inner {
+    embedder: Option<Box<embedder::Embedder>>,
+    skills: Option<SkillCorpus>,
+    mcp: Option<McpCorpus>,
+    /// Latest raw MCP tool list — kept even when embeddings are
+    /// unavailable so `tool_search` can fall back to lexical matching,
+    /// and so tools that arrive mid-init get embedded once init lands.
+    raw_mcp: Vec<FullMCPTool>,
+}
+
+/// Everything a turn hint can carry: skill suggestions + MCP tool
+/// suggestions, matched against one shared query embedding.
+#[derive(Default)]
+pub struct PromptMatches {
+    pub skills: Vec<SkillMatch>,
+    pub mcp_tools: Vec<McpToolMatch>,
+}
+
+impl PromptMatches {
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty() && self.mcp_tools.is_empty()
+    }
 }
 
 pub struct SemanticService {
-    state: Mutex<MatcherState>,
-    top_k: usize,
-    min_dense: f32,
+    inner: Mutex<Inner>,
+    config: SemanticConfig,
+    /// Resolved on every `update_mcp_tools`: whether the current tool count
+    /// puts the system prompt in deferred-schema mode. Hints mirror this —
+    /// in deferred mode a matched tool's full definition rides in the hint,
+    /// because the system prompt no longer carries it.
+    mcp_deferred: AtomicBool,
 }
 
 impl SemanticService {
@@ -52,13 +82,12 @@ impl SemanticService {
         skills: Vec<SkillDefinition>,
         event_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Arc<Self> {
-        let enabled = config.semantic.enabled && !skills.is_empty();
         let service = Arc::new(Self {
-            state: Mutex::new(if enabled { MatcherState::Initializing } else { MatcherState::Disabled }),
-            top_k: config.semantic.top_k,
-            min_dense: config.semantic.min_dense_score,
+            inner: Mutex::new(Inner::default()),
+            config: config.semantic.clone(),
+            mcp_deferred: AtomicBool::new(false),
         });
-        if !enabled {
+        if !config.semantic.enabled {
             return service;
         }
 
@@ -72,30 +101,40 @@ impl SemanticService {
                 ));
             }
 
-            let built =
-                tokio::task::spawn_blocking(move || SkillMatcher::build(&skills, cache_dir)).await;
+            let this_blocking = Arc::clone(&this);
+            let built = tokio::task::spawn_blocking(move || {
+                let mut emb = embedder::Embedder::init(cache_dir)?;
+                let skill_corpus = SkillCorpus::build(&mut emb, &skills)?;
+                // Store under the lock, then embed any MCP tools that
+                // arrived while the model was loading — same thread, same
+                // blocking budget.
+                {
+                    let mut inner = this_blocking.inner.lock().unwrap();
+                    inner.embedder = Some(Box::new(emb));
+                    inner.skills = Some(skill_corpus);
+                }
+                this_blocking.rebuild_mcp_corpus();
+                Ok::<usize, String>(this_blocking.inner.lock().unwrap().skills.as_ref().map_or(0, SkillCorpus::len))
+            })
+            .await;
 
             match built {
-                Ok(Ok(skill_matcher)) => {
-                    let count = skill_matcher.len();
-                    *this.state.lock().unwrap() = MatcherState::Ready(Box::new(skill_matcher));
-                    tracing::info!("semantic: skill matcher ready ({count} skills)");
+                Ok(Ok(count)) => {
+                    tracing::info!("semantic: matcher ready ({count} skills)");
                     if first_run {
                         let _ = event_tx.send(AppEvent::SemanticStatus(
-                            "Embedding model ready — skill matching active".to_string(),
+                            "Embedding model ready — semantic matching active".to_string(),
                         ));
                     }
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("semantic: init failed: {e}");
-                    *this.state.lock().unwrap() = MatcherState::Failed;
                     let _ = event_tx.send(AppEvent::SemanticStatus(format!(
-                        "Skill matching unavailable: {e}"
+                        "Semantic matching unavailable: {e}"
                     )));
                 }
                 Err(join_err) => {
                     tracing::warn!("semantic: init task panicked: {join_err}");
-                    *this.state.lock().unwrap() = MatcherState::Failed;
                 }
             }
         });
@@ -107,39 +146,177 @@ impl SemanticService {
     #[cfg(test)]
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(MatcherState::Disabled),
-            top_k: 0,
-            min_dense: 1.0,
+            inner: Mutex::new(Inner::default()),
+            config: SemanticConfig::default(),
+            mcp_deferred: AtomicBool::new(false),
         })
     }
 
-    /// Match `prompt` against the skill corpus. Returns an empty list until
-    /// background init completes. Blocking (ONNX inference under the state
-    /// lock, no awaits) — call from `spawn_blocking`.
-    pub fn match_skills(&self, prompt: &str) -> Vec<SkillMatch> {
-        let mut guard = self.state.lock().unwrap();
-        match &mut *guard {
-            MatcherState::Ready(skill_matcher) => {
-                skill_matcher.query(prompt, self.top_k, self.min_dense)
+    /// Replace the MCP tool catalog (server connected / reloaded / toggled).
+    /// Stores the raw list immediately; embedding happens on a blocking
+    /// thread when the embedder is available, or is picked up by init when
+    /// it lands. Cheap to call from the event loop.
+    pub fn update_mcp_tools(self: &Arc<Self>, tools: Vec<FullMCPTool>) {
+        self.mcp_deferred.store(
+            self.config.enabled && self.config.mcp_schemas.deferred_for(tools.len()),
+            Ordering::Relaxed,
+        );
+        let embedder_ready = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.raw_mcp = tools;
+            inner.embedder.is_some()
+        };
+        if !embedder_ready {
+            return; // init completion (or nothing, if disabled/failed) picks it up
+        }
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || this.rebuild_mcp_corpus());
+    }
+
+    /// Whether the system prompt should currently defer MCP schemas.
+    /// `system_prompt::build` resolves the mode itself from the same
+    /// config + live tool count; this accessor is for hint rendering.
+    pub fn mcp_schemas_deferred(&self) -> bool {
+        self.mcp_deferred.load(Ordering::Relaxed)
+    }
+
+    /// (Re)embed the MCP corpus from `raw_mcp`. Blocking; holds the inner
+    /// lock for the duration (~100 ms for dozens of tools) — concurrent
+    /// `match_prompt` calls on other blocking threads just wait.
+    fn rebuild_mcp_corpus(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { embedder, mcp, raw_mcp, .. } = &mut *inner;
+        let Some(emb) = embedder else { return };
+        if raw_mcp.is_empty() {
+            *mcp = None;
+            return;
+        }
+        match McpCorpus::build(emb, raw_mcp) {
+            Ok(corpus) => {
+                tracing::info!("semantic: MCP tool corpus ready ({} tools)", corpus.len());
+                *mcp = Some(corpus);
             }
-            _ => Vec::new(),
+            Err(e) => tracing::warn!("semantic: MCP corpus build failed: {e}"),
         }
     }
 
-    /// Render matches as the advisory block appended to an outgoing turn.
-    /// Deliberately framed as optional — a false positive must be ignorable.
-    pub fn render_hint(matches: &[SkillMatch]) -> String {
-        let mut lines = vec![
-            "[Skill hint — automatic semantic match, may be irrelevant]".to_string(),
-            "Skills that may apply to the user's request:".to_string(),
-        ];
-        for m in matches {
-            lines.push(format!("- {} — {}", m.slug, m.description));
+    /// Match `prompt` against both corpora with one query embedding.
+    /// Returns nothing until background init completes. Blocking (ONNX
+    /// inference under the state lock, no awaits) — call from
+    /// `spawn_blocking`.
+    pub fn match_prompt(&self, prompt: &str) -> PromptMatches {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { embedder, skills, mcp, .. } = &mut *inner;
+        let Some(emb) = embedder else {
+            return PromptMatches::default();
+        };
+        let query_vec = match emb.embed_query(prompt) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("semantic: query embedding failed: {e}");
+                return PromptMatches::default();
+            }
+        };
+        let top_k = self.config.top_k;
+        let min_dense = self.config.min_dense_score;
+        PromptMatches {
+            skills: skills
+                .as_ref()
+                .map(|c| c.query(&query_vec, prompt, top_k, min_dense))
+                .unwrap_or_default(),
+            mcp_tools: mcp
+                .as_ref()
+                .map(|c| c.query(&query_vec, prompt, top_k, min_dense))
+                .unwrap_or_default(),
         }
-        lines.push(
-            "If one clearly fits, load it with the `skill` tool (action=\"load\", name=\"<slug>\") before answering. Otherwise ignore this note."
-                .to_string(),
-        );
-        lines.join("\n")
+    }
+
+    /// Explicit MCP tool lookup for the `tool_search` builtin. Unlike the
+    /// per-turn hint this is best-effort: no dense floor (the model asked,
+    /// so return the closest thing we have), and when embeddings are
+    /// unavailable it degrades to lexical substring matching over the raw
+    /// tool list instead of returning nothing. Blocking — call from
+    /// `spawn_blocking`.
+    pub fn search_tools(&self, query: &str, limit: usize) -> Vec<McpToolMatch> {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { embedder, mcp, raw_mcp, .. } = &mut *inner;
+
+        if let (Some(emb), Some(corpus)) = (embedder.as_mut(), mcp.as_ref())
+            && let Ok(query_vec) = emb.embed_query(query)
+        {
+            return corpus.query(&query_vec, query, limit, f32::MIN);
+        }
+
+        // Lexical fallback: rank by how many query words hit name+description.
+        let needles: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 2)
+            .map(str::to_string)
+            .collect();
+        if needles.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(usize, &FullMCPTool)> = raw_mcp
+            .iter()
+            .map(|t| {
+                let haystack = format!("{} {}", t.full_name, t.tool.description).to_lowercase();
+                let hits = needles.iter().filter(|n| haystack.contains(n.as_str())).count();
+                (hits, t)
+            })
+            .filter(|(hits, _)| *hits > 0)
+            .collect();
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, t)| McpToolMatch {
+                full_name: t.full_name.clone(),
+                description: t.tool.description.clone(),
+                schema: t.tool.input_schema.clone(),
+                dense: 0.0,
+                sparse: 0.0,
+            })
+            .collect()
+    }
+
+    /// Render matches as the advisory block appended to an outgoing turn,
+    /// or `None` when there is nothing to say. Deliberately framed as
+    /// optional — a false positive must be ignorable. In deferred-schema
+    /// mode matched MCP tools carry their full definition, because the
+    /// system prompt no longer does.
+    pub fn render_hint(&self, matches: &PromptMatches) -> Option<String> {
+        if matches.is_empty() {
+            return None;
+        }
+        let mut lines =
+            vec!["[Hint — automatic semantic match, may be irrelevant]".to_string()];
+        if !matches.skills.is_empty() {
+            lines.push("Skills that may apply to the user's request:".to_string());
+            for m in &matches.skills {
+                lines.push(format!("- {} — {}", m.slug, m.description));
+            }
+            lines.push(
+                "If one clearly fits, load it with the `skill` tool (action=\"load\", name=\"<slug>\") before answering."
+                    .to_string(),
+            );
+        }
+        if !matches.mcp_tools.is_empty() {
+            lines.push("MCP tools that may apply:".to_string());
+            let deferred = self.mcp_schemas_deferred();
+            for m in &matches.mcp_tools {
+                if deferred {
+                    lines.push(crate::util::format_tool_definition(
+                        &m.full_name,
+                        &m.description,
+                        &m.schema,
+                    ));
+                } else {
+                    lines.push(format!("- `{}`: {}", m.full_name, m.description));
+                }
+            }
+        }
+        lines.push("If none of this fits the task, ignore this note.".to_string());
+        Some(lines.join("\n"))
     }
 }

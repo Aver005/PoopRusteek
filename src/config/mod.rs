@@ -155,19 +155,22 @@ pub struct SkillsConfig {
     pub paths: Vec<String>,
 }
 
-/// Semantic skill matching (`[semantic]`). Enabled by default: the first
-/// launch downloads the embedding model (~120 MB) into
+/// Semantic matching (`[semantic]`) over skills and MCP tools. Enabled by
+/// default: the first launch downloads the embedding model (~120 MB) into
 /// `Config::data_dir()/models` once; everything after that is offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticConfig {
     pub enabled: bool,
-    /// Max skills suggested per turn.
+    /// Max suggestions per corpus (skills, MCP tools) per turn.
     pub top_k: usize,
     /// Dense-cosine floor a candidate must clear when it has no lexical
     /// overlap with the prompt. e5 cosines cluster high, so this is tighter
     /// than it looks — tune against the `semantic::eval` harness
     /// (`cargo test semantic::eval -- --ignored --nocapture`), not by feel.
     pub min_dense_score: f32,
+    /// How MCP tool schemas reach the system prompt — see [`McpSchemaMode`].
+    #[serde(default)]
+    pub mcp_schemas: McpSchemaMode,
 }
 
 impl Default for SemanticConfig {
@@ -176,6 +179,42 @@ impl Default for SemanticConfig {
             enabled: true,
             top_k: 3,
             min_dense_score: 0.80,
+            mcp_schemas: McpSchemaMode::default(),
+        }
+    }
+}
+
+/// Whether the system prompt carries full MCP tool definitions or a
+/// compact name+description list with schemas fetched on demand (semantic
+/// per-turn hints + the `tool_search` builtin). Deferring saves thousands
+/// of prompt tokens once a few servers are connected.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpSchemaMode {
+    /// Defer once the catalog outgrows `AUTO_DEFER_THRESHOLD` tools.
+    #[default]
+    Auto,
+    /// Always inline full definitions (pre-0.2 behavior).
+    Full,
+    /// Always defer (any nonzero tool count).
+    Deferred,
+}
+
+impl McpSchemaMode {
+    /// Above this many MCP tools, `Auto` switches to deferred schemas. One
+    /// connected Playwright server alone is ~25 tools, so auto-defer is the
+    /// common case for anyone actually using MCP.
+    pub const AUTO_DEFER_THRESHOLD: usize = 12;
+
+    /// Resolve the mode against a live tool count. Callers that have
+    /// semantic matching disabled must pass `Full` instead of consulting
+    /// this — without embeddings, `tool_search` degrades to substring
+    /// matching, which is too weak to be the only path to a schema.
+    pub fn deferred_for(self, tool_count: usize) -> bool {
+        match self {
+            McpSchemaMode::Full => false,
+            McpSchemaMode::Deferred => tool_count > 0,
+            McpSchemaMode::Auto => tool_count > Self::AUTO_DEFER_THRESHOLD,
         }
     }
 }
@@ -328,6 +367,25 @@ mod tests {
     #[test]
     fn rate_limit_display_both_set() {
         assert_eq!(agent_with(500, 10).rate_limit_display(), "500ms, 10/min");
+    }
+
+    #[test]
+    fn mcp_schema_mode_resolution() {
+        use McpSchemaMode::*;
+        assert!(!Full.deferred_for(1000));
+        assert!(!Deferred.deferred_for(0), "nothing to defer with no tools");
+        assert!(Deferred.deferred_for(1));
+        assert!(!Auto.deferred_for(McpSchemaMode::AUTO_DEFER_THRESHOLD));
+        assert!(Auto.deferred_for(McpSchemaMode::AUTO_DEFER_THRESHOLD + 1));
+    }
+
+    #[test]
+    fn semantic_config_without_mcp_schemas_field_still_loads() {
+        // Stage-1 config files carry [semantic] without `mcp_schemas` —
+        // the field must default instead of failing the parse.
+        let toml_text = "enabled = true\ntop_k = 3\nmin_dense_score = 0.8\n";
+        let parsed: SemanticConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(parsed.mcp_schemas, McpSchemaMode::Auto);
     }
 
     #[test]

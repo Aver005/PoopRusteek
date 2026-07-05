@@ -37,12 +37,12 @@ pub async fn run_agent_loop(
     let mut collected_tool_calls = Vec::new();
     let mut messages = messages;
 
-    // Semantic skill hint: match the newest user message against the skill
-    // corpus and attach an advisory note the model can act on via the
-    // `skill` tool. Lives only in this turn's local message copy — it is
-    // never persisted to the conversation. ONNX inference is CPU-bound, so
-    // it runs on a blocking thread, not this task; a not-yet-initialized
-    // matcher returns no matches instantly.
+    // Semantic hint: match the newest user message against the skill and
+    // MCP-tool corpora and attach an advisory note the model can act on
+    // (`skill` tool / listed MCP tools). Lives only in this turn's local
+    // message copy — it is never persisted to the conversation. ONNX
+    // inference is CPU-bound, so it runs on a blocking thread, not this
+    // task; a not-yet-initialized matcher returns nothing instantly.
     if let Some(user_text) = messages
         .iter()
         .rev()
@@ -50,22 +50,23 @@ pub async fn run_agent_loop(
         .map(|m| m.content.clone())
     {
         let service = Arc::clone(&semantic);
-        let matches = tokio::task::spawn_blocking(move || service.match_skills(&user_text))
+        let matches = tokio::task::spawn_blocking(move || service.match_prompt(&user_text))
             .await
             .unwrap_or_default();
-        if !matches.is_empty() {
+        if let Some(hint) = semantic.render_hint(&matches) {
+            let described: Vec<String> = matches
+                .skills
+                .iter()
+                .map(|m| format!("skill:{}(d={:.3},s={:.3})", m.slug, m.dense, m.sparse))
+                .chain(matches.mcp_tools.iter().map(|m| {
+                    format!("mcp:{}(d={:.3},s={:.3})", m.full_name, m.dense, m.sparse)
+                }))
+                .collect();
             debug_log::log(
-                "agent.skill_hint",
-                format!(
-                    "conversation={conversation} matches={}",
-                    matches
-                        .iter()
-                        .map(|m| format!("{}(d={:.3},s={:.3})", m.slug, m.dense, m.sparse))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                "agent.semantic_hint",
+                format!("conversation={conversation} matches={}", described.join(", ")),
             );
-            messages.push(ChatMessage::system(&SemanticService::render_hint(&matches)));
+            messages.push(ChatMessage::system(&hint));
         }
     }
 
