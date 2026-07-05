@@ -106,7 +106,7 @@ impl LLMProvider for GeminiProvider {
                     continue;
                 };
                 let Ok(chunk) = serde_json::from_str::<GenerateContentResponse>(payload) else {
-                    debug_log::log("gemini.stream.parse", "skipping malformed chunk".to_string());
+                    debug_log::log("gemini.stream.parse", "skipping malformed chunk");
                     continue;
                 };
                 let (text, finish) = gemini_compat::extract_piece(&chunk);

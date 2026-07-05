@@ -15,6 +15,7 @@ mod prompts;
 mod whitelist;
 mod util;
 mod skills;
+mod semantic;
 
 use std::sync::Arc;
 use color_eyre::Result;

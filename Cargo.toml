@@ -76,6 +76,15 @@ sha2 = "0.10"
 # PTY for interactive CLI tools (arrow-key menus, REPLs)
 portable-pty = "0.9"
 
+# Semantic skill matching: local ONNX embeddings (multilingual-e5-small) +
+# Snowball stemming for the sparse half of the hybrid match. Slimmed
+# features: no image models, rustls instead of native-tls (matches reqwest).
+fastembed = { version = "5.17.2", default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+] }
+rust-stemmers = "1.2.0"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1"
 

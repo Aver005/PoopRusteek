@@ -10,6 +10,9 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Semantic (embedding-based) skill matching — see `crate::semantic`.
+    #[serde(default)]
+    pub semantic: SemanticConfig,
     /// Additional OpenAI-compatible providers (LM Studio, Ollama, vLLM,
     /// OpenRouter, …) managed via `/providers`. The DeepSeek web client
     /// configured by `[provider]` above is the implicit built-in entry and
@@ -152,6 +155,31 @@ pub struct SkillsConfig {
     pub paths: Vec<String>,
 }
 
+/// Semantic skill matching (`[semantic]`). Enabled by default: the first
+/// launch downloads the embedding model (~120 MB) into
+/// `Config::data_dir()/models` once; everything after that is offline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticConfig {
+    pub enabled: bool,
+    /// Max skills suggested per turn.
+    pub top_k: usize,
+    /// Dense-cosine floor a candidate must clear when it has no lexical
+    /// overlap with the prompt. e5 cosines cluster high, so this is tighter
+    /// than it looks — tune against the `semantic::eval` harness
+    /// (`cargo test semantic::eval -- --ignored --nocapture`), not by feel.
+    pub min_dense_score: f32,
+}
+
+impl Default for SemanticConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            top_k: 3,
+            min_dense_score: 0.80,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -180,6 +208,7 @@ impl Default for Config {
             },
             mcp: McpConfig::default(),
             skills: SkillsConfig::default(),
+            semantic: SemanticConfig::default(),
             providers: Vec::new(),
             active_provider: None,
         }

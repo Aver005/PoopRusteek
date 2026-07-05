@@ -35,6 +35,7 @@ pub struct TurnSpec {
 pub struct AgentRuntime {
     tools: Arc<ToolRegistry>,
     mcp: Arc<tokio::sync::Mutex<MCPManager>>,
+    semantic: Arc<crate::semantic::SemanticService>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 }
 
@@ -42,9 +43,10 @@ impl AgentRuntime {
     pub fn new(
         tools: Arc<ToolRegistry>,
         mcp: Arc<tokio::sync::Mutex<MCPManager>>,
+        semantic: Arc<crate::semantic::SemanticService>,
         event_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Self {
-        Self { tools, mcp, event_tx }
+        Self { tools, mcp, semantic, event_tx }
     }
 
     /// Launch a turn on its own task; the returned handle drives cancellation.
@@ -54,6 +56,7 @@ impl AgentRuntime {
             spec.provider,
             Arc::clone(&self.tools),
             Arc::clone(&self.mcp),
+            Arc::clone(&self.semantic),
             spec.messages,
             spec.system_prompt,
             spec.model,

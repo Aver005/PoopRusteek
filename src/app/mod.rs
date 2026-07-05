@@ -233,8 +233,17 @@ impl App {
             state.mcp_status.last_stats_update = Some(std::time::Instant::now());
         }
 
-        let runtime =
-            runtime::AgentRuntime::new(Arc::clone(&tools), Arc::clone(&mcp), event_tx.clone());
+        // Semantic skill matcher: background init (first run downloads the
+        // embedding model); turns get skill hints once it's ready.
+        let semantic =
+            crate::semantic::SemanticService::start(&config, skills.clone(), event_tx.clone());
+
+        let runtime = runtime::AgentRuntime::new(
+            Arc::clone(&tools),
+            Arc::clone(&mcp),
+            semantic,
+            event_tx.clone(),
+        );
 
         Ok(Self {
             config,
@@ -610,6 +619,9 @@ impl App {
                         self.state.mcp_status.view.status_message = format!("Authorization failed: {e}");
                     }
                 }
+            }
+            AppEvent::SemanticStatus(message) => {
+                self.state.status_message = message;
             }
             _ => {}
         }

@@ -105,6 +105,11 @@
 | `src/acp/types.rs` | ACP request/response/content types |
 | `src/skills/mod.rs` | `SkillDefinition`, `SkillSource`, frontmatter parse — now keeps repeated keys instead of only the first occurrence |
 | `src/skills/discovery.rs` | Skill discovery (many dirs), formats; tilde expansion fixed via `util::expand_tilde` | ~280 |
+| `src/semantic/mod.rs` | `SemanticService` — off-loop init handle for local skill matching (Disabled/Initializing/Ready/Failed; blocking `match_skills`, `render_hint`) |
+| `src/semantic/embedder.rs` | fastembed wrapper pinned to multilingual-e5-small; e5 `query:`/`passage:` prefix contract, L2-normalized outputs; model cache `Config::data_dir()/models` |
+| `src/semantic/sparse.rs` | Stemmed TF-IDF sparse vectors (ru/en Snowball) — lexical half of the hybrid match |
+| `src/semantic/matcher.rs` | `SkillMatcher` — dense+sparse RRF fusion, dense-floor/lexical-overlap gate, top-k |
+| `src/semantic/eval.rs` | Retrieval eval: fixture corpus + 16 ru/en queries → MRR (`#[ignore]`, needs the model) |
 | `src/util.rs` | `atomic_write` (now actually used everywhere), `expand_tilde` (single shared impl), `truncate_at_char_boundary` |
 | `src/cli/onboarding.rs` | **DELETED** — replaced by `View::Onboarding` in-TUI flow | — |
 | `src/cli/file_mentions.rs` | `@file:line` expansion — line-range clamp fixed (was an out-of-bounds slice panic) | ~120 |

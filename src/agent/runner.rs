@@ -2,7 +2,8 @@ use crate::app::conversation::ConversationId;
 use crate::app::events::{AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo};
 use crate::debug_log;
 use crate::mcp::MCPManager;
-use crate::provider::{ChatMessage, CompletionRequest, LLMProvider};
+use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
+use crate::semantic::SemanticService;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
 use crate::agent::stream::{collect_stream, StreamEnd};
@@ -22,6 +23,7 @@ pub async fn run_agent_loop(
     provider: Arc<dyn LLMProvider>,
     tools: Arc<ToolRegistry>,
     mcp: Arc<tokio::sync::Mutex<MCPManager>>,
+    semantic: Arc<SemanticService>,
     messages: Vec<ChatMessage>,
     system_prompt: String,
     model: String,
@@ -34,6 +36,38 @@ pub async fn run_agent_loop(
 ) {
     let mut collected_tool_calls = Vec::new();
     let mut messages = messages;
+
+    // Semantic skill hint: match the newest user message against the skill
+    // corpus and attach an advisory note the model can act on via the
+    // `skill` tool. Lives only in this turn's local message copy — it is
+    // never persisted to the conversation. ONNX inference is CPU-bound, so
+    // it runs on a blocking thread, not this task; a not-yet-initialized
+    // matcher returns no matches instantly.
+    if let Some(user_text) = messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User) && !m.content.trim().is_empty())
+        .map(|m| m.content.clone())
+    {
+        let service = Arc::clone(&semantic);
+        let matches = tokio::task::spawn_blocking(move || service.match_skills(&user_text))
+            .await
+            .unwrap_or_default();
+        if !matches.is_empty() {
+            debug_log::log(
+                "agent.skill_hint",
+                format!(
+                    "conversation={conversation} matches={}",
+                    matches
+                        .iter()
+                        .map(|m| format!("{}(d={:.3},s={:.3})", m.slug, m.dense, m.sparse))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            messages.push(ChatMessage::system(&SemanticService::render_hint(&matches)));
+        }
+    }
 
     for step in 0..max_steps {
         let step_number = step + 1;
@@ -547,6 +581,7 @@ mod tests {
             provider,
             tools,
             mcp,
+            SemanticService::disabled(),
             vec![ChatMessage::user("hi")],
             "system".to_string(),
             "fake".to_string(),
@@ -603,6 +638,7 @@ mod tests {
             provider,
             tools,
             mcp,
+            SemanticService::disabled(),
             vec![ChatMessage::user("hi")],
             "system".to_string(),
             "fake".to_string(),
@@ -645,6 +681,7 @@ mod tests {
             provider,
             tools,
             mcp,
+            SemanticService::disabled(),
             vec![ChatMessage::user("hi")],
             "system".to_string(),
             "fake".to_string(),

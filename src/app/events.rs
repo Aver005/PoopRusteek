@@ -179,6 +179,10 @@ pub enum AppEvent {
     },
     /// A background session-deletion batch finished.
     SessionsDeleted { deleted: usize, failed: Vec<String> },
+
+    /// Progress/status from the semantic skill-matcher background init
+    /// (first-run model download, readiness, failure). Status-line only.
+    SemanticStatus(String),
 }
 
 // Populated at the `AgentDone` send site but every current receiver
