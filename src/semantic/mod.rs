@@ -64,9 +64,27 @@ impl PromptMatches {
     }
 }
 
+/// Point-in-time state for `/rag` status display.
+pub struct RagStatus {
+    pub enabled: bool,
+    pub ready: bool,
+    pub init_running: bool,
+    pub model_on_disk: bool,
+    pub skills_indexed: usize,
+    pub mcp_indexed: usize,
+    pub mcp_known: usize,
+    pub deferred: bool,
+}
+
 pub struct SemanticService {
     inner: Mutex<Inner>,
     config: SemanticConfig,
+    /// Runtime switch behind `/rag on|off` — starts from `config.enabled`.
+    /// Off means: no hints, no semantic ranking (lexical `tool_search`
+    /// fallback stays), and the app inlines full MCP schemas again.
+    enabled: AtomicBool,
+    /// Guard so `/rag on` + `/rag reload` can't stack duplicate inits.
+    init_running: AtomicBool,
     /// Resolved on every `update_mcp_tools`: whether the current tool count
     /// puts the system prompt in deferred-schema mode. Hints mirror this —
     /// in deferred mode a matched tool's full definition rides in the hint,
@@ -85,13 +103,27 @@ impl SemanticService {
         let service = Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             config: config.semantic.clone(),
+            enabled: AtomicBool::new(config.semantic.enabled),
+            init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
         });
-        if !config.semantic.enabled {
-            return service;
+        if config.semantic.enabled {
+            service.spawn_init(skills, event_tx);
         }
+        service
+    }
 
-        let this = Arc::clone(&service);
+    /// Launch model load (+ download on first run) and corpus embedding on
+    /// a background task. No-op if an init is already in flight.
+    pub fn spawn_init(
+        self: &Arc<Self>,
+        skills: Vec<SkillDefinition>,
+        event_tx: mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if self.init_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = Arc::clone(self);
         tokio::spawn(async move {
             let cache_dir = Config::data_dir().join("models");
             let first_run = !embedder::model_cache_present(&cache_dir);
@@ -118,6 +150,7 @@ impl SemanticService {
             })
             .await;
 
+            this.init_running.store(false, Ordering::SeqCst);
             match built {
                 Ok(Ok(count)) => {
                     tracing::info!("semantic: matcher ready ({count} skills)");
@@ -138,8 +171,63 @@ impl SemanticService {
                 }
             }
         });
+    }
 
-        service
+    /// `/rag on|off`. Recomputes deferred-schema state for the current tool
+    /// count; the caller is responsible for persisting the config flag and
+    /// (on enable) calling `spawn_init` if `is_ready()` is still false.
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+        let tool_count = self.inner.lock().unwrap().raw_mcp.len();
+        self.mcp_deferred.store(
+            on && self.config.mcp_schemas.deferred_for(tool_count),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.inner.lock().unwrap().embedder.is_some()
+    }
+
+    /// `/rag reload` — drop the loaded model and every embedded corpus,
+    /// then re-init from scratch: the model files are re-verified (missing
+    /// ones re-downloaded) and skills re-embedded; the kept `raw_mcp` list
+    /// re-embeds automatically when init lands. No-op if an init is
+    /// already in flight (returns false so the caller can say so).
+    pub fn reload(
+        self: &Arc<Self>,
+        skills: Vec<SkillDefinition>,
+        event_tx: mpsc::UnboundedSender<AppEvent>,
+    ) -> bool {
+        if self.init_running.load(Ordering::SeqCst) {
+            return false;
+        }
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.embedder = None;
+            inner.skills = None;
+            inner.mcp = None;
+        }
+        self.spawn_init(skills, event_tx);
+        true
+    }
+
+    pub fn status(&self) -> RagStatus {
+        let inner = self.inner.lock().unwrap();
+        RagStatus {
+            enabled: self.is_enabled(),
+            ready: inner.embedder.is_some(),
+            init_running: self.init_running.load(Ordering::SeqCst),
+            model_on_disk: embedder::model_cache_present(&Config::data_dir().join("models")),
+            skills_indexed: inner.skills.as_ref().map_or(0, SkillCorpus::len),
+            mcp_indexed: inner.mcp.as_ref().map_or(0, McpCorpus::len),
+            mcp_known: inner.raw_mcp.len(),
+            deferred: self.mcp_deferred.load(Ordering::Relaxed),
+        }
     }
 
     /// An always-off service for contexts with no config/event channel.
@@ -148,6 +236,8 @@ impl SemanticService {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             config: SemanticConfig::default(),
+            enabled: AtomicBool::new(false),
+            init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
         })
     }
@@ -158,7 +248,7 @@ impl SemanticService {
     /// it lands. Cheap to call from the event loop.
     pub fn update_mcp_tools(self: &Arc<Self>, tools: Vec<FullMCPTool>) {
         self.mcp_deferred.store(
-            self.config.enabled && self.config.mcp_schemas.deferred_for(tools.len()),
+            self.is_enabled() && self.config.mcp_schemas.deferred_for(tools.len()),
             Ordering::Relaxed,
         );
         let embedder_ready = {
@@ -201,10 +291,13 @@ impl SemanticService {
     }
 
     /// Match `prompt` against both corpora with one query embedding.
-    /// Returns nothing until background init completes. Blocking (ONNX
-    /// inference under the state lock, no awaits) — call from
-    /// `spawn_blocking`.
+    /// Returns nothing until background init completes or while `/rag off`
+    /// is in effect. Blocking (ONNX inference under the state lock, no
+    /// awaits) — call from `spawn_blocking`.
     pub fn match_prompt(&self, prompt: &str) -> PromptMatches {
+        if !self.is_enabled() {
+            return PromptMatches::default();
+        }
         let mut inner = self.inner.lock().unwrap();
         let Inner { embedder, skills, mcp, .. } = &mut *inner;
         let Some(emb) = embedder else {
@@ -241,7 +334,10 @@ impl SemanticService {
         let mut inner = self.inner.lock().unwrap();
         let Inner { embedder, mcp, raw_mcp, .. } = &mut *inner;
 
-        if let (Some(emb), Some(corpus)) = (embedder.as_mut(), mcp.as_ref())
+        // Semantic path only while enabled — `/rag off` means off; the
+        // lexical fallback below stays as the dumb-but-working baseline.
+        if self.is_enabled()
+            && let (Some(emb), Some(corpus)) = (embedder.as_mut(), mcp.as_ref())
             && let Ok(query_vec) = emb.embed_query(query)
         {
             return corpus.query(&query_vec, query, limit, f32::MIN);

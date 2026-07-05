@@ -1,6 +1,6 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
+> Last updated: 2026-07-05 (added /rag — semantic-matching status/on/off/reload). Before: 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
 
 ## HOW COMMANDS WORK
 
@@ -13,7 +13,7 @@
 ### `CommandResult` variants (`src/commands/mod.rs:26`)
 `Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)` · `OpenConfirm(ConfirmAction)`
 
-## FULL COMMAND LIST (33 commands, +2 `/cwd` aliases)
+## FULL COMMAND LIST (34 commands, +2 `/cwd` aliases)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -49,6 +49,7 @@
 | `/logout` | — | — | Confirm → cancel all turns, clear `provider.token`, save config, show onboarding (`reset_to_onboarding`) | `defs/logout.rs` |
 | `/wipe` | — | — | Confirm → cancel all turns, `remove_dir_all` over `wipe_roots()` (config-file parent + data dir, deduped), factory reset to `Config::default`, clear whitelist/history, show onboarding | `defs/wipe.rs` |
 | `/debug` | — | `[on\|off]` | Toggle debug logging at runtime via `debug_log::set_enabled` (no args = flip current state); lazily opens `.dev/debug.log` on first enable | `defs/debug.rs` |
+| `/rag` | — | `[on\|off\|reload]` | Semantic matching control. Bare = how-it-works + live status (state/model/indexed counts/config) + subcommand list. `on`/`off` = persist `semantic.enabled` + flip the running `SemanticService` (off → hints stop, full MCP schemas return; on → `spawn_init` if not ready). `reload` = drop model+corpora, re-verify/re-download model, re-embed skills and a freshly-fetched MCP tool list. Effects live in `apply_rag_action` (keys/dispatch.rs) via `CommandResult::Rag(RagAction)` | `defs/rag.rs` |
 
 ## NOTES & GOTCHAS
 

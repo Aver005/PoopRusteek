@@ -189,7 +189,109 @@ impl App {
                     }
                 }
             },
+            CommandResult::Rag(action) => self.apply_rag_action(action),
         }
         Ok(false)
+    }
+
+    /// `/rag` effects: status display, persisted on/off switch, full
+    /// reload. Everything heavy (model load, embedding) happens inside the
+    /// service on blocking threads — these arms only flip flags and spawn.
+    fn apply_rag_action(&mut self, action: crate::commands::RagAction) {
+        use crate::commands::RagAction;
+        match action {
+            RagAction::Status => {
+                let text = self.rag_status_text();
+                self.state.push_system(&text);
+            }
+            RagAction::SetEnabled(on) => {
+                self.config.semantic.enabled = on;
+                if let Err(e) = crate::config::save(&self.config) {
+                    self.state.push_system(&format!("Failed to save config: {e}"));
+                    return;
+                }
+                self.semantic.set_enabled(on);
+                if on {
+                    if !self.semantic.is_ready() {
+                        self.semantic
+                            .spawn_init(self.skills.clone(), self.event_tx.clone());
+                        self.state.push_system(
+                            "RAG enabled — initializing in the background (first run downloads the ~120 MB embedding model). Hints start once it's ready.",
+                        );
+                    } else {
+                        self.state.push_system("RAG enabled.");
+                    }
+                } else {
+                    self.state.push_system(
+                        "RAG disabled: no more hints, full MCP schemas return to the system prompt from the next turn. Re-enable with /rag on.",
+                    );
+                }
+            }
+            RagAction::Reload => {
+                if !self.semantic.is_enabled() {
+                    self.state.push_system("RAG is disabled — run /rag on first.");
+                    return;
+                }
+                if !self
+                    .semantic
+                    .reload(self.skills.clone(), self.event_tx.clone())
+                {
+                    self.state.push_system(
+                        "RAG is already initializing — wait for it to finish before reloading.",
+                    );
+                    return;
+                }
+                // Also refresh the raw MCP tool list so the rebuilt index
+                // can't resurrect tools from servers that have gone away.
+                let mcp = Arc::clone(&self.mcp);
+                let semantic = Arc::clone(&self.semantic);
+                tokio::spawn(async move {
+                    let tools = mcp.lock().await.get_all_tools();
+                    semantic.update_mcp_tools(tools);
+                });
+                self.state.push_system(
+                    "RAG reloading: verifying the model (missing files are re-downloaded) and re-embedding skills + MCP tools in the background.",
+                );
+            }
+        }
+    }
+
+    fn rag_status_text(&self) -> String {
+        let status = self.semantic.status();
+        let state = match (status.enabled, status.ready, status.init_running) {
+            (false, ..) => "disabled",
+            (true, true, _) => "enabled, ready",
+            (true, false, true) => "enabled, initializing...",
+            (true, false, false) => "enabled, not initialized (init failed? try /rag reload)",
+        };
+        let model = if status.model_on_disk {
+            format!(
+                "on disk ({})",
+                crate::config::Config::data_dir().join("models").display()
+            )
+        } else {
+            "not downloaded yet (~120 MB, fetched on first init)".to_string()
+        };
+        format!(
+            "RAG — local semantic matching over skills and MCP tools.\n\
+             Every prompt is embedded locally (multilingual-e5-small, ONNX; no network after the one-time model download) and matched against both catalogs — dense cosine + stemmed keyword TF-IDF, fused with RRF. Top hits ride along with the turn as an advisory hint; with many MCP tools connected, full schemas leave the system prompt and are fetched via the tool_search tool instead.\n\
+             \n\
+             State:   {state}\n\
+             Model:   {model}\n\
+             Indexed: {} skills, {} MCP tools ({} known; deferred schemas: {})\n\
+             Config:  top_k={}, min_dense_score={:.2}, mcp_schemas={:?}\n\
+             \n\
+             Subcommands:\n\
+             \u{2022} /rag on      — enable (downloads the model on first use)\n\
+             \u{2022} /rag off     — disable completely; full MCP schemas return to the system prompt\n\
+             \u{2022} /rag reload  — reinitialize: verify/re-download the model, re-embed skills + MCP tools",
+            status.skills_indexed,
+            status.mcp_indexed,
+            status.mcp_known,
+            if status.deferred { "on" } else { "off" },
+            self.config.semantic.top_k,
+            self.config.semantic.min_dense_score,
+            self.config.semantic.mcp_schemas,
+        )
     }
 }

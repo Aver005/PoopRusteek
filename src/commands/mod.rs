@@ -23,6 +23,20 @@ pub enum JobCommandAction {
     Prune,
 }
 
+/// `/rag` subcommand intents — interpreted in `apply_command_result`,
+/// which has the `App`-level access (semantic service, mutable config)
+/// these effects need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RagAction {
+    /// `/rag` — short how-it-works + live status + subcommand list.
+    Status,
+    /// `/rag on` / `/rag off` — persist the flag and flip the service.
+    SetEnabled(bool),
+    /// `/rag reload` — re-verify the model (re-download missing files)
+    /// and re-embed every corpus.
+    Reload,
+}
+
 pub enum CommandResult {
     Handled,
     LoadSession(String),
@@ -74,6 +88,8 @@ pub enum CommandResult {
     /// `/models <id>` — validate the id against the provider's model list
     /// and switch to it (404-style error when it doesn't exist).
     SwitchModel(String),
+    /// `/rag [on|off|reload]` — semantic-matching control.
+    Rag(RagAction),
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +196,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::logout::LogoutCommand));
         self.register(Box::new(defs::wipe::WipeCommand));
         self.register(Box::new(defs::debug::DebugCommand));
+        self.register(Box::new(defs::rag::RagCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));
