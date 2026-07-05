@@ -528,30 +528,3 @@ impl SemanticService {
     }
 }
 
-/// Render `/search` results for the chat view. Free-standing so the
-/// dispatch task can format without holding the service.
-pub fn render_history_results(query: &str, matches: &[history::HistoryMatch]) -> String {
-    if matches.is_empty() {
-        return format!(
-            "No history matches for \"{query}\". The index may still be building — check /rag."
-        );
-    }
-    let mut lines = vec![format!("History matches for \"{query}\":")];
-    for (i, m) in matches.iter().enumerate() {
-        // Date part is enough for orientation; the full stamp is noise here.
-        let when = m.timestamp.split('T').next().unwrap_or(&m.timestamp);
-        let snippet =
-            crate::util::truncate_with_ellipsis(&m.text.replace(['\n', '\r'], " "), 220);
-        lines.push(format!(
-            "{}. [{}] {} — {}: {}\n   session: {}",
-            i + 1,
-            when,
-            m.title,
-            m.role,
-            snippet,
-            m.session_id,
-        ));
-    }
-    lines.push("Open one with /load <session-id>.".to_string());
-    lines.join("\n")
-}

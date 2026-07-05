@@ -23,6 +23,7 @@ mod mcp;
 mod modal;
 mod onboarding;
 mod providers;
+mod search;
 
 use crate::app::events::View;
 use crate::app::input::InputState;
@@ -80,6 +81,10 @@ impl App {
 
         if self.state.view == View::Providers {
             return self.handle_providers_key(key).await;
+        }
+
+        if self.state.view == View::Search {
+            return self.handle_search_key(key).await;
         }
 
         self.handle_chat_key(key).await

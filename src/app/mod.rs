@@ -11,6 +11,7 @@ mod multichat;
 mod pickers;
 pub mod providers;
 mod runtime;
+pub mod search;
 mod sessions;
 mod system_prompt;
 
@@ -120,6 +121,7 @@ pub struct AppState {
     pub onboarding: OnboardingState,
     pub mcp_status: mcp_status::McpStatus,
     pub providers_view: providers::ProvidersViewState,
+    pub search: search::SearchViewState,
     pub workspace_path: String,
     pub show_stats_panel: bool,
     pub attached_files: Vec<crate::provider::AttachedFile>,
@@ -214,6 +216,7 @@ impl App {
             onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
             providers_view: providers::ProvidersViewState::default(),
+            search: search::SearchViewState::default(),
             show_stats_panel: true,
             workspace_path: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -640,6 +643,24 @@ impl App {
             }
             AppEvent::SemanticStatus(message) => {
                 self.state.status_message = message;
+            }
+            AppEvent::HistorySearchDone { query, matches } => {
+                let search = &mut self.state.search;
+                // Only the reply to the latest query counts.
+                if search.last_query == query {
+                    search.searching = false;
+                    search.matches = matches;
+                    search.reset_selection();
+                    search.status = if search.matches.is_empty() {
+                        "No matches — the index may still be building (see /rag)".to_string()
+                    } else {
+                        format!("{} matches", search.matches.len())
+                    };
+                    // Land the user straight on the results.
+                    if !search.matches.is_empty() {
+                        search.focus = search::SearchFocus::Results;
+                    }
+                }
             }
             _ => {}
         }

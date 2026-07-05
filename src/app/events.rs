@@ -183,6 +183,14 @@ pub enum AppEvent {
     /// Progress/status from the semantic skill-matcher background init
     /// (first-run model download, readiness, failure). Status-line only.
     SemanticStatus(String),
+
+    /// A `/search` lookup finished on its blocking thread. `query` echoes
+    /// the request so stale replies (user already searched again) can be
+    /// recognized and dropped.
+    HistorySearchDone {
+        query: String,
+        matches: Vec<crate::semantic::history::HistoryMatch>,
+    },
 }
 
 // Populated at the `AgentDone` send site but every current receiver
@@ -264,6 +272,8 @@ pub enum View {
     Onboarding,
     /// `/providers` — the provider-management panel.
     Providers,
+    /// `/search` — the history-search screen.
+    Search,
 }
 
 /// Pure state for the in-TUI onboarding screen. No app deps — fully testable.

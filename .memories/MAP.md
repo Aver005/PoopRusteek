@@ -114,6 +114,9 @@
 | `src/semantic/eval.rs` | Retrieval eval: skill + MCP fixtures → MRR, history E2E roundtrip (`#[ignore]`, need the model). Latest: skills 0.927, MCP 0.836 |
 | `src/tools/tool_search.rs` | `tool_search` builtin — capability search over MCP tools, returns full definitions; lexical fallback pre-init. The escape hatch for deferred MCP schemas |
 | `src/tools/history_search.rs` | `history_search` builtin — agent-facing search over past sessions (session id + title + date + excerpt per hit) |
+| `src/app/search.rs` | `View::Search` state: query `InputState`, matches in ranker order, pure `visible_indices` (role filter → per-session dedup → sort), `spawn_history_search` |
+| `src/app/keys/search.rs` | Search-screen keys — two focus zones (query text vs results hotkeys: s/r/u/Enter-open/q) |
+| `src/tui/render/search.rs` | Search-screen render: query box w/ drawn cursor, filter chips bar, 3-row result items, selection-derived scroll |
 | `src/util.rs` | `atomic_write` (now actually used everywhere), `expand_tilde` (single shared impl), `truncate_at_char_boundary` |
 | `src/cli/onboarding.rs` | **DELETED** — replaced by `View::Onboarding` in-TUI flow | — |
 | `src/cli/file_mentions.rs` | `@file:line` expansion — line-range clamp fixed (was an out-of-bounds slice panic) | ~120 |

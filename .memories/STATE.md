@@ -22,7 +22,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **320 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
+| Tests | **326 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 
 ## CURRENT FOCUS

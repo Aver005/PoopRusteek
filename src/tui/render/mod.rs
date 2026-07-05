@@ -14,6 +14,7 @@ mod modals;
 mod onboarding;
 mod popup;
 mod providers;
+mod search;
 mod status;
 mod util;
 
@@ -107,6 +108,8 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             mcp::render_mcp_view(frame, area, &state.mcp_status.view, &theme);
         } else if state.view == View::Providers {
             providers::render_providers_view(frame, area, &state.providers_view, config, &theme);
+        } else if state.view == View::Search {
+            search::render_search_view(frame, area, &state.search, &theme);
         } else if state.focused().messages.is_empty() && !state.focused().generation.active {
             landing::render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
@@ -185,6 +188,8 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         || state.focused().generation.active
         || state.view == View::Mcp
         || state.view == View::Providers
+        // Search draws its own block cursor in the query line.
+        || state.view == View::Search
     {
         terminal.hide_cursor()?;
     } else {

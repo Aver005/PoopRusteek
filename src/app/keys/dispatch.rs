@@ -191,22 +191,11 @@ impl App {
             },
             CommandResult::Rag(action) => self.apply_rag_action(action),
             CommandResult::SearchHistory(query) => {
-                self.state.status_message = format!("Searching history for \"{query}\"...");
-                let semantic = Arc::clone(&self.semantic);
-                let event_tx = self.event_tx.clone();
-                let conversation = self.state.conversations.focused_id();
-                tokio::spawn(async move {
-                    let for_search = query.clone();
-                    let results =
-                        tokio::task::spawn_blocking(move || semantic.search_history(&for_search, 8))
-                            .await
-                            .unwrap_or_default();
-                    let text = crate::semantic::render_history_results(&query, &results);
-                    let _ = event_tx.send(events::AppEvent::AddMessage(
-                        conversation,
-                        ChatMessage::ui_system(&text),
-                    ));
-                });
+                self.state.view = View::Search;
+                self.state.search = crate::app::search::SearchViewState::fresh(&query);
+                if !query.is_empty() {
+                    self.spawn_history_search(query);
+                }
             }
         }
         Ok(false)

@@ -1,10 +1,11 @@
 use crate::app::AppState;
-use crate::commands::{with_args, Command, CommandResult};
+use crate::commands::{Command, CommandResult};
 use crate::config::Config;
 
-/// `/search <query>` — semantic + keyword search across the indexed
-/// message history of every saved session. The search itself runs off the
-/// event loop; results flush back into the chat as a UI-only message.
+/// `/search [query]` — open the history-search screen (`View::Search`):
+/// semantic + keyword search across every saved session, with sort/filter
+/// controls. With a query the lookup starts immediately; bare `/search`
+/// opens the screen with an empty query line.
 pub struct SearchCommand;
 
 impl Command for SearchCommand {
@@ -17,12 +18,10 @@ impl Command for SearchCommand {
     }
 
     fn usage(&self) -> &str {
-        "/search <query>"
+        "/search [query]"
     }
 
     fn execute(&self, args: &str, _state: &mut AppState, _config: &Config) -> CommandResult {
-        with_args(args, self.usage(), |query| {
-            CommandResult::SearchHistory(query.to_string())
-        })
+        CommandResult::SearchHistory(args.trim().to_string())
     }
 }
