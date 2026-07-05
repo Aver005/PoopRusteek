@@ -6,9 +6,13 @@ Guidance for Claude Code (and any other agent) working in this repository.
 
 Pooprusteek is a Rust TUI coding agent that talks to DeepSeek's reverse-engineered
 web API (no paid API key — cookie/token auth, local SHA-3 proof-of-work) instead
-of an official LLM API. Built on `tokio` + `ratatui`, it runs a single event-driven
-terminal UI supporting parallel conversations, sub-agents, an iterative GOAL
-worker/evaluator loop, MCP (stdio/HTTP/SSE tool servers), and markdown skills —
+of an official LLM API, with optional extra providers (OpenAI-compatible /
+Anthropic Messages / Gemini endpoints via `/providers`). Built on `tokio` +
+`ratatui`, it runs a single event-driven terminal UI supporting parallel
+conversations, sub-agents, an iterative GOAL worker/evaluator loop, MCP
+(stdio/HTTP/SSE tool servers with OAuth), markdown skills, and a **fully local
+semantic (RAG) layer** — multilingual-e5-small ONNX embeddings + stemmed TF-IDF
++ RRF over three corpora: skills, MCP tools, and persistent message history —
 a free, terminal-native alternative to Claude Code.
 
 ## Read first
@@ -36,6 +40,22 @@ MSRV 1.91 (edition 2024). CI (`.github/workflows/ci.yml`) runs build + test on
 Windows and Linux; clippy runs advisory (`continue-on-error`) until historical
 warnings are paid down.
 
+Semantic/retrieval changes have their own quality gate — an `#[ignore]`d MRR
+eval harness that needs the ~120 MB embedding model on disk (downloaded once,
+shared with the app):
+
+```
+cargo test --bin pooprusteek semantic::eval -- --ignored --nocapture
+```
+
+Run it whenever you touch `src/semantic/` ranking (thresholds, RRF, corpus
+text composition) and record the numbers in the journal. Current baselines:
+skills MRR 0.927, MCP tools MRR 0.836.
+
+Build flake to know about: parallel rustc + ort linking can exhaust the
+Windows pagefile (`STATUS_STACK_BUFFER_OVERRUN` / os error 1455, "paging file
+too small"). It is NOT a code error — retry, or `cargo test -j 1`.
+
 ## Architecture (see `.memories/ARCHITECTURE.md` for the full picture)
 
 A single `tokio::select!` event loop multiplexes ticks, terminal input, and an
@@ -49,6 +69,28 @@ spawned task. Every emitted event is tagged with a `ConversationId` so
 background turns route into the right buffer instead of the focused one. The
 TUI render path reads the focused conversation's state and never mutates it.
 
+Key subsystems added on top of that core:
+
+- **`src/semantic/` — local RAG.** `SemanticService` is a shared handle over
+  one embedder + three corpora (skills, MCP tools, message history). Init is
+  background (`spawn_init` on `spawn_blocking`; first run downloads the model,
+  then backfills history from saved session files). Each turn gets an
+  ephemeral hint (`match_prompt` in `run_agent_loop`) suggesting skills and
+  MCP tools; the `tool_search` / `history_search` builtins expose the same
+  index to the model on demand. **Deferred MCP schemas**: above 12 tools
+  (`[semantic] mcp_schemas = auto`), the system prompt lists MCP tools
+  name+one-liner only — full definitions come from hints or `tool_search`.
+  The history index (`data_dir/semantic/history.json`) is a rebuildable cache
+  over session files (per-session watermarks, model-stamp wipe); `/search`
+  (View::Search) and `/rag` are the user-facing surfaces.
+- **`src/provider/` — multi-protocol.** The built-in DeepSeek web client
+  (PoW + SSE) plus `/providers`-managed entries speaking OpenAI Chat
+  Completions, Anthropic Messages, or Gemini. All implement `LLMProvider`
+  with `fork()` for per-conversation session isolation.
+- **`src/mcp/` — servers + OAuth.** 8-source config discovery, `/mcp add`
+  (JSON / wizard / one-liner), RFC 9728/8414/7591 + PKCE authorization with
+  OS-keyring token storage.
+
 ## Invariants for contributors (human or AI)
 
 1. **Never block or `.await` network/LLM/file I/O inside `handle_event`** — it runs on the main `select!` loop; spawn a task and send an `AppEvent` back instead.
@@ -59,6 +101,9 @@ TUI render path reads the focused conversation's state and never mutates it.
 6. **The tools layer must never reach into the app layer** — `tools/` and `app/` communicate exclusively through `AppEvent`s, never direct calls or shared state upward.
 7. **A new tool = implement the `Tool` trait + one registration line** in `tools/registry.rs`.
 8. **Update `.memories` (`STATE.md`, `BUGS.md`, `JOURNAL/`) as part of "done"** for any non-trivial change. Anchor documentation to function/struct names, not line numbers — line numbers drift on the next edit.
+9. **CPU-heavy work (ONNX embedding, PoW solving) runs on `tokio::task::spawn_blocking` only** — never on the event loop, never bare on an async worker. The `SemanticService` inner mutex is held across synchronous work only, never across an `.await`.
+10. **Never print to stdout/stderr while the app runs** — the TUI owns the terminal and `--acp` owns stdout for JSON-RPC. `tracing` goes to the data-dir log file (set up in `main.rs`); ad-hoc debugging goes through `debug_log`. This includes dependencies: fastembed's download progress bar is explicitly disabled for this reason.
+11. **The semantic layer must degrade, never block features** — every entry point returns empty/falls back to lexical when the embedder is disabled, still initializing, or failed. Deferred MCP schemas are only allowed when semantic matching is enabled (`App::effective_mcp_schema_mode` forces `Full` otherwise); session files remain the source of truth for the history index (it is a wipeable cache).
 
 ## Conventions
 
