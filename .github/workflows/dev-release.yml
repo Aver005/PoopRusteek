@@ -5,7 +5,10 @@ name: Dev build release
 # paths-ignore). The release tag is `v<Cargo.toml version>-dev`, so it moves
 # forward with each push as long as the version stays the same, and a
 # Cargo.toml version bump produces a new tag/release instead of overwriting
-# the previous one.
+# the previous one. Release notes are rendered from
+# `scripts/dev-release.template.md` (shared with .gitlab-ci.yml) via
+# `scripts/render-release-notes.sh` — see that template for the full list
+# of substitutable variables.
 
 on:
   push:
@@ -75,12 +78,16 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Flatten artifacts
+      - name: Flatten binary artifacts
         shell: bash
         run: |
           mkdir -p release-assets
@@ -92,7 +99,22 @@ jobs:
         shell: bash
         run: |
           VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}-dev" >> "$GITHUB_OUTPUT"
+
+      - name: Capture previous dev-build commit
+        id: prev
+        shell: bash
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            PREV_SHA=$(git rev-parse "refs/tags/$TAG")
+            echo "sha=$PREV_SHA" >> "$GITHUB_OUTPUT"
+            echo "label=\`$TAG\` (\`$(printf '%s' "$PREV_SHA" | cut -c1-8)\`)" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "label=(none — first dev build)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Move tag to current commit
         shell: bash
@@ -106,13 +128,89 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release delete "${{ steps.ver.outputs.tag }}" --yes || true
 
+      - name: Compute changelog since previous dev build
+        id: log
+        shell: bash
+        run: |
+          PREV="${{ steps.prev.outputs.sha }}"
+          if [ -n "$PREV" ] && [ "$PREV" != "${{ github.sha }}" ]; then
+            RANGE="$PREV..${{ github.sha }}"
+            COUNT=$(git rev-list --count "$RANGE")
+            FILES=$(git diff --name-only "$RANGE" | wc -l | tr -d ' ')
+            LOG=$(git log --pretty=format:'- %s (`%h`)' "$RANGE")
+            CONTRIBUTORS=$(git log --pretty=format:'%an' "$RANGE" | sort -u | awk 'NR>1{printf ", "}{printf "%s", $0}')
+          else
+            COUNT=0
+            FILES=0
+            LOG="_First dev build — no prior history to diff against._"
+            CONTRIBUTORS="—"
+          fi
+          {
+            echo "count=$COUNT"
+            echo "files=$FILES"
+            echo "contributors=$CONTRIBUTORS"
+            echo "log<<GHA_EOF_LOG"
+            echo "$LOG"
+            echo "GHA_EOF_LOG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute artifact list
+        id: artifacts
+        shell: bash
+        run: |
+          cd release-assets
+          COUNT=$(ls -1 | wc -l | tr -d ' ')
+          LIST=$(for f in *; do printf -- '- `%s` (%s)\n' "$f" "$(du -h "$f" | cut -f1)"; done)
+          {
+            echo "count=$COUNT"
+            echo "list<<GHA_EOF_ARTIFACTS"
+            echo "$LIST"
+            echo "GHA_EOF_ARTIFACTS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render release notes
+        shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          PREVIOUS_TAG: ${{ steps.prev.outputs.label }}
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_AUTHOR_NAME: ${{ github.event.head_commit.author.name }}
+          COMMIT_AUTHOR_EMAIL: ${{ github.event.head_commit.author.email }}
+          COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+          PUSHED_BY: ${{ github.actor }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_COUNT_SINCE_LAST_BUILD: ${{ steps.log.outputs.count }}
+          COMMITS_SINCE_LAST_BUILD: ${{ steps.log.outputs.log }}
+          CONTRIBUTORS_SINCE_LAST_BUILD: ${{ steps.log.outputs.contributors }}
+          CHANGED_FILES_COUNT: ${{ steps.log.outputs.files }}
+          ARTIFACT_COUNT: ${{ steps.artifacts.outputs.count }}
+          ARTIFACT_LIST: ${{ steps.artifacts.outputs.list }}
+        run: |
+          export COMMIT_SHORT_SHA="$(printf '%s' "$COMMIT_SHA" | cut -c1-8)"
+          export COMMIT_TITLE="$(printf '%s\n' "$COMMIT_MESSAGE" | head -1)"
+          export RUST_VERSION="$(rustc --version)"
+          export BUILD_DATE="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          chmod +x scripts/render-release-notes.sh
+          scripts/render-release-notes.sh scripts/dev-release.template.md release-body.md \
+            TAG VERSION PREVIOUS_TAG BRANCH REPO REPO_URL \
+            COMMIT_SHA COMMIT_SHORT_SHA COMMIT_TITLE COMMIT_MESSAGE \
+            COMMIT_AUTHOR_NAME COMMIT_AUTHOR_EMAIL COMMIT_TIMESTAMP \
+            PUSHED_BY BUILD_DATE RUN_ID RUN_URL RUST_VERSION \
+            COMMIT_COUNT_SINCE_LAST_BUILD COMMITS_SINCE_LAST_BUILD \
+            CONTRIBUTORS_SINCE_LAST_BUILD CHANGED_FILES_COUNT \
+            ARTIFACT_COUNT ARTIFACT_LIST
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: "Dev build ${{ steps.ver.outputs.tag }}"
           prerelease: true
-          body: |
-            Automated dev build from `develop` @ ${{ github.sha }}.
-            Not a stable release — always the latest build that passed CI on `develop`.
+          body_path: release-body.md
           files: release-assets/*

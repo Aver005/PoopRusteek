@@ -41,6 +41,9 @@ pub(super) struct ServerContext {
     /// Live fetched-model view (shared with the app/proxy refresher) —
     /// `/v1/models` and routing pick up new fetches without a restart.
     pub models: Arc<ProviderModelCache>,
+    /// Reused client for endpoints proxied verbatim to an upstream
+    /// (`/embeddings`, `/rerank`) — see `openai::passthrough`.
+    pub http_client: reqwest::Client,
     pub stats: Arc<ServerStats>,
     /// `Some` when per-request access-log events are wanted (proxy mode).
     pub log_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -67,6 +70,12 @@ impl ServerContext {
                 }
             }
         });
+        // Passthrough calls (embeddings/rerank) can be slow on big batches;
+        // give them a generous read timeout, fail fast on dead endpoints.
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
         Self {
             api: settings.api,
             api_key: settings.api_key,
@@ -74,6 +83,7 @@ impl ServerContext {
             deepseek,
             entries: settings.entries,
             models,
+            http_client,
             stats,
             log_tx,
         }

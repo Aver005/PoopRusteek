@@ -7,20 +7,25 @@
 //! the literal `data: [DONE]`.
 
 use super::catalog::{self, ResolvedModel};
-use super::http::{json_response, ApiBody, LogDetail, ServerContext};
+use super::http::{full_body, json_response, ApiBody, LogDetail, ServerContext};
+use crate::config::ProviderProtocol;
 use crate::provider::openai_compat::{
-    self, ChatCompletionRequest, CompletionMeta, ErrorResponse,
+    self, ChatCompletionRequest, CompletionMeta, ErrorResponse, ReasoningStreamSplitter,
 };
-use crate::provider::{CompletionRequest, LLMProvider};
+use crate::provider::{ChatMessage, CompletionRequest, LLMProvider};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::{header, Method, Request, Response, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Requests are buffered before parsing; cap them so a misbehaving client
 /// can't balloon memory. 16 MiB fits any realistic chat history.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// A resolved backend, or a ready-to-return error response (boxed — see
+/// [`resolve_backend`]).
+type BackendResult = Result<(ResolvedModel, Arc<dyn LLMProvider>), Box<Response<ApiBody>>>;
 
 /// Dispatch one request. `None` = not a route of this dialect (the caller
 /// answers 404).
@@ -36,8 +41,77 @@ pub(super) async fn route(
     match (request.method().clone(), path.as_str()) {
         (Method::GET, "/models") => Some(models_response(context)),
         (Method::POST, "/chat/completions") => Some(chat_completions(request, context).await),
+        // Legacy text-completion endpoint (deprecated by OpenAI, still used
+        // by some older clients) — synthesized from the chat path.
+        (Method::POST, "/completions") => Some(legacy_completions(request, context).await),
+        // Not part of chat: forwarded verbatim to the entry that serves the
+        // requested model (embeddings/reranking are upstream-specific).
+        (Method::POST, "/embeddings") => Some(passthrough(request, context, "/embeddings").await),
+        (Method::POST, "/rerank") => Some(passthrough(request, context, "/rerank").await),
         _ => None,
     }
+}
+
+/// Read and size-cap a request body, or the ready-to-return error response.
+async fn read_body(request: Request<Incoming>) -> Result<Bytes, Response<ApiBody>> {
+    http_body_util::Limited::new(request.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .map_err(|_| {
+            json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &ErrorResponse::invalid_request(format!(
+                    "request body unreadable or larger than {MAX_BODY_BYTES} bytes"
+                )),
+            )
+        })
+}
+
+fn model_not_found(message: String) -> Response<ApiBody> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        &ErrorResponse {
+            error: openai_compat::ErrorBody {
+                message,
+                kind: "invalid_request_error".to_string(),
+                code: Some("model_not_found".to_string()),
+            },
+        },
+    )
+}
+
+/// Resolve a model id to a backend and build its provider, or the
+/// ready-to-return error response (boxed — a `Response` dwarfs the Ok
+/// tuple, and clippy rightly flags a fat `Err`). Shared by chat + legacy.
+fn resolve_backend(model_id: &str, context: &ServerContext) -> BackendResult {
+    let resolved = catalog::resolve_model(
+        model_id,
+        context.deepseek.is_some(),
+        &context.entries,
+        &context.models.snapshot(),
+    )
+    .map_err(|message| Box::new(model_not_found(message)))?;
+
+    let provider: Arc<dyn LLMProvider> = match &resolved {
+        ResolvedModel::Deepseek { .. } => context
+            .deepseek
+            .clone()
+            .expect("resolve_model only yields Deepseek when the backend exists")
+            .fork(),
+        ResolvedModel::Entry { entry } => {
+            crate::provider::build_entry_provider(entry).map_err(|error| {
+                Box::new(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &ErrorResponse::server_error(format!(
+                        "failed to initialize provider '{}': {error}",
+                        entry.name
+                    )),
+                ))
+            })?
+        }
+    };
+    Ok((resolved, provider))
 }
 
 fn models_response(context: &ServerContext) -> Response<ApiBody> {
@@ -58,19 +132,9 @@ async fn chat_completions(
     request: Request<Incoming>,
     context: &Arc<ServerContext>,
 ) -> Response<ApiBody> {
-    let body = match http_body_util::Limited::new(request.into_body(), MAX_BODY_BYTES)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &ErrorResponse::invalid_request(format!(
-                    "request body unreadable or larger than {MAX_BODY_BYTES} bytes"
-                )),
-            );
-        }
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
 
     let wire: ChatCompletionRequest = match serde_json::from_slice(&body) {
@@ -90,48 +154,9 @@ async fn chat_completions(
         tracing::warn!("server: request carries `tools` — structured tool-calling is not translated, ignoring");
     }
 
-    let resolved = match catalog::resolve_model(
-        &wire.model,
-        context.deepseek.is_some(),
-        &context.entries,
-        &context.models.snapshot(),
-    ) {
-        Ok(resolved) => resolved,
-        Err(message) => {
-            return json_response(
-                StatusCode::NOT_FOUND,
-                &ErrorResponse {
-                    error: openai_compat::ErrorBody {
-                        message,
-                        kind: "invalid_request_error".to_string(),
-                        code: Some("model_not_found".to_string()),
-                    },
-                },
-            );
-        }
-    };
-
-    // Stateless session strategy: every request runs on its own fresh
-    // provider. DeepSeek gets a fork of the shared base (one rate limiter
-    // for all server traffic); entries are built per request because a
-    // caller-chosen sub-model lives in the entry config itself.
-    let provider: Arc<dyn LLMProvider> = match &resolved {
-        ResolvedModel::Deepseek { .. } => match &context.deepseek {
-            Some(base) => base.fork(),
-            None => unreachable!("resolve_model only yields Deepseek when the backend exists"),
-        },
-        ResolvedModel::Entry { entry } => match crate::provider::build_entry_provider(entry) {
-            Ok(provider) => provider,
-            Err(error) => {
-                return json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &ErrorResponse::server_error(format!(
-                        "failed to initialize provider '{}': {error}",
-                        entry.name
-                    )),
-                );
-            }
-        },
+    let (resolved, provider) = match resolve_backend(&wire.model, context) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
     };
 
     // The response echoes the id the caller asked for, per OpenAI protocol.
@@ -234,6 +259,10 @@ async fn bridge_stream(
         tokio::spawn(async move { provider.complete_stream(request, chunk_tx).await })
     };
 
+    // Route `<think>` reasoning into `reasoning_content` deltas live, so a
+    // reasoning model's chain-of-thought reaches clients in the right field
+    // instead of polluting the answer (see openai_compat::split_reasoning).
+    let mut splitter = ReasoningStreamSplitter::new();
     let mut first = true;
     let mut finish_reason: Option<String> = None;
     let mut client_gone = false;
@@ -244,7 +273,11 @@ async fn bridge_stream(
         if chunk.content.is_empty() {
             continue;
         }
-        let frame = sse_data(&openai_compat::delta_chunk(&chunk.content, first, &meta));
+        let (reasoning, content) = splitter.push(&chunk.content);
+        if reasoning.is_empty() && content.is_empty() {
+            continue; // held back a partial tag — nothing to emit yet
+        }
+        let frame = sse_data(&openai_compat::split_delta_chunk(&reasoning, &content, first, &meta));
         first = false;
         if body_tx.send(frame).is_err() {
             client_gone = true;
@@ -254,6 +287,13 @@ async fn bridge_stream(
     }
 
     if !client_gone {
+        // Flush any tail the splitter held (e.g. an unterminated `<think>`).
+        let (reasoning, content) = splitter.finish();
+        if !reasoning.is_empty() || !content.is_empty() {
+            let _ = body_tx.send(sse_data(&openai_compat::split_delta_chunk(
+                &reasoning, &content, first, &meta,
+            )));
+        }
         match upstream.await {
             Ok(Ok(())) => {
                 let reason = finish_reason.as_deref().unwrap_or("stop");
@@ -292,6 +332,320 @@ async fn discard_deepseek_session(is_deepseek: bool, provider: &Arc<dyn LLMProvi
     }
 }
 
+// ── Legacy `/v1/completions` (deprecated OpenAI text-completion) ────────
+
+#[derive(Debug, Deserialize)]
+struct LegacyCompletionRequest {
+    model: String,
+    #[serde(default)]
+    prompt: Option<LegacyPrompt>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    stream: Option<bool>,
+}
+
+/// The legacy `prompt` field: a single string or a list of strings.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LegacyPrompt {
+    Text(String),
+    List(Vec<String>),
+}
+
+impl LegacyPrompt {
+    fn into_text(self) -> String {
+        match self {
+            LegacyPrompt::Text(text) => text,
+            LegacyPrompt::List(parts) => parts.join("\n"),
+        }
+    }
+}
+
+/// Legacy text completion, synthesized on top of the chat path: the prompt
+/// becomes a single user message, and the answer is shaped back as a
+/// `text_completion`. Works for every backend (DeepSeek included), unlike a
+/// raw upstream passthrough. Any `<think>` reasoning is stripped (legacy
+/// completions have no field for it).
+async fn legacy_completions(
+    request: Request<Incoming>,
+    context: &Arc<ServerContext>,
+) -> Response<ApiBody> {
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let wire: LegacyCompletionRequest = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse::invalid_request(format!("invalid request body: {error}")),
+            );
+        }
+    };
+
+    let (resolved, provider) = match resolve_backend(&wire.model, context) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+
+    let prompt = wire.prompt.map(LegacyPrompt::into_text).unwrap_or_default();
+    let internal = CompletionRequest {
+        messages: vec![ChatMessage::user(&prompt)],
+        model: resolved.internal_model().to_string(),
+        temperature: wire.temperature.unwrap_or(context.defaults.temperature),
+        max_tokens: wire.max_tokens.unwrap_or(context.defaults.max_tokens),
+        stream: wire.stream.unwrap_or(false),
+    };
+    let public_model = wire.model.clone();
+    let meta = CompletionMeta::generate(&public_model);
+    let streaming = internal.stream;
+
+    let mut response = if streaming {
+        legacy_stream(provider, resolved.is_deepseek(), internal, meta)
+    } else {
+        legacy_blocking(provider, resolved.is_deepseek(), &prompt, internal, meta).await
+    };
+    response.extensions_mut().insert(LogDetail(format!(
+        "legacy model={public_model} → {}{}",
+        resolved.internal_model(),
+        if streaming { " (stream)" } else { "" }
+    )));
+    response
+}
+
+/// One `text_completion` choice object.
+fn legacy_choice(text: &str, finish_reason: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "index": 0,
+        "text": text,
+        "finish_reason": finish_reason,
+        "logprobs": serde_json::Value::Null,
+    })
+}
+
+async fn legacy_blocking(
+    provider: Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    prompt: &str,
+    request: CompletionRequest,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    let result = provider.complete(request).await;
+    discard_deepseek_session(is_deepseek, &provider).await;
+    match result {
+        Ok(response) => {
+            let (_reasoning, text) = openai_compat::split_reasoning(&response.content);
+            let usage = response
+                .usage
+                .unwrap_or_else(|| openai_compat::estimated_usage(&[prompt], &text));
+            let finish = response.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "id": meta.id,
+                    "object": "text_completion",
+                    "created": meta.created,
+                    "model": meta.model,
+                    "choices": [legacy_choice(&text, Some(&finish))],
+                    "usage": usage,
+                }),
+            )
+        }
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse::server_error(error.to_string()),
+        ),
+    }
+}
+
+fn legacy_stream(
+    provider: Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    request: CompletionRequest,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    let (body_tx, mut body_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    tokio::spawn(bridge_legacy_stream(provider, is_deepseek, request, meta, body_tx));
+    let stream = futures::stream::poll_fn(move |task_context| {
+        body_rx
+            .poll_recv(task_context)
+            .map(|next| next.map(|bytes| Ok(Frame::data(bytes))))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(StreamBody::new(stream).boxed())
+        .expect("static response parts are valid")
+}
+
+/// Legacy streaming: `text_completion` chunks. Reasoning is dropped (no
+/// field), so only the post-`<think>` content is streamed as `text`.
+async fn bridge_legacy_stream(
+    provider: Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    request: CompletionRequest,
+    meta: CompletionMeta,
+    body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+) {
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = {
+        let provider = Arc::clone(&provider);
+        tokio::spawn(async move { provider.complete_stream(request, chunk_tx).await })
+    };
+
+    let text_chunk = |text: &str, finish: Option<&str>| {
+        sse_data(&serde_json::json!({
+            "id": meta.id,
+            "object": "text_completion",
+            "created": meta.created,
+            "model": meta.model,
+            "choices": [legacy_choice(text, finish)],
+        }))
+    };
+
+    let mut splitter = ReasoningStreamSplitter::new();
+    let mut finish_reason: Option<String> = None;
+    let mut client_gone = false;
+    while let Some(chunk) = chunk_rx.recv().await {
+        if chunk.finish_reason.is_some() {
+            finish_reason = chunk.finish_reason.clone();
+        }
+        if chunk.content.is_empty() {
+            continue;
+        }
+        // Only the content half becomes `text`; reasoning is discarded.
+        let (_reasoning, content) = splitter.push(&chunk.content);
+        if content.is_empty() {
+            continue;
+        }
+        if body_tx.send(text_chunk(&content, None)).is_err() {
+            client_gone = true;
+            upstream.abort();
+            break;
+        }
+    }
+
+    if !client_gone {
+        let (_reasoning, content) = splitter.finish();
+        match upstream.await {
+            Ok(Ok(())) => {
+                let reason = finish_reason.as_deref().unwrap_or("stop");
+                let _ = body_tx.send(text_chunk(&content, Some(reason)));
+                let _ = body_tx.send(Bytes::from_static(b"data: [DONE]\n\n"));
+            }
+            Ok(Err(error)) => {
+                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(error.to_string())));
+            }
+            Err(join_error) => {
+                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(format!(
+                    "completion task failed: {join_error}"
+                ))));
+            }
+        }
+    }
+
+    discard_deepseek_session(is_deepseek, &provider).await;
+}
+
+// ── Passthrough (`/v1/embeddings`, `/v1/rerank`) ───────────────────────
+
+/// Endpoints pooprusteek doesn't model itself (embeddings, reranking) are
+/// forwarded verbatim to the upstream `/providers` entry that serves the
+/// requested model — the only backend that can actually answer them. The
+/// request body's `model` is rewritten to the resolved sub-model; the
+/// upstream's status + body come back untouched. The built-in DeepSeek web
+/// backend has no such endpoints, so those models return a clear error.
+async fn passthrough(
+    request: Request<Incoming>,
+    context: &Arc<ServerContext>,
+    path_suffix: &str,
+) -> Response<ApiBody> {
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let mut payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse::invalid_request(format!("invalid request body: {error}")),
+            );
+        }
+    };
+    let Some(model_id) = payload.get("model").and_then(serde_json::Value::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request("request has no `model` field"),
+        );
+    };
+    let model_id = model_id.to_string();
+
+    let resolved = match catalog::resolve_model(
+        &model_id,
+        context.deepseek.is_some(),
+        &context.entries,
+        &context.models.snapshot(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => return model_not_found(message),
+    };
+    let entry = match resolved {
+        ResolvedModel::Entry { entry } => entry,
+        ResolvedModel::Deepseek { .. } => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse::invalid_request(format!(
+                    "the built-in DeepSeek backend has no {path_suffix} endpoint — pick a /providers model"
+                )),
+            );
+        }
+    };
+    if entry.protocol != ProviderProtocol::Openai {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(format!(
+                "{path_suffix} passthrough is only supported for OpenAI-compatible providers (got '{}' on '{}')",
+                entry.protocol.label(),
+                entry.name,
+            )),
+        );
+    }
+
+    // Forward with the sub-model the caller actually asked for.
+    payload["model"] = serde_json::json!(entry.model);
+    let url = format!("{}{path_suffix}", entry.base_url);
+    let mut upstream = context.http_client.post(&url).json(&payload);
+    if let Some(key) = &entry.api_key {
+        upstream = upstream.bearer_auth(key);
+    }
+
+    match upstream.send().await {
+        Ok(response) => {
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let upstream_bytes = response.bytes().await.unwrap_or_default();
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(full_body(upstream_bytes))
+                .expect("static response parts are valid")
+        }
+        Err(error) => json_response(
+            StatusCode::BAD_GATEWAY,
+            &ErrorResponse::server_error(format!(
+                "upstream '{}' {path_suffix} request failed: {error}",
+                entry.name
+            )),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::events::AppEvent;
@@ -327,6 +681,7 @@ mod tests {
     async fn answer_mock_request(
         request: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+        let path = request.uri().path().to_string();
         let body = request
             .into_body()
             .collect()
@@ -334,6 +689,27 @@ mod tests {
             .map(|collected| collected.to_bytes())
             .unwrap_or_default();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+
+        // Non-chat endpoints the gateway forwards verbatim.
+        if path.ends_with("/embeddings") {
+            let payload = serde_json::json!({
+                "object": "list",
+                "model": parsed["model"],
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+                "usage": {"prompt_tokens": 2, "total_tokens": 2},
+            });
+            let response = Response::builder()
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(payload.to_string())))
+                .expect("static response parts are valid");
+            return Ok(response);
+        }
+
+        // Chat completions — the model requested (already the sub-model the
+        // gateway rewrote to) selects the canned answer: `think` returns an
+        // inline `<think>` block, anything else a plain greeting.
+        let model = parsed["model"].as_str().unwrap_or("?").to_string();
+        let reasoning = model.contains("think");
         let streaming = parsed["stream"].as_bool().unwrap_or(false);
         let response = if streaming {
             let sse = concat!(
@@ -347,6 +723,11 @@ mod tests {
         } else {
             // Echo the model the gateway sent so the test can verify the
             // caller-chosen sub-model actually reached the upstream.
+            let content = if reasoning {
+                "<think>inner thoughts</think>Final answer.".to_string()
+            } else {
+                format!("Hello from {model}")
+            };
             let payload = serde_json::json!({
                 "id": "up-1",
                 "object": "chat.completion",
@@ -354,7 +735,7 @@ mod tests {
                 "model": parsed["model"],
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": format!("Hello from {}", parsed["model"].as_str().unwrap_or("?"))},
+                    "message": {"role": "assistant", "content": content},
                     "finish_reason": "stop",
                 }],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
@@ -474,6 +855,101 @@ mod tests {
             .expect("terminal chunk json");
         assert_eq!(last["choices"][0]["finish_reason"], "stop");
 
+        handle.request_shutdown();
+    }
+
+    /// Spin up gateway + mock upstream and return the base URL + shutdown
+    /// handle. Shared setup for the endpoint-specific tests below.
+    async fn start_gateway() -> (String, crate::server::ServerHandle) {
+        let upstream = spawn_mock_upstream().await;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
+        let handle = spawn(gateway_settings(upstream), models, 1, event_tx);
+        let addr = loop {
+            match event_rx.recv().await {
+                Some(AppEvent::ServerStarted { addr, .. }) => break addr,
+                Some(_) => continue,
+                None => panic!("server ended before ServerStarted"),
+            }
+        };
+        (format!("http://{addr}"), handle)
+    }
+
+    /// An inline `<think>` block from the upstream is hoisted into
+    /// `reasoning_content`, leaving `content` clean (the reviewer's #2).
+    #[tokio::test]
+    async fn gateway_hoists_think_block_into_reasoning_content() {
+        let (base, handle) = start_gateway().await;
+        let completion: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "mock/think",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .expect("completion request")
+            .json()
+            .await
+            .expect("completion json");
+        let message = &completion["choices"][0]["message"];
+        assert_eq!(message["content"], "Final answer.");
+        assert_eq!(message["reasoning_content"], "inner thoughts");
+        handle.request_shutdown();
+    }
+
+    /// Legacy `/v1/completions`: prompt → chat → `text_completion` shape.
+    #[tokio::test]
+    async fn gateway_legacy_completions_returns_text_completion() {
+        let (base, handle) = start_gateway().await;
+        let completion: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/v1/completions"))
+            .json(&serde_json::json!({"model": "mock/custom", "prompt": "hello"}))
+            .send()
+            .await
+            .expect("legacy request")
+            .json()
+            .await
+            .expect("legacy json");
+        assert_eq!(completion["object"], "text_completion");
+        assert_eq!(completion["choices"][0]["text"], "Hello from custom");
+        assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+        handle.request_shutdown();
+    }
+
+    /// `/v1/embeddings` forwards to the entry upstream with the sub-model
+    /// rewritten in; the upstream's body comes back verbatim.
+    #[tokio::test]
+    async fn gateway_embeddings_passthrough_rewrites_model() {
+        let (base, handle) = start_gateway().await;
+        let embeddings: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/v1/embeddings"))
+            .json(&serde_json::json!({"model": "mock/bge", "input": "x"}))
+            .send()
+            .await
+            .expect("embeddings request")
+            .json()
+            .await
+            .expect("embeddings json");
+        assert_eq!(embeddings["object"], "list");
+        // The upstream echoes the model it received — proving the sub-model
+        // (`bge`), not the wire id (`mock/bge`), was forwarded.
+        assert_eq!(embeddings["model"], "bge");
+        assert_eq!(embeddings["data"][0]["embedding"].as_array().map(Vec::len), Some(3));
+        handle.request_shutdown();
+    }
+
+    /// An unknown model on a passthrough endpoint is a 404, not a 502.
+    #[tokio::test]
+    async fn gateway_embeddings_unknown_model_is_404() {
+        let (base, handle) = start_gateway().await;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/embeddings"))
+            .json(&serde_json::json!({"model": "nope", "input": "x"}))
+            .send()
+            .await
+            .expect("embeddings request");
+        assert_eq!(response.status(), 404);
         handle.request_shutdown();
     }
 }

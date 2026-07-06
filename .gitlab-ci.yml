@@ -14,6 +14,10 @@
 # the new commit. `CI_JOB_TOKEN` alone may not have tag-delete permission
 # depending on project settings.
 #
+# Release notes are rendered from `scripts/dev-release.template.md` (shared
+# with .github/workflows/dev-release.yml) via `scripts/render-release-notes.sh`
+# — see that template for the full list of substitutable variables.
+#
 # Only the Linux leg runs on a default shared runner. Windows/macOS need
 # GitLab SaaS runners (`saas-windows-medium-amd64` / `saas-macos-medium-m1`,
 # paid compute minutes) and are `when: manual` + `allow_failure: true` so
@@ -72,9 +76,12 @@ build:linux:
     - strip target/release/pooprusteek || true
     - mkdir -p dist
     - tar -C target/release -czf dist/pooprusteek-linux-x86_64.tar.gz pooprusteek
+    - echo "RUST_VERSION=$(rustc --version)" >> build.env
   artifacts:
     paths:
       - dist/
+    reports:
+      dotenv: build.env
     expire_in: 7 days
 
 build:windows:
@@ -117,6 +124,8 @@ release:dev-build:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   <<: *dev_build_rules
+  variables:
+    GIT_DEPTH: "0"
   needs:
     - job: prepare:version
       artifacts: true
@@ -129,10 +138,30 @@ release:dev-build:
       artifacts: true
       optional: true
   script:
+    - apk add --no-cache bash git curl jq >/dev/null
     - ls -la dist || true
+    - |
+      PREV_SHA=$(curl -s --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags/${RELEASE_TAG}" \
+        | jq -r '.commit.id // empty')
     - >
       curl --silent --request DELETE --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}"
       "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags/${RELEASE_TAG}" || true
+    - |
+      if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$CI_COMMIT_SHA" ]; then
+        RANGE="$PREV_SHA..$CI_COMMIT_SHA"
+        COMMIT_COUNT_SINCE_LAST_BUILD=$(git rev-list --count "$RANGE")
+        CHANGED_FILES_COUNT=$(git diff --name-only "$RANGE" | wc -l | tr -d ' ')
+        COMMITS_SINCE_LAST_BUILD=$(git log --pretty=format:'- %s (`%h`)' "$RANGE")
+        CONTRIBUTORS_SINCE_LAST_BUILD=$(git log --pretty=format:'%an' "$RANGE" | sort -u | awk 'NR>1{printf ", "}{printf "%s", $0}')
+        PREVIOUS_TAG="\`$RELEASE_TAG\` (\`$(printf '%s' "$PREV_SHA" | cut -c1-8)\`)"
+      else
+        COMMIT_COUNT_SINCE_LAST_BUILD=0
+        CHANGED_FILES_COUNT=0
+        COMMITS_SINCE_LAST_BUILD="_First dev build — no prior history to diff against._"
+        CONTRIBUTORS_SINCE_LAST_BUILD="—"
+        PREVIOUS_TAG="(none — first dev build)"
+      fi
     - |
       ASSET_ARGS=""
       for f in dist/*; do
@@ -141,10 +170,50 @@ release:dev-build:
         url="${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/$f"
         ASSET_ARGS="$ASSET_ARGS --assets-link {\"name\":\"$name\",\"url\":\"$url\"}"
       done
+    - |
+      ARTIFACT_COUNT=$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')
+      ARTIFACT_LIST=$(cd dist && for f in *; do [ -f "$f" ] && printf -- '- `%s` (%s)\n' "$f" "$(du -h "$f" | cut -f1)"; done)
+    - |
+      COMMIT_AUTHOR_NAME=$(printf '%s' "$CI_COMMIT_AUTHOR" | sed -n 's/^\(.*\) <.*>$/\1/p')
+      COMMIT_AUTHOR_EMAIL=$(printf '%s' "$CI_COMMIT_AUTHOR" | sed -n 's/^.*<\(.*\)>$/\1/p')
+    - |
+      export TAG="$RELEASE_TAG"
+      export VERSION="$VERSION"
+      export PREVIOUS_TAG
+      export BRANCH="$CI_COMMIT_BRANCH"
+      export REPO="$CI_PROJECT_PATH"
+      export REPO_URL="$CI_PROJECT_URL"
+      export COMMIT_SHA="$CI_COMMIT_SHA"
+      export COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA"
+      export COMMIT_TITLE="$CI_COMMIT_TITLE"
+      export COMMIT_MESSAGE="$CI_COMMIT_MESSAGE"
+      export COMMIT_AUTHOR_NAME
+      export COMMIT_AUTHOR_EMAIL
+      export COMMIT_TIMESTAMP="$CI_COMMIT_TIMESTAMP"
+      export PUSHED_BY="$GITLAB_USER_LOGIN"
+      export BUILD_DATE="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+      export RUN_ID="$CI_PIPELINE_ID"
+      export RUN_URL="$CI_PIPELINE_URL"
+      export RUST_VERSION="${RUST_VERSION:-unknown}"
+      export COMMIT_COUNT_SINCE_LAST_BUILD
+      export COMMITS_SINCE_LAST_BUILD
+      export CONTRIBUTORS_SINCE_LAST_BUILD
+      export CHANGED_FILES_COUNT
+      export ARTIFACT_COUNT
+      export ARTIFACT_LIST
+      bash scripts/render-release-notes.sh scripts/dev-release.template.md release-body.md \
+        TAG VERSION PREVIOUS_TAG BRANCH REPO REPO_URL \
+        COMMIT_SHA COMMIT_SHORT_SHA COMMIT_TITLE COMMIT_MESSAGE \
+        COMMIT_AUTHOR_NAME COMMIT_AUTHOR_EMAIL COMMIT_TIMESTAMP \
+        PUSHED_BY BUILD_DATE RUN_ID RUN_URL RUST_VERSION \
+        COMMIT_COUNT_SINCE_LAST_BUILD COMMITS_SINCE_LAST_BUILD \
+        CONTRIBUTORS_SINCE_LAST_BUILD CHANGED_FILES_COUNT \
+        ARTIFACT_COUNT ARTIFACT_LIST
+    - |
       release-cli create \
         --tag-name "$RELEASE_TAG" \
         --ref "$CI_COMMIT_SHA" \
-        --description "Automated dev build from develop @ $CI_COMMIT_SHORT_SHA. Not a stable release." \
+        --description "$(cat release-body.md)" \
         $ASSET_ARGS
   artifacts:
     paths:

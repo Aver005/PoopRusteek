@@ -58,6 +58,11 @@ pub struct ChatCompletionMessage {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// DeepSeek/OpenAI reasoning-model field: the model's chain-of-thought,
+    /// kept out of `content`. Populated by [`split_reasoning`] when the
+    /// backend emitted a leading `<think>`/`<thinking>` block inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// OpenAI message content: a plain string, or an array of typed parts
@@ -140,6 +145,10 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Streaming half of [`ChatCompletionMessage::reasoning_content`] — the
+    /// live chain-of-thought deltas, routed here by [`ReasoningStreamSplitter`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +357,10 @@ pub fn response_to_openai(
     fallback_usage: Usage,
     meta: &CompletionMeta,
 ) -> ChatCompletionResponse {
+    // Reasoning models (deepseek-r1, qwen3, gpt-oss, … via any backend that
+    // emits inline `<think>`) fold chain-of-thought into content; hoist it
+    // into the OpenAI `reasoning_content` field so clients get a clean answer.
+    let (reasoning, content) = split_reasoning(&response.content);
     ChatCompletionResponse {
         id: meta.id.clone(),
         object: "chat.completion".to_string(),
@@ -357,9 +370,10 @@ pub fn response_to_openai(
             index: 0,
             message: ChatCompletionMessage {
                 role: "assistant".to_string(),
-                content: MessageContent::Text(response.content.clone()),
+                content: MessageContent::Text(content),
                 name: None,
                 tool_call_id: None,
+                reasoning_content: reasoning,
             },
             finish_reason: Some(
                 response.finish_reason.clone().unwrap_or_else(|| "stop".to_string()),
@@ -369,9 +383,14 @@ pub fn response_to_openai(
     }
 }
 
-/// A streamed content delta. `first` marks the opening chunk of the turn,
-/// which per the OpenAI protocol also announces `role: "assistant"`.
-pub fn delta_chunk(content: &str, first: bool, meta: &CompletionMeta) -> ChatCompletionChunk {
+/// A streamed delta carrying reasoning and/or content deltas (either may be
+/// empty). `first` announces `role: "assistant"` per the OpenAI protocol.
+pub fn split_delta_chunk(
+    reasoning: &str,
+    content: &str,
+    first: bool,
+    meta: &CompletionMeta,
+) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: meta.id.clone(),
         object: "chat.completion.chunk".to_string(),
@@ -381,7 +400,8 @@ pub fn delta_chunk(content: &str, first: bool, meta: &CompletionMeta) -> ChatCom
             index: 0,
             delta: Delta {
                 role: first.then(|| "assistant".to_string()),
-                content: Some(content.to_string()),
+                content: (!content.is_empty()).then(|| content.to_string()),
+                reasoning_content: (!reasoning.is_empty()).then(|| reasoning.to_string()),
             },
             finish_reason: None,
         }],
@@ -429,6 +449,171 @@ pub fn chunk_from_openai(chunk: ChatCompletionChunk) -> CompletionChunk {
         .map(|choice| (choice.delta.content.unwrap_or_default(), choice.finish_reason))
         .unwrap_or_default();
     CompletionChunk { content, finish_reason }
+}
+
+// ── Reasoning extraction (`<think>` → `reasoning_content`) ──────────────
+//
+// Reasoning models (deepseek-r1, qwen3, gpt-oss, … through Ollama/vLLM/LM
+// Studio) prepend their chain-of-thought to `content` wrapped in a
+// `<think>…</think>` (or `<thinking>…</thinking>`) block — the same
+// convention `agent/tool_parser` already strips for the TUI. The server
+// hoists that block into OpenAI's `reasoning_content` field so API clients
+// get a clean final answer. Only a block at the very START of the content
+// is treated as reasoning (that is where these models put it), so a normal
+// answer that happens to mention `<think>` mid-text is untouched.
+//
+// NOTE: the built-in DeepSeek *web* reasoner is a separate case — it streams
+// typed THINK fragments the provider currently merges into content with no
+// tags, so there is nothing here to split. Separating those cleanly needs a
+// reasoning channel on `CompletionChunk` + fragment-type tracking in
+// `provider/deepseek/stream.rs` (and it would change the TUI's inline-thinking
+// display) — left as a deliberate follow-up.
+
+const THINK_OPENERS: [&str; 2] = ["<think>", "<thinking>"];
+const THINK_CLOSERS: [&str; 2] = ["</think>", "</thinking>"];
+
+/// Split a completed message into `(reasoning, content)`. Extracts a leading
+/// `<think>…</think>` block; an unterminated opener (model hit the token
+/// budget mid-thought) makes the whole remainder reasoning with empty
+/// content. No leading think block → `(None, content unchanged)`.
+pub fn split_reasoning(content: &str) -> (Option<String>, String) {
+    let trimmed = content.trim_start();
+    let Some(opener) = THINK_OPENERS.iter().find(|open| trimmed.starts_with(**open)) else {
+        return (None, content.to_string());
+    };
+    let after_open = &trimmed[opener.len()..];
+    let close = THINK_CLOSERS
+        .iter()
+        .filter_map(|close| after_open.find(close).map(|index| (index, close.len())))
+        .min_by_key(|(index, _)| *index);
+    let (reasoning, rest) = match close {
+        Some((index, close_len)) => (
+            after_open[..index].trim().to_string(),
+            after_open[index + close_len..].trim_start().to_string(),
+        ),
+        // Unterminated (e.g. finish_reason == "length"): all reasoning.
+        None => (after_open.trim().to_string(), String::new()),
+    };
+    ((!reasoning.is_empty()).then_some(reasoning), rest)
+}
+
+/// Longest byte length `k` such that `buffer`'s last `k` bytes form a
+/// non-empty prefix of some `token` (and land on a char boundary) — the
+/// tail a streaming splitter must hold back in case a tag is split across
+/// deltas. `0` when no suffix could extend into a token.
+fn holdback_len(buffer: &str, tokens: &[&str]) -> usize {
+    let max = tokens.iter().map(|token| token.len()).max().unwrap_or(0).saturating_sub(1);
+    for k in (1..=max.min(buffer.len())).rev() {
+        let start = buffer.len() - k;
+        if !buffer.is_char_boundary(start) {
+            continue;
+        }
+        let suffix = &buffer[start..];
+        if tokens.iter().any(|token| token.starts_with(suffix)) {
+            return k;
+        }
+    }
+    0
+}
+
+#[derive(Debug, PartialEq)]
+enum SplitPhase {
+    /// Deciding whether the stream opens with a think block.
+    Start,
+    /// Inside a `<think>` block, watching for the closer.
+    InReasoning,
+    /// Past any think block — everything is content.
+    InContent,
+}
+
+/// Incremental [`split_reasoning`] for the streaming path: feed content
+/// deltas, get back `(reasoning_delta, content_delta)`, then [`finish`] to
+/// flush any held tail. Holds back only a partial-tag-sized suffix, so
+/// normal (non-reasoning) output flows through essentially unbuffered.
+///
+/// [`finish`]: ReasoningStreamSplitter::finish
+pub struct ReasoningStreamSplitter {
+    phase: SplitPhase,
+    buffer: String,
+}
+
+impl Default for ReasoningStreamSplitter {
+    fn default() -> Self {
+        Self { phase: SplitPhase::Start, buffer: String::new() }
+    }
+}
+
+impl ReasoningStreamSplitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Classify a content delta. Returns `(reasoning, content)` produced by
+    /// this push (either may be empty).
+    pub fn push(&mut self, delta: &str) -> (String, String) {
+        self.buffer.push_str(delta);
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        loop {
+            match self.phase {
+                SplitPhase::Start => {
+                    let trimmed = self.buffer.trim_start();
+                    if let Some(opener) =
+                        THINK_OPENERS.iter().find(|open| trimmed.starts_with(**open))
+                    {
+                        // Drop the leading whitespace + opener; the rest is
+                        // reasoning to classify next iteration.
+                        let remainder = trimmed[opener.len()..].to_string();
+                        self.buffer = remainder;
+                        self.phase = SplitPhase::InReasoning;
+                        continue;
+                    }
+                    // Still possibly growing into an opener → hold everything.
+                    if THINK_OPENERS.iter().any(|open| open.starts_with(trimmed)) {
+                        break;
+                    }
+                    // Not a think block: flush all as content, for good.
+                    content.push_str(&self.buffer);
+                    self.buffer.clear();
+                    self.phase = SplitPhase::InContent;
+                    break;
+                }
+                SplitPhase::InReasoning => {
+                    let closer = THINK_CLOSERS
+                        .iter()
+                        .filter_map(|close| self.buffer.find(close).map(|i| (i, close.len())))
+                        .min_by_key(|(i, _)| *i);
+                    if let Some((index, close_len)) = closer {
+                        reasoning.push_str(&self.buffer[..index]);
+                        self.buffer = self.buffer[index + close_len..].to_string();
+                        self.phase = SplitPhase::InContent;
+                        continue;
+                    }
+                    // No full closer yet — emit all but a possible partial one.
+                    let hold = holdback_len(&self.buffer, &THINK_CLOSERS);
+                    let emit_to = self.buffer.len() - hold;
+                    reasoning.push_str(&self.buffer[..emit_to]);
+                    self.buffer = self.buffer[emit_to..].to_string();
+                    break;
+                }
+                SplitPhase::InContent => {
+                    content.push_str(&self.buffer);
+                    self.buffer.clear();
+                    break;
+                }
+            }
+        }
+        (reasoning, content)
+    }
+
+    /// Flush the held tail at end of stream. A never-closed opener yields
+    /// trailing reasoning; anything else is content.
+    pub fn finish(self) -> (String, String) {
+        match self.phase {
+            SplitPhase::InReasoning => (self.buffer, String::new()),
+            _ => (String::new(), self.buffer),
+        }
+    }
 }
 
 // ── Models listing ──────────────────────────────────────────────────────
@@ -545,8 +730,8 @@ mod tests {
 
     #[test]
     fn stream_protocol_first_delta_and_final_chunk() {
-        let first = delta_chunk("Hel", true, &meta());
-        let middle = delta_chunk("lo", false, &meta());
+        let first = split_delta_chunk("", "Hel", true, &meta());
+        let middle = split_delta_chunk("", "lo", false, &meta());
         let last = final_chunk("stop", &meta());
 
         let first_json = serde_json::to_value(&first).unwrap();
@@ -614,7 +799,7 @@ mod tests {
             model: "m".to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: None, content: Some("tok".to_string()) },
+                delta: Delta { role: None, content: Some("tok".to_string()), reasoning_content: None },
                 finish_reason: Some("stop".to_string()),
             }],
         };
@@ -638,5 +823,91 @@ mod tests {
         let json = serde_json::to_value(&error).unwrap();
         assert_eq!(json["error"]["type"], "invalid_request_error");
         assert_eq!(json["error"]["message"], "bad role");
+    }
+
+    #[test]
+    fn split_reasoning_extracts_leading_think_block() {
+        let (reasoning, content) = split_reasoning("<think>ponder this</think>The answer is 4.");
+        assert_eq!(reasoning.as_deref(), Some("ponder this"));
+        assert_eq!(content, "The answer is 4.");
+
+        // `<thinking>` variant + leading whitespace + trimmed content.
+        let (reasoning, content) = split_reasoning("\n<thinking>  hmm  </thinking>\n\nDone");
+        assert_eq!(reasoning.as_deref(), Some("hmm"));
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn split_reasoning_leaves_plain_content_untouched() {
+        let (reasoning, content) = split_reasoning("Just a normal answer with no reasoning.");
+        assert!(reasoning.is_none());
+        assert_eq!(content, "Just a normal answer with no reasoning.");
+
+        // A mid-text mention of the tag is NOT reasoning (only a leading block).
+        let (reasoning, content) = split_reasoning("Consider the <think> tag here.");
+        assert!(reasoning.is_none());
+        assert_eq!(content, "Consider the <think> tag here.");
+    }
+
+    #[test]
+    fn split_reasoning_unterminated_is_all_reasoning() {
+        // finish_reason == "length" mid-thought: budget spent on reasoning,
+        // no visible answer — everything is reasoning, content empty.
+        let (reasoning, content) = split_reasoning("<think>still working through it");
+        assert_eq!(reasoning.as_deref(), Some("still working through it"));
+        assert_eq!(content, "");
+    }
+
+    /// The streaming splitter, fed at ANY chunk boundary, must produce the
+    /// same total (reasoning, content) as the pure `split_reasoning` — even
+    /// when a `<think>`/`</think>` tag is torn across deltas.
+    #[test]
+    fn stream_splitter_matches_pure_split_at_every_boundary() {
+        let cases = [
+            "<think>reasoning here</think>final answer",
+            "<thinking>multi\nline\nthought</thinking>the result",
+            "no reasoning at all, just content",
+            "  leading spaces then content",
+            "<think>unterminated thought with no closer",
+            "<think></think>empty reasoning block then answer",
+        ];
+        for whole in cases {
+            let (want_reasoning, want_content) = split_reasoning(whole);
+            let want_reasoning = want_reasoning.unwrap_or_default();
+            // Feed one byte at a time — the worst case for split tags.
+            let mut splitter = ReasoningStreamSplitter::new();
+            let (mut got_reasoning, mut got_content) = (String::new(), String::new());
+            let mut start = 0;
+            while start < whole.len() {
+                let mut end = start + 1;
+                while !whole.is_char_boundary(end) {
+                    end += 1;
+                }
+                let (r, c) = splitter.push(&whole[start..end]);
+                got_reasoning.push_str(&r);
+                got_content.push_str(&c);
+                start = end;
+            }
+            let (r, c) = splitter.finish();
+            got_reasoning.push_str(&r);
+            got_content.push_str(&c);
+            // The pure fn trims; the streaming one preserves interior text
+            // verbatim, so compare on trimmed reasoning and exact content.
+            assert_eq!(got_reasoning.trim(), want_reasoning, "reasoning for {whole:?}");
+            assert_eq!(got_content, want_content, "content for {whole:?}");
+        }
+    }
+
+    #[test]
+    fn stream_splitter_passes_plain_content_through() {
+        let mut splitter = ReasoningStreamSplitter::new();
+        let (r, c) = splitter.push("Hello, ");
+        // First delta may hold a bit while ruling out an opener, but nothing
+        // is ever misfiled as reasoning.
+        assert!(r.is_empty());
+        let (r2, c2) = splitter.push("world!");
+        let (r3, c3) = splitter.finish();
+        assert!(r2.is_empty() && r3.is_empty());
+        assert_eq!(format!("{c}{c2}{c3}"), "Hello, world!");
     }
 }
