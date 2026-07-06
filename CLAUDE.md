@@ -36,9 +36,17 @@ cargo test --bin pooprusteek
 cargo clippy --bin pooprusteek
 ```
 
-MSRV 1.91 (edition 2024). CI (`.github/workflows/ci.yml`) runs build + test on
-Windows and Linux; clippy runs advisory (`continue-on-error`) until historical
-warnings are paid down.
+MSRV 1.91 (edition 2024). CI (`.github/workflows/ci.yml`) is one sequential
+pipeline: `test` (build+test, Windows+Linux) and `lint` (`cargo fmt --check`
++ `cargo clippy -D warnings`, blocking) gate everything else — the rolling
+`dev-build` release (`release-build` + `publish` jobs, see
+`scripts/dev-release.template.md`) only builds and publishes once both pass,
+and only for a push to `develop`. A local pre-commit hook
+(`.githooks/pre-commit`, opt in via `git config core.hooksPath .githooks`)
+runs the same three checks before a commit is even made; bypass with
+`git commit --no-verify`. `.gitlab-ci.yml` mirrors the same
+`check → build → release` shape for a future GitLab project (unverified,
+no GitLab remote exists yet).
 
 Semantic/retrieval changes have their own quality gate — an `#[ignore]`d MRR
 eval harness that needs the ~120 MB embedding model on disk (downloaded once,

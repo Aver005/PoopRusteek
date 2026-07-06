@@ -24,8 +24,16 @@
 # the pipeline doesn't block on a runner that may not exist for this
 # project yet — trigger them by hand, or drop the `when: manual` override
 # once those runners are actually available.
+#
+# `check` gates everything downstream: fmt/clippy/test must pass before any
+# release binary gets built, let alone published. None of the later jobs
+# declare an explicit `needs:` back to `check` — GitLab's default
+# stage-sequential behavior (a stage doesn't start until every job in the
+# previous stage has succeeded) already enforces the wait, since `check` is
+# first in `stages:`.
 
 stages:
+  - check
   - prepare
   - build
   - release
@@ -54,6 +62,17 @@ variables:
         - ".gitlab-ci.yml"
       when: manual
       allow_failure: true
+
+check:
+  stage: check
+  image: rust:1.91
+  <<: *dev_build_rules
+  before_script:
+    - rustup component add clippy rustfmt
+  script:
+    - cargo fmt --all -- --check
+    - cargo clippy --bin pooprusteek -- -D warnings
+    - cargo test --bin pooprusteek
 
 prepare:version:
   stage: prepare
