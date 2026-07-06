@@ -211,6 +211,14 @@ pub enum AppEvent {
     ServerFailed { generation: u64, error: String },
     /// The server's accept loop exited (shutdown request or handle drop).
     ServerStopped { generation: u64 },
+    /// One access-log line from the API server. Only emitted when the
+    /// server was spawned with `request_log` on (proxy mode) — the TUI
+    /// never receives it.
+    ServerRequestLog { line: String },
+
+    /// A background provider-model refresh (startup, periodic refetch,
+    /// provider add) finished — see `provider::model_cache`.
+    ProviderModelsRefreshed { summary: String, failed: usize },
 }
 
 // Populated at the `AgentDone` send site but every current receiver

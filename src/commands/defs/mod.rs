@@ -31,6 +31,7 @@ pub mod delete;
 pub mod logout;
 pub mod wipe;
 pub mod debug;
+pub mod provider_models;
 pub mod rag;
 pub mod search;
 pub mod serve;

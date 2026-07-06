@@ -49,7 +49,7 @@ pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
             detail: format!(
                 "{} · {}{}",
                 entry.base_url,
-                entry.model,
+                if entry.model.is_empty() { "(no default model)" } else { &entry.model },
                 if entry.api_key.is_some() { " · key set" } else { "" },
             ),
             active: custom_active.as_deref() == Some(entry.name.as_str()),
@@ -57,6 +57,29 @@ pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
         });
     }
     rows
+}
+
+/// Fetch model lists for `entries` off the event loop and report back via
+/// `AppEvent::ProviderModelsRefreshed`. The one spawn point for every
+/// TUI-side refresh: startup (respects `cache_ms`), the periodic refetch,
+/// and provider adds (both `force`).
+pub fn spawn_models_refresh(
+    cache: std::sync::Arc<crate::provider::model_cache::ProviderModelCache>,
+    entries: Vec<ProviderEntry>,
+    cache_ttl_ms: u64,
+    force: bool,
+    event_tx: tokio::sync::mpsc::UnboundedSender<crate::app::events::AppEvent>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let outcome = cache.refresh(&entries, cache_ttl_ms, force).await;
+        let _ = event_tx.send(crate::app::events::AppEvent::ProviderModelsRefreshed {
+            summary: outcome.summary(),
+            failed: outcome.failed.len(),
+        });
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +132,7 @@ impl ProviderWizardStep {
             ProviderWizardStep::Protocol => "Protocol",
             ProviderWizardStep::BaseUrl => "Base URL (usually ends with /v1)",
             ProviderWizardStep::ApiKey => "API key (blank = none)",
-            ProviderWizardStep::Model => "Model id",
+            ProviderWizardStep::Model => "Default model id (blank = use the provider's model list)",
             ProviderWizardStep::Confirm => "Confirm",
         }
     }
@@ -154,10 +177,9 @@ impl ProviderAddState {
         let name = self.name.buffer.trim().to_string();
         validate_name(&name, config)?;
         let base_url = validate_base_url(self.base_url.buffer.trim())?;
+        // Optional since the fetched model list (`model_cache`) can drive
+        // the API catalog; TUI activation prompts for a /models pick.
         let model = self.model.buffer.trim().to_string();
-        if model.is_empty() {
-            return Err("model can't be empty".to_string());
-        }
         let api_key = self.api_key.buffer.trim();
         Ok(ProviderEntry {
             name,
@@ -238,6 +260,113 @@ pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, Stri
 }
 
 impl crate::app::App {
+    /// Tick-driven periodic model refetch (`[provider_models] refetch_ms`).
+    /// Cheap elapsed check on the event loop; the fetch itself is spawned.
+    pub(crate) fn maybe_refetch_provider_models(&mut self) {
+        let period_ms = self.config.provider_models.refetch_ms;
+        if period_ms == 0 || self.config.providers.is_empty() {
+            return;
+        }
+        if (self.last_models_refetch.elapsed().as_millis() as u64) < period_ms {
+            return;
+        }
+        self.last_models_refetch = std::time::Instant::now();
+        spawn_models_refresh(
+            std::sync::Arc::clone(&self.provider_models),
+            self.config.providers.clone(),
+            self.config.provider_models.cache_ms,
+            true,
+            self.event_tx.clone(),
+        );
+    }
+
+    /// Force-fetch one just-added provider's models so the API catalog and
+    /// `/serve` status pick it up immediately.
+    pub(crate) fn fetch_models_for_new_entry(&self, entry: &ProviderEntry) {
+        spawn_models_refresh(
+            std::sync::Arc::clone(&self.provider_models),
+            vec![entry.clone()],
+            self.config.provider_models.cache_ms,
+            true,
+            self.event_tx.clone(),
+        );
+    }
+
+    /// `/refetch-providers` + `/cache-providers` effects.
+    pub(crate) fn apply_provider_models_action(
+        &mut self,
+        action: crate::commands::ProviderModelsAction,
+    ) {
+        use crate::commands::ProviderModelsAction;
+        let describe = |ms: u64| {
+            if ms == 0 { "off".to_string() } else { format!("{ms}ms") }
+        };
+        match action {
+            ProviderModelsAction::Show => {
+                let snapshot = self.provider_models.snapshot();
+                let mut lines: Vec<String> = self
+                    .config
+                    .providers
+                    .iter()
+                    .map(|entry| {
+                        match (snapshot.get(&entry.name), self.provider_models.age_ms(&entry.name)) {
+                            (Some(models), Some(age)) => format!(
+                                "\u{2022} {} — {} models (fetched {}s ago)",
+                                entry.name,
+                                models.len(),
+                                age / 1000,
+                            ),
+                            _ => format!("\u{2022} {} — not fetched yet", entry.name),
+                        }
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    lines.push("\u{2022} (no /providers entries)".to_string());
+                }
+                self.state.push_system(&format!(
+                    "Provider model lists — fetched from each entry's GET /models; they feed the \
+                     API server catalog (/v1/models) and model routing.\n\
+                     \n\
+                     Refetch: every {} (/refetch-providers <ms|off>)\n\
+                     Cache:   valid {} across restarts (/cache-providers <ms|off>)\n\
+                     \n\
+                     {}",
+                    describe(self.config.provider_models.refetch_ms),
+                    describe(self.config.provider_models.cache_ms),
+                    lines.join("\n"),
+                ));
+            }
+            ProviderModelsAction::SetRefetch(ms) => {
+                let previous = self.config.provider_models.refetch_ms;
+                self.config.provider_models.refetch_ms = ms;
+                if let Err(error) = crate::config::save(&self.config) {
+                    self.config.provider_models.refetch_ms = previous;
+                    self.state.push_system(&format!("Failed to save config: {error}"));
+                    return;
+                }
+                // New period counts from now, not from the last fire.
+                self.last_models_refetch = std::time::Instant::now();
+                self.state.push_system(&match ms {
+                    0 => "Provider model refetch disabled (still fetched on startup and provider add).".to_string(),
+                    _ => format!("Provider models will be refetched every {ms}ms."),
+                });
+            }
+            ProviderModelsAction::SetCache(ms) => {
+                let previous = self.config.provider_models.cache_ms;
+                self.config.provider_models.cache_ms = ms;
+                if let Err(error) = crate::config::save(&self.config) {
+                    self.config.provider_models.cache_ms = previous;
+                    self.state.push_system(&format!("Failed to save config: {error}"));
+                    return;
+                }
+                self.state.push_system(&match ms {
+                    0 => "Provider model cache disabled — every startup re-fetches.".to_string(),
+                    _ => format!("Provider model lists stay valid for {ms}ms across restarts."),
+                });
+            }
+        }
+    }
+
     /// `/models` entry point: fetch the active provider's model list off
     /// the event loop and report back via `AppEvent::ModelsListed`. With
     /// `switch_to: Some(id)` the handler validates and switches instead of
@@ -432,10 +561,13 @@ mod tests {
     }
 
     #[test]
-    fn wizard_rejects_empty_model() {
+    fn wizard_allows_blank_model() {
+        // Blank model = "use the provider's fetched model list" — the API
+        // catalog and /models activation flow handle the rest.
         let mut wizard = ProviderAddState::new();
         wizard.name.buffer = "x".to_string();
         wizard.base_url.buffer = "http://h/v1".to_string();
-        assert!(wizard.build_entry(&Config::default()).is_err());
+        let entry = wizard.build_entry(&Config::default()).unwrap();
+        assert!(entry.model.is_empty());
     }
 }

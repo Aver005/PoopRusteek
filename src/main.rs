@@ -37,6 +37,15 @@ struct Args {
     /// `/serve on` right away). `--server` and `--api` are aliases.
     #[arg(long, visible_alias = "server", visible_alias = "api")]
     serve: bool,
+
+    /// Run the API server without the TUI: stdout carries a timestamped
+    /// event/request log instead of an interface. Same as `--api --uiless`.
+    #[arg(long)]
+    proxy: bool,
+
+    /// With --serve/--server/--api: drop the TUI (headless proxy mode).
+    #[arg(long, requires = "serve")]
+    uiless: bool,
 }
 
 #[tokio::main]
@@ -82,6 +91,12 @@ async fn main() -> Result<()> {
 
     if args.acp {
         return run_acp_server(&config);
+    }
+
+    // Headless proxy: the API server is the whole program — no TUI, stdout
+    // is the event log (tracing still goes to the data-dir file).
+    if args.proxy || (args.serve && args.uiless) {
+        return Ok(server::proxy::run(config).await?);
     }
 
     // TUI-only (never in --acp mode, where stdout is the JSON-RPC channel):

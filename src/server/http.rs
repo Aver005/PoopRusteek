@@ -6,6 +6,7 @@
 use super::{catalog, openai, ServerSettings, ServerStats};
 use crate::app::events::AppEvent;
 use crate::config::{ProviderEntry, ServerApi};
+use crate::provider::model_cache::ProviderModelCache;
 use crate::provider::openai_compat::{ErrorResponse, RequestDefaults};
 use crate::provider::LLMProvider;
 use http_body_util::combinators::BoxBody;
@@ -23,6 +24,11 @@ use tokio::sync::{mpsc, watch};
 /// share one service signature.
 pub(super) type ApiBody = BoxBody<Bytes, std::convert::Infallible>;
 
+/// Attached to a response by a dialect handler to enrich the access-log
+/// line (model id, streaming flag) without widening any signatures.
+#[derive(Debug, Clone)]
+pub(super) struct LogDetail(pub String);
+
 /// Per-launch state shared by every connection.
 pub(super) struct ServerContext {
     pub api: ServerApi,
@@ -32,11 +38,21 @@ pub(super) struct ServerContext {
     /// configured. Built once so all server traffic shares one rate limiter.
     pub deepseek: Option<Arc<dyn LLMProvider>>,
     pub entries: Vec<ProviderEntry>,
+    /// Live fetched-model view (shared with the app/proxy refresher) —
+    /// `/v1/models` and routing pick up new fetches without a restart.
+    pub models: Arc<ProviderModelCache>,
     pub stats: Arc<ServerStats>,
+    /// `Some` when per-request access-log events are wanted (proxy mode).
+    pub log_tx: Option<mpsc::UnboundedSender<AppEvent>>,
 }
 
 impl ServerContext {
-    fn build(settings: ServerSettings, stats: Arc<ServerStats>) -> Self {
+    fn build(
+        settings: ServerSettings,
+        models: Arc<ProviderModelCache>,
+        stats: Arc<ServerStats>,
+        log_tx: Option<mpsc::UnboundedSender<AppEvent>>,
+    ) -> Self {
         let deepseek = settings.deepseek.as_ref().and_then(|seed| {
             match crate::provider::deepseek::DeepseekProvider::new(
                 &seed.provider,
@@ -57,7 +73,9 @@ impl ServerContext {
             defaults: settings.defaults,
             deepseek,
             entries: settings.entries,
+            models,
             stats,
+            log_tx,
         }
     }
 }
@@ -67,13 +85,15 @@ impl ServerContext {
 /// via `AppEvent`, then accept until shutdown.
 pub(super) async fn run(
     settings: ServerSettings,
+    models: Arc<ProviderModelCache>,
     generation: u64,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
     stats: Arc<ServerStats>,
 ) {
     let address = format!("{}:{}", settings.host, settings.port);
-    let context = Arc::new(ServerContext::build(settings, stats));
+    let log_tx = settings.request_log.then(|| event_tx.clone());
+    let context = Arc::new(ServerContext::build(settings, models, stats, log_tx));
 
     let mut listener = None;
     let mut last_error = String::new();
@@ -152,9 +172,26 @@ async fn handle_request(
     request: Request<Incoming>,
     context: Arc<ServerContext>,
 ) -> Result<Response<ApiBody>, std::convert::Infallible> {
+    let started = std::time::Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let mut response = route(request, &context).await;
     if response.status().is_client_error() || response.status().is_server_error() {
         context.stats.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(log_tx) = &context.log_tx {
+        let detail = response
+            .extensions()
+            .get::<LogDetail>()
+            .map(|detail| format!(" · {}", detail.0))
+            .unwrap_or_default();
+        let _ = log_tx.send(AppEvent::ServerRequestLog {
+            line: format!(
+                "{method} {path} → {} ({}ms){detail}",
+                response.status().as_u16(),
+                started.elapsed().as_millis()
+            ),
+        });
     }
     // Permissive CORS so browser-based OpenAI clients can call a local
     // gateway; the bearer check (when enabled) remains the actual gate.
@@ -184,7 +221,11 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
                 "status": "ok",
                 "server": "pooprusteek",
                 "api": context.api.label(),
-                "models": catalog::list_model_ids(context.deepseek.is_some(), &context.entries),
+                "models": catalog::list_model_ids(
+                    context.deepseek.is_some(),
+                    &context.entries,
+                    &context.models.snapshot(),
+                ),
             }),
         );
     }
@@ -267,6 +308,7 @@ mod tests {
             defaults: RequestDefaults { temperature: 0.7, max_tokens: 4096 },
             deepseek: None,
             entries: Vec::new(),
+            request_log: false,
         }
     }
 
@@ -277,7 +319,8 @@ mod tests {
     #[tokio::test]
     async fn server_serves_routes_and_shuts_down() {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = spawn(test_settings(Some("sekret")), 7, event_tx);
+        let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
+        let handle = spawn(test_settings(Some("sekret")), models, 7, event_tx);
 
         // No `{:?}` on the mismatch: Debug-formatting an `AppEvent` here
         // would mark `AgentResult`'s fields as read and unfulfill their

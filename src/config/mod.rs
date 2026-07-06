@@ -27,6 +27,43 @@ pub struct Config {
     /// The local API server (`--serve` / `/serve`) — see `crate::server`.
     #[serde(default)]
     pub server: ServerConfig,
+    /// Background fetching of `/providers` model lists — see
+    /// `crate::provider::model_cache`.
+    #[serde(default)]
+    pub provider_models: ProviderModelsConfig,
+}
+
+/// `[provider_models]` — how the per-provider model catalogs (fetched via
+/// each entry's `GET /models`) are kept fresh. They feed the API server's
+/// `/v1/models` and model-id routing, plus the `/providers` panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelsConfig {
+    /// Background refetch period in ms (`/refetch-providers`); 0 = off
+    /// (fetch only on startup and when a provider is added).
+    #[serde(default = "default_provider_models_ms")]
+    pub refetch_ms: u64,
+    /// How long a persisted model list stays valid across restarts in ms
+    /// (`/cache-providers`); 0 = off (every startup re-fetches).
+    #[serde(default = "default_provider_models_ms")]
+    pub cache_ms: u64,
+}
+
+fn default_provider_models_ms() -> u64 {
+    ProviderModelsConfig::DEFAULT_MS
+}
+
+impl Default for ProviderModelsConfig {
+    fn default() -> Self {
+        Self {
+            refetch_ms: default_provider_models_ms(),
+            cache_ms: default_provider_models_ms(),
+        }
+    }
+}
+
+impl ProviderModelsConfig {
+    /// Both knobs default to 3 minutes.
+    pub const DEFAULT_MS: u64 = 180_000;
 }
 
 /// `[server]` — the local HTTP API gateway (`/serve on`, `--serve`).
@@ -178,7 +215,12 @@ pub struct ProviderEntry {
     /// servers usually don't).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Model id sent with every request.
+    /// Default model id: what TUI chat sends and what the bare `<name>`
+    /// API alias resolves to. May be empty (wizard allows skipping it) —
+    /// the fetched model list (`[provider_models]`, `model_cache`) then
+    /// drives the API catalog, and the TUI prompts for a `/models` pick on
+    /// activation.
+    #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub protocol: ProviderProtocol,
@@ -361,6 +403,7 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider: None,
             server: ServerConfig::default(),
+            provider_models: ProviderModelsConfig::default(),
         }
     }
 }

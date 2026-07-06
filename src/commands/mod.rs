@@ -54,6 +54,19 @@ pub enum ServeAction {
     SetApi(crate::config::ServerApi),
 }
 
+/// `/refetch-providers` + `/cache-providers` intents — interpreted in
+/// `app/providers.rs::apply_provider_models_action`, which owns the model
+/// cache handle and mutable config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderModelsAction {
+    /// Bare command — current periods + per-provider fetch state.
+    Show,
+    /// `/refetch-providers <ms>` — background refetch period (0 = off).
+    SetRefetch(u64),
+    /// `/cache-providers <ms>` — persisted-cache validity (0 = off).
+    SetCache(u64),
+}
+
 pub enum CommandResult {
     Handled,
     LoadSession(String),
@@ -120,6 +133,9 @@ pub enum CommandResult {
     /// `/serve [on|off|api <dialect>]` and `/server <port>` — API-server
     /// control.
     Serve(ServeAction),
+    /// `/refetch-providers` + `/cache-providers` — provider model-list
+    /// freshness knobs.
+    ProviderModels(ProviderModelsAction),
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +247,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::themes::ThemesCommand));
         self.register(Box::new(defs::serve::ServeCommand));
         self.register(Box::new(defs::serve::ServerCommand));
+        self.register(Box::new(defs::provider_models::RefetchProvidersCommand));
+        self.register(Box::new(defs::provider_models::CacheProvidersCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

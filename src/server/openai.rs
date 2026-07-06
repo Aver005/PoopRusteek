@@ -7,7 +7,7 @@
 //! the literal `data: [DONE]`.
 
 use super::catalog::{self, ResolvedModel};
-use super::http::{json_response, ApiBody, ServerContext};
+use super::http::{json_response, ApiBody, LogDetail, ServerContext};
 use crate::provider::openai_compat::{
     self, ChatCompletionRequest, CompletionMeta, ErrorResponse,
 };
@@ -41,7 +41,11 @@ pub(super) async fn route(
 }
 
 fn models_response(context: &ServerContext) -> Response<ApiBody> {
-    let ids = catalog::list_model_ids(context.deepseek.is_some(), &context.entries);
+    let ids = catalog::list_model_ids(
+        context.deepseek.is_some(),
+        &context.entries,
+        &context.models.snapshot(),
+    );
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
     let created = chrono::Utc::now().timestamp().max(0) as u64;
     json_response(
@@ -90,6 +94,7 @@ async fn chat_completions(
         &wire.model,
         context.deepseek.is_some(),
         &context.entries,
+        &context.models.snapshot(),
     ) {
         Ok(resolved) => resolved,
         Err(message) => {
@@ -143,11 +148,19 @@ async fn chat_completions(
     internal.model = resolved.internal_model().to_string();
 
     let meta = CompletionMeta::generate(&public_model);
-    if internal.stream {
+    let streaming = internal.stream;
+    let mut response = if streaming {
         stream_completion(provider, resolved.is_deepseek(), internal, meta)
     } else {
         blocking_completion(provider, resolved.is_deepseek(), internal, meta).await
-    }
+    };
+    // Enriches the proxy access log; free otherwise.
+    response.extensions_mut().insert(LogDetail(format!(
+        "model={public_model} → {}{}",
+        resolved.internal_model(),
+        if streaming { " (stream)" } else { "" }
+    )));
+    response
 }
 
 async fn blocking_completion(
@@ -368,6 +381,7 @@ mod tests {
                 model: "m".to_string(),
                 protocol: ProviderProtocol::Openai,
             }],
+            request_log: false,
         }
     }
 
@@ -378,7 +392,8 @@ mod tests {
     async fn gateway_completes_against_an_entry_backend() {
         let upstream = spawn_mock_upstream().await;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = spawn(gateway_settings(upstream), 1, event_tx);
+        let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
+        let handle = spawn(gateway_settings(upstream), models, 1, event_tx);
         let addr = match event_rx.recv().await {
             Some(AppEvent::ServerStarted { addr, .. }) => addr,
             _ => panic!("expected ServerStarted"),

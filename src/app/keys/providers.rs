@@ -52,6 +52,18 @@ impl App {
                                 // instead of a silent dead chat.
                                 format!("{} selected, but no usable provider (check token/URL)", row.name)
                             };
+                        // A default-model-less entry can serve the API (the
+                        // fetched list routes it) but the TUI chat needs a
+                        // concrete model — open the picker to choose one.
+                        let needs_model = self
+                            .config
+                            .active_provider_entry()
+                            .is_some_and(|entry| entry.model.is_empty());
+                        if needs_model && self.state.focused().provider.is_some() {
+                            self.state.providers_view.status_message =
+                                format!("{} is now active — pick its chat model", row.name);
+                            self.request_models(None);
+                        }
                     }
                     Err(error) => {
                         self.state.providers_view.status_message =
@@ -175,19 +187,20 @@ impl App {
                         wizard.step = ProviderWizardStep::Model;
                     }
                     ProviderWizardStep::Model => {
-                        if wizard.model.buffer.trim().is_empty() {
-                            wizard.error = Some("model can't be empty".to_string());
-                        } else {
-                            wizard.error = None;
-                            wizard.step = ProviderWizardStep::Confirm;
-                        }
+                        // Optional — blank means "use the provider's own
+                        // model list" (fetched in the background).
+                        wizard.error = None;
+                        wizard.step = ProviderWizardStep::Confirm;
                     }
                     ProviderWizardStep::Confirm => match wizard.build_entry(&self.config) {
                         Ok(entry) => {
                             let name = entry.name.clone();
-                            self.config.providers.push(entry);
+                            self.config.providers.push(entry.clone());
                             match crate::config::save(&self.config) {
                                 Ok(()) => {
+                                    // Pull its model list right away so the
+                                    // API catalog knows the new backend.
+                                    self.fetch_models_for_new_entry(&entry);
                                     self.state.modal = None;
                                     // Land on the panel with the new entry
                                     // selected, one Enter away from active.

@@ -50,12 +50,21 @@ cache_ttl = 300            # MCP tools/list cache TTL secs; set via /mcp ttl
 enabled = []               # list of enabled skill names
 paths = []                 # extra skill search dirs
 
-[server]                   # API gateway (src/server/) — /serve, /server <port>, --serve
+[server]                   # API gateway (src/server/) — /serve, /server <port>, --serve, --proxy
 host = "127.0.0.1"         # loopback by default; widen deliberately
 port = 7667                # persisted by /server <port> ("poop" on T9)
 api = "openai"             # openai | anthropic | gemini — wire dialect; only openai implemented (others answer 501)
 # api_key = "…"            # optional; when set every request needs Authorization: Bearer <api_key>
+
+[provider_models]          # per-entry model lists (provider/model_cache.rs) — feed /v1/models + routing
+refetch_ms = 180000        # background refetch period; /refetch-providers <ms|off>; 0 = off
+cache_ms = 180000          # persisted-cache validity across restarts; /cache-providers <ms|off>; 0 = off
 ```
+
+- `ProviderEntry.model` may be **empty** (wizard's Model step is optional): the API catalog
+  then serves the fetched list only, bare `<name>` routes to the first fetched model, and
+  activating the entry in the TUI auto-opens the `/models` picker.
+- Fetched lists persist in `data_dir/provider_models.json` (atomic_write; rebuildable cache).
 
 - `load()` returns `Config::default()` if the file is missing (no crash). `save()` writes pretty TOML, creating parent dirs.
 - Unknown fields are ignored (serde defaults). `ProviderKind` is serde-lowercase.

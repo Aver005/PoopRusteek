@@ -163,9 +163,12 @@ impl App {
                     match crate::app::providers::parse_quick_add(&raw, &self.config) {
                         Ok(entry) => {
                             let name = entry.name.clone();
-                            self.config.providers.push(entry);
+                            self.config.providers.push(entry.clone());
                             match crate::config::save(&self.config) {
                                 Ok(()) => {
+                                    // Pull its model list right away so the
+                                    // API catalog knows the new backend.
+                                    self.fetch_models_for_new_entry(&entry);
                                     self.state.push_system(&format!(
                                         "Provider '{name}' added. Open /providers and press Enter on it to activate."
                                     ));
@@ -223,6 +226,9 @@ impl App {
             }
             CommandResult::Serve(action) => {
                 self.apply_serve_action(action);
+            }
+            CommandResult::ProviderModels(action) => {
+                self.apply_provider_models_action(action);
             }
             CommandResult::SearchHistory(query) => {
                 self.state.view = View::Search;

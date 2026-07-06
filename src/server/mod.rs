@@ -24,9 +24,11 @@
 pub mod catalog;
 mod http;
 mod openai;
+pub mod proxy;
 
 use crate::app::events::AppEvent;
 use crate::config::{Config, ProviderConfig, ProviderEntry, ServerApi};
+use crate::provider::model_cache::ProviderModelCache;
 use crate::provider::openai_compat::RequestDefaults;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -47,6 +49,9 @@ pub struct ServerSettings {
     /// Seed for the built-in DeepSeek backend, when a token is configured.
     pub deepseek: Option<DeepseekSeed>,
     pub entries: Vec<ProviderEntry>,
+    /// Emit an `AppEvent::ServerRequestLog` per request. On for proxy mode
+    /// (the log IS the UI there); off for the TUI, which shows counters.
+    pub request_log: bool,
 }
 
 /// What `DeepseekProvider::new` needs, detached from the live `Config`.
@@ -80,6 +85,7 @@ impl ServerSettings {
                 max_retries: config.agent.max_retries,
             }),
             entries: config.providers.clone(),
+            request_log: false,
         }
     }
 }
@@ -123,8 +129,11 @@ impl ServerHandle {
 
 /// Launch the server task. Binding happens inside the task — never on the
 /// event loop — and the outcome comes back as `ServerStarted`/`ServerFailed`.
+/// `models` is the shared provider-model cache: the app (or proxy) keeps it
+/// fresh; the server reads it live, so `/v1/models` grows as fetches land.
 pub fn spawn(
     settings: ServerSettings,
+    models: Arc<ProviderModelCache>,
     generation: u64,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> ServerHandle {
@@ -132,7 +141,7 @@ pub fn spawn(
     let stats = Arc::new(ServerStats::default());
     let handle_stats = Arc::clone(&stats);
     let (host, port, api) = (settings.host.clone(), settings.port, settings.api);
-    let task = tokio::spawn(http::run(settings, generation, event_tx, shutdown_rx, stats));
+    let task = tokio::spawn(http::run(settings, models, generation, event_tx, shutdown_rx, stats));
     ServerHandle {
         generation,
         host,

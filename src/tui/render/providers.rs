@@ -195,7 +195,13 @@ pub(super) fn render_provider_add(
                 Style::default().fg(theme.text_soft),
             )));
             lines.push(Line::from(Span::styled(
-                format!("  Model:    {}", wizard.model.buffer.trim()),
+                format!(
+                    "  Model:    {}",
+                    match wizard.model.buffer.trim() {
+                        "" => "(auto — provider's model list)",
+                        model => model,
+                    },
+                ),
                 Style::default().fg(theme.fg),
             )));
         }

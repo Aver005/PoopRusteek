@@ -109,6 +109,11 @@ pub struct App {
     server: Option<crate::server::ServerHandle>,
     /// Monotonic server-launch counter — see `AppEvent::ServerStarted`.
     server_generation: u64,
+    /// Fetched `/providers` model lists (persisted, TTL'd) — feeds the API
+    /// server catalog and `/serve` status. See `provider::model_cache`.
+    provider_models: std::sync::Arc<crate::provider::model_cache::ProviderModelCache>,
+    /// When the periodic model refetch last ran (`[provider_models] refetch_ms`).
+    last_models_refetch: std::time::Instant,
 }
 
 pub struct AppState {
@@ -275,6 +280,20 @@ impl App {
 
         let persister = persist::Persister::start(Arc::clone(&semantic));
 
+        // Provider model lists: load the persisted cache and refresh stale
+        // entries in the background (`cache_ms` decides what "stale" means;
+        // a fresh cache makes this a no-op network-wise).
+        let provider_models = crate::provider::model_cache::ProviderModelCache::load();
+        if !config.providers.is_empty() {
+            providers::spawn_models_refresh(
+                Arc::clone(&provider_models),
+                config.providers.clone(),
+                config.provider_models.cache_ms,
+                false,
+                event_tx.clone(),
+            );
+        }
+
         Ok(Self {
             config,
             state,
@@ -290,6 +309,8 @@ impl App {
             persister,
             server: None,
             server_generation: 0,
+            provider_models,
+            last_models_refetch: std::time::Instant::now(),
         })
     }
 
@@ -595,6 +616,7 @@ impl App {
                     self.state.focused_mut().generation.animation_tick =
                         self.state.focused_mut().generation.animation_tick.wrapping_add(1);
                 }
+                self.maybe_refetch_provider_models();
             }
             AppEvent::GoalEvaluationDone(outcome) => {
                 self.handle_goal_evaluation_done(outcome).await;
@@ -717,6 +739,18 @@ impl App {
                     self.server = None;
                     self.state.status_message = "API server stopped".to_string();
                     self.state.focused_mut().messages.push(ChatMessage::ui_system("API server stopped."));
+                }
+            }
+            AppEvent::ServerRequestLog { .. } => {
+                // Proxy-mode-only event (request_log is off for TUI-owned
+                // servers); nothing to show here.
+            }
+            AppEvent::ProviderModelsRefreshed { summary, failed } => {
+                self.state.status_message = summary.clone();
+                // Quiet on success (background bookkeeping); failures get a
+                // visible line so a dead endpoint doesn't fail silently.
+                if failed > 0 {
+                    self.state.focused_mut().messages.push(ChatMessage::ui_system(&format!("⚠ {summary}")));
                 }
             }
             AppEvent::HistorySearchDone { query, matches } => {

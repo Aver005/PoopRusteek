@@ -82,7 +82,12 @@ impl App {
             );
         }
         self.server_generation += 1;
-        let handle = server::spawn(settings, self.server_generation, self.event_tx.clone());
+        let handle = server::spawn(
+            settings,
+            std::sync::Arc::clone(&self.provider_models),
+            self.server_generation,
+            self.event_tx.clone(),
+        );
         self.state.push_system(&format!(
             "API server starting on {}:{} ({} dialect) — {why}.",
             handle.host,
@@ -120,11 +125,19 @@ impl App {
         let models = catalog::list_model_ids(
             !self.config.provider.token.is_empty(),
             &self.config.providers,
+            &self.provider_models.snapshot(),
         );
-        let models = if models.is_empty() {
-            "none — configure a provider first".to_string()
-        } else {
-            models.join(", ")
+        // Fetched lists can run long (OpenRouter ≈ hundreds) — cap the chat
+        // display; the full list is one `GET /v1/models` away.
+        const SHOWN: usize = 24;
+        let models = match models.len() {
+            0 => "none — configure a provider first".to_string(),
+            n if n > SHOWN => format!(
+                "{} … +{} more (see /refetch-providers or GET /v1/models)",
+                models[..SHOWN].join(", "),
+                n - SHOWN,
+            ),
+            _ => models.join(", "),
         };
         let auth = match &config.api_key {
             Some(key) if !key.trim().is_empty() => "bearer token required",

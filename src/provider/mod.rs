@@ -3,6 +3,7 @@ pub mod anthropic_compat;
 pub mod deepseek;
 pub mod gemini_client;
 pub mod gemini_compat;
+pub mod model_cache;
 #[cfg(test)]
 pub mod fake;
 pub mod openai_client;
