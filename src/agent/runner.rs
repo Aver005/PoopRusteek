@@ -1,5 +1,7 @@
 use crate::agent::stream::{StreamEnd, collect_stream};
-use crate::agent::tool_parser::{StreamTextTracker, parse_tool_calls, strip_tool_calls};
+use crate::agent::tool_parser::{
+    StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
+};
 use crate::app::conversation::ConversationId;
 use crate::app::events::{
     AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo,
@@ -38,6 +40,11 @@ pub async fn run_agent_loop(
 ) {
     let mut collected_tool_calls = Vec::new();
     let mut messages = messages;
+    // How many times, within one turn, a malformed `<tool_use>` block may be
+    // handed back to the model for correction before the turn gives up. Bounds
+    // a weaker model that can't recover its own XML/JSON so it can't spin.
+    const MAX_MALFORMED_TOOL_RETRIES: u32 = 2;
+    let mut malformed_retries: u32 = 0;
 
     // Semantic hint: match the newest user message against the skill and
     // MCP-tool corpora and attach an advisory note the model can act on
@@ -195,7 +202,7 @@ pub async fn run_agent_loop(
             }
         }
 
-        let tool_calls = parse_tool_calls(&full_response);
+        let (tool_calls, parse_errors) = parse_tool_calls_with_errors(&full_response);
         let visible_text = strip_tool_calls(&full_response);
         debug_log::log(
             "agent.step.parsed",
@@ -251,6 +258,50 @@ pub async fn run_agent_loop(
         }
 
         if tool_calls.is_empty() {
+            // A `<tool_use>` block that yielded zero parsed calls means the
+            // model emitted a malformed tool call (swapped tags, invalid JSON,
+            // …). Ending the turn silently here is exactly what made the agent
+            // look frozen — nothing shown, nothing run. Feed the parse errors
+            // back so it can re-issue the call, bounded so a model that can't
+            // recover can't loop. (A provider error with empty calls already
+            // returned above, so these errors are from a clean stream.)
+            if !parse_errors.is_empty() && malformed_retries < MAX_MALFORMED_TOOL_RETRIES {
+                malformed_retries += 1;
+                // Keep what the model actually emitted (raw, not stripped) so
+                // full-history providers see the mistake; DeepSeek already has
+                // it server-side and re-sends only the correction below.
+                messages.push(ChatMessage::assistant(&full_response));
+                messages.push(ChatMessage::user(&malformed_tool_feedback(&parse_errors)));
+                debug_log::log(
+                    "agent.step.malformed_tool_use",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} retry={malformed_retries}/{MAX_MALFORMED_TOOL_RETRIES} errors={}",
+                        parse_errors.join(" | ")
+                    ),
+                );
+                let _ = event_tx.send(AppEvent::AddMessage(
+                    conversation,
+                    ChatMessage::system(&format!(
+                        "⚠ Malformed tool call (attempt {malformed_retries}/{MAX_MALFORMED_TOOL_RETRIES}) — asking the model to retry"
+                    )),
+                ));
+                continue;
+            }
+            if !parse_errors.is_empty() {
+                debug_log::log(
+                    "agent.step.malformed_tool_use_exhausted",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} errors={}",
+                        parse_errors.join(" | ")
+                    ),
+                );
+                let _ = event_tx.send(AppEvent::AddMessage(
+                    conversation,
+                    ChatMessage::system(
+                        "⚠ The model kept emitting malformed tool calls; stopping this turn. Try rephrasing your request.",
+                    ),
+                ));
+            }
             if !visible_text.is_empty() {
                 messages.push(ChatMessage::assistant(&visible_text));
             } else {
@@ -558,6 +609,22 @@ pub async fn run_agent_loop(
         conversation,
         "Reached max agent steps before producing a final answer".to_string(),
     ));
+}
+
+/// Correction message handed back to the model after it emitted a `<tool_use>`
+/// block that couldn't be parsed. Names each concrete problem and restates the
+/// exact required shape so the model can re-issue the call.
+fn malformed_tool_feedback(errors: &[String]) -> String {
+    format!(
+        "Your previous message contained a tool call that could NOT be parsed, \
+         so it was NOT executed:\n- {}\n\nRe-issue it using exactly this shape, \
+         and nothing after </tool_use>:\n\
+         <tool_use>\n<name>TOOL_NAME</name>\n<arguments>\n{{ \"key\": \"value\" }}\n</arguments>\n</tool_use>\n\n\
+         The arguments must be a single valid JSON object. Inside JSON string \
+         values, escape every backslash as \\\\ and every double quote as \\\" \
+         (e.g. a Windows path: \"C:\\\\Users\\\\Aver\\\\file.png\").",
+        errors.join("\n- ")
+    )
 }
 
 fn summarize_tool_result(result: &str) -> String {

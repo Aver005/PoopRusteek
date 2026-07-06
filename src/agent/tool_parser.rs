@@ -29,39 +29,87 @@ pub struct ParsedToolCall {
     pub arguments: Value,
 }
 
+/// Parse every tool call in `text`. Convenience wrapper over
+/// [`parse_tool_calls_with_errors`] that discards the diagnostics — callers
+/// that need to know a `<tool_use>` block was present but *malformed* (so they
+/// can ask the model to retry instead of silently ending the turn) use the
+/// `_with_errors` variant.
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
+    parse_tool_calls_with_errors(text).0
+}
+
+/// Parse every tool call in `text`, returning both the successful calls and a
+/// human-readable diagnostic for each `<tool_use>`/`[TOOL:…]` block that looked
+/// like a call but failed to parse.
+///
+/// A non-empty error list with zero calls is the signature of the "frozen
+/// agent" bug: a weaker model emits a `<tool_use>` block with swapped closing
+/// tags or invalid JSON, every call silently drops, `strip_tool_calls` erases
+/// the block, and the turn ends with nothing shown and nothing run. The runner
+/// feeds these diagnostics back so the model can re-issue the call.
+///
+/// Tolerances beyond the strict `<name>`+`<arguments>` shape:
+/// - swapped `</arguments>`/`</tool_use>` closing tags (take text after the
+///   `<arguments>` opener up to whichever closer appears first);
+/// - a dropped `<arguments>` wrapper (fall back to the first `{…}` after
+///   `<name>`);
+/// - the bare-JSON shapes `{"tool":…,"args":…}` and `{"name":…,"arguments":…}`.
+///
+/// Genuinely broken JSON (e.g. unescaped quotes around a Windows path) is *not*
+/// guessed at — repairing it risks running the wrong command — it becomes a
+/// diagnostic instead.
+pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<String>) {
     let mut calls = Vec::new();
+    let mut errors = Vec::new();
 
     for cap in XML_TOOL_RE.captures_iter(text) {
         let body = cap[1].trim();
 
-        if let (Some(name_cap), Some(args_cap)) =
-            (XML_NAME_RE.captures(body), XML_ARGS_RE.captures(body))
-        {
+        if let Some(name_cap) = XML_NAME_RE.captures(body) {
             let name = name_cap[1].trim().to_string();
-            let args_str = args_cap[1].trim();
-            match serde_json::from_str::<Value>(args_str) {
-                Ok(arguments) => calls.push(ParsedToolCall { name, arguments }),
-                Err(error) => tracing::warn!("Failed to parse <tool_use> arguments: {error}"),
+            match extract_arguments(body) {
+                Some(args_str) => match serde_json::from_str::<Value>(args_str.trim()) {
+                    Ok(arguments) => calls.push(ParsedToolCall { name, arguments }),
+                    Err(error) => errors.push(format!(
+                        "tool `{name}`: <arguments> is not valid JSON ({error}). Re-send \
+                         with a valid JSON object and escape every backslash (\\\\) and \
+                         quote (\\\") inside string values."
+                    )),
+                },
+                None => errors.push(format!(
+                    "tool `{name}`: missing <arguments> block. Send exactly \
+                     <tool_use><name>{name}</name><arguments>{{ ... }}</arguments></tool_use>."
+                )),
             }
             continue;
         }
 
+        // No <name> tag — accept the bare-JSON object shapes.
         match serde_json::from_str::<Value>(body) {
             Ok(value) => {
                 let name = value
                     .get("tool")
+                    .or_else(|| value.get("name"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 let arguments = value
                     .get("args")
+                    .or_else(|| value.get("arguments"))
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
-                if let Some(name) = name {
-                    calls.push(ParsedToolCall { name, arguments });
+                match name {
+                    Some(name) => calls.push(ParsedToolCall { name, arguments }),
+                    None => errors.push(
+                        "a <tool_use> block had no <name> tag and no \"tool\"/\"name\" \
+                         field in its JSON."
+                            .to_string(),
+                    ),
                 }
             }
-            Err(error) => tracing::warn!("Failed to parse <tool_use> body: {error}"),
+            Err(error) => errors.push(format!(
+                "malformed <tool_use> block ({error}). Use \
+                 <tool_use><name>TOOL</name><arguments>{{ valid JSON }}</arguments></tool_use>."
+            )),
         }
     }
 
@@ -77,12 +125,47 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
                 });
             }
             Err(e) => {
-                tracing::warn!("Failed to parse tool arguments for '{name}': {e}");
+                errors.push(format!(
+                    "tool `{name}`: arguments are not valid JSON ({e})."
+                ));
             }
         }
     }
 
-    calls
+    (calls, errors)
+}
+
+/// Pull the JSON arguments out of a `<tool_use>` body, tolerating the common
+/// malformations that weaker models produce. Returns the raw argument slice
+/// (still to be JSON-parsed by the caller), or `None` when no arguments region
+/// can be located at all.
+fn extract_arguments(body: &str) -> Option<String> {
+    // Well-formed <arguments>…</arguments>.
+    if let Some(cap) = XML_ARGS_RE.captures(body) {
+        return Some(cap[1].trim().to_string());
+    }
+    // Missing/misplaced </arguments> — most often swapped with </tool_use>
+    // (`…</tool_use></arguments>`). The outer XML_TOOL_RE already cut at the
+    // first </tool_use>, so `body` ends right after the JSON: take everything
+    // past the opener, defensively trimming any stray closer.
+    if let Some(idx) = body.find("<arguments>") {
+        let mut rest = &body[idx + "<arguments>".len()..];
+        if let Some(end) = rest.find("</arguments>") {
+            rest = &rest[..end];
+        }
+        if let Some(end) = rest.find("</tool_use>") {
+            rest = &rest[..end];
+        }
+        return Some(rest.trim().to_string());
+    }
+    // No <arguments> wrapper at all — fall back to the first JSON object after
+    // <name>.
+    let after_name = XML_NAME_RE
+        .find(body)
+        .map(|m| &body[m.end()..])
+        .unwrap_or(body);
+    let start = after_name.find('{')?;
+    Some(after_name[start..].trim().to_string())
 }
 
 pub fn strip_tool_calls(text: &str) -> String {
@@ -314,6 +397,63 @@ Then [TOOL:file.read] {"path": "test.txt"}"#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "powershell");
         assert_eq!(calls[0].arguments["command"], "Get-Location");
+    }
+
+    /// The exact failure from the frozen-agent report: the model swapped the
+    /// `</tool_use>` and `</arguments>` closing tags. Old parser dropped it
+    /// with "Failed to parse <tool_use> body"; now the arguments are recovered.
+    #[test]
+    fn test_parse_xml_tool_call_with_swapped_closing_tags() {
+        let text = "<tool_use>\n<name>powershell</name>\n<arguments>\n{\"command\":\"Get-Location\"}\n</tool_use>\n</arguments>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert_eq!(calls.len(), 1, "errors: {errors:?}");
+        assert_eq!(calls[0].name, "powershell");
+        assert_eq!(calls[0].arguments["command"], "Get-Location");
+    }
+
+    /// Genuinely broken JSON (unescaped quotes around a Windows path, the other
+    /// half of the report) must NOT be silently dropped — it becomes an error
+    /// the runner can feed back, and yields zero calls (never a wrong command).
+    #[test]
+    fn test_malformed_json_arguments_report_error_not_call() {
+        let text = "<tool_use>\n<name>powershell</name>\n<arguments>\n{\"command\": \"Start-Process \"C:\\Users\\Aver\\x.png\"\"}\n</arguments>\n</tool_use>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert!(
+            calls.is_empty(),
+            "should not fabricate a call from bad JSON"
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("powershell"));
+        assert!(errors[0].contains("not valid JSON"));
+    }
+
+    /// A dropped `<arguments>` wrapper still recovers the JSON object.
+    #[test]
+    fn test_parse_xml_tool_call_without_arguments_wrapper() {
+        let text = "<tool_use>\n<name>bash</name>\n{\"command\":\"ls\"}\n</tool_use>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert_eq!(calls.len(), 1, "errors: {errors:?}");
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    /// The bare-JSON `{"name":…,"arguments":…}` shape (no XML tags) parses too.
+    #[test]
+    fn test_parse_bare_json_name_arguments_shape() {
+        let text = "<tool_use>{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}</tool_use>";
+        let (calls, _errors) = parse_tool_calls_with_errors(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn test_well_formed_call_produces_no_errors() {
+        let text =
+            "<tool_use><name>bash</name><arguments>{\"command\":\"ls\"}</arguments></tool_use>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert_eq!(calls.len(), 1);
+        assert!(errors.is_empty());
     }
 
     #[test]

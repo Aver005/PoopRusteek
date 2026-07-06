@@ -95,6 +95,13 @@ pub async fn spawn_background(
         .map_err(|e| format!("Failed to spawn command: {e}"))?;
     let child_pid = child.id();
 
+    // Bind to the kill-on-close job so a force-close of pooprusteek can't
+    // orphan this DETACHED_PROCESS child (see `win_job`).
+    #[cfg(windows)]
+    if let Some(handle) = child.raw_handle() {
+        super::types::win_job::assign_child_handle(handle);
+    }
+
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -227,6 +234,12 @@ pub async fn spawn_interactive(
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let child_pid = child.process_id();
+    // Bind the PTY child to the kill-on-close job so a force-close can't orphan
+    // it (see `win_job`). Only the pid is available here.
+    #[cfg(windows)]
+    if let Some(pid) = child_pid {
+        super::types::win_job::assign_pid(pid);
+    }
     let killer: Box<dyn ChildKiller + Send + Sync> = child.clone_killer();
 
     let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;

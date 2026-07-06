@@ -1,6 +1,6 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-07-04 (fixed silent global-session-per-restart bug; see RESOLVED)
+> Last updated: 2026-07-07 (fixed frozen-agent-on-malformed-tool_use + orphaned detached powershell; see RESOLVED)
 > Full audit digest: `reference/AUDIT-2026-07-02.md` (2026-07-02)
 
 ## CRITICAL
@@ -35,6 +35,8 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **Frozen agent on malformed `<tool_use>` + orphaned detached powershell** (2026-07-07). DeepSeek emitted a `<tool_use>` with swapped `</tool_use>`/`</arguments>` closing tags **and** invalid JSON (unescaped quotes around a Windows path). `parse_tool_calls` silently dropped it (log-only warn), `strip_tool_calls` erased it → empty turn → `AgentDone` with nothing shown/run; every later turn repeated → "frozen". The same unbalanced quote hung `powershell -Command` (unterminated string, `stdin=null`, `DETACHED_PROCESS`), and detached jobs are only reaped on graceful exit → a force-close orphaned 6 of them. **Fix:** (1) `parse_tool_calls_with_errors` + tolerant `extract_arguments` (swapped tags, dropped `<arguments>`, `{"name","arguments"}` shape) — broken JSON becomes a diagnostic, never a guessed call; (2) runner feeds the parse error back and retries (`MAX_MALFORMED_TOOL_RETRIES=2`) instead of ending silently; (3) Windows Job Object with `KILL_ON_JOB_CLOSE` binds every background/PTY child so a force-close kills the tree. `→ src/agent/tool_parser.rs`, `src/agent/runner.rs`, `src/tools/background/types.rs` (`win_job`) + `spawn.rs`. Write-up: `JOURNAL/2026-07-07.md` (pt.2).
 
 - ✅ `~~ONNX embedder OOM on low-RAM hosts: `bad allocation` / `BFCArena Failed to allocate ~1.2 GB` on `/encoder/layer.0/attention/self/Add`~~` — `Embedder::embed(_, None)` let fastembed use its default batch of **256**; peak attention memory ≈ `batch × 12 heads × 512² × 4B` ≈ 3.2 GB, which OOMs on thin machines (surfaced during `backfill_history`, the heaviest embed pass). seq is already truncated to 512 and history already chunked, so batch was the only unbounded lever. Fixed 2026-07-06: new `[semantic] rag_limit` (`auto`/`off`/`<N>`) + `/rag-limit` command; **auto** sizes the batch from total RAM (`util::total_ram_bytes()`, per-platform, falls back to batch 8 when RAM can't be probed). e5-small is non-quantized so an arbitrary cap is safe. `→ src/semantic/embedder.rs`, `src/config/mod.rs`, `src/util.rs`, `src/commands/defs/rag_limit.rs`. Full write-up: `JOURNAL/2026-07-06.md` (pt.2).
 

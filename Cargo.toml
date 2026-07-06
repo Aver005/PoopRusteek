@@ -94,10 +94,16 @@ rust-stemmers = "1.2.0"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1"
 # GlobalMemoryStatusEx (auto-size embedder batch) + SetStdHandle (redirect
-# stderr into errors.log so ONNX Runtime's output can't corrupt the TUI).
+# stderr into errors.log so ONNX Runtime's output can't corrupt the TUI) +
+# Job Objects (kill-on-close so detached background jobs can't outlive a
+# force-closed app; see tools::background::types::win_job).
 windows-sys = { version = "0.60", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Console",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]

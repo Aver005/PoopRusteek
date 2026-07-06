@@ -9,7 +9,7 @@
 use super::modals::render_autocomplete;
 use super::onboarding::pulsing_title;
 use super::status::{render_input_border, render_mini_status};
-use super::util::{centered_h, format_date, provider_label, truncate};
+use super::util::{centered_h, fit_col, format_date, provider_label};
 use crate::app::AppState;
 use crate::config::Config;
 use crate::tui::theme::Theme;
@@ -218,42 +218,60 @@ fn render_sessions_table(
     let date_style = Style::default().fg(theme.text_dim).bg(theme.bg);
     let model_style = Style::default().fg(theme.accent_soft).bg(theme.bg);
     let sep_style = Style::default().fg(theme.border).bg(theme.bg);
+    let gap_style = Style::default().bg(theme.bg);
+
+    // Column budget within the (centered) table width. `id`, `model`, and
+    // `date` take fixed slots; `title` flexes to fill whatever they leave, so
+    // the row can't overflow the width and clip the right-hand date column.
+    // A right pad keeps the row off the last column. Widths are display cells.
+    let w = area.width as usize;
+    const LEAD: usize = 2;
+    const GAP: usize = 2;
+    const ID_W: usize = 16;
+    const MODEL_W: usize = 16;
+    const DATE_W: usize = 12; // "Mon DD HH:MM"
+    const RIGHT_PAD: usize = 2;
+    let fixed = LEAD + ID_W + GAP + GAP + MODEL_W + GAP + DATE_W + RIGHT_PAD;
+    let title_w = w.saturating_sub(fixed).max(8);
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header
+    // Header + a column rule sized to match the row layout below.
     lines.push(Line::from(vec![Span::styled(
         " Recent sessions ",
         header_style,
     )]));
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "  {} {} {}  {}",
-            "──".repeat(8),
-            "──".repeat(15),
-            "──".repeat(8),
-            "──".repeat(6)
+            "{}{}{}{}{}{}{}{}",
+            " ".repeat(LEAD),
+            "─".repeat(ID_W),
+            " ".repeat(GAP),
+            "─".repeat(title_w),
+            " ".repeat(GAP),
+            "─".repeat(MODEL_W),
+            " ".repeat(GAP),
+            "─".repeat(DATE_W),
         ),
         sep_style,
     )]));
 
     for s in sessions.iter().take(5) {
-        let id_short = truncate(&s.id, 16);
-        let title = truncate(&s.title, 30);
         let date = format_date(&s.updated_at);
-        let model_tag = if s.model_type.is_empty() {
+        let model_col = if s.model_type.is_empty() {
             String::new()
         } else {
-            format!(" [{}]", s.model_type)
+            format!("[{}]", s.model_type)
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {id_short}"), id_style),
-            Span::styled("  ", Style::default().bg(theme.bg)),
-            Span::styled(title.to_string(), title_style),
-            Span::styled("  ", Style::default().bg(theme.bg)),
-            Span::styled(model_tag, model_style),
-            Span::styled("  ", Style::default().bg(theme.bg)),
-            Span::styled(date, date_style),
+            Span::styled(" ".repeat(LEAD), gap_style),
+            Span::styled(fit_col(&s.id, ID_W), id_style),
+            Span::styled(" ".repeat(GAP), gap_style),
+            Span::styled(fit_col(&s.title, title_w), title_style),
+            Span::styled(" ".repeat(GAP), gap_style),
+            Span::styled(fit_col(&model_col, MODEL_W), model_style),
+            Span::styled(" ".repeat(GAP), gap_style),
+            Span::styled(fit_col(&date, DATE_W), date_style),
         ]));
     }
 

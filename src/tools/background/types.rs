@@ -157,6 +157,117 @@ pub(crate) async fn force_kill_pid(pid: u32) -> std::io::Result<()> {
     }
 }
 
+/// Windows-only: bind every background/PTY child to a process-wide Job Object
+/// configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+///
+/// Background children are spawned `DETACHED_PROCESS` (see `spawn.rs`) so they
+/// don't share our console — which also means killing pooprusteek does *not*
+/// cascade to them. The registry's `shutdown_all` reaps them on a graceful
+/// exit, but a force-close (window closed, `taskkill`, crash) skips that and
+/// orphans every running job (the "6 stuck powershell" report). A Job Object
+/// closes that gap at the OS level: when our process dies, the last handle to
+/// the job closes and Windows terminates the whole job tree — graceful or not.
+#[cfg(windows)]
+pub(crate) mod win_job {
+    use std::os::windows::io::RawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    /// The shared job handle (stored as `usize` so it is `Send`/`Sync`), or 0
+    /// if the job could not be created — in which case assignment is a no-op
+    /// and we fall back to the existing best-effort `shutdown_all` reaping.
+    fn job_handle() -> HANDLE {
+        static JOB: OnceLock<usize> = OnceLock::new();
+        let raw = *JOB.get_or_init(|| create_kill_on_close_job().unwrap_or(0));
+        raw as HANDLE
+    }
+
+    fn create_kill_on_close_job() -> Option<usize> {
+        // SAFETY: standard Win32 Job Object setup. CreateJobObjectW with null
+        // attributes/name creates an anonymous job; a null return is the
+        // documented failure signal, which we map to None.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                crate::debug_log::log(
+                    "background.job.create_failed",
+                    "CreateJobObjectW returned null",
+                );
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                crate::debug_log::log(
+                    "background.job.setinfo_failed",
+                    "SetInformationJobObject(KILL_ON_JOB_CLOSE) failed",
+                );
+                CloseHandle(job);
+                return None;
+            }
+            Some(job as usize)
+        }
+    }
+
+    fn assign(process: HANDLE, pid_label: &str) {
+        let job = job_handle();
+        if job.is_null() || process.is_null() {
+            return;
+        }
+        // SAFETY: `job` is our live job handle; `process` is a valid process
+        // handle owned by the caller for the duration of this call.
+        let ok = unsafe { AssignProcessToJobObject(job, process) };
+        if ok == 0 {
+            // Non-fatal: the process may already belong to a job that forbids
+            // nesting/breakaway. `shutdown_all` still reaps it on graceful
+            // exit; we just lose the force-close guarantee for this one.
+            crate::debug_log::log(
+                "background.job.assign_failed",
+                format!("AssignProcessToJobObject failed for {pid_label}"),
+            );
+        }
+    }
+
+    /// Assign a pipe-based child (whose OS process handle we own) to the job.
+    pub(crate) fn assign_child_handle(handle: RawHandle) {
+        assign(handle as HANDLE, "child-handle");
+    }
+
+    /// Assign a process by pid (used for PTY children, where we only have the
+    /// pid). Opens a short-lived handle with just the rights the assignment
+    /// needs, then closes it — the job keeps the process bound.
+    pub(crate) fn assign_pid(pid: u32) {
+        // SAFETY: OpenProcess returns null on failure (handled); the handle is
+        // closed before returning.
+        unsafe {
+            let handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
+            if handle.is_null() {
+                crate::debug_log::log(
+                    "background.job.open_failed",
+                    format!("OpenProcess failed for pid={pid}"),
+                );
+                return;
+            }
+            assign(handle, &format!("pid={pid}"));
+            CloseHandle(handle);
+        }
+    }
+}
+
 pub struct SpawnOutcome {
     pub id: u64,
     pub initial_output: String,

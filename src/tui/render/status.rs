@@ -179,13 +179,13 @@ pub(super) fn render_mini_status(
     } else {
         String::new()
     };
-    let session_prefix = format!(
+    let session_label = format!(
         " {}",
-        view_model::session_prefix(&state.focused().session_id)
+        view_model::session_label(&state.focused().session_id)
     );
     let right = format!(
         "{} msgs:{} tot:{} | {} ",
-        goal_tag, msg_count, total_tokens, session_prefix
+        goal_tag, msg_count, total_tokens, session_label
     );
 
     // Red error marker — only here when the panel (its primary home) is hidden.

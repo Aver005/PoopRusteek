@@ -17,6 +17,45 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Fit `s` into exactly `width` display columns for fixed-column table layout:
+/// truncate with a trailing `…` when too wide, right-pad with spaces when too
+/// narrow. Width is measured in display cells (via `UnicodeWidthStr`), not
+/// bytes or chars, so Cyrillic, CJK, and emoji content stays column-aligned.
+pub(super) fn fit_col(s: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w == width {
+        return s.to_string();
+    }
+    if w < width {
+        let mut out = String::with_capacity(s.len() + (width - w));
+        out.push_str(s);
+        out.push_str(&" ".repeat(width - w));
+        return out;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    // Too wide: take as many chars as fit in `width - 1` cells (reserving one
+    // for the ellipsis), then pad in case a wide char left a one-cell gap.
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthStr::width(ch.to_string().as_str()).max(1);
+        if used + cw > budget {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    used += 1;
+    if used < width {
+        out.push_str(&" ".repeat(width - used));
+    }
+    out
+}
+
 pub(super) fn format_date(rfc3339: &str) -> String {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
         dt.format("%b %d %H:%M").to_string()
@@ -135,6 +174,30 @@ pub(super) fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_col_pads_short_and_truncates_long() {
+        // Short content is right-padded to the exact column width.
+        assert_eq!(fit_col("ab", 5), "ab   ");
+        // Exact-width content is returned unchanged.
+        assert_eq!(fit_col("abcde", 5), "abcde");
+        // Over-width content is truncated with a trailing ellipsis; the result
+        // is still exactly `width` display columns.
+        let out = fit_col("abcdefgh", 5);
+        assert_eq!(out, "abcd…");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
+    }
+
+    #[test]
+    fn fit_col_multibyte_uses_display_width() {
+        // Cyrillic letters are 1 cell each.
+        assert_eq!(fit_col("привет", 4), "при…");
+        // CJK chars are 2 cells each: "世界世" is 6 cells; fitting to 5 keeps
+        // two chars + … = 5 cells exactly (not 5 chars).
+        let out = fit_col("世界世", 5);
+        assert_eq!(out, "世界…");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
+    }
 
     #[test]
     fn status_bar_gap_ascii_matches_byte_length_math() {

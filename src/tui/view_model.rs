@@ -37,6 +37,20 @@ pub fn session_prefix(id: &str) -> &str {
     crate::util::truncate_at_char_boundary(id, 8)
 }
 
+/// A human-friendly label for the status bar's session slot. Session ids from
+/// `create_session_id` look like `"2026-07-04T23-32-11-123Z-<uuid8>"`, whose
+/// leading 8 chars (`"2026-07-"`) read like a truncated date. Render the
+/// encoded timestamp as `"MMM DD HH:MM"` instead; ids that aren't in that
+/// timestamp form fall back to the short [`session_prefix`].
+pub fn session_label(id: &str) -> String {
+    if let Some(ts) = id.get(..19)
+        && let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H-%M-%S")
+    {
+        return dt.format("%b %d %H:%M").to_string();
+    }
+    session_prefix(id).to_string()
+}
+
 /// `" mcp:<connected>/<total>"`, or empty when no servers are configured.
 pub fn mcp_label(mcp: &McpStatus) -> String {
     if mcp.server_count > 0 {
@@ -90,6 +104,20 @@ mod tests {
         assert_eq!(session_prefix("0123456789abcdef"), "01234567");
         assert_eq!(session_prefix("short"), "short");
         assert_eq!(session_prefix("12345678"), "12345678");
+    }
+
+    #[test]
+    fn session_label_renders_timestamp_ids_as_dates() {
+        // A `create_session_id`-shaped id renders as a readable date-time
+        // rather than the misleading "2026-07-" first-8-chars slice.
+        assert_eq!(
+            session_label("2026-07-04T23-32-11-123Z-a1b2c3d4"),
+            "Jul 04 23:32"
+        );
+        // Non-timestamp ids (too short to parse, or a different scheme) fall
+        // back to the short prefix.
+        assert_eq!(session_label("0123456789abcdef"), "01234567");
+        assert_eq!(session_label("short"), "short");
     }
 
     #[test]
