@@ -28,7 +28,8 @@ impl App {
                 self.config.server.port = port;
                 if let Err(error) = crate::config::save(&self.config) {
                     self.config.server.port = previous;
-                    self.state.push_system(&format!("Failed to save config: {error}"));
+                    self.state
+                        .push_system(&format!("Failed to save config: {error}"));
                     return;
                 }
                 if self.server.is_some() {
@@ -52,7 +53,8 @@ impl App {
                 self.config.server.api = api;
                 if let Err(error) = crate::config::save(&self.config) {
                     self.config.server.api = previous;
-                    self.state.push_system(&format!("Failed to save config: {error}"));
+                    self.state
+                        .push_system(&format!("Failed to save config: {error}"));
                     return;
                 }
                 if self.server.is_some() {
@@ -71,7 +73,8 @@ impl App {
     /// (and its aliases) trigger it from `main` before the loop starts.
     pub fn start_server(&mut self, why: &str) {
         if self.server.is_some() {
-            self.state.push_system("API server is already running — see /serve.");
+            self.state
+                .push_system("API server is already running — see /serve.");
             return;
         }
         let settings = server::ServerSettings::from_config(&self.config);

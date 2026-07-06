@@ -100,7 +100,11 @@ pub fn load_own_enabled_map() -> HashMap<String, bool> {
     let Some(parsed) = load_own_config_file() else {
         return HashMap::new();
     };
-    parsed.mcp_servers.into_iter().map(|(k, v)| (k, v.enabled)).collect()
+    parsed
+        .mcp_servers
+        .into_iter()
+        .map(|(k, v)| (k, v.enabled))
+        .collect()
 }
 
 /// Enabled-state overrides for *foreign* servers (see module docs) that
@@ -112,7 +116,11 @@ pub fn load_overrides() -> HashMap<String, bool> {
     let Some(parsed) = load_own_config_file() else {
         return HashMap::new();
     };
-    parsed.overrides.into_iter().map(|(k, v)| (k, v.enabled)).collect()
+    parsed
+        .overrides
+        .into_iter()
+        .map(|(k, v)| (k, v.enabled))
+        .collect()
 }
 
 fn load_own_config(configs: &mut HashMap<String, MCPServerConfig>) {
@@ -144,13 +152,26 @@ pub fn save_mcp_config(
     own_servers: &HashMap<String, (MCPServerConfig, bool)>,
     foreign_overrides: &HashMap<String, bool>,
 ) -> crate::error::AppResult<()> {
-    let mcp_servers = own_servers.iter().map(|(name, (config, enabled))| {
-        (name.clone(), McpServerDef { enabled: *enabled, config: config.clone() })
-    }).collect();
-    let overrides = foreign_overrides.iter()
+    let mcp_servers = own_servers
+        .iter()
+        .map(|(name, (config, enabled))| {
+            (
+                name.clone(),
+                McpServerDef {
+                    enabled: *enabled,
+                    config: config.clone(),
+                },
+            )
+        })
+        .collect();
+    let overrides = foreign_overrides
+        .iter()
         .map(|(name, enabled)| (name.clone(), ServerOverride { enabled: *enabled }))
         .collect();
-    let own = OwnConfigFile { mcp_servers, overrides };
+    let own = OwnConfigFile {
+        mcp_servers,
+        overrides,
+    };
     let content = serde_json::to_string_pretty(&own)
         .map_err(|e| crate::error::AppError::Config(e.to_string()))?;
     let path = own_config_path();
@@ -173,9 +194,10 @@ fn load_from_path(
         return false;
     }
     if let Ok(content) = std::fs::read_to_string(path)
-        && let Ok(parsed) = parse(&content) {
-            merge_parsed(parsed, configs);
-        }
+        && let Ok(parsed) = parse(&content)
+    {
+        merge_parsed(parsed, configs);
+    }
     true
 }
 
@@ -217,8 +239,7 @@ fn load_claude_desktop_config(configs: &mut HashMap<String, MCPServerConfig>) {
             .map(|h| h.join("Library/Application Support/Claude/claude_desktop_config.json"))
     } else {
         // Windows and Linux both keep it under the platform config dir.
-        dirs::config_dir()
-            .map(|c| c.join("Claude/claude_desktop_config.json"))
+        dirs::config_dir().map(|c| c.join("Claude/claude_desktop_config.json"))
     };
 
     if let Some(path) = config_path {
@@ -228,9 +249,13 @@ fn load_claude_desktop_config(configs: &mut HashMap<String, MCPServerConfig>) {
 
 /// Parse Claude Desktop's `claude_desktop_config.json` shape — always stdio
 /// (`command`/`args`/`env`, no url variant) under an `mcpServers` key.
-fn parse_claude_desktop_json(content: &str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
+fn parse_claude_desktop_json(
+    content: &str,
+) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
     let desktop_config: ClaudeDesktopConfig = serde_json::from_str(content)?;
-    Ok(desktop_config.mcp_servers.into_iter()
+    Ok(desktop_config
+        .mcp_servers
+        .into_iter()
         .map(|(name, server)| {
             let config = MCPServerConfig::Stdio {
                 command: server.command,
@@ -244,8 +269,7 @@ fn parse_claude_desktop_json(content: &str) -> Result<HashMap<String, MCPServerC
 }
 
 fn load_vscode_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let settings_path = dirs::config_dir()
-        .map(|c| c.join("Code/User/settings.json"));
+    let settings_path = dirs::config_dir().map(|c| c.join("Code/User/settings.json"));
 
     if let Some(path) = settings_path {
         load_from_path(&path, parse_vscode_settings, configs);
@@ -255,39 +279,41 @@ fn load_vscode_config(configs: &mut HashMap<String, MCPServerConfig>) {
 /// Parse the `mcp.servers` section of VS Code's `settings.json`. Servers
 /// with a `url` become HTTP, otherwise stdio; entries that don't match the
 /// expected shape are skipped individually rather than failing the file.
-fn parse_vscode_settings(content: &str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
+fn parse_vscode_settings(
+    content: &str,
+) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
     let settings: serde_json::Value = serde_json::from_str(content)?;
     let mut configs = HashMap::new();
 
     if let Some(mcp) = settings.get("mcp")
         && let Some(servers) = mcp.get("servers")
-            && let Some(obj) = servers.as_object() {
-                for (name, server_value) in obj {
-                    if let Ok(server) = serde_json::from_value::<VSCodeMCPServer>(server_value.clone()) {
-                        let config = if let Some(url) = &server.url {
-                            MCPServerConfig::Http {
-                                url: url.clone(),
-                                headers: server.headers.unwrap_or_default(),
-                            }
-                        } else {
-                            MCPServerConfig::Stdio {
-                                command: server.command,
-                                args: server.args,
-                                env: server.env,
-                                cwd: None,
-                            }
-                        };
-                        configs.insert(name.clone(), config);
+        && let Some(obj) = servers.as_object()
+    {
+        for (name, server_value) in obj {
+            if let Ok(server) = serde_json::from_value::<VSCodeMCPServer>(server_value.clone()) {
+                let config = if let Some(url) = &server.url {
+                    MCPServerConfig::Http {
+                        url: url.clone(),
+                        headers: server.headers.unwrap_or_default(),
                     }
-                }
+                } else {
+                    MCPServerConfig::Stdio {
+                        command: server.command,
+                        args: server.args,
+                        env: server.env,
+                        cwd: None,
+                    }
+                };
+                configs.insert(name.clone(), config);
             }
+        }
+    }
 
     Ok(configs)
 }
 
 fn load_cursor_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let cursor_path = dirs::home_dir()
-        .map(|h| h.join(".cursor/mcp.json"));
+    let cursor_path = dirs::home_dir().map(|h| h.join(".cursor/mcp.json"));
 
     if let Some(path) = cursor_path {
         load_from_path(&path, parse_mcp_json, configs);
@@ -314,17 +340,17 @@ fn load_opencode_config(configs: &mut HashMap<String, MCPServerConfig>) {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 // try opencode format first, fall back to standard mcp format
-                let is_opencode = path.file_name()
+                let is_opencode = path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .map(|n| n.starts_with("opencode"))
                     .unwrap_or(false);
 
-                if is_opencode
-                    && let Ok(parsed) = parse_opencode_json(&content) {
-                        merge_parsed(parsed, configs);
-                        return;
-                    }
-                    // fall through to standard parser if opencode format fails
+                if is_opencode && let Ok(parsed) = parse_opencode_json(&content) {
+                    merge_parsed(parsed, configs);
+                    return;
+                }
+                // fall through to standard parser if opencode format fails
 
                 if let Ok(parsed) = parse_mcp_json(&content) {
                     merge_parsed(parsed, configs);
@@ -335,51 +361,68 @@ fn load_opencode_config(configs: &mut HashMap<String, MCPServerConfig>) {
     }
 }
 
-fn parse_opencode_json(content: &str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
+fn parse_opencode_json(
+    content: &str,
+) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(content)?;
     let mut configs = HashMap::new();
 
     if let Some(mcp) = value.get("mcp")
-        && let Some(obj) = mcp.as_object() {
-            for (name, server) in obj {
-                // skip disabled servers
-                if server.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-                    continue;
-                }
+        && let Some(obj) = mcp.as_object()
+    {
+        for (name, server) in obj {
+            // skip disabled servers
+            if server.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                continue;
+            }
 
-                let config = match server.get("type").and_then(|t| t.as_str()) {
-                    Some("remote") => {
-                        let url = server.get("url")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let headers = server.get("headers")
-                            .and_then(|h| serde_json::from_value(h.clone()).ok())
-                            .unwrap_or_default();
-                        match server.get("subtype").and_then(|t| t.as_str()) {
-                            Some("sse") => MCPServerConfig::Sse { url, headers },
-                            _ => MCPServerConfig::Http { url, headers },
-                        }
+            let config = match server.get("type").and_then(|t| t.as_str()) {
+                Some("remote") => {
+                    let url = server
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let headers = server
+                        .get("headers")
+                        .and_then(|h| serde_json::from_value(h.clone()).ok())
+                        .unwrap_or_default();
+                    match server.get("subtype").and_then(|t| t.as_str()) {
+                        Some("sse") => MCPServerConfig::Sse { url, headers },
+                        _ => MCPServerConfig::Http { url, headers },
                     }
-                    Some("local") => {
-                        let (command, args) = if let Some(cmd_arr) = server.get("command").and_then(|c| c.as_array()) {
-                            let mut parts: Vec<String> = cmd_arr.iter()
+                }
+                Some("local") => {
+                    let (command, args) =
+                        if let Some(cmd_arr) = server.get("command").and_then(|c| c.as_array()) {
+                            let mut parts: Vec<String> = cmd_arr
+                                .iter()
                                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                                 .collect();
-                            let cmd = if parts.is_empty() { String::new() } else { parts.remove(0) };
+                            let cmd = if parts.is_empty() {
+                                String::new()
+                            } else {
+                                parts.remove(0)
+                            };
                             (cmd, parts)
                         } else {
                             (String::new(), vec![])
                         };
-                        let env = server.get("env")
-                            .and_then(|e| serde_json::from_value(e.clone()).ok());
-                        MCPServerConfig::Stdio { command, args, env, cwd: None }
+                    let env = server
+                        .get("env")
+                        .and_then(|e| serde_json::from_value(e.clone()).ok());
+                    MCPServerConfig::Stdio {
+                        command,
+                        args,
+                        env,
+                        cwd: None,
                     }
-                    _ => continue,
-                };
-                configs.insert(name.clone(), config);
-            }
+                }
+                _ => continue,
+            };
+            configs.insert(name.clone(), config);
         }
+    }
 
     Ok(configs)
 }
@@ -405,41 +448,53 @@ fn parse_mcp_json(content: &str) -> Result<HashMap<String, MCPServerConfig>, ser
     let mut configs = HashMap::new();
 
     if let Some(servers) = value.get("mcpServers").or_else(|| value.get("servers"))
-        && let Some(obj) = servers.as_object() {
-            for (name, server) in obj {
-                let config = if let Some(url) = server.get("url").and_then(|u| u.as_str()) {
-                    let headers = server.get("headers")
-                        .and_then(|h| serde_json::from_value(h.clone()).ok())
-                        .unwrap_or_default();
-                    let is_sse = server.get("transport")
-                        .and_then(|t| t.as_str())
-                        .map(|t| t.eq_ignore_ascii_case("sse"))
-                        .unwrap_or(false);
-                    if is_sse {
-                        MCPServerConfig::Sse { url: url.to_string(), headers }
-                    } else {
-                        MCPServerConfig::Http { url: url.to_string(), headers }
+        && let Some(obj) = servers.as_object()
+    {
+        for (name, server) in obj {
+            let config = if let Some(url) = server.get("url").and_then(|u| u.as_str()) {
+                let headers = server
+                    .get("headers")
+                    .and_then(|h| serde_json::from_value(h.clone()).ok())
+                    .unwrap_or_default();
+                let is_sse = server
+                    .get("transport")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.eq_ignore_ascii_case("sse"))
+                    .unwrap_or(false);
+                if is_sse {
+                    MCPServerConfig::Sse {
+                        url: url.to_string(),
+                        headers,
                     }
                 } else {
-                    let command = server.get("command")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let args = server.get("args")
-                        .and_then(|a| serde_json::from_value(a.clone()).ok())
-                        .unwrap_or_default();
-                    let env = server.get("env")
-                        .and_then(|e| serde_json::from_value(e.clone()).ok());
-                    MCPServerConfig::Stdio {
-                        command,
-                        args,
-                        env,
-                        cwd: None,
+                    MCPServerConfig::Http {
+                        url: url.to_string(),
+                        headers,
                     }
-                };
-                configs.insert(name.clone(), config);
-            }
+                }
+            } else {
+                let command = server
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = server
+                    .get("args")
+                    .and_then(|a| serde_json::from_value(a.clone()).ok())
+                    .unwrap_or_default();
+                let env = server
+                    .get("env")
+                    .and_then(|e| serde_json::from_value(e.clone()).ok());
+                MCPServerConfig::Stdio {
+                    command,
+                    args,
+                    env,
+                    cwd: None,
+                }
+            };
+            configs.insert(name.clone(), config);
         }
+    }
 
     Ok(configs)
 }
@@ -472,7 +527,10 @@ mod tests {
     #[test]
     fn own_config_file_round_trips_overrides() {
         let mut overrides = HashMap::new();
-        overrides.insert("claude-desktop-server".to_string(), ServerOverride { enabled: false });
+        overrides.insert(
+            "claude-desktop-server".to_string(),
+            ServerOverride { enabled: false },
+        );
         let file = OwnConfigFile {
             mcp_servers: HashMap::new(),
             overrides,
@@ -493,17 +551,38 @@ mod tests {
         let mut own = HashMap::new();
         own.insert(
             "our-server".to_string(),
-            (MCPServerConfig::Stdio { command: "our-cmd".to_string(), args: vec![], env: None, cwd: None }, true),
+            (
+                MCPServerConfig::Stdio {
+                    command: "our-cmd".to_string(),
+                    args: vec![],
+                    env: None,
+                    cwd: None,
+                },
+                true,
+            ),
         );
-        let mcp_servers: HashMap<String, McpServerDef> = own.iter()
-            .map(|(name, (config, enabled))| (name.clone(), McpServerDef { enabled: *enabled, config: config.clone() }))
+        let mcp_servers: HashMap<String, McpServerDef> = own
+            .iter()
+            .map(|(name, (config, enabled))| {
+                (
+                    name.clone(),
+                    McpServerDef {
+                        enabled: *enabled,
+                        config: config.clone(),
+                    },
+                )
+            })
             .collect();
         let mut foreign_overrides = HashMap::new();
         foreign_overrides.insert("claude-desktop-server".to_string(), false);
-        let overrides: HashMap<String, ServerOverride> = foreign_overrides.iter()
+        let overrides: HashMap<String, ServerOverride> = foreign_overrides
+            .iter()
             .map(|(name, enabled)| (name.clone(), ServerOverride { enabled: *enabled }))
             .collect();
-        let file = OwnConfigFile { mcp_servers, overrides };
+        let file = OwnConfigFile {
+            mcp_servers,
+            overrides,
+        };
         let json = serde_json::to_string(&file).unwrap();
 
         assert!(json.contains("our-server"));
@@ -531,7 +610,12 @@ mod tests {
         }"#;
         let configs = parse_mcp_json(json).unwrap();
         match &configs["fs"] {
-            MCPServerConfig::Stdio { command, args, env, cwd } => {
+            MCPServerConfig::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args, &vec!["-y".to_string(), "server-fs".to_string()]);
                 assert_eq!(env.as_ref().unwrap().get("KEY").unwrap(), "value");
@@ -604,7 +688,9 @@ mod tests {
         }"#;
         let configs = parse_opencode_json(json).unwrap();
         match &configs["local-tool"] {
-            MCPServerConfig::Stdio { command, args, env, .. } => {
+            MCPServerConfig::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "node");
                 assert_eq!(args, &vec!["server.js".to_string()]);
                 assert_eq!(env.as_ref().unwrap().get("FOO").unwrap(), "bar");

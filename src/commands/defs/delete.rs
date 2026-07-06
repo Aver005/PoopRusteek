@@ -1,5 +1,5 @@
-use crate::app::events::SessionScope;
 use crate::app::AppState;
+use crate::app::events::SessionScope;
 use crate::commands::{Command, CommandResult};
 use crate::config::Config;
 
@@ -16,7 +16,11 @@ fn parse(args: &str, scope: SessionScope) -> CommandResult {
     let id = args.trim();
     CommandResult::OpenDeleteSessions {
         scope,
-        session_id: if id.is_empty() { None } else { Some(id.to_string()) },
+        session_id: if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        },
     }
 }
 

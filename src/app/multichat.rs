@@ -3,7 +3,7 @@
 //! store there is no live/parked split — switching focus is just a focus change,
 //! and every conversation (focused or not) is a full record.
 
-use super::{conversation, generation, App};
+use super::{App, conversation, generation};
 use crate::app::events::AppEvent;
 use crate::error::AppResult;
 use crate::provider::{ChatMessage, Role};
@@ -28,7 +28,13 @@ fn conversation_title(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .find(|m| m.role == Role::User)
-        .map(|m| m.content.chars().take(40).collect::<String>().replace('\n', " "))
+        .map(|m| {
+            m.content
+                .chars()
+                .take(40)
+                .collect::<String>()
+                .replace('\n', " ")
+        })
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "(empty chat)".to_string())
 }
@@ -82,20 +88,22 @@ impl App {
             auto_approve: true, // background: auto-approve, never block on a modal
         });
 
-        self.state.conversations.add_background(conversation::Conversation {
-            id,
-            kind,
-            parent: Some(parent),
-            title,
-            session_id: crate::session::create_session_id(),
-            session_started_at: chrono::Utc::now().to_rfc3339(),
-            messages,
-            provider: Some(provider),
-            generation,
-            agent_task: Some(handle),
-            tag: None,
-            broken: false,
-        });
+        self.state
+            .conversations
+            .add_background(conversation::Conversation {
+                id,
+                kind,
+                parent: Some(parent),
+                title,
+                session_id: crate::session::create_session_id(),
+                session_started_at: chrono::Utc::now().to_rfc3339(),
+                messages,
+                provider: Some(provider),
+                generation,
+                agent_task: Some(handle),
+                tag: None,
+                broken: false,
+            });
         Ok(())
     }
 
@@ -134,7 +142,9 @@ impl App {
         self.state
             .focused_mut()
             .messages
-            .push(ChatMessage::system(&format!("🤖 sub-agent started — {label}")));
+            .push(ChatMessage::system(&format!(
+                "🤖 sub-agent started — {label}"
+            )));
         Ok(())
     }
 
@@ -145,7 +155,11 @@ impl App {
                 handle.abort();
             }
             discard_remote_session_of(&conv);
-            let title = if conv.title.is_empty() { "(background agent)".to_string() } else { conv.title };
+            let title = if conv.title.is_empty() {
+                "(background agent)".to_string()
+            } else {
+                conv.title
+            };
             self.state
                 .focused_mut()
                 .messages
@@ -234,16 +248,23 @@ impl App {
         let focused_id = self.state.conversations.focused_id();
         if let Some(pid) = conv.parent
             && pid != focused_id
-                && let Some(pconv) = self.state.conversations.get_mut(pid) {
-                    pconv.messages.push(ChatMessage::system(&block));
-                    self.state.focused_mut().messages.push(ChatMessage::system(&format!(
-                        "{label} finished in another chat — {}",
-                        conv.title
-                    )));
-                    return;
-                }
+            && let Some(pconv) = self.state.conversations.get_mut(pid)
+        {
+            pconv.messages.push(ChatMessage::system(&block));
+            self.state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::system(&format!(
+                    "{label} finished in another chat — {}",
+                    conv.title
+                )));
+            return;
+        }
 
-        self.state.focused_mut().messages.push(ChatMessage::system(&block));
+        self.state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::system(&block));
         self.auto_save_session();
     }
 
@@ -329,7 +350,11 @@ impl App {
             let label = format!(
                 "{marker}{}{}",
                 conversation_title(&conv.messages),
-                if conv.is_streaming() { "  [streaming]" } else { "" }
+                if conv.is_streaming() {
+                    "  [streaming]"
+                } else {
+                    ""
+                }
             );
             items.push((conv.id, PickerItem::new(label, conv.id.0.to_string())));
         }
@@ -364,8 +389,16 @@ impl App {
                 };
                 let label = format!(
                     "{tag} {}{}",
-                    if c.title.is_empty() { "(agent)".to_string() } else { c.title.clone() },
-                    if c.is_streaming() { "  [running]" } else { "  [done]" }
+                    if c.title.is_empty() {
+                        "(agent)".to_string()
+                    } else {
+                        c.title.clone()
+                    },
+                    if c.is_streaming() {
+                        "  [running]"
+                    } else {
+                        "  [done]"
+                    }
                 );
                 PickerItem::new(label, c.id.0.to_string())
             })

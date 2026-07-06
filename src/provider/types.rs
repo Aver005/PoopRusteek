@@ -563,4 +563,3 @@ pub struct DeepSeekUser {
     pub has_legacy_chat_history: bool,
     pub need_birthday: bool,
 }
-

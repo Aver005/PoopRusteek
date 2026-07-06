@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::debug_log;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -149,11 +149,15 @@ pub struct ShellTool {
 
 impl ShellTool {
     pub fn bash() -> Self {
-        Self { shell: Shell::bash() }
+        Self {
+            shell: Shell::bash(),
+        }
     }
 
     pub fn powershell() -> Self {
-        Self { shell: Shell::powershell() }
+        Self {
+            shell: Shell::powershell(),
+        }
     }
 }
 
@@ -208,7 +212,10 @@ impl Tool for ShellTool {
 
         let interactive = args["interactive"].as_bool().unwrap_or(false);
         let background = args["background"].as_bool().unwrap_or(false);
-        let wait_seconds = args["wait_seconds"].as_f64().unwrap_or(2.0).clamp(0.0, 10.0);
+        let wait_seconds = args["wait_seconds"]
+            .as_f64()
+            .unwrap_or(2.0)
+            .clamp(0.0, 10.0);
         let persistent = args["persistent"]
             .as_bool()
             .unwrap_or_else(|| looks_persistent_background_command(command));
@@ -216,7 +223,11 @@ impl Tool for ShellTool {
             Some(
                 args["ttl_seconds"]
                     .as_u64()
-                    .or_else(|| args["ttl_seconds"].as_f64().map(|value| value.max(0.0) as u64))
+                    .or_else(|| {
+                        args["ttl_seconds"]
+                            .as_f64()
+                            .map(|value| value.max(0.0) as u64)
+                    })
                     .unwrap_or(background::DEFAULT_PERSISTENT_TTL_SECS),
             )
         } else {
@@ -259,7 +270,15 @@ impl Tool for ShellTool {
         if background {
             let mut cmd = Command::new(self.shell.name);
             cmd.args(&argv);
-            return run_background(&self.shell, cmd, command, wait_seconds, persistent, ttl_secs).await;
+            return run_background(
+                &self.shell,
+                cmd,
+                command,
+                wait_seconds,
+                persistent,
+                ttl_secs,
+            )
+            .await;
         }
 
         let mut cmd = Command::new(self.shell.name);
@@ -329,16 +348,23 @@ impl Tool for ShellTool {
         let exit_status = if timed_out {
             debug_log::log(
                 "shell.foreground_timeout",
-                format!("{} pid={pid} exceeded {FOREGROUND_TIMEOUT_SECS}s, killing tree", self.shell.name),
+                format!(
+                    "{} pid={pid} exceeded {FOREGROUND_TIMEOUT_SECS}s, killing tree",
+                    self.shell.name
+                ),
             );
             tracing::warn!(
                 "{} command timed out after {FOREGROUND_TIMEOUT_SECS}s (pid={pid}), killing process tree",
                 self.shell.name
             );
             if pid != 0
-                && let Err(e) = background::force_kill_pid(pid).await {
-                    tracing::warn!("Failed to kill timed-out {} pid={pid}: {e}", self.shell.name);
-                }
+                && let Err(e) = background::force_kill_pid(pid).await
+            {
+                tracing::warn!(
+                    "Failed to kill timed-out {} pid={pid}: {e}",
+                    self.shell.name
+                );
+            }
             None
         } else {
             child.wait().await.ok()
@@ -722,9 +748,19 @@ mod tests {
         assert_eq!(job_mode_label(true, Some(30)), "persistent, idle ttl=30s");
     }
 
-    async fn run_capped_reader(input: &[u8], budget: &Arc<AtomicUsize>, truncated: &Arc<AtomicBool>) -> Vec<u8> {
+    async fn run_capped_reader(
+        input: &[u8],
+        budget: &Arc<AtomicUsize>,
+        truncated: &Arc<AtomicBool>,
+    ) -> Vec<u8> {
         let dest: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        capped_pipe_reader(input, Arc::clone(&dest), Arc::clone(budget), Arc::clone(truncated)).await;
+        capped_pipe_reader(
+            input,
+            Arc::clone(&dest),
+            Arc::clone(budget),
+            Arc::clone(truncated),
+        )
+        .await;
         dest.lock().unwrap().clone()
     }
 
@@ -781,7 +817,10 @@ mod tests {
 
     #[test]
     fn truncation_marker_text_matches_the_configured_cap() {
-        assert_eq!(FOREGROUND_TRUNCATION_MARKER, "\n[output truncated at 1 MiB]");
+        assert_eq!(
+            FOREGROUND_TRUNCATION_MARKER,
+            "\n[output truncated at 1 MiB]"
+        );
         assert!(FOREGROUND_TRUNCATION_MARKER.contains("1 MiB"));
     }
 

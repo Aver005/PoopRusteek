@@ -7,8 +7,8 @@ use crate::debug_log;
 use crate::error::{AppError, AppResult};
 use crate::provider::prompt;
 use crate::provider::{ChatMessage, CompletionRequest, Role};
-use reqwest::{header::HeaderValue, Response};
-use serde_json::{json, Value};
+use reqwest::{Response, header::HeaderValue};
+use serde_json::{Value, json};
 
 const CREATE_POW_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
@@ -35,12 +35,7 @@ impl DeepseekProvider {
         let body = json!({ "target_path": TARGET_PATH });
         let headers = self.auth_headers()?;
         let response = self
-            .send_json_request(
-                "pow.challenge.request",
-                CREATE_POW_URL,
-                &headers,
-                &body,
-            )
+            .send_json_request("pow.challenge.request", CREATE_POW_URL, &headers, &body)
             .await?;
 
         let status = response.status();
@@ -64,13 +59,14 @@ impl DeepseekProvider {
             "pow.challenge.raw_body",
             format!("len={} body={}", raw_text.len(), raw_text),
         );
-        let raw: super::pow::PowChallengeResponse = serde_json::from_str(&raw_text).map_err(|error| {
-            debug_log::log(
-                "pow.challenge.parse",
-                format!("failed to parse challenge response json: {error}; raw={raw_text}"),
-            );
-            AppError::Json(error)
-        })?;
+        let raw: super::pow::PowChallengeResponse =
+            serde_json::from_str(&raw_text).map_err(|error| {
+                debug_log::log(
+                    "pow.challenge.parse",
+                    format!("failed to parse challenge response json: {error}; raw={raw_text}"),
+                );
+                AppError::Json(error)
+            })?;
         debug_log::log_json("pow.challenge.response", &raw);
         let challenge = raw.data.biz_data.challenge;
         // The solve is a synchronous CPU-bound wasm hash loop (tens to
@@ -108,7 +104,10 @@ impl DeepseekProvider {
         })
     }
 
-    pub(super) async fn send_request(&self, request: &CompletionRequest) -> AppResult<(Response, String)> {
+    pub(super) async fn send_request(
+        &self,
+        request: &CompletionRequest,
+    ) -> AppResult<(Response, String)> {
         let (system_prompt, non_system_messages) = prompt::split_system_prompt(&request.messages);
         let should_reset = {
             let state = self
@@ -148,16 +147,21 @@ impl DeepseekProvider {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(
-                Self::read_error_response("completion.request", response, "Chat completion failed")
-                    .await,
-            );
+            return Err(Self::read_error_response(
+                "completion.request",
+                response,
+                "Chat completion failed",
+            )
+            .await);
         }
 
         Ok((response, session.session_id))
     }
 
-    pub(super) async fn fetch_remote_history(&self, session_id: &str) -> AppResult<Vec<ChatMessage>> {
+    pub(super) async fn fetch_remote_history(
+        &self,
+        session_id: &str,
+    ) -> AppResult<Vec<ChatMessage>> {
         let body = json!({
             "session_id": session_id,
             "parent_message_id": Value::Null,
@@ -197,14 +201,32 @@ impl DeepseekProvider {
                 _ => continue,
             };
             if role == Role::User || role == Role::Assistant {
-                messages.push(ChatMessage { role, content, name: None, tool_call_id: None, display_content: None, tool_error: false, ui_only: false, created_at: String::new(), total_tokens: None, model: String::new(), status: None, think_elapsed_secs: 0.0, references_count: 0, search_triggered: false });
+                messages.push(ChatMessage {
+                    role,
+                    content,
+                    name: None,
+                    tool_call_id: None,
+                    display_content: None,
+                    tool_error: false,
+                    ui_only: false,
+                    created_at: String::new(),
+                    total_tokens: None,
+                    model: String::new(),
+                    status: None,
+                    think_elapsed_secs: 0.0,
+                    references_count: 0,
+                    search_triggered: false,
+                });
             }
         }
         Ok(messages)
     }
 }
 
-pub(super) fn get_value_by_path<'a>(value: &'a Value, path: &[PathSegment<'_>]) -> Option<&'a Value> {
+pub(super) fn get_value_by_path<'a>(
+    value: &'a Value,
+    path: &[PathSegment<'_>],
+) -> Option<&'a Value> {
     let mut current = value;
     for segment in path {
         current = match segment {
@@ -245,34 +267,37 @@ fn extract_response_fragments_content(response_node: &Value) -> String {
 
 pub(super) fn extract_text_from_event(event: &Value) -> String {
     if let Some(object) = event.as_object()
-        && let Some(event_v) = object.get("v") {
-            let patch_path = object.get("p").and_then(Value::as_str);
-            let operation = object.get("o").and_then(Value::as_str);
+        && let Some(event_v) = object.get("v")
+    {
+        let patch_path = object.get("p").and_then(Value::as_str);
+        let operation = object.get("o").and_then(Value::as_str);
 
-            if let Some(text) = event_v.as_str() {
-                if text == "FINISHED" {
-                    return String::new();
-                }
-                if let Some(path) = patch_path
-                    && !path.contains("/content") {
-                        return String::new();
-                    }
-                if let Some(op) = operation
-                    && op != "APPEND" && op != "SET" {
-                        return String::new();
-                    }
-                return text.to_string();
+        if let Some(text) = event_v.as_str() {
+            if text == "FINISHED" {
+                return String::new();
             }
+            if let Some(path) = patch_path
+                && !path.contains("/content")
+            {
+                return String::new();
+            }
+            if let Some(op) = operation
+                && op != "APPEND"
+                && op != "SET"
+            {
+                return String::new();
+            }
+            return text.to_string();
+        }
 
-            if event_v.is_object() {
-                let from_response = extract_response_fragments_content(
-                    event_v.get("response").unwrap_or(&Value::Null),
-                );
-                if !from_response.is_empty() {
-                    return from_response;
-                }
+        if event_v.is_object() {
+            let from_response =
+                extract_response_fragments_content(event_v.get("response").unwrap_or(&Value::Null));
+            if !from_response.is_empty() {
+                return from_response;
             }
         }
+    }
 
     let paths = [
         [
@@ -353,10 +378,9 @@ pub(super) fn normalize_event_payload(payload: Value) -> Value {
             return Value::String(String::new());
         }
 
-        let may_be_json =
-            (trimmed.starts_with('{') && trimmed.ends_with('}'))
-                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-                || (trimmed.starts_with('"') && trimmed.ends_with('"'));
+        let may_be_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'));
         if !may_be_json {
             return Value::String(trimmed.to_string());
         }
@@ -415,9 +439,10 @@ pub(super) fn extract_parent_message_id(event: &Value) -> Option<i64> {
                 return Some(number);
             }
             if let Some(text) = value.as_str()
-                && let Ok(parsed) = text.parse::<i64>() {
-                    return Some(parsed);
-                }
+                && let Ok(parsed) = text.parse::<i64>()
+            {
+                return Some(parsed);
+            }
         }
     }
 

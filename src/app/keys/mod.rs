@@ -27,9 +27,9 @@ mod providers;
 mod search;
 mod themes;
 
+use crate::app::App;
 use crate::app::events::View;
 use crate::app::input::InputState;
-use crate::app::App;
 use crate::error::AppResult;
 
 /// Apply a standard text-editing keystroke to `input`; returns whether the
@@ -40,7 +40,11 @@ use crate::error::AppResult;
 /// Enter always means "submit" there, mirroring the main chat input's
 /// Shift+Enter-for-newline convention (`chat::handle_chat_key`,
 /// `KeyCode::Enter if SHIFT`).
-fn apply_text_key(input: &mut InputState, key: crossterm::event::KeyEvent, allow_newline: bool) -> bool {
+fn apply_text_key(
+    input: &mut InputState,
+    key: crossterm::event::KeyEvent,
+    allow_newline: bool,
+) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
     match key.code {
         KeyCode::Enter if allow_newline && key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -51,12 +55,30 @@ fn apply_text_key(input: &mut InputState, key: crossterm::event::KeyEvent, allow
             input.insert_char(c);
             true
         }
-        KeyCode::Backspace => { input.backspace(); true }
-        KeyCode::Delete => { input.delete_forward(); true }
-        KeyCode::Left => { input.move_left(false, key.modifiers.contains(KeyModifiers::CONTROL)); true }
-        KeyCode::Right => { input.move_right(false, key.modifiers.contains(KeyModifiers::CONTROL)); true }
-        KeyCode::Home => { input.move_home(false); true }
-        KeyCode::End => { input.move_end(false); true }
+        KeyCode::Backspace => {
+            input.backspace();
+            true
+        }
+        KeyCode::Delete => {
+            input.delete_forward();
+            true
+        }
+        KeyCode::Left => {
+            input.move_left(false, key.modifiers.contains(KeyModifiers::CONTROL));
+            true
+        }
+        KeyCode::Right => {
+            input.move_right(false, key.modifiers.contains(KeyModifiers::CONTROL));
+            true
+        }
+        KeyCode::Home => {
+            input.move_home(false);
+            true
+        }
+        KeyCode::End => {
+            input.move_end(false);
+            true
+        }
         _ => false,
     }
 }

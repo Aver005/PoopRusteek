@@ -5,7 +5,7 @@
 use super::DeepseekProvider;
 use crate::debug_log;
 use crate::error::{AppError, AppResult};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const CREATE_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
 
@@ -57,7 +57,9 @@ impl DeepseekProvider {
         let session_id = payload["data"]["biz_data"]["chat_session"]["id"]
             .as_str()
             .map(|id| id.to_string())
-            .ok_or_else(|| AppError::Provider("Invalid session payload: missing chat_session.id".to_string()))?;
+            .ok_or_else(|| {
+                AppError::Provider("Invalid session payload: missing chat_session.id".to_string())
+            })?;
         debug_log::log("session.create.success", format!("session_id={session_id}"));
         Ok(session_id)
     }
@@ -69,14 +71,13 @@ impl DeepseekProvider {
                 .lock()
                 .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
 
-            if !should_reset
-                && let Some(session_id) = &state.session_id {
-                    return Ok(SessionSnapshot {
-                        session_id: session_id.clone(),
-                        parent_message_id: state.parent_message_id,
-                        system_sent_for_session: state.system_sent_for_session,
-                    });
-                }
+            if !should_reset && let Some(session_id) = &state.session_id {
+                return Ok(SessionSnapshot {
+                    session_id: session_id.clone(),
+                    parent_message_id: state.parent_message_id,
+                    system_sent_for_session: state.system_sent_for_session,
+                });
+            }
         }
 
         let session_id = self.create_session().await?;

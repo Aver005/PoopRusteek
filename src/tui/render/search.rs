@@ -5,11 +5,11 @@
 
 use crate::app::search::{SearchFocus, SearchViewState};
 use crate::tui::theme::Theme;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 /// Rows per result: title line + snippet line + spacer.
 const ROWS_PER_ITEM: u16 = 3;
@@ -93,7 +93,9 @@ fn render_filter_bar(frame: &mut Frame, area: Rect, view: &SearchViewState, them
             Span::styled(format!(" {label} "), Style::default().fg(theme.text_dim)),
             Span::styled(
                 format!("[{value}]"),
-                Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]
     };
@@ -103,7 +105,11 @@ fn render_filter_bar(frame: &mut Frame, area: Rect, view: &SearchViewState, them
     spans.extend(tag("role", view.role_filter.label()));
     spans.extend(tag(
         "unique",
-        if view.unique_sessions { "per session" } else { "off" },
+        if view.unique_sessions {
+            "per session"
+        } else {
+            "off"
+        },
     ));
     spans.push(Span::styled(
         format!("  ·  {right}"),
@@ -146,10 +152,17 @@ fn render_results(frame: &mut Frame, area: Rect, view: &SearchViewState, theme: 
         let date = m.timestamp.split('T').next().unwrap_or("—");
         let date = if date.is_empty() { "—" } else { date };
         let marker = if is_selected { "▶ " } else { "  " };
-        let role_color = if m.role == "user" { theme.accent_soft } else { theme.success };
+        let role_color = if m.role == "user" {
+            theme.accent_soft
+        } else {
+            theme.success
+        };
 
         let title_style = if is_selected {
-            Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
         };
@@ -166,10 +179,8 @@ fn render_results(frame: &mut Frame, area: Rect, view: &SearchViewState, theme: 
 
         if y + 1 < area.y + area.height {
             let budget = (area.width as usize).saturating_sub(6).max(16);
-            let snippet = crate::util::truncate_with_ellipsis(
-                &m.text.replace(['\n', '\r'], " "),
-                budget,
-            );
+            let snippet =
+                crate::util::truncate_with_ellipsis(&m.text.replace(['\n', '\r'], " "), budget);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("    ", Style::default()),

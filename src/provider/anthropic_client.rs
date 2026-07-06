@@ -52,16 +52,21 @@ impl AnthropicCompatProvider {
         }
     }
 
-    async fn send(&self, request: &CompletionRequest, stream: bool) -> AppResult<reqwest::Response> {
+    async fn send(
+        &self,
+        request: &CompletionRequest,
+        stream: bool,
+    ) -> AppResult<reqwest::Response> {
         let mut body = anthropic_compat::request_to_anthropic(request);
         body["stream"] = serde_json::json!(stream);
         body["model"] = serde_json::json!(self.model);
         // Modern Claude models (Opus 4.7+, Sonnet 5, Fable/Mythos 5) return
         // 400 on any sampling parameter — drop it for those families only.
         if anthropic_compat::model_rejects_sampling(&self.model)
-            && let Some(object) = body.as_object_mut() {
-                object.remove("temperature");
-            }
+            && let Some(object) = body.as_object_mut()
+        {
+            object.remove("temperature");
+        }
 
         let url = format!("{}/messages", self.base_url);
         debug_log::log(
@@ -81,11 +86,12 @@ impl AnthropicCompatProvider {
             // Anthropic's error envelope is {"type":"error","error":{...}}.
             let message = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
-                .and_then(|value| {
-                    value["error"]["message"].as_str().map(str::to_string)
-                })
+                .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
                 .unwrap_or_else(|| crate::util::truncate_at_char_boundary(&text, 300).to_string());
-            debug_log::log("anthropic_compat.error", format!("status={status} message={message}"));
+            debug_log::log(
+                "anthropic_compat.error",
+                format!("status={status} message={message}"),
+            );
             return Err(AppError::Provider(format!("{status}: {message}")));
         }
         Ok(response)
@@ -120,7 +126,10 @@ impl LLMProvider for AnthropicCompatProvider {
                 };
                 match anthropic_compat::parse_stream_event(payload) {
                     StreamEvent::Text(text) => {
-                        let _ = tx.send(CompletionChunk { content: text, finish_reason: None });
+                        let _ = tx.send(CompletionChunk {
+                            content: text,
+                            finish_reason: None,
+                        });
                     }
                     StreamEvent::Done => {
                         let _ = tx.send(CompletionChunk {

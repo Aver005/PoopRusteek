@@ -6,23 +6,25 @@
 //! response on the same stream (see `send_request` on `StdioTransport` and
 //! `parse_sse_stream`/`parse_sse_fallback` on `SseTransport`).
 
-use super::jsonrpc::{ids_match, is_notification_or_request, JsonRpcRequest, JsonRpcResponse};
+use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse, ids_match, is_notification_or_request};
 use crate::error::AppResult;
 use async_trait::async_trait;
 use futures::StreamExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::time::{timeout, Duration, Instant};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::time::{Duration, Instant, timeout};
 
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse>;
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()>;
     async fn close(&mut self) -> AppResult<()>;
-    fn session_id(&self) -> Option<String> { None }
+    fn session_id(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct StdioTransport {
@@ -100,10 +102,12 @@ impl StdioTransport {
         cwd: Option<&str>,
     ) -> AppResult<Self> {
         let mut child = spawn_command(command, args, env, cwd)?;
-        let stdin = child.stdin.take()
-            .ok_or_else(|| crate::error::AppError::Mcp("Failed to open stdin for MCP subprocess".to_string()))?;
-        let stdout = child.stdout.take()
-            .ok_or_else(|| crate::error::AppError::Mcp("Failed to open stdout for MCP subprocess".to_string()))?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            crate::error::AppError::Mcp("Failed to open stdin for MCP subprocess".to_string())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            crate::error::AppError::Mcp("Failed to open stdout for MCP subprocess".to_string())
+        })?;
         let reader = BufReader::new(stdout);
 
         // The child's stderr pipe has a small OS buffer (~64KB on most
@@ -184,7 +188,9 @@ impl Transport for StdioTransport {
             // needed here once the deadline has passed.
             let remaining = deadline.duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(crate::error::AppError::Mcp("MCP request timed out after 60s".to_string()));
+                return Err(crate::error::AppError::Mcp(
+                    "MCP request timed out after 60s".to_string(),
+                ));
             }
 
             let mut line = String::new();
@@ -192,7 +198,9 @@ impl Transport for StdioTransport {
             let bytes_read = match read {
                 Ok(inner) => inner?,
                 Err(_) => {
-                    return Err(crate::error::AppError::Mcp("MCP request timed out after 60s".to_string()));
+                    return Err(crate::error::AppError::Mcp(
+                        "MCP request timed out after 60s".to_string(),
+                    ));
                 }
             };
             if bytes_read == 0 {
@@ -215,7 +223,10 @@ impl Transport for StdioTransport {
             };
 
             if is_notification_or_request(&value) {
-                tracing::debug!("MCP stdio: skipping notification/server-request while awaiting id={}: {value}", request.id);
+                tracing::debug!(
+                    "MCP stdio: skipping notification/server-request while awaiting id={}: {value}",
+                    request.id
+                );
                 continue;
             }
 
@@ -232,7 +243,8 @@ impl Transport for StdioTransport {
                 other => {
                     tracing::debug!(
                         "MCP stdio: skipping response with non-matching id={:?} (waiting for id={})",
-                        other, request.id
+                        other,
+                        request.id
                     );
                     continue;
                 }
@@ -326,7 +338,8 @@ fn auth_required_error(resp: &reqwest::Response) -> Option<crate::error::AppErro
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
         return None;
     }
-    let www_authenticate = resp.headers()
+    let www_authenticate = resp
+        .headers()
         .get(reqwest::header::WWW_AUTHENTICATE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
@@ -336,7 +349,11 @@ fn auth_required_error(resp: &reqwest::Response) -> Option<crate::error::AppErro
 /// Capture a fresh `MCP-Session-Id` response header into `session_id`, if
 /// present. Shared by both transports' `send_request`.
 fn capture_session_id(resp: &reqwest::Response, session_id: &Mutex<Option<String>>, url: &str) {
-    if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+    if let Some(sid) = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
         *session_id.lock().unwrap() = Some(sid.to_string());
         tracing::debug!("{url} acquired session via MCP-Session-Id header");
     }
@@ -345,7 +362,9 @@ fn capture_session_id(resp: &reqwest::Response, session_id: &Mutex<Option<String
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse> {
-        let req = self.client.post(&self.url)
+        let req = self
+            .client
+            .post(&self.url)
             .json(request)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
@@ -360,7 +379,10 @@ impl Transport for HttpTransport {
         capture_session_id(&resp, &self.session_id, &self.url);
 
         let body = resp.text().await.map_err(|e| {
-            crate::error::AppError::Mcp(format!("Failed to read HTTP response body at {}: {e}", self.url))
+            crate::error::AppError::Mcp(format!(
+                "Failed to read HTTP response body at {}: {e}",
+                self.url
+            ))
         })?;
 
         // Try JSON first. Unlike stdio, a single POST here maps to a single
@@ -369,24 +391,36 @@ impl Transport for HttpTransport {
         // a notification/request shape back as the "response".
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
             && !is_notification_or_request(&value)
-                && let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value) {
-                    return Ok(response);
-                }
+            && let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value)
+        {
+            return Ok(response);
+        }
 
         // JSON failed — fallback to SSE parsing if body looks like SSE
         if body.contains("data:") || body.starts_with("event:") {
-            tracing::debug!("HttpTransport: received SSE response, falling back to SSE parse for id={} at {}", request.id, self.url);
+            tracing::debug!(
+                "HttpTransport: received SSE response, falling back to SSE parse for id={} at {}",
+                request.id,
+                self.url
+            );
             return SseTransport::parse_sse_fallback(&body, request.id, &self.url, status).await;
         }
 
-        let snippet = if body.len() > 200 { crate::util::truncate_with_ellipsis(&body, 200) } else { body.clone() };
-        Err(crate::error::AppError::Mcp(
-            format!("HTTP MCP decode error (status={status}, url={}): body: {snippet}", self.url)
-        ))
+        let snippet = if body.len() > 200 {
+            crate::util::truncate_with_ellipsis(&body, 200)
+        } else {
+            body.clone()
+        };
+        Err(crate::error::AppError::Mcp(format!(
+            "HTTP MCP decode error (status={status}, url={}): body: {snippet}",
+            self.url
+        )))
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
-        let req = self.client.post(&self.url)
+        let req = self
+            .client
+            .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(data.to_vec());
@@ -461,7 +495,9 @@ impl SseTransport {
                 };
 
                 if is_notification_or_request(&value) {
-                    tracing::debug!("SSE notification/server-request while awaiting id={request_id}: {value}");
+                    tracing::debug!(
+                        "SSE notification/server-request while awaiting id={request_id}: {value}"
+                    );
                     continue;
                 }
 
@@ -481,16 +517,18 @@ impl SseTransport {
             }
         }
 
-        Err(crate::error::AppError::Mcp(
-            format!("SSE stream ended without matching response for id={request_id} (status={status}, url={url})")
-        ))
+        Err(crate::error::AppError::Mcp(format!(
+            "SSE stream ended without matching response for id={request_id} (status={status}, url={url})"
+        )))
     }
 }
 
 #[async_trait]
 impl Transport for SseTransport {
     async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse> {
-        let req = self.client.post(&self.url)
+        let req = self
+            .client
+            .post(&self.url)
             .json(request)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
@@ -505,14 +543,23 @@ impl Transport for SseTransport {
         capture_session_id(&resp, &self.session_id, &self.url);
 
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_else(|_| format!("(failed to read body, status={status})"));
-            let snippet = if body.len() > 200 { crate::util::truncate_with_ellipsis(&body, 200) } else { body };
-            return Err(crate::error::AppError::Mcp(
-                format!("SSE transport error (status={status}, url={}): {snippet}", self.url)
-            ));
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| format!("(failed to read body, status={status})"));
+            let snippet = if body.len() > 200 {
+                crate::util::truncate_with_ellipsis(&body, 200)
+            } else {
+                body
+            };
+            return Err(crate::error::AppError::Mcp(format!(
+                "SSE transport error (status={status}, url={}): {snippet}",
+                self.url
+            )));
         }
 
-        let content_type = resp.headers()
+        let content_type = resp
+            .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
@@ -523,7 +570,10 @@ impl Transport for SseTransport {
         } else {
             // Try JSON first; if it fails and body looks like SSE, try SSE parse
             let body = resp.text().await.map_err(|e| {
-                crate::error::AppError::Mcp(format!("Failed to read SSE response body at {}: {e}", self.url))
+                crate::error::AppError::Mcp(format!(
+                    "Failed to read SSE response body at {}: {e}",
+                    self.url
+                ))
             })?;
             let result = serde_json::from_str::<JsonRpcResponse>(&body);
             match result {
@@ -531,13 +581,20 @@ impl Transport for SseTransport {
                 Err(json_err) => {
                     // Fallback: treat non-JSON body as SSE stream
                     if body.contains("data:") || body.contains("event:") {
-                        tracing::debug!("SSE transport: non-SSE Content-Type but body looks like SSE, trying SSE parse");
+                        tracing::debug!(
+                            "SSE transport: non-SSE Content-Type but body looks like SSE, trying SSE parse"
+                        );
                         Self::parse_sse_fallback(&body, request.id, &self.url, status).await
                     } else {
-                        let snippet = if body.len() > 200 { crate::util::truncate_with_ellipsis(&body, 200) } else { body };
-                        Err(crate::error::AppError::Mcp(
-                            format!("SSE transport decode error (status={status}, url={}): {json_err} — body: {snippet}", self.url)
-                        ))
+                        let snippet = if body.len() > 200 {
+                            crate::util::truncate_with_ellipsis(&body, 200)
+                        } else {
+                            body
+                        };
+                        Err(crate::error::AppError::Mcp(format!(
+                            "SSE transport decode error (status={status}, url={}): {json_err} — body: {snippet}",
+                            self.url
+                        )))
                     }
                 }
             }
@@ -545,7 +602,9 @@ impl Transport for SseTransport {
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
-        let req = self.client.post(&self.url)
+        let req = self
+            .client
+            .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .body(data.to_vec());
@@ -597,20 +656,23 @@ impl SseTransport {
             };
 
             if is_notification_or_request(&value) {
-                tracing::debug!("SSE fallback: skipping notification/server-request while awaiting id={request_id}: {value}");
+                tracing::debug!(
+                    "SSE fallback: skipping notification/server-request while awaiting id={request_id}: {value}"
+                );
                 continue;
             }
 
             if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value)
                 && let Some(id) = &response.id
-                    && ids_match(request_id, id) {
-                        return Ok(response);
-                    }
+                && ids_match(request_id, id)
+            {
+                return Ok(response);
+            }
         }
 
-        Err(crate::error::AppError::Mcp(
-            format!("SSE fallback: no matching response for id={request_id} (status={status}, url={url})")
-        ))
+        Err(crate::error::AppError::Mcp(format!(
+            "SSE fallback: no matching response for id={request_id} (status={status}, url={url})"
+        )))
     }
 }
 
@@ -619,10 +681,14 @@ pub struct DummyTransport;
 #[async_trait]
 impl Transport for DummyTransport {
     async fn send_request(&mut self, _request: &JsonRpcRequest) -> AppResult<JsonRpcResponse> {
-        Err(crate::error::AppError::Mcp("Server is disabled".to_string()))
+        Err(crate::error::AppError::Mcp(
+            "Server is disabled".to_string(),
+        ))
     }
     async fn send_raw(&mut self, _data: &[u8]) -> AppResult<()> {
-        Err(crate::error::AppError::Mcp("Server is disabled".to_string()))
+        Err(crate::error::AppError::Mcp(
+            "Server is disabled".to_string(),
+        ))
     }
     async fn close(&mut self) -> AppResult<()> {
         Ok(())

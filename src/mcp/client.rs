@@ -10,14 +10,14 @@
 //! previously that lock was held for the whole call, freezing the UI event
 //! loop for the duration of every MCP tool invocation.
 
-use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse, JsonRpcNotification};
-use super::transport::{Transport, StdioTransport, HttpTransport, SseTransport};
+use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use super::transport::{HttpTransport, SseTransport, StdioTransport, Transport};
 use super::types::*;
 use crate::error::AppResult;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 pub struct MCPClient {
@@ -97,9 +97,8 @@ impl MCPClient {
         }
         drop(transport);
 
-        let caps: ServerCapabilities = serde_json::from_value(
-            response.result.unwrap_or(json!({}))
-        )?;
+        let caps: ServerCapabilities =
+            serde_json::from_value(response.result.unwrap_or(json!({})))?;
         Ok(caps)
     }
 
@@ -123,12 +122,15 @@ impl MCPClient {
         let result = response.result.unwrap_or(json!({}));
         let tools_value = result.get("tools").cloned().unwrap_or(json!([]));
         let raw_tools: Vec<MCPToolRaw> = serde_json::from_value(tools_value)?;
-        let tools = raw_tools.into_iter().map(|t| MCPTool {
-            name: t.name,
-            description: t.description,
-            input_schema: t.input_schema,
-            server_name: self.server_name.clone(),
-        }).collect();
+        let tools = raw_tools
+            .into_iter()
+            .map(|t| MCPTool {
+                name: t.name,
+                description: t.description,
+                input_schema: t.input_schema,
+                server_name: self.server_name.clone(),
+            })
+            .collect();
         Ok(tools)
     }
 
@@ -137,11 +139,14 @@ impl MCPClient {
         let result = response.result.unwrap_or(json!({}));
         let resources_value = result.get("resources").cloned().unwrap_or(json!([]));
         let raw_resources: Vec<MCPResourceRaw> = serde_json::from_value(resources_value)?;
-        let resources = raw_resources.into_iter().map(|r| MCPResource {
-            uri: r.uri,
-            name: r.name,
-            description: r.description,
-        }).collect();
+        let resources = raw_resources
+            .into_iter()
+            .map(|r| MCPResource {
+                uri: r.uri,
+                name: r.name,
+                description: r.description,
+            })
+            .collect();
         Ok(resources)
     }
 
@@ -168,7 +173,10 @@ impl MCPClient {
 
         let result = response.result.unwrap_or(json!({}));
         let content = result.get("content").cloned().unwrap_or(json!([]));
-        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let text = flatten_content(&content);
 
@@ -182,11 +190,7 @@ impl MCPClient {
         self.call_impl(method, params).await
     }
 
-    async fn call_impl(
-        &self,
-        method: &str,
-        params: Option<Value>,
-    ) -> AppResult<JsonRpcResponse> {
+    async fn call_impl(&self, method: &str, params: Option<Value>) -> AppResult<JsonRpcResponse> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let request = JsonRpcRequest::new(id, method, params);
@@ -195,9 +199,10 @@ impl MCPClient {
         let response = transport.send_request(&request).await?;
 
         if let Some(err) = &response.error {
-            return Err(crate::error::AppError::Mcp(
-                format!("JSON-RPC error (method={method}): code={}, message={}", err.code, err.message)
-            ));
+            return Err(crate::error::AppError::Mcp(format!(
+                "JSON-RPC error (method={method}): code={}, message={}",
+                err.code, err.message
+            )));
         }
 
         Ok(response)

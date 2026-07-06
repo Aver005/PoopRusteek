@@ -1,15 +1,15 @@
 pub mod anthropic_client;
 pub mod anthropic_compat;
 pub mod deepseek;
+#[cfg(test)]
+pub mod fake;
 pub mod gemini_client;
 pub mod gemini_compat;
 pub mod model_cache;
-#[cfg(test)]
-pub mod fake;
 pub mod openai_client;
 pub mod openai_compat;
-pub mod prompt;
 pub mod pow;
+pub mod prompt;
 pub mod sse;
 pub mod types;
 
@@ -299,7 +299,10 @@ pub struct Usage {
 
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
-    async fn complete(&self, request: CompletionRequest) -> crate::error::AppResult<CompletionResponse>;
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> crate::error::AppResult<CompletionResponse>;
     async fn complete_stream(
         &self,
         request: CompletionRequest,
@@ -345,10 +348,7 @@ pub trait LLMProvider: Send + Sync {
 
     /// Delete a server-side session by its id (for `/delete`).
     /// Default: unsupported.
-    async fn delete_remote_session_by_id(
-        &self,
-        _session_id: &str,
-    ) -> crate::error::AppResult<()> {
+    async fn delete_remote_session_by_id(&self, _session_id: &str) -> crate::error::AppResult<()> {
         Err(crate::error::AppError::Custom(
             "Remote session deletion not supported by this provider".to_string(),
         ))

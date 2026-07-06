@@ -7,7 +7,7 @@
 //! cohesive instead of scattered across the key handlers.
 
 use crate::app::input::InputState;
-use crate::config::{Config, ProviderEntry, ProviderProtocol, BUILTIN_PROVIDER_NAME};
+use crate::config::{BUILTIN_PROVIDER_NAME, Config, ProviderEntry, ProviderProtocol};
 
 /// Live state of the `/providers` full-screen panel.
 #[derive(Debug, Clone, Default)]
@@ -30,14 +30,20 @@ pub struct ProviderRow {
 }
 
 pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
-    let custom_active = config.active_provider_entry().map(|entry| entry.name.clone());
+    let custom_active = config
+        .active_provider_entry()
+        .map(|entry| entry.name.clone());
     let mut rows = vec![ProviderRow {
         name: BUILTIN_PROVIDER_NAME.to_string(),
         tag: "built-in",
         detail: format!(
             "built-in DeepSeek web · {} · {}",
             config.provider.model,
-            if config.provider.token.is_empty() { "no token" } else { "token set" },
+            if config.provider.token.is_empty() {
+                "no token"
+            } else {
+                "token set"
+            },
         ),
         active: custom_active.is_none(),
         builtin: true,
@@ -49,8 +55,16 @@ pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
             detail: format!(
                 "{} · {}{}",
                 entry.base_url,
-                if entry.model.is_empty() { "(no default model)" } else { &entry.model },
-                if entry.api_key.is_some() { " · key set" } else { "" },
+                if entry.model.is_empty() {
+                    "(no default model)"
+                } else {
+                    &entry.model
+                },
+                if entry.api_key.is_some() {
+                    " · key set"
+                } else {
+                    ""
+                },
             ),
             active: custom_active.as_deref() == Some(entry.name.as_str()),
             builtin: false,
@@ -93,14 +107,21 @@ pub enum ProviderWizardStep {
 }
 
 /// Wizard order of the protocol choices (`protocol_selected` indexes this).
-pub const PROTOCOL_CHOICES: [ProviderProtocol; 3] =
-    [ProviderProtocol::Openai, ProviderProtocol::Anthropic, ProviderProtocol::Gemini];
+pub const PROTOCOL_CHOICES: [ProviderProtocol; 3] = [
+    ProviderProtocol::Openai,
+    ProviderProtocol::Anthropic,
+    ProviderProtocol::Gemini,
+];
 
 /// Human description for the wizard's protocol list.
 pub fn protocol_choice_label(protocol: ProviderProtocol) -> &'static str {
     match protocol {
-        ProviderProtocol::Openai => "OpenAI Chat Completions (LM Studio, Ollama /v1, vLLM, xAI/Grok, OpenRouter)",
-        ProviderProtocol::Anthropic => "Anthropic Messages (Anthropic API, Claude-compatible proxies)",
+        ProviderProtocol::Openai => {
+            "OpenAI Chat Completions (LM Studio, Ollama /v1, vLLM, xAI/Grok, OpenRouter)"
+        }
+        ProviderProtocol::Anthropic => {
+            "Anthropic Messages (Anthropic API, Claude-compatible proxies)"
+        }
         ProviderProtocol::Gemini => "Google Generative Language (Gemini)",
     }
 }
@@ -108,7 +129,9 @@ pub fn protocol_choice_label(protocol: ProviderProtocol) -> &'static str {
 /// Example base URL shown under the wizard's Base URL step.
 pub fn base_url_example(protocol: ProviderProtocol) -> &'static str {
     match protocol {
-        ProviderProtocol::Openai => "e.g. http://localhost:1234/v1 (LM Studio), http://localhost:11434/v1 (Ollama), https://api.x.ai/v1 (Grok)",
+        ProviderProtocol::Openai => {
+            "e.g. http://localhost:1234/v1 (LM Studio), http://localhost:11434/v1 (Ollama), https://api.x.ai/v1 (Grok)"
+        }
         ProviderProtocol::Anthropic => "e.g. https://api.anthropic.com/v1",
         ProviderProtocol::Gemini => "e.g. https://generativelanguage.googleapis.com/v1beta",
     }
@@ -196,7 +219,9 @@ pub fn validate_name(name: &str, config: &Config) -> Result<(), String> {
         return Err("name can't be empty".to_string());
     }
     if name == BUILTIN_PROVIDER_NAME {
-        return Err(format!("'{BUILTIN_PROVIDER_NAME}' is the built-in provider"));
+        return Err(format!(
+            "'{BUILTIN_PROVIDER_NAME}' is the built-in provider"
+        ));
     }
     if config.providers.iter().any(|entry| entry.name == name) {
         return Err(format!("'{name}' already exists"));
@@ -241,7 +266,9 @@ pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, Stri
         }
         _ => ProviderProtocol::Openai,
     };
-    let base_url = tokens.next().ok_or_else(|| "expected a base URL after the name".to_string())?;
+    let base_url = tokens
+        .next()
+        .ok_or_else(|| "expected a base URL after the name".to_string())?;
     let model = tokens.next().unwrap_or("default");
     let api_key = tokens.next();
     if tokens.next().is_some() {
@@ -299,7 +326,11 @@ impl crate::app::App {
     ) {
         use crate::commands::ProviderModelsAction;
         let describe = |ms: u64| {
-            if ms == 0 { "off".to_string() } else { format!("{ms}ms") }
+            if ms == 0 {
+                "off".to_string()
+            } else {
+                format!("{ms}ms")
+            }
         };
         match action {
             ProviderModelsAction::Show => {
@@ -309,7 +340,10 @@ impl crate::app::App {
                     .providers
                     .iter()
                     .map(|entry| {
-                        match (snapshot.get(&entry.name), self.provider_models.age_ms(&entry.name)) {
+                        match (
+                            snapshot.get(&entry.name),
+                            self.provider_models.age_ms(&entry.name),
+                        ) {
                             (Some(models), Some(age)) => format!(
                                 "\u{2022} {} — {} models (fetched {}s ago)",
                                 entry.name,
@@ -341,7 +375,8 @@ impl crate::app::App {
                 self.config.provider_models.refetch_ms = ms;
                 if let Err(error) = crate::config::save(&self.config) {
                     self.config.provider_models.refetch_ms = previous;
-                    self.state.push_system(&format!("Failed to save config: {error}"));
+                    self.state
+                        .push_system(&format!("Failed to save config: {error}"));
                     return;
                 }
                 // New period counts from now, not from the last fire.
@@ -356,7 +391,8 @@ impl crate::app::App {
                 self.config.provider_models.cache_ms = ms;
                 if let Err(error) = crate::config::save(&self.config) {
                     self.config.provider_models.cache_ms = previous;
-                    self.state.push_system(&format!("Failed to save config: {error}"));
+                    self.state
+                        .push_system(&format!("Failed to save config: {error}"));
                     return;
                 }
                 self.state.push_system(&match ms {
@@ -373,13 +409,17 @@ impl crate::app::App {
     /// opening the picker.
     pub(crate) fn request_models(&mut self, switch_to: Option<String>) {
         let Some(provider) = self.state.focused().provider.clone() else {
-            self.state.push_system("No active provider — configure one via /providers first.");
+            self.state
+                .push_system("No active provider — configure one via /providers first.");
             return;
         };
         self.state.status_message = "Fetching models...".to_string();
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            let result = provider.list_models().await.map_err(|error| error.to_string());
+            let result = provider
+                .list_models()
+                .await
+                .map_err(|error| error.to_string());
             let _ = event_tx.send(crate::app::events::AppEvent::ModelsListed { result, switch_to });
         });
     }
@@ -400,7 +440,8 @@ impl crate::app::App {
             }
             Ok(models) => models,
             Err(error) => {
-                self.state.push_system(&format!("Failed to list models: {error}"));
+                self.state
+                    .push_system(&format!("Failed to list models: {error}"));
                 return;
             }
         };
@@ -437,10 +478,18 @@ impl crate::app::App {
     /// Switch the active provider's model: the active `/providers` entry's
     /// `model` field, or `[provider].model` for the built-in DeepSeek.
     pub(crate) fn apply_model_switch(&mut self, model: &str) {
-        let active_name = self.config.active_provider_entry().map(|entry| entry.name.clone());
+        let active_name = self
+            .config
+            .active_provider_entry()
+            .map(|entry| entry.name.clone());
         match active_name {
             Some(name) => {
-                if let Some(entry) = self.config.providers.iter_mut().find(|entry| entry.name == name) {
+                if let Some(entry) = self
+                    .config
+                    .providers
+                    .iter_mut()
+                    .find(|entry| entry.name == name)
+                {
                     entry.model = model.to_string();
                 }
             }
@@ -451,10 +500,12 @@ impl crate::app::App {
         match crate::config::save(&self.config) {
             Ok(()) => {
                 self.rebuild_provider();
-                self.state.push_system(&format!("Model switched to {model}."));
+                self.state
+                    .push_system(&format!("Model switched to {model}."));
             }
             Err(error) => {
-                self.state.push_system(&format!("Failed to save config: {error}"));
+                self.state
+                    .push_system(&format!("Failed to save config: {error}"));
             }
         }
     }
@@ -499,12 +550,19 @@ mod tests {
     #[test]
     fn stale_active_name_falls_back_to_builtin() {
         let rows = provider_rows(&config_with(vec![entry("lmstudio")], Some("gone")));
-        assert!(rows[0].active, "unknown active name must fall back to the built-in provider");
+        assert!(
+            rows[0].active,
+            "unknown active name must fall back to the built-in provider"
+        );
     }
 
     #[test]
     fn quick_add_minimal_form() {
-        let parsed = parse_quick_add("ollama http://localhost:11434/v1 llama3", &Config::default()).unwrap();
+        let parsed = parse_quick_add(
+            "ollama http://localhost:11434/v1 llama3",
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(parsed.name, "ollama");
         assert_eq!(parsed.base_url, "http://localhost:11434/v1");
         assert_eq!(parsed.model, "llama3");
@@ -513,7 +571,8 @@ mod tests {
 
     #[test]
     fn quick_add_defaults_model_and_trims_trailing_slash() {
-        let parsed = parse_quick_add("lmstudio http://localhost:1234/v1/", &Config::default()).unwrap();
+        let parsed =
+            parse_quick_add("lmstudio http://localhost:1234/v1/", &Config::default()).unwrap();
         assert_eq!(parsed.model, "default");
         assert_eq!(parsed.base_url, "http://localhost:1234/v1");
         assert_eq!(parsed.protocol, ProviderProtocol::Openai);
@@ -531,7 +590,8 @@ mod tests {
         assert_eq!(parsed.api_key.as_deref(), Some("sk-ant-x"));
 
         // Explicit "openai" token is also accepted (and not eaten as a URL).
-        let parsed = parse_quick_add("lm openai http://localhost:1234/v1", &Config::default()).unwrap();
+        let parsed =
+            parse_quick_add("lm openai http://localhost:1234/v1", &Config::default()).unwrap();
         assert_eq!(parsed.protocol, ProviderProtocol::Openai);
     }
 

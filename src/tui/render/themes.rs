@@ -7,15 +7,15 @@
 
 use super::popup::push_text_box_lines;
 use crate::app::themes::{
-    theme_rows, ThemeRowKind, ThemesViewState, ThemeWizardState, ThemeWizardStep,
+    ThemeRowKind, ThemeWizardState, ThemeWizardStep, ThemesViewState, theme_rows,
 };
 use crate::config::Config;
-use crate::tui::theme::{Theme, PRESETS, ROLES};
+use crate::tui::theme::{PRESETS, ROLES, Theme};
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 pub(super) fn render_themes_view(
     frame: &mut Frame,
@@ -77,9 +77,7 @@ pub(super) fn render_themes_view(
         None => "  j/k ↑↓ preview  Enter apply  n new theme  e edit  d delete  Esc/q back  ",
         Some(wizard) => match wizard.step {
             ThemeWizardStep::Base => "  ↑↓ choose palette  Enter next  Esc back  ",
-            ThemeWizardStep::Color(_) => {
-                "  Enter keep & next  Ctrl+S finish now  Esc previous  "
-            }
+            ThemeWizardStep::Color(_) => "  Enter keep & next  Ctrl+S finish now  Esc previous  ",
             ThemeWizardStep::Confirm => "  Enter save & apply  Esc back  ",
             ThemeWizardStep::Name => "  Enter next  Esc cancel  ",
         },
@@ -128,7 +126,10 @@ fn render_theme_list(
         };
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(theme.success).bg(bg)),
-            Span::styled(if selected { "▶ " } else { "  " }, Style::default().fg(theme.accent).bg(bg)),
+            Span::styled(
+                if selected { "▶ " } else { "  " },
+                Style::default().fg(theme.accent).bg(bg),
+            ),
             Span::styled(row.label.clone(), label_style),
         ]));
         lines.push(Line::from(Span::styled(
@@ -149,12 +150,21 @@ fn render_theme_list(
 
     frame.render_widget(
         Paragraph::new(lines),
-        Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1)),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
     );
 }
 
 fn render_wizard_panel(frame: &mut Frame, area: Rect, wizard: &ThemeWizardState, theme: &Theme) {
-    let title = if wizard.editing.is_some() { " Edit theme " } else { " New theme " };
+    let title = if wizard.editing.is_some() {
+        " Edit theme "
+    } else {
+        " New theme "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -165,7 +175,11 @@ fn render_wizard_panel(frame: &mut Frame, area: Rect, wizard: &ThemeWizardState,
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
-            format!(" Step {}/{} — ", wizard.step.number(), ThemeWizardStep::total()),
+            format!(
+                " Step {}/{} — ",
+                wizard.step.number(),
+                ThemeWizardStep::total()
+            ),
             Style::default().fg(theme.text_dim),
         ),
         Span::styled(
@@ -182,7 +196,13 @@ fn render_wizard_panel(frame: &mut Frame, area: Rect, wizard: &ThemeWizardState,
                 Style::default().fg(theme.text_soft),
             )));
             lines.push(Line::from(""));
-            push_text_box_lines(&mut lines, &wizard.name.buffer, wizard.name.cursor, theme, 1);
+            push_text_box_lines(
+                &mut lines,
+                &wizard.name.buffer,
+                wizard.name.cursor,
+                theme,
+                1,
+            );
         }
         ThemeWizardStep::Base => {
             lines.push(Line::from(Span::styled(
@@ -197,7 +217,11 @@ fn render_wizard_panel(frame: &mut Frame, area: Rect, wizard: &ThemeWizardState,
                     Span::styled("  ", Style::default()),
                     Span::styled(
                         indicator,
-                        Style::default().fg(if is_cursor { theme.accent } else { theme.text_dim }),
+                        Style::default().fg(if is_cursor {
+                            theme.accent
+                        } else {
+                            theme.text_dim
+                        }),
                     ),
                     Span::styled(
                         preset.label,
@@ -225,7 +249,13 @@ fn render_wizard_panel(frame: &mut Frame, area: Rect, wizard: &ThemeWizardState,
                 Style::default().fg(theme.text_dim),
             )));
             lines.push(Line::from(""));
-            push_text_box_lines(&mut lines, &wizard.hex_input.buffer, wizard.hex_input.cursor, theme, 1);
+            push_text_box_lines(
+                &mut lines,
+                &wizard.hex_input.buffer,
+                wizard.hex_input.cursor,
+                theme,
+                1,
+            );
         }
         ThemeWizardStep::Confirm => {
             lines.push(Line::from(Span::styled(
@@ -281,7 +311,9 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         "  PoopRusteek \u{1F9FB}",
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat((inner.width as usize).saturating_sub(4))),
@@ -304,8 +336,14 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
     )));
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
-        Span::styled(" ⚙ shell ", Style::default().fg(theme.accent_soft).bg(theme.tool_bg)),
-        Span::styled(" cargo test — 227 passed ", Style::default().fg(theme.text_soft).bg(theme.tool_bg)),
+        Span::styled(
+            " ⚙ shell ",
+            Style::default().fg(theme.accent_soft).bg(theme.tool_bg),
+        ),
+        Span::styled(
+            " cargo test — 227 passed ",
+            Style::default().fg(theme.text_soft).bg(theme.tool_bg),
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  ✔ success  ", Style::default().fg(theme.success)),
@@ -314,7 +352,10 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
     ]));
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
-        Span::styled(" selected text ", Style::default().fg(theme.fg).bg(theme.selection)),
+        Span::styled(
+            " selected text ",
+            Style::default().fg(theme.fg).bg(theme.selection),
+        ),
         Span::styled("  ", Style::default()),
         Span::styled(" ❯ input", Style::default().fg(theme.fg).bg(theme.input_bg)),
         Span::styled("█", Style::default().fg(theme.accent).bg(theme.input_bg)),
@@ -327,7 +368,9 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
     for row in 0..mid {
         let mut spans: Vec<Span> = vec![Span::styled("  ", Style::default())];
         for column in [row, row + mid] {
-            let Some(role) = ROLES.get(column) else { continue };
+            let Some(role) = ROLES.get(column) else {
+                continue;
+            };
             let color = theme.get(role.key).unwrap_or_default();
             let is_editing = editing_role == Some(column);
             spans.push(Span::styled(
@@ -338,7 +381,9 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
             spans.push(Span::styled(
                 format!("{:<14}", role.key),
                 if is_editing {
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.text_dim)
                 },

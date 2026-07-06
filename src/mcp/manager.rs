@@ -52,7 +52,7 @@ fn resolve_enabled_and_source(
 struct ServerCache {
     tools: Vec<MCPTool>,
     resources: Vec<MCPResource>,
-    tool_entries: Vec<(String, String, String)>,  // (full_name, server_name, tool_name)
+    tool_entries: Vec<(String, String, String)>, // (full_name, server_name, tool_name)
     cached_at: Instant,
 }
 
@@ -118,7 +118,9 @@ async fn connect_one(
 
     if let Err(e) = client.initialize().await {
         if let crate::error::AppError::McpAuthRequired { www_authenticate } = &e {
-            let hint = www_authenticate.as_deref().and_then(super::oauth::extract_resource_metadata);
+            let hint = www_authenticate
+                .as_deref()
+                .and_then(super::oauth::extract_resource_metadata);
             tracing::info!("MCP '{name}' requires authorization");
             return empty(MCPServerStatus::AuthRequired(hint));
         }
@@ -132,7 +134,10 @@ async fn connect_one(
 
     if let Some(cache) = cached {
         if cache.age_secs < cache_ttl {
-            tracing::info!("MCP '{name}' using cache ({}s old, TTL {cache_ttl})", cache.age_secs);
+            tracing::info!(
+                "MCP '{name}' using cache ({}s old, TTL {cache_ttl})",
+                cache.age_secs
+            );
             return ConnectOutcome {
                 name,
                 status: MCPServerStatus::Connected,
@@ -142,7 +147,10 @@ async fn connect_one(
                 used_cache: true,
             };
         }
-        tracing::info!("MCP '{name}' cache expired ({}s >= TTL {cache_ttl}s)", cache.age_secs);
+        tracing::info!(
+            "MCP '{name}' cache expired ({}s >= TTL {cache_ttl}s)",
+            cache.age_secs
+        );
     }
 
     // Fetch from server. A failed `list_tools` used to still fall through to
@@ -217,7 +225,8 @@ impl MCPManager {
         let foreign_overrides = load_overrides();
 
         for (name, config) in configs {
-            let (enabled, source) = resolve_enabled_and_source(&name, &own_enabled, &foreign_overrides);
+            let (enabled, source) =
+                resolve_enabled_and_source(&name, &own_enabled, &foreign_overrides);
             self.add_server(name, config, enabled, source).await;
         }
 
@@ -245,7 +254,13 @@ impl MCPManager {
         self.close_all_clients().await;
     }
 
-    async fn add_server(&mut self, name: String, config: MCPServerConfig, enabled: bool, source: ServerSource) {
+    async fn add_server(
+        &mut self,
+        name: String,
+        config: MCPServerConfig,
+        enabled: bool,
+        source: ServerSource,
+    ) {
         if !enabled {
             let entry = MCPServerEntry {
                 client: Arc::new(MCPClient::dummy(&name)),
@@ -268,15 +283,18 @@ impl MCPManager {
         };
 
         if let Some(client) = client {
-            self.servers.insert(name, MCPServerEntry {
-                client: Arc::new(client),
-                config,
-                status: MCPServerStatus::Pending,
-                tools: Vec::new(),
-                resources: Vec::new(),
-                enabled: true,
-                source,
-            });
+            self.servers.insert(
+                name,
+                MCPServerEntry {
+                    client: Arc::new(client),
+                    config,
+                    status: MCPServerStatus::Pending,
+                    tools: Vec::new(),
+                    resources: Vec::new(),
+                    enabled: true,
+                    source,
+                },
+            );
         }
     }
 
@@ -305,12 +323,21 @@ impl MCPManager {
         // borrow of `self`, and that borrow is fully released by the time
         // `.collect()` returns, well before `join_all` runs or
         // `apply_connect_outcome` needs `&mut self`.
-        let inputs: Vec<(String, Arc<MCPClient>, Option<CachedSnapshot>)> = self.servers.iter()
-            .map(|(name, entry)| (name.clone(), Arc::clone(&entry.client), self.cache_snapshot(name)))
+        let inputs: Vec<(String, Arc<MCPClient>, Option<CachedSnapshot>)> = self
+            .servers
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    Arc::clone(&entry.client),
+                    self.cache_snapshot(name),
+                )
+            })
             .collect();
         let cache_ttl = self.cache_ttl;
 
-        let jobs = inputs.into_iter()
+        let jobs = inputs
+            .into_iter()
             .map(|(name, client, cached)| connect_one(name, client, cached, cache_ttl));
         let outcomes = futures::future::join_all(jobs).await;
 
@@ -323,7 +350,9 @@ impl MCPManager {
     /// `reconnect_server`, which each need to (re)connect just the one
     /// server they're acting on rather than every server via `connect_all`.
     async fn connect_server(&mut self, name: &str) {
-        let Some(entry) = self.servers.get(name) else { return };
+        let Some(entry) = self.servers.get(name) else {
+            return;
+        };
         let client = Arc::clone(&entry.client);
         let cached = self.cache_snapshot(name);
         let outcome = connect_one(name.to_string(), client, cached, self.cache_ttl).await;
@@ -359,16 +388,20 @@ impl MCPManager {
         // usable tool entries; a failed connect maps nothing.
         if outcome.used_cache || matches!(outcome.status, MCPServerStatus::Connected) {
             for (full_name, server_name, tool_name) in &outcome.tool_entries {
-                self.tool_name_map.insert(full_name.clone(), (server_name.clone(), tool_name.clone()));
+                self.tool_name_map
+                    .insert(full_name.clone(), (server_name.clone(), tool_name.clone()));
             }
             // Only a fresh fetch (re)fills the cache — see doc comment above.
             if !outcome.used_cache {
-                self.cache.insert(outcome.name.clone(), ServerCache {
-                    tools: outcome.tools.clone(),
-                    resources: outcome.resources.clone(),
-                    tool_entries: outcome.tool_entries.clone(),
-                    cached_at: Instant::now(),
-                });
+                self.cache.insert(
+                    outcome.name.clone(),
+                    ServerCache {
+                        tools: outcome.tools.clone(),
+                        resources: outcome.resources.clone(),
+                        tool_entries: outcome.tool_entries.clone(),
+                        cached_at: Instant::now(),
+                    },
+                );
             }
         }
 
@@ -426,11 +459,22 @@ impl MCPManager {
     /// The in-tree agent loop has since migrated to `client_for` (avoids
     /// holding the manager lock across the network await), so nothing here
     /// calls this anymore — kept anyway per the doc comment above.
-    #[expect(dead_code, reason = "back-compat entry point, deliberately kept per doc comment above")]
-    pub async fn call_tool(&mut self, full_tool_name: &str, args: Value) -> AppResult<MCPToolResult> {
-        let server_name = self.tool_name_map.get(full_tool_name)
+    #[expect(
+        dead_code,
+        reason = "back-compat entry point, deliberately kept per doc comment above"
+    )]
+    pub async fn call_tool(
+        &mut self,
+        full_tool_name: &str,
+        args: Value,
+    ) -> AppResult<MCPToolResult> {
+        let server_name = self
+            .tool_name_map
+            .get(full_tool_name)
             .map(|(s, _)| s.clone())
-            .ok_or_else(|| crate::error::AppError::Mcp(format!("Unknown MCP tool: {full_tool_name}")))?;
+            .ok_or_else(|| {
+                crate::error::AppError::Mcp(format!("Unknown MCP tool: {full_tool_name}"))
+            })?;
 
         let Some((client, tool_name)) = self.client_for(full_tool_name) else {
             // Either unknown (already ruled out above) or not connected.
@@ -464,40 +508,46 @@ impl MCPManager {
         let mut result = Vec::new();
         for (full_name, (server_name, tool_name)) in &self.tool_name_map {
             if let Some(entry) = self.servers.get(server_name)
-                && let Some(tool) = entry.tools.iter().find(|t| t.name == *tool_name) {
-                    result.push(FullMCPTool {
-                        full_name: full_name.clone(),
-                        tool: tool.clone(),
-                    });
-                }
+                && let Some(tool) = entry.tools.iter().find(|t| t.name == *tool_name)
+            {
+                result.push(FullMCPTool {
+                    full_name: full_name.clone(),
+                    tool: tool.clone(),
+                });
+            }
         }
         result
     }
 
     pub fn get_servers_info(&self) -> Vec<ServerDisplayInfo> {
-        let mut list: Vec<ServerDisplayInfo> = self.servers.iter().map(|(name, entry)| {
-            let transport = match &entry.config {
-                MCPServerConfig::Stdio { .. } => "stdio",
-                MCPServerConfig::Http { .. } => "http",
-                MCPServerConfig::Sse { .. } => "sse",
-            }.to_string();
-            ServerDisplayInfo {
-                name: name.clone(),
-                transport,
-                status: match &entry.status {
-                    MCPServerStatus::Pending => "pending".to_string(),
-                    MCPServerStatus::Connecting => "connecting".to_string(),
-                    MCPServerStatus::Connected => "connected".to_string(),
-                    MCPServerStatus::AuthRequired(_) => "auth required".to_string(),
-                    MCPServerStatus::Error(e) => format!("error: {e}"),
-                    MCPServerStatus::Disabled => "disabled".to_string(),
-                },
-                tool_count: entry.tools.len(),
-                resource_count: entry.resources.len(),
-                enabled: entry.enabled,
-                needs_auth: matches!(entry.status, MCPServerStatus::AuthRequired(_)),
-            }
-        }).collect();
+        let mut list: Vec<ServerDisplayInfo> = self
+            .servers
+            .iter()
+            .map(|(name, entry)| {
+                let transport = match &entry.config {
+                    MCPServerConfig::Stdio { .. } => "stdio",
+                    MCPServerConfig::Http { .. } => "http",
+                    MCPServerConfig::Sse { .. } => "sse",
+                }
+                .to_string();
+                ServerDisplayInfo {
+                    name: name.clone(),
+                    transport,
+                    status: match &entry.status {
+                        MCPServerStatus::Pending => "pending".to_string(),
+                        MCPServerStatus::Connecting => "connecting".to_string(),
+                        MCPServerStatus::Connected => "connected".to_string(),
+                        MCPServerStatus::AuthRequired(_) => "auth required".to_string(),
+                        MCPServerStatus::Error(e) => format!("error: {e}"),
+                        MCPServerStatus::Disabled => "disabled".to_string(),
+                    },
+                    tool_count: entry.tools.len(),
+                    resource_count: entry.resources.len(),
+                    enabled: entry.enabled,
+                    needs_auth: matches!(entry.status, MCPServerStatus::AuthRequired(_)),
+                }
+            })
+            .collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         list
     }
@@ -528,20 +578,33 @@ impl MCPManager {
     /// caller report something more useful than "added" (e.g. "added, but
     /// requires authorization" or "added, but failed to connect: ...")
     /// without a second round trip through `get_servers_info`.
-    pub async fn add_new_server(&mut self, name: String, config: MCPServerConfig) -> AppResult<MCPServerStatus> {
+    pub async fn add_new_server(
+        &mut self,
+        name: String,
+        config: MCPServerConfig,
+    ) -> AppResult<MCPServerStatus> {
         if self.servers.contains_key(&name) {
-            return Err(crate::error::AppError::Mcp(format!("Server '{name}' already exists")));
+            return Err(crate::error::AppError::Mcp(format!(
+                "Server '{name}' already exists"
+            )));
         }
-        self.add_server(name.clone(), config, true, ServerSource::Own).await;
+        self.add_server(name.clone(), config, true, ServerSource::Own)
+            .await;
         if !self.servers.contains_key(&name) {
             // `add_server` silently no-ops when `build_client` fails (bad
             // stdio command, malformed URL, ...) — surface that here instead
             // of reporting success for a server that was never actually added.
-            return Err(crate::error::AppError::Mcp(format!("Failed to create a client for '{name}'")));
+            return Err(crate::error::AppError::Mcp(format!(
+                "Failed to create a client for '{name}'"
+            )));
         }
         self.connect_server(&name).await;
         self.persist_config().await;
-        Ok(self.servers.get(&name).map(|e| e.status.clone()).unwrap_or(MCPServerStatus::Pending))
+        Ok(self
+            .servers
+            .get(&name)
+            .map(|e| e.status.clone())
+            .unwrap_or(MCPServerStatus::Pending))
     }
 
     pub async fn toggle_server(&mut self, name: &str) -> AppResult<()> {
@@ -588,14 +651,17 @@ impl MCPManager {
     pub async fn reconnect_server(&mut self, name: &str) -> AppResult<()> {
         let config = self.servers.get(name).map(|e| e.config.clone());
         let Some(config) = config else {
-            return Err(crate::error::AppError::Mcp(format!("Server '{name}' not found")));
+            return Err(crate::error::AppError::Mcp(format!(
+                "Server '{name}' not found"
+            )));
         };
         let old_client = self.servers.get(name).map(|e| Arc::clone(&e.client));
         let client = build_client(name, &config).await?;
         if let Some(old_client) = old_client
-            && let Err(e) = old_client.close().await {
-                tracing::debug!("MCP '{name}' close before reconnect failed (best-effort): {e}");
-            }
+            && let Err(e) = old_client.close().await
+        {
+            tracing::debug!("MCP '{name}' close before reconnect failed (best-effort): {e}");
+        }
         // remove old tool mappings
         self.tool_name_map.retain(|_, (s, _)| s != name);
         if let Some(entry) = self.servers.get_mut(name) {
@@ -613,9 +679,10 @@ impl MCPManager {
     pub async fn remove_server(&mut self, name: &str) -> AppResult<()> {
         self.tool_name_map.retain(|_, (s, _)| s != name);
         if let Some(entry) = self.servers.remove(name)
-            && let Err(e) = entry.client.close().await {
-                tracing::debug!("MCP '{name}' close on remove failed (best-effort): {e}");
-            }
+            && let Err(e) = entry.client.close().await
+        {
+            tracing::debug!("MCP '{name}' close on remove failed (best-effort): {e}");
+        }
         self.persist_config().await;
         Ok(())
     }
@@ -771,9 +838,12 @@ pub async fn startup_initialize(mcp: &tokio::sync::Mutex<MCPManager>) {
 /// token, so this is safe to call unconditionally for every server.
 async fn build_client(name: &str, config: &MCPServerConfig) -> AppResult<MCPClient> {
     match config {
-        MCPServerConfig::Stdio { command, args, env, cwd } => {
-            MCPClient::from_stdio(name, command, args, env.as_ref(), cwd.as_deref()).await
-        }
+        MCPServerConfig::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => MCPClient::from_stdio(name, command, args, env.as_ref(), cwd.as_deref()).await,
         MCPServerConfig::Http { url, headers } => {
             let headers = super::oauth_store::with_bearer_header(name, headers.clone()).await;
             MCPClient::from_http(name, url, headers).await
@@ -822,7 +892,10 @@ mod tests {
         let foreign = HashMap::new();
 
         let (enabled, source) = resolve_enabled_and_source("never-toggled-server", &own, &foreign);
-        assert!(enabled, "undiscovered foreign servers should default to enabled, matching prior behavior");
+        assert!(
+            enabled,
+            "undiscovered foreign servers should default to enabled, matching prior behavior"
+        );
         assert_eq!(source, ServerSource::Foreign);
     }
 

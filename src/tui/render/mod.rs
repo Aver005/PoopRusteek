@@ -87,7 +87,11 @@ fn sync_window_title(terminal: &mut TuiTerminal, state: &AppState) {
     });
 }
 
-pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> crate::error::AppResult<()> {
+pub fn render(
+    terminal: &mut TuiTerminal,
+    state: &AppState,
+    config: &Config,
+) -> crate::error::AppResult<()> {
     // The active theme comes from config; while the `/themes` screen is
     // open the *whole frame* is drawn with the highlighted / in-progress
     // theme instead — that's the live preview, and leaving without applying
@@ -107,7 +111,14 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
         );
 
         if state.view == View::Onboarding {
-            onboarding::render_onboarding(frame, area, &state.onboarding, state.focused().generation.animation_tick, &theme, &cursor_cell);
+            onboarding::render_onboarding(
+                frame,
+                area,
+                &state.onboarding,
+                state.focused().generation.animation_tick,
+                &theme,
+                &cursor_cell,
+            );
             // Bottom status line — /logout and /wipe land here with their result.
             if area.height > 1 {
                 let status_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
@@ -125,10 +136,7 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             landing::render_landing(frame, area, state, config, &theme, &cursor_cell);
         } else {
             let has_attachments = !state.attached_files.is_empty();
-            let mut constraints = vec![
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ];
+            let mut constraints = vec![Constraint::Min(1), Constraint::Length(1)];
             if has_attachments {
                 constraints.push(Constraint::Length(1));
             }
@@ -189,7 +197,14 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
             if has_attachments {
                 status::render_attach_bar(frame, chunks[attach_idx], state, &theme);
             }
-            widgets::input::render_input(frame, chunks[input_idx], state, &theme, false, &cursor_cell);
+            widgets::input::render_input(
+                frame,
+                chunks[input_idx],
+                state,
+                &theme,
+                false,
+                &cursor_cell,
+            );
             status::render_input_border(frame, chunks[border_idx], &theme);
             status::render_mini_status(frame, chunks[status_idx], state, config, &theme);
 

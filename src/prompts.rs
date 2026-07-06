@@ -61,12 +61,13 @@ fn collect_asset_candidates(relative_path: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            candidates.push(dir.join(sanitized));
-            if let Some(parent) = dir.parent() {
-                candidates.push(parent.join(sanitized));
-            }
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join(sanitized));
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join(sanitized));
         }
+    }
 
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join(sanitized));
 

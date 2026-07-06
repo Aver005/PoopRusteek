@@ -7,7 +7,7 @@
 //! the literal `data: [DONE]`.
 
 use super::catalog::{self, ResolvedModel};
-use super::http::{full_body, json_response, ApiBody, LogDetail, ServerContext};
+use super::http::{ApiBody, LogDetail, ServerContext, full_body, json_response};
 use crate::config::ProviderProtocol;
 use crate::provider::openai_compat::{
     self, ChatCompletionRequest, CompletionMeta, ErrorResponse, ReasoningStreamSplitter,
@@ -15,7 +15,7 @@ use crate::provider::openai_compat::{
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
-use hyper::{header, Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -151,7 +151,9 @@ async fn chat_completions(
         // Captured, not silently swallowed (see openai_compat) — but v1
         // doesn't translate structured tool-calling, so the caller's tools
         // are ignored rather than rejected (many clients always send them).
-        tracing::warn!("server: request carries `tools` — structured tool-calling is not translated, ignoring");
+        tracing::warn!(
+            "server: request carries `tools` — structured tool-calling is not translated, ignoring"
+        );
     }
 
     let (resolved, provider) = match resolve_backend(&wire.model, context) {
@@ -277,7 +279,9 @@ async fn bridge_stream(
         if reasoning.is_empty() && content.is_empty() {
             continue; // held back a partial tag — nothing to emit yet
         }
-        let frame = sse_data(&openai_compat::split_delta_chunk(&reasoning, &content, first, &meta));
+        let frame = sse_data(&openai_compat::split_delta_chunk(
+            &reasoning, &content, first, &meta,
+        ));
         first = false;
         if body_tx.send(frame).is_err() {
             client_gone = true;
@@ -442,7 +446,10 @@ async fn legacy_blocking(
             let usage = response
                 .usage
                 .unwrap_or_else(|| openai_compat::estimated_usage(&[prompt], &text));
-            let finish = response.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+            let finish = response
+                .finish_reason
+                .clone()
+                .unwrap_or_else(|| "stop".to_string());
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -469,7 +476,13 @@ fn legacy_stream(
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
     let (body_tx, mut body_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-    tokio::spawn(bridge_legacy_stream(provider, is_deepseek, request, meta, body_tx));
+    tokio::spawn(bridge_legacy_stream(
+        provider,
+        is_deepseek,
+        request,
+        meta,
+        body_tx,
+    ));
     let stream = futures::stream::poll_fn(move |task_context| {
         body_rx
             .poll_recv(task_context)
@@ -627,8 +640,8 @@ async fn passthrough(
 
     match upstream.send().await {
         Ok(response) => {
-            let status = StatusCode::from_u16(response.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let upstream_bytes = response.bytes().await.unwrap_or_default();
             Response::builder()
                 .status(status)
@@ -651,7 +664,7 @@ mod tests {
     use crate::app::events::AppEvent;
     use crate::config::{ProviderEntry, ProviderProtocol, ServerApi};
     use crate::provider::openai_compat::RequestDefaults;
-    use crate::server::{spawn, ServerSettings};
+    use crate::server::{ServerSettings, spawn};
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes, Incoming};
     use hyper::{Request, Response};
@@ -753,7 +766,10 @@ mod tests {
             port: 0,
             api: ServerApi::Openai,
             api_key: None,
-            defaults: RequestDefaults { temperature: 0.7, max_tokens: 256 },
+            defaults: RequestDefaults {
+                temperature: 0.7,
+                max_tokens: 256,
+            },
             deepseek: None,
             entries: vec![ProviderEntry {
                 name: "mock".to_string(),
@@ -837,8 +853,7 @@ mod tests {
             .filter_map(|line| line.strip_prefix("data: "))
             .collect();
         assert_eq!(payloads.last(), Some(&"[DONE]"));
-        let first: serde_json::Value =
-            serde_json::from_str(payloads[0]).expect("first chunk json");
+        let first: serde_json::Value = serde_json::from_str(payloads[0]).expect("first chunk json");
         assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(first["choices"][0]["delta"]["content"], "Hel");
         let contents: String = payloads[..payloads.len() - 1]
@@ -851,8 +866,8 @@ mod tests {
             })
             .collect();
         assert_eq!(contents, "Hello");
-        let last: serde_json::Value = serde_json::from_str(payloads[payloads.len() - 2])
-            .expect("terminal chunk json");
+        let last: serde_json::Value =
+            serde_json::from_str(payloads[payloads.len() - 2]).expect("terminal chunk json");
         assert_eq!(last["choices"][0]["finish_reason"], "stop");
 
         handle.request_shutdown();
@@ -935,7 +950,10 @@ mod tests {
         // The upstream echoes the model it received — proving the sub-model
         // (`bge`), not the wire id (`mock/bge`), was forwarded.
         assert_eq!(embeddings["model"], "bge");
-        assert_eq!(embeddings["data"][0]["embedding"].as_array().map(Vec::len), Some(3));
+        assert_eq!(
+            embeddings["data"][0]["embedding"].as_array().map(Vec::len),
+            Some(3)
+        );
         handle.request_shutdown();
     }
 

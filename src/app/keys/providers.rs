@@ -4,13 +4,16 @@
 //! network happens until the next turn.
 
 use super::apply_text_key;
-use crate::app::events::{Modal, View};
-use crate::app::providers::{provider_rows, ProviderAddState, ProviderWizardStep};
 use crate::app::App;
+use crate::app::events::{Modal, View};
+use crate::app::providers::{ProviderAddState, ProviderWizardStep, provider_rows};
 use crate::error::AppResult;
 
 impl App {
-    pub(super) async fn handle_providers_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+    pub(super) async fn handle_providers_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> AppResult<bool> {
         use crossterm::event::KeyCode;
 
         let rows = provider_rows(&self.config);
@@ -38,8 +41,7 @@ impl App {
                         format!("{} is already active", row.name);
                     return Ok(false);
                 }
-                self.config.active_provider =
-                    (!row.builtin).then(|| row.name.clone());
+                self.config.active_provider = (!row.builtin).then(|| row.name.clone());
                 match crate::config::save(&self.config) {
                     Ok(()) => {
                         self.rebuild_provider();
@@ -50,7 +52,10 @@ impl App {
                                 // Selected but unusable (deepseek without a
                                 // token / endpoint init failure) — say so
                                 // instead of a silent dead chat.
-                                format!("{} selected, but no usable provider (check token/URL)", row.name)
+                                format!(
+                                    "{} selected, but no usable provider (check token/URL)",
+                                    row.name
+                                )
                             };
                         // A default-model-less entry can serve the API (the
                         // fetched list routes it) but the TUI chat needs a
@@ -93,7 +98,11 @@ impl App {
                         }
                         self.state.providers_view.status_message = format!(
                             "{name} removed{}",
-                            if was_active { " — back on deepseek" } else { "" },
+                            if was_active {
+                                " — back on deepseek"
+                            } else {
+                                ""
+                            },
                         );
                     }
                     Err(error) => {
@@ -149,7 +158,9 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') if wizard.step == ProviderWizardStep::Protocol => {
                     wizard.protocol_selected = wizard.protocol_selected.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') if wizard.step == ProviderWizardStep::Protocol => {
+                KeyCode::Down | KeyCode::Char('j')
+                    if wizard.step == ProviderWizardStep::Protocol =>
+                {
                     wizard.protocol_selected = (wizard.protocol_selected + 1)
                         .min(crate::app::providers::PROTOCOL_CHOICES.len() - 1);
                 }

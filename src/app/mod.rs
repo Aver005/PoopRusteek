@@ -19,21 +19,21 @@ mod system_prompt;
 pub mod themes;
 
 use crate::commands::CommandRegistry;
+use crate::commands::CommandSuggestion;
 use crate::config::Config;
 use crate::error::AppResult;
 use crate::mcp::MCPManager;
 use crate::prompts::{self, PromptFiles};
-use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::provider::estimate_tokens;
+use crate::provider::{ChatMessage, LLMProvider, Role};
+use crate::skills::{SkillDefinition, discovery::discover_all_skills};
 use crate::tools::registry::ToolRegistry;
-use crate::commands::CommandSuggestion;
-use crate::skills::{discovery::discover_all_skills, SkillDefinition};
 use events::{
-    AppEvent, ConfirmAction, GoalStage, Modal, OnboardingState, PendingInteraction, QuestionRequest,
-    QuestionState, ToolApprovalRequest, View,
+    AppEvent, ConfirmAction, GoalStage, Modal, OnboardingState, PendingInteraction,
+    QuestionRequest, QuestionState, ToolApprovalRequest, View,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::mpsc;
 
 /// PID of the foreground child process (if any), for killing on abort.
@@ -167,7 +167,9 @@ impl AppState {
 
     /// Append a system message to the focused conversation.
     pub fn push_system(&mut self, content: &str) {
-        self.focused_mut().messages.push(ChatMessage::system(content));
+        self.focused_mut()
+            .messages
+            .push(ChatMessage::system(content));
     }
 
     /// Reset the focused conversation's chat view: wipe its messages and
@@ -203,7 +205,9 @@ impl App {
 
         let mut skills = discover_all_skills(&config.skills.paths);
         for skill in &mut skills {
-            if config.skills.enabled.contains(&skill.slug) || config.skills.enabled.contains(&skill.name) {
+            if config.skills.enabled.contains(&skill.slug)
+                || config.skills.enabled.contains(&skill.name)
+            {
                 skill.enabled = true;
             }
         }
@@ -218,7 +222,12 @@ impl App {
                 history: crate::session::load_history(),
                 ..Default::default()
             },
-            status_message: if has_provider { "Ready" } else { "No token configured" }.to_string(),
+            status_message: if has_provider {
+                "Ready"
+            } else {
+                "No token configured"
+            }
+            .to_string(),
             scroll_offset: 0,
             modal: None,
             approved_tools: crate::whitelist::load(),
@@ -226,7 +235,11 @@ impl App {
             pending_question: None,
             pending_interactions: std::collections::VecDeque::new(),
             autocomplete: AutocompleteState::default(),
-            view: if has_provider { View::Chat } else { View::Onboarding },
+            view: if has_provider {
+                View::Chat
+            } else {
+                View::Onboarding
+            },
             onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
             providers_view: providers::ProvidersViewState::default(),
@@ -354,7 +367,9 @@ impl App {
         // saves run on the persist worker now, and quitting right after a
         // turn completes must not lose that turn's save. Bounded like the
         // remote discards above: exiting must not hang on a wedged disk.
-        self.persister.flush(std::time::Duration::from_secs(3)).await;
+        self.persister
+            .flush(std::time::Duration::from_secs(3))
+            .await;
         // Kill all background/PTY processes so spawn_blocking waiters unblock
         // and the tokio runtime can shut down cleanly.
         let _ = crate::tools::background::shutdown_all().await;
@@ -364,10 +379,7 @@ impl App {
         result
     }
 
-    async fn run_loop(
-        &mut self,
-        terminal: &mut crate::tui::TuiTerminal,
-    ) -> AppResult<()> {
+    async fn run_loop(&mut self, terminal: &mut crate::tui::TuiTerminal) -> AppResult<()> {
         use crossterm::event::EventStream;
         use futures::StreamExt;
 
@@ -504,7 +516,10 @@ impl App {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::AgentStarted(_) => {
-                self.state.focused_mut().generation.begin(std::time::Instant::now());
+                self.state
+                    .focused_mut()
+                    .generation
+                    .begin(std::time::Instant::now());
                 self.state.status_message = "Thinking...".to_string();
             }
             AppEvent::BeginAssistantMessage(_) => {
@@ -525,7 +540,10 @@ impl App {
                 // --- GOAL cycle check ---
                 if self.state.goal.mode && self.state.goal.stage == GoalStage::RunAgent1 {
                     // Agent 1 finished — get last assistant content for evaluation
-                    let agent_result = self.state.focused_mut().messages
+                    let agent_result = self
+                        .state
+                        .focused_mut()
+                        .messages
                         .iter()
                         .rev()
                         .find(|m| m.role == Role::Assistant)
@@ -535,14 +553,20 @@ impl App {
                     if !agent_result.is_empty() {
                         self.state.status_message = "Evaluating goal...".to_string();
                         self.state.goal.stage = GoalStage::RunEvaluator;
-                        self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                            "🔍 Evaluating result against goal..."
-                        ));
+                        self.state
+                            .focused_mut()
+                            .messages
+                            .push(ChatMessage::ui_system(
+                                "🔍 Evaluating result against goal...",
+                            ));
                         self.spawn_goal_evaluation(agent_result);
                     } else {
-                        self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                            "⚠ Agent produced no output. Retrying..."
-                        ));
+                        self.state
+                            .focused_mut()
+                            .messages
+                            .push(ChatMessage::ui_system(
+                                "⚠ Agent produced no output. Retrying...",
+                            ));
                         self.retry_agent1().await;
                     }
                 }
@@ -577,7 +601,8 @@ impl App {
                 if self.state.approved_tools.contains(&request.tool_name) {
                     request.resolve(true).await;
                     self.state.focused_mut().generation.active = true;
-                    self.state.status_message = format!("Running {} (auto-approved)", request.tool_name);
+                    self.state.status_message =
+                        format!("Running {} (auto-approved)", request.tool_name);
                 } else if self.state.modal.is_some()
                     || self.state.pending_tool_approval.is_some()
                     || self.state.pending_question.is_some()
@@ -613,22 +638,48 @@ impl App {
                     || self.state.focused_mut().generation.active
                     || (self.state.focused_mut().messages.is_empty() && self.state.modal.is_none())
                 {
-                    self.state.focused_mut().generation.animation_tick =
-                        self.state.focused_mut().generation.animation_tick.wrapping_add(1);
+                    self.state.focused_mut().generation.animation_tick = self
+                        .state
+                        .focused_mut()
+                        .generation
+                        .animation_tick
+                        .wrapping_add(1);
                 }
                 self.maybe_refetch_provider_models();
             }
             AppEvent::GoalEvaluationDone(outcome) => {
                 self.handle_goal_evaluation_done(outcome).await;
             }
-            AppEvent::SpawnSubAgent { parent, label, prompt } => {
+            AppEvent::SpawnSubAgent {
+                parent,
+                label,
+                prompt,
+            } => {
                 self.spawn_sub_agent(parent, label, prompt).await?;
             }
-            AppEvent::SessionFetched { conversation, session_id, result } => {
-                self.apply_fetched_session(conversation, &session_id, result).await;
+            AppEvent::SessionFetched {
+                conversation,
+                session_id,
+                result,
+            } => {
+                self.apply_fetched_session(conversation, &session_id, result)
+                    .await;
             }
-            AppEvent::SessionAvailabilityChecked { conversation, session, remote_id, parent_message_id, alive } => {
-                self.apply_session_availability(conversation, session, remote_id, parent_message_id, alive).await;
+            AppEvent::SessionAvailabilityChecked {
+                conversation,
+                session,
+                remote_id,
+                parent_message_id,
+                alive,
+            } => {
+                self.apply_session_availability(
+                    conversation,
+                    session,
+                    remote_id,
+                    parent_message_id,
+                    alive,
+                )
+                .await;
             }
             AppEvent::RemoteSessionsListed { result } => {
                 if let Some(Modal::DeleteSessions(st)) = self.state.modal.as_mut() {
@@ -658,12 +709,18 @@ impl App {
                 } else {
                     "Some session deletions failed".to_string()
                 };
-                self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::ui_system(&message));
             }
             AppEvent::McpOperationDone { message } => {
                 self.state.mcp_status.view.status_message = message.clone();
                 self.state.status_message = message.clone();
-                self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::ui_system(&message));
                 // Force the next loop iteration to re-pull fresh server info.
                 self.state.mcp_status.view.servers.clear();
                 self.state.mcp_status.last_stats_update = None;
@@ -688,7 +745,8 @@ impl App {
             AppEvent::McpOAuthResult { server, result } => {
                 match result {
                     Ok(()) => {
-                        self.state.mcp_status.view.status_message = format!("{server} authorized, reconnecting...");
+                        self.state.mcp_status.view.status_message =
+                            format!("{server} authorized, reconnecting...");
                         // The token is already persisted (oauth_store::save) —
                         // reconnect picks it up via `build_client`'s
                         // `with_bearer_header` call and reports its own
@@ -704,7 +762,8 @@ impl App {
                         });
                     }
                     Err(e) => {
-                        self.state.mcp_status.view.status_message = format!("Authorization failed: {e}");
+                        self.state.mcp_status.view.status_message =
+                            format!("Authorization failed: {e}");
                     }
                 }
             }
@@ -721,24 +780,41 @@ impl App {
                         handle.api.label()
                     );
                     self.state.status_message = message.clone();
-                    self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+                    self.state
+                        .focused_mut()
+                        .messages
+                        .push(ChatMessage::ui_system(&message));
                 }
             }
             AppEvent::ServerFailed { generation, error } => {
-                if self.server.as_ref().is_some_and(|handle| handle.generation == generation) {
+                if self
+                    .server
+                    .as_ref()
+                    .is_some_and(|handle| handle.generation == generation)
+                {
                     self.server = None;
                 }
                 let message = format!("API server failed to start: {error}");
                 self.state.status_message = message.clone();
-                self.state.focused_mut().messages.push(ChatMessage::ui_system(&message));
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::ui_system(&message));
             }
             AppEvent::ServerStopped { generation } => {
                 // Only the *current* server's stop clears the handle; a
                 // replaced server (port change restart) reports late.
-                if self.server.as_ref().is_some_and(|handle| handle.generation == generation) {
+                if self
+                    .server
+                    .as_ref()
+                    .is_some_and(|handle| handle.generation == generation)
+                {
                     self.server = None;
                     self.state.status_message = "API server stopped".to_string();
-                    self.state.focused_mut().messages.push(ChatMessage::ui_system("API server stopped."));
+                    self.state
+                        .focused_mut()
+                        .messages
+                        .push(ChatMessage::ui_system("API server stopped."));
                 }
             }
             AppEvent::ServerRequestLog { .. } => {
@@ -750,7 +826,10 @@ impl App {
                 // Quiet on success (background bookkeeping); failures get a
                 // visible line so a dead endpoint doesn't fail silently.
                 if failed > 0 {
-                    self.state.focused_mut().messages.push(ChatMessage::ui_system(&format!("⚠ {summary}")));
+                    self.state
+                        .focused_mut()
+                        .messages
+                        .push(ChatMessage::ui_system(&format!("⚠ {summary}")));
                 }
             }
             AppEvent::HistorySearchDone { query, matches } => {
@@ -828,9 +907,7 @@ impl App {
         let mut kept = std::collections::VecDeque::new();
         while let Some(item) = self.state.pending_interactions.pop_front() {
             match item {
-                PendingInteraction::Approval(request)
-                    if request.conversation == conversation =>
-                {
+                PendingInteraction::Approval(request) if request.conversation == conversation => {
                     request.resolve(false).await;
                 }
                 other => kept.push_back(other),
@@ -887,9 +964,12 @@ impl App {
         let provider = match &self.state.focused().provider {
             Some(p) => Arc::clone(p),
             None => {
-                self.state.focused_mut().messages.push(ChatMessage::assistant(
-                    "No provider configured. Set your DeepSeek token in config.",
-                ));
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::assistant(
+                        "No provider configured. Set your DeepSeek token in config.",
+                    ));
                 return Ok(());
             }
         };
@@ -951,7 +1031,7 @@ impl App {
 
     /// Open the generic confirm modal for `/logout` or `/wipe`.
     pub(crate) fn open_confirm(&mut self, action: ConfirmAction) {
-        use events::{ConfirmState};
+        use events::ConfirmState;
         let cs = match action {
             ConfirmAction::Logout => ConfirmState::logout(),
             ConfirmAction::Wipe => ConfirmState::wipe(),
@@ -992,7 +1072,9 @@ impl App {
         self.cancel_all_turns().await;
         // Drain queued writes first — a still-in-flight session save could
         // otherwise re-create files inside the directories deleted below.
-        self.persister.flush(std::time::Duration::from_secs(3)).await;
+        self.persister
+            .flush(std::time::Duration::from_secs(3))
+            .await;
         let roots = wipe_roots();
         let mut errors: Vec<String> = Vec::new();
         for root in &roots {
@@ -1049,16 +1131,18 @@ impl App {
         let last_model = conv.generation.last_model.clone();
         let last_status = conv.generation.last_status.clone();
         if let Some(last) = conv.messages.iter_mut().last()
-            && last.role == Role::Assistant && !last.content.is_empty() {
-                let tokens = estimate_tokens(&last.content);
-                last.total_tokens = Some(tokens);
-                last.model = last_model;
-                last.status = last_status;
-                last.think_elapsed_secs = 0.0;
-                last.references_count = 0;
-                conv.generation.last_tokens = tokens;
-                conv.generation.last_duration_secs = elapsed;
-            }
+            && last.role == Role::Assistant
+            && !last.content.is_empty()
+        {
+            let tokens = estimate_tokens(&last.content);
+            last.total_tokens = Some(tokens);
+            last.model = last_model;
+            last.status = last_status;
+            last.think_elapsed_secs = 0.0;
+            last.references_count = 0;
+            conv.generation.last_tokens = tokens;
+            conv.generation.last_duration_secs = elapsed;
+        }
     }
 
     fn render(&self, terminal: &mut crate::tui::TuiTerminal) -> AppResult<()> {
@@ -1075,9 +1159,14 @@ impl App {
 
         let mut result = input.to_string();
         for mention in &mentions {
-            let tag = format!("@{}", mention.path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"));
+            let tag = format!(
+                "@{}",
+                mention
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+            );
             let replacement = crate::cli::file_mentions::format_mention(mention);
             result = result.replace(&tag, &replacement);
         }
@@ -1110,7 +1199,11 @@ mod wipe_tests {
         let mut deduped = roots.clone();
         deduped.sort();
         deduped.dedup();
-        assert_eq!(roots.len(), deduped.len(), "wipe_roots must return deduped paths");
+        assert_eq!(
+            roots.len(),
+            deduped.len(),
+            "wipe_roots must return deduped paths"
+        );
         assert!(!roots.is_empty());
     }
 }

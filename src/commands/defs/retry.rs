@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{save_config_then, Command, CommandResult};
+use crate::commands::{Command, CommandResult, save_config_then};
 use crate::config::Config;
 
 pub struct RetryCommand;
@@ -24,11 +24,7 @@ impl Command for RetryCommand {
             "on" | "" | "-1" => -1,
             s => match s.parse() {
                 Ok(v) if v >= -1 => v,
-                _ => {
-                    return CommandResult::Error(
-                        "Usage: /retry <number|on|off|-1>".to_string(),
-                    )
-                }
+                _ => return CommandResult::Error("Usage: /retry <number|on|off|-1>".to_string()),
             },
         };
         let mut cfg = config.clone();

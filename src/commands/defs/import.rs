@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{with_args, Command, CommandResult};
+use crate::commands::{Command, CommandResult, with_args};
 use crate::config::Config;
 use crate::provider::{ChatMessage, Role};
 use crate::session::SESSION_VERSION;
@@ -96,7 +96,9 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("## ") {
             if let Some(role) = current_role.take() {
-                let created_at = current_created_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                let created_at = current_created_at
+                    .clone()
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
                 messages.push(ChatMessage {
                     role,
                     content: current_content.trim().to_string(),
@@ -134,15 +136,15 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
             current_created_at = Some(val.trim().to_string());
         } else if line == "---" {
             // separator, skip
-        } else if current_role.is_some()
-            && (!current_content.is_empty() || !line.trim().is_empty()) {
-                if current_content.is_empty() {
-                    current_content.push_str(line.trim_end());
-                } else {
-                    current_content.push('\n');
-                    current_content.push_str(line.trim_end());
-                }
+        } else if current_role.is_some() && (!current_content.is_empty() || !line.trim().is_empty())
+        {
+            if current_content.is_empty() {
+                current_content.push_str(line.trim_end());
+            } else {
+                current_content.push('\n');
+                current_content.push_str(line.trim_end());
             }
+        }
     }
 
     if let Some(role) = current_role {

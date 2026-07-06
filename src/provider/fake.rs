@@ -57,7 +57,11 @@ impl FakeProvider {
     }
 
     fn next_body(&self) -> String {
-        self.responses.lock().unwrap().pop_front().unwrap_or_default()
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default()
     }
 }
 

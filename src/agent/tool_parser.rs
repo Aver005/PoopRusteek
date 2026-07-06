@@ -20,9 +20,8 @@ static STRIP_TOOL_XML_RE: LazyLock<Regex> = LazyLock::new(|| {
 static STRIP_THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<thinking>\s*.*?\s*</thinking>").expect("hardcoded regex is valid")
 });
-static STRIP_LEGACY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").expect("hardcoded regex is valid")
-});
+static STRIP_LEGACY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").expect("hardcoded regex is valid"));
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -36,10 +35,9 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     for cap in XML_TOOL_RE.captures_iter(text) {
         let body = cap[1].trim();
 
-        if let (Some(name_cap), Some(args_cap)) = (
-            XML_NAME_RE.captures(body),
-            XML_ARGS_RE.captures(body),
-        ) {
+        if let (Some(name_cap), Some(args_cap)) =
+            (XML_NAME_RE.captures(body), XML_ARGS_RE.captures(body))
+        {
             let name = name_cap[1].trim().to_string();
             let args_str = args_cap[1].trim();
             match serde_json::from_str::<Value>(args_str) {
@@ -55,7 +53,10 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
                     .get("tool")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                let arguments = value.get("args").cloned().unwrap_or(Value::Object(Default::default()));
+                let arguments = value
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default()));
                 if let Some(name) = name {
                     calls.push(ParsedToolCall { name, arguments });
                 }
@@ -70,7 +71,10 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
 
         match serde_json::from_str::<Value>(args_str) {
             Ok(args) => {
-                calls.push(ParsedToolCall { name, arguments: args });
+                calls.push(ParsedToolCall {
+                    name,
+                    arguments: args,
+                });
             }
             Err(e) => {
                 tracing::warn!("Failed to parse tool arguments for '{name}': {e}");
@@ -84,7 +88,10 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
 pub fn strip_tool_calls(text: &str) -> String {
     let without_xml = STRIP_TOOL_XML_RE.replace_all(text, "");
     let without_thinking = STRIP_THINKING_RE.replace_all(&without_xml, "");
-    STRIP_LEGACY_RE.replace_all(without_thinking.trim(), "").trim().to_string()
+    STRIP_LEGACY_RE
+        .replace_all(without_thinking.trim(), "")
+        .trim()
+        .to_string()
 }
 
 /// Incremental equivalent of [`stream_visible_text`] for streaming.
@@ -165,8 +172,7 @@ impl StreamTextTracker {
                 match_len_at_start(&STRIP_THINKING_RE, hot)
                     .filter(|&len| !hot[..len].contains("<tool_use>"))
             } else if hot.starts_with("[TOOL:") {
-                match_len_at_start(&STRIP_LEGACY_RE, hot)
-                    .filter(|&len| !hot[..len].contains('<'))
+                match_len_at_start(&STRIP_LEGACY_RE, hot).filter(|&len| !hot[..len].contains('<'))
             } else {
                 None
             };
@@ -222,7 +228,9 @@ fn match_len_at_start(re: &Regex, text: &str) -> Option<usize> {
 fn strip_stream_blocks(text: &str) -> String {
     let without_xml = STRIP_TOOL_XML_RE.replace_all(text, "");
     let without_thinking = STRIP_THINKING_RE.replace_all(&without_xml, "");
-    STRIP_LEGACY_RE.replace_all(&without_thinking, "").into_owned()
+    STRIP_LEGACY_RE
+        .replace_all(&without_thinking, "")
+        .into_owned()
 }
 
 /// Truncate stripped text at the first bare `<` or partial tool marker.
@@ -232,13 +240,7 @@ fn truncate_visible(mut visible: String) -> String {
     }
 
     let cut_markers = [
-        "<tool",
-        "</tool",
-        "<name",
-        "</name",
-        "<arg",
-        "</arg",
-        "[TOOL:",
+        "<tool", "</tool", "<name", "</name", "<arg", "</arg", "[TOOL:",
     ];
 
     if let Some(index) = cut_markers
@@ -276,7 +278,8 @@ mod tests {
 
     #[test]
     fn test_parse_mcp_tool_call() {
-        let text = r#"[TOOL:mcp__github__create_issue] {"title": "Bug report", "body": "Found a bug"}"#;
+        let text =
+            r#"[TOOL:mcp__github__create_issue] {"title": "Bug report", "body": "Found a bug"}"#;
         let calls = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "mcp__github__create_issue");

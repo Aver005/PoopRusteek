@@ -4,9 +4,9 @@
 //! sub-agent spawns. Keeping it out of the key-decoding path means a new
 //! command effect touches exactly this match and nothing else.
 
+use crate::app::App;
 use crate::app::events::{self, Modal, View};
 use crate::app::mcp_add::{self, McpAddState};
-use crate::app::App;
 use crate::commands::CommandResult;
 use crate::error::AppResult;
 use crate::provider::ChatMessage;
@@ -37,12 +37,14 @@ impl App {
                     let mut mcp = self.mcp.lock().await;
                     mcp.set_cache_ttl(ttl);
                 }
-                self.state.push_system(&format!("MCP cache TTL set to {ttl}s"));
+                self.state
+                    .push_system(&format!("MCP cache TTL set to {ttl}s"));
             }
             CommandResult::ReloadMcp => {
-                self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                    "Reloading all MCP servers...",
-                ));
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::ui_system("Reloading all MCP servers..."));
                 // Off the event loop: reconnecting every
                 // server can take seconds per server.
                 let mcp = Arc::clone(&self.mcp);
@@ -66,29 +68,29 @@ impl App {
                 self.state.mcp_status.view.selected = 0;
                 self.state.mcp_status.view.scroll_offset = 0;
             }
-            CommandResult::OpenMcpAdd(args) => {
-                match args {
-                    None => {
-                        self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
+            CommandResult::OpenMcpAdd(args) => match args {
+                None => {
+                    self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
+                }
+                Some(raw) => match mcp_add::parse_quick_add(&raw) {
+                    Ok(entries) => {
+                        self.state
+                            .focused_mut()
+                            .messages
+                            .push(ChatMessage::ui_system(&format!(
+                                "Adding {} MCP server(s)...",
+                                entries.len()
+                            )));
+                        self.spawn_mcp_add(entries);
                     }
-                    Some(raw) => {
-                        match mcp_add::parse_quick_add(&raw) {
-                            Ok(entries) => {
-                                self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                                    &format!("Adding {} MCP server(s)...", entries.len()),
-                                ));
-                                self.spawn_mcp_add(entries);
-                            }
-                            Err(reason) => {
-                                self.state.focused_mut().messages.push(ChatMessage::ui_system(
+                    Err(reason) => {
+                        self.state.focused_mut().messages.push(ChatMessage::ui_system(
                                     &format!("Couldn't parse \"/mcp add {raw}\" as a quick config ({reason}) \u{2014} pick a method:"),
                                 ));
-                                self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
-                            }
-                        }
+                        self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
                     }
-                }
-            }
+                },
+            },
             CommandResult::ShowTools => {
                 let tools_text = self.build_tools_display().await;
                 self.state.push_system(&tools_text);
@@ -175,9 +177,8 @@ impl App {
                                 }
                                 Err(error) => {
                                     self.config.providers.pop();
-                                    self.state.push_system(&format!(
-                                        "Failed to save config: {error}"
-                                    ));
+                                    self.state
+                                        .push_system(&format!("Failed to save config: {error}"));
                                 }
                             }
                         }
@@ -200,12 +201,18 @@ impl App {
             CommandResult::OpenThemeWizard => {
                 self.state.view = View::Themes;
                 self.state.themes = crate::app::themes::ThemesViewState::open(&self.config);
-                self.state.themes.wizard =
-                    Some(crate::app::themes::ThemeWizardState::new());
+                self.state.themes.wizard = Some(crate::app::themes::ThemeWizardState::new());
             }
             CommandResult::SetTheme(name) => {
-                let known = crate::tui::theme::PRESETS.iter().any(|preset| preset.name == name)
-                    || self.config.ui.custom_themes.iter().any(|theme| theme.name == name);
+                let known = crate::tui::theme::PRESETS
+                    .iter()
+                    .any(|preset| preset.name == name)
+                    || self
+                        .config
+                        .ui
+                        .custom_themes
+                        .iter()
+                        .any(|theme| theme.name == name);
                 if known {
                     self.apply_theme(&name);
                     // apply_theme reports into the themes view; echo the
@@ -216,7 +223,13 @@ impl App {
                     let available: Vec<&str> = crate::tui::theme::PRESETS
                         .iter()
                         .map(|preset| preset.name)
-                        .chain(self.config.ui.custom_themes.iter().map(|theme| theme.name.as_str()))
+                        .chain(
+                            self.config
+                                .ui
+                                .custom_themes
+                                .iter()
+                                .map(|theme| theme.name.as_str()),
+                        )
                         .collect();
                     self.state.push_system(&format!(
                         "Unknown theme '{name}'. Available: {} — or /themes to browse with live preview.",
@@ -254,7 +267,8 @@ impl App {
             RagAction::SetEnabled(on) => {
                 self.config.semantic.enabled = on;
                 if let Err(e) = crate::config::save(&self.config) {
-                    self.state.push_system(&format!("Failed to save config: {e}"));
+                    self.state
+                        .push_system(&format!("Failed to save config: {e}"));
                     return;
                 }
                 self.semantic.set_enabled(on);
@@ -276,7 +290,8 @@ impl App {
             }
             RagAction::Reload => {
                 if !self.semantic.is_enabled() {
-                    self.state.push_system("RAG is disabled — run /rag on first.");
+                    self.state
+                        .push_system("RAG is disabled — run /rag on first.");
                     return;
                 }
                 if !self

@@ -3,21 +3,21 @@
 //! dialect. No wire-format knowledge lives here — that's `openai.rs` (and
 //! future dialect modules).
 
-use super::{catalog, openai, ServerSettings, ServerStats};
+use super::{ServerSettings, ServerStats, catalog, openai};
 use crate::app::events::AppEvent;
 use crate::config::{ProviderEntry, ServerApi};
+use crate::provider::LLMProvider;
 use crate::provider::model_cache::ProviderModelCache;
 use crate::provider::openai_compat::{ErrorResponse, RequestDefaults};
-use crate::provider::LLMProvider;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
-use hyper::{header, Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, watch};
 
 /// All response bodies are boxed so fixed JSON replies and SSE streams
@@ -139,7 +139,9 @@ pub(super) async fn run(
     let bound = listener.local_addr().ok();
     tracing::info!(
         "server: listening on {} ({} dialect)",
-        bound.map(|a| a.to_string()).unwrap_or_else(|| address.clone()),
+        bound
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| address.clone()),
         context.api.label()
     );
     if let Some(addr) = bound {
@@ -206,14 +208,19 @@ async fn handle_request(
     // Permissive CORS so browser-based OpenAI clients can call a local
     // gateway; the bearer check (when enabled) remains the actual gate.
     let headers = response.headers_mut();
-    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().expect("static header value"));
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        "*".parse().expect("static header value"),
+    );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         "GET, POST, OPTIONS".parse().expect("static header value"),
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        "authorization, content-type".parse().expect("static header value"),
+        "authorization, content-type"
+            .parse()
+            .expect("static header value"),
     );
     Ok(response)
 }
@@ -306,7 +313,7 @@ pub(super) fn json_response(status: StatusCode, payload: &impl Serialize) -> Res
 mod tests {
     use crate::app::events::AppEvent;
     use crate::provider::openai_compat::RequestDefaults;
-    use crate::server::{spawn, ServerSettings};
+    use crate::server::{ServerSettings, spawn};
 
     /// Bindable-anywhere settings: port 0 (OS-assigned), no providers.
     fn test_settings(api_key: Option<&str>) -> ServerSettings {
@@ -315,7 +322,10 @@ mod tests {
             port: 0,
             api: crate::config::ServerApi::Openai,
             api_key: api_key.map(str::to_string),
-            defaults: RequestDefaults { temperature: 0.7, max_tokens: 4096 },
+            defaults: RequestDefaults {
+                temperature: 0.7,
+                max_tokens: 4096,
+            },
             deepseek: None,
             entries: Vec::new(),
             request_log: false,
@@ -336,7 +346,10 @@ mod tests {
         // would mark `AgentResult`'s fields as read and unfulfill their
         // `#[expect(dead_code)]` in test builds.
         let addr = match event_rx.recv().await {
-            Some(AppEvent::ServerStarted { generation: 7, addr }) => addr,
+            Some(AppEvent::ServerStarted {
+                generation: 7,
+                addr,
+            }) => addr,
             _ => panic!("expected ServerStarted for generation 7"),
         };
         let base = format!("http://{addr}");

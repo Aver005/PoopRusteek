@@ -2,13 +2,13 @@
 //! output draining, input, kill, pruning, idle-expiry, and shutdown.
 
 use super::types::{
-    is_running_status, ActivitySlot, BackgroundHandle, BgCmd, OutputBuffer, ProcessSnapshot,
-    ProcessStatus, StatusSlot, StdinWriter,
+    ActivitySlot, BackgroundHandle, BgCmd, OutputBuffer, ProcessSnapshot, ProcessStatus,
+    StatusSlot, StdinWriter, is_running_status,
 };
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 struct BackgroundRegistry {
     next_id: u64,
@@ -114,10 +114,13 @@ pub async fn write_input(id: u64, bytes: &[u8]) -> Result<(), String> {
     };
     let handle = handle.ok_or_else(|| format!("No background process with id={id}"))?;
     if !handle.interactive {
-        return Err("Process is not interactive; start it with interactive=true to send input.".to_string());
+        return Err(
+            "Process is not interactive; start it with interactive=true to send input.".to_string(),
+        );
     }
     let writer = handle.writer.as_ref().ok_or_else(|| {
-        "Process has no stdin writer (this should not happen for interactive processes).".to_string()
+        "Process has no stdin writer (this should not happen for interactive processes)."
+            .to_string()
     })?;
     let mut guard = writer.lock().unwrap();
     let result = guard
@@ -192,8 +195,12 @@ pub async fn expire_persistent_idle_processes() -> usize {
                 }
                 let last_activity_at = *handle.last_activity_at.lock().unwrap();
                 let status = handle.status.lock().unwrap().clone();
-                let idle_secs = now.signed_duration_since(last_activity_at).num_seconds().max(0) as u64;
-                (handle.persistent && is_running_status(&status) && idle_secs >= ttl_secs).then_some(*id)
+                let idle_secs = now
+                    .signed_duration_since(last_activity_at)
+                    .num_seconds()
+                    .max(0) as u64;
+                (handle.persistent && is_running_status(&status) && idle_secs >= ttl_secs)
+                    .then_some(*id)
             })
             .collect();
         expired_ids

@@ -19,7 +19,7 @@
 
 use crate::provider::{CompletionRequest, CompletionResponse, Role, Usage};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Build the `generateContent` request body. `ui_only` messages are
 /// filtered for the same reason every other compat layer filters them.
@@ -206,10 +206,12 @@ mod tests {
         // user + tool merged; assistant → "model".
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0]["role"], "user");
-        assert!(contents[0]["parts"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("[tool result]"));
+        assert!(
+            contents[0]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[tool result]")
+        );
         assert_eq!(contents[1]["role"], "model");
     }
 
@@ -246,26 +248,21 @@ mod tests {
 
     #[test]
     fn finish_reasons_map() {
-        let parsed: GenerateContentResponse = serde_json::from_str(
-            r#"{"candidates": [{"finishReason": "MAX_TOKENS"}]}"#,
-        )
-        .unwrap();
+        let parsed: GenerateContentResponse =
+            serde_json::from_str(r#"{"candidates": [{"finishReason": "MAX_TOKENS"}]}"#).unwrap();
         assert_eq!(extract_piece(&parsed).1.as_deref(), Some("length"));
 
-        let parsed: GenerateContentResponse = serde_json::from_str(
-            r#"{"candidates": [{"finishReason": "SAFETY"}]}"#,
-        )
-        .unwrap();
+        let parsed: GenerateContentResponse =
+            serde_json::from_str(r#"{"candidates": [{"finishReason": "SAFETY"}]}"#).unwrap();
         assert_eq!(extract_piece(&parsed).1.as_deref(), Some("safety"));
     }
 
     #[test]
     fn stream_chunk_without_finish_is_plain_text() {
         // A mid-stream chunk is the same shape, just no finishReason.
-        let parsed: GenerateContentResponse = serde_json::from_str(
-            r#"{"candidates": [{"content": {"parts": [{"text": "tok"}]}}]}"#,
-        )
-        .unwrap();
+        let parsed: GenerateContentResponse =
+            serde_json::from_str(r#"{"candidates": [{"content": {"parts": [{"text": "tok"}]}}]}"#)
+                .unwrap();
         let (text, finish) = extract_piece(&parsed);
         assert_eq!(text, "tok");
         assert!(finish.is_none());

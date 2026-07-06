@@ -15,7 +15,7 @@ use crate::error::AppResult;
 use crate::provider::types;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // Session management
 const FETCH_SESSIONS_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/fetch_page";
@@ -64,7 +64,12 @@ impl DeepseekProvider {
     /// no body to parse, or a nested field other than `biz_data`) and use
     /// `post_void` or call `send_json_request` directly rather than being
     /// forced onto this helper.
-    async fn post_biz<T: DeserializeOwned>(&self, action: &str, url: &str, body: Value) -> AppResult<T> {
+    async fn post_biz<T: DeserializeOwned>(
+        &self,
+        action: &str,
+        url: &str,
+        body: Value,
+    ) -> AppResult<T> {
         let headers = self.auth_headers()?;
         let response = self.send_json_request(action, url, &headers, &body).await?;
         if !response.status().is_success() {
@@ -78,9 +83,16 @@ impl DeepseekProvider {
     /// response body on success. Fits the fire-and-forget endpoints whose
     /// only interesting output is the error path; `error_context` is the
     /// human-readable label passed to `read_error_response`.
-    async fn post_void(&self, action: &str, url: &str, body: Value, error_context: &str) -> AppResult<()> {
+    async fn post_void(
+        &self,
+        action: &str,
+        url: &str,
+        body: Value,
+        error_context: &str,
+    ) -> AppResult<()> {
         let headers = self.auth_headers()?;
-        self.post_void_with_headers(action, url, headers, body, error_context).await
+        self.post_void_with_headers(action, url, headers, body, error_context)
+            .await
     }
 
     /// `post_void` variant taking caller-built headers — used by the PoW
@@ -109,7 +121,8 @@ impl DeepseekProvider {
         let mut headers = self.auth_headers()?;
         headers.insert(
             "x-ds-pow-response",
-            HeaderValue::from_str(&pow_b64).map_err(|e| crate::error::AppError::Provider(e.to_string()))?,
+            HeaderValue::from_str(&pow_b64)
+                .map_err(|e| crate::error::AppError::Provider(e.to_string()))?,
         );
         Ok(headers)
     }
@@ -142,7 +155,13 @@ impl DeepseekProvider {
     /// Delete a remote session.
     pub async fn delete_remote_session(&self, session_id: &str) -> AppResult<()> {
         let body = json!({ "chat_session_id": session_id });
-        self.post_void("session.delete", DELETE_SESSION_URL, body, "Delete session failed").await
+        self.post_void(
+            "session.delete",
+            DELETE_SESSION_URL,
+            body,
+            "Delete session failed",
+        )
+        .await
     }
 
     /// Fetch the account's remote session list (first page).
@@ -164,23 +183,35 @@ impl DeepseekProvider {
 // verified-dead litter.
 #[allow(dead_code)]
 impl DeepseekProvider {
-
     /// Delete all remote sessions.
     pub async fn delete_all_remote_sessions(&self) -> AppResult<()> {
         let body = json!({});
-        self.post_void("session.delete_all", DELETE_ALL_SESSIONS_URL, body, "Delete all sessions failed").await
+        self.post_void(
+            "session.delete_all",
+            DELETE_ALL_SESSIONS_URL,
+            body,
+            "Delete all sessions failed",
+        )
+        .await
     }
 
     /// Rename a remote session.
     pub async fn rename_remote_session(&self, session_id: &str, title: &str) -> AppResult<()> {
         let body = json!({ "chat_session_id": session_id, "title": title });
-        self.post_void("session.rename", UPDATE_TITLE_URL, body, "Rename session failed").await
+        self.post_void(
+            "session.rename",
+            UPDATE_TITLE_URL,
+            body,
+            "Rename session failed",
+        )
+        .await
     }
 
     /// Pin or unpin a remote session.
     pub async fn pin_remote_session(&self, session_id: &str, pinned: bool) -> AppResult<()> {
         let body = json!({ "chat_session_id": session_id, "pinned": pinned });
-        self.post_void("session.pin", UPDATE_PINNED_URL, body, "Pin session failed").await
+        self.post_void("session.pin", UPDATE_PINNED_URL, body, "Pin session failed")
+            .await
     }
 
     // ─── Message Actions ───────────────────────────────────────
@@ -197,7 +228,13 @@ impl DeepseekProvider {
             "message_id": message_id,
             "feedback": feedback,
         });
-        self.post_void("message.feedback", MESSAGE_FEEDBACK_URL, body, "Feedback failed").await
+        self.post_void(
+            "message.feedback",
+            MESSAGE_FEEDBACK_URL,
+            body,
+            "Feedback failed",
+        )
+        .await
     }
 
     /// Edit a message (requires PoW).
@@ -218,7 +255,14 @@ impl DeepseekProvider {
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
         });
-        self.post_void_with_headers("message.edit", EDIT_MESSAGE_URL, headers, body, "Edit message failed").await
+        self.post_void_with_headers(
+            "message.edit",
+            EDIT_MESSAGE_URL,
+            headers,
+            body,
+            "Edit message failed",
+        )
+        .await
     }
 
     /// Regenerate the last assistant response (requires PoW).
@@ -238,7 +282,14 @@ impl DeepseekProvider {
             "search_enabled": search_enabled,
             "ref_file_ids": [],
         });
-        self.post_void_with_headers("message.regenerate", REGENERATE_URL, headers, body, "Regenerate failed").await
+        self.post_void_with_headers(
+            "message.regenerate",
+            REGENERATE_URL,
+            headers,
+            body,
+            "Regenerate failed",
+        )
+        .await
     }
 
     /// Continue an incomplete assistant response.
@@ -251,33 +302,38 @@ impl DeepseekProvider {
             "chat_session_id": session_id,
             "response_message_id": response_message_id,
         });
-        self.post_void("message.continue", CONTINUE_URL, body, "Continue failed").await
+        self.post_void("message.continue", CONTINUE_URL, body, "Continue failed")
+            .await
     }
 
     /// Stop an active stream.
-    pub async fn stop_stream(
-        &self,
-        session_id: &str,
-        response_message_id: i64,
-    ) -> AppResult<()> {
+    pub async fn stop_stream(&self, session_id: &str, response_message_id: i64) -> AppResult<()> {
         let body = json!({
             "chat_session_id": session_id,
             "response_message_id": response_message_id,
         });
-        self.post_void("message.stop_stream", STOP_STREAM_URL, body, "Stop stream failed").await
+        self.post_void(
+            "message.stop_stream",
+            STOP_STREAM_URL,
+            body,
+            "Stop stream failed",
+        )
+        .await
     }
 
     /// Resume a stopped stream.
-    pub async fn resume_stream(
-        &self,
-        session_id: &str,
-        response_message_id: i64,
-    ) -> AppResult<()> {
+    pub async fn resume_stream(&self, session_id: &str, response_message_id: i64) -> AppResult<()> {
         let body = json!({
             "chat_session_id": session_id,
             "response_message_id": response_message_id,
         });
-        self.post_void("message.resume_stream", RESUME_STREAM_URL, body, "Resume stream failed").await
+        self.post_void(
+            "message.resume_stream",
+            RESUME_STREAM_URL,
+            body,
+            "Resume stream failed",
+        )
+        .await
     }
 
     // ─── File Operations ───────────────────────────────────────
@@ -287,14 +343,8 @@ impl DeepseekProvider {
         use reqwest::multipart;
 
         let mut headers = self.pow_auth_headers().await?;
-        headers.insert(
-            "x-thinking-enabled",
-            HeaderValue::from_static("false"),
-        );
-        headers.insert(
-            "x-model-type",
-            HeaderValue::from_static("default"),
-        );
+        headers.insert("x-thinking-enabled", HeaderValue::from_static("false"));
+        headers.insert("x-model-type", HeaderValue::from_static("default"));
 
         let path = std::path::Path::new(file_path);
         let file_name = path
@@ -309,10 +359,13 @@ impl DeepseekProvider {
 
         headers.insert(
             "x-file-size",
-            HeaderValue::from_str(&file_size).map_err(|e| crate::error::AppError::Provider(e.to_string()))?,
+            HeaderValue::from_str(&file_size)
+                .map_err(|e| crate::error::AppError::Provider(e.to_string()))?,
         );
 
-        let file_bytes = tokio::fs::read(file_path).await.map_err(crate::error::AppError::Io)?;
+        let file_bytes = tokio::fs::read(file_path)
+            .await
+            .map_err(crate::error::AppError::Io)?;
         let file_part = multipart::Part::bytes(file_bytes)
             .file_name(file_name.clone())
             .mime_str("application/octet-stream")
@@ -332,11 +385,12 @@ impl DeepseekProvider {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(Self::read_error_response("file.upload", response, "File upload failed").await);
+            return Err(
+                Self::read_error_response("file.upload", response, "File upload failed").await,
+            );
         }
 
-        let payload: types::ApiResponse<types::UploadedFile> =
-            response.json().await?;
+        let payload: types::ApiResponse<types::UploadedFile> = response.json().await?;
         Ok(payload.data.biz_data)
     }
 
@@ -358,11 +412,12 @@ impl DeepseekProvider {
         let headers = self.auth_headers()?;
         let response = self.send_get_request("file.fetch", &url, &headers).await?;
         if !response.status().is_success() {
-            return Err(Self::read_error_response("file.fetch", response, "Fetch files failed").await);
+            return Err(
+                Self::read_error_response("file.fetch", response, "Fetch files failed").await,
+            );
         }
 
-        let payload: types::ApiResponse<types::FetchFilesData> =
-            response.json().await?;
+        let payload: types::ApiResponse<types::FetchFilesData> = response.json().await?;
         Ok(payload.data.biz_data.files)
     }
 
@@ -402,7 +457,13 @@ impl DeepseekProvider {
     /// Delete a share.
     pub async fn delete_share(&self, share_id: &str) -> AppResult<()> {
         let body = json!({ "share_id": share_id });
-        self.post_void("share.delete", DELETE_SHARE_URL, body, "Delete share failed").await
+        self.post_void(
+            "share.delete",
+            DELETE_SHARE_URL,
+            body,
+            "Delete share failed",
+        )
+        .await
     }
 
     /// Fork a shared conversation into a new session.
@@ -414,15 +475,18 @@ impl DeepseekProvider {
     // ─── Search ────────────────────────────────────────────────
 
     /// Prepare the search index for a session (or all sessions).
-    pub async fn prepare_search_index(
-        &self,
-        session_id: Option<&str>,
-    ) -> AppResult<()> {
+    pub async fn prepare_search_index(&self, session_id: Option<&str>) -> AppResult<()> {
         let body = match session_id {
             Some(sid) => json!({ "chat_session_id": sid }),
             None => json!({}),
         };
-        self.post_void("index.prepare", INDEX_PREPARE_URL, body, "Prepare index failed").await
+        self.post_void(
+            "index.prepare",
+            INDEX_PREPARE_URL,
+            body,
+            "Prepare index failed",
+        )
+        .await
     }
 
     /// Query the conversation search index.
@@ -448,13 +512,25 @@ impl DeepseekProvider {
     /// Logout all active sessions.
     pub async fn logout_all_sessions(&self) -> AppResult<()> {
         let body = json!({});
-        self.post_void("user.logout_all", LOGOUT_ALL_SESSIONS_URL, body, "Logout all failed").await
+        self.post_void(
+            "user.logout_all",
+            LOGOUT_ALL_SESSIONS_URL,
+            body,
+            "Logout all failed",
+        )
+        .await
     }
 
     /// Set user birthday.
     pub async fn set_birthday(&self, birthday: &str) -> AppResult<()> {
         let body = json!({ "birthday": birthday });
-        self.post_void("user.set_birthday", SET_BIRTHDAY_URL, body, "Set birthday failed").await
+        self.post_void(
+            "user.set_birthday",
+            SET_BIRTHDAY_URL,
+            body,
+            "Set birthday failed",
+        )
+        .await
     }
 
     // ─── Client Settings ──────────────────────────────────────
@@ -465,13 +541,22 @@ impl DeepseekProvider {
         did: &str,
         scope: &str,
     ) -> AppResult<serde_json::Value> {
-        let url = format!("{CLIENT_SETTINGS_URL}?did={}&scope={}", urlencoding(did), urlencoding(scope));
+        let url = format!(
+            "{CLIENT_SETTINGS_URL}?did={}&scope={}",
+            urlencoding(did),
+            urlencoding(scope)
+        );
         let headers = self.auth_headers()?;
         let response = self
             .send_get_request("client.settings", &url, &headers)
             .await?;
         if !response.status().is_success() {
-            return Err(Self::read_error_response("client.settings", response, "Get client settings failed").await);
+            return Err(Self::read_error_response(
+                "client.settings",
+                response,
+                "Get client settings failed",
+            )
+            .await);
         }
         let payload: Value = response.json().await?;
         Ok(payload)
@@ -489,7 +574,13 @@ impl DeepseekProvider {
             "did": did,
             "sso_id": sso_id,
         });
-        self.post_void("client.settings.report", CLIENT_SETTINGS_REPORT_URL, body, "Report settings failed").await
+        self.post_void(
+            "client.settings.report",
+            CLIENT_SETTINGS_REPORT_URL,
+            body,
+            "Report settings failed",
+        )
+        .await
     }
 }
 

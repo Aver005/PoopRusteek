@@ -20,7 +20,11 @@ pub(super) fn center_popup(area: Rect, width: u16, height: u16) -> Rect {
 
 /// The standard modal frame: all borders, `accent`-colored border and bold
 /// title, panel background.
-pub(super) fn modal_block(title: impl Into<Line<'static>>, accent: Color, theme: &Theme) -> Block<'static> {
+pub(super) fn modal_block(
+    title: impl Into<Line<'static>>,
+    accent: Color,
+    theme: &Theme,
+) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
@@ -50,7 +54,13 @@ pub(super) fn fill_panel_space(lines: &mut Vec<Line<'static>>, target_rows: usiz
 /// `.lines()` — that drops a trailing empty line, which matters when the
 /// cursor sits on one) and highlighting the cursor's character in reverse
 /// video, same visual treatment as `render_question`'s custom-input mode.
-pub(super) fn push_text_box_lines(lines: &mut Vec<Line<'static>>, buffer: &str, cursor_chars: usize, theme: &Theme, max_rows: usize) {
+pub(super) fn push_text_box_lines(
+    lines: &mut Vec<Line<'static>>,
+    buffer: &str,
+    cursor_chars: usize,
+    theme: &Theme,
+    max_rows: usize,
+) {
     let rows: Vec<&str> = buffer.split('\n').collect();
 
     // Walk the whole buffer once, tracking (row, col) as a char-index
@@ -86,20 +96,35 @@ pub(super) fn push_text_box_lines(lines: &mut Vec<Line<'static>>, buffer: &str, 
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().fg(theme.fg)),
                     Span::styled(before, Style::default().fg(theme.fg).bg(theme.input_bg)),
-                    Span::styled(cursor_ch, Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::REVERSED)),
+                    Span::styled(
+                        cursor_ch,
+                        Style::default()
+                            .fg(theme.bg)
+                            .bg(theme.accent)
+                            .add_modifier(Modifier::REVERSED),
+                    ),
                     Span::styled(after, Style::default().fg(theme.fg).bg(theme.input_bg)),
                 ]));
             } else {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().fg(theme.fg)),
                     Span::styled(before, Style::default().fg(theme.fg).bg(theme.input_bg)),
-                    Span::styled(" ", Style::default().fg(theme.fg).bg(theme.accent).add_modifier(Modifier::REVERSED)),
+                    Span::styled(
+                        " ",
+                        Style::default()
+                            .fg(theme.fg)
+                            .bg(theme.accent)
+                            .add_modifier(Modifier::REVERSED),
+                    ),
                 ]));
             }
         } else {
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default().fg(theme.fg)),
-                Span::styled(row_text.to_string(), Style::default().fg(theme.fg).bg(theme.input_bg)),
+                Span::styled(
+                    row_text.to_string(),
+                    Style::default().fg(theme.fg).bg(theme.input_bg),
+                ),
             ]));
         }
     }

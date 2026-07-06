@@ -37,28 +37,36 @@ pub struct SkillFrontmatter {
 
 pub fn parse_skill_content(_path: &std::path::Path, content: &str) -> SkillFrontmatter {
     let content = content.trim();
-    let mut frontmatter = SkillFrontmatter { name: None, description: None };
+    let mut frontmatter = SkillFrontmatter {
+        name: None,
+        description: None,
+    };
 
     if let Some(after_open) = content.strip_prefix("---")
-        && let Some(end) = after_open.find("---") {
-            let fm_str = &after_open[..end];
-            // Accumulate every recognized key across all frontmatter lines
-            // instead of returning on the first match — a file with both
-            // `name:` and `description:` used to silently drop whichever
-            // key came second.
-            for line in fm_str.lines() {
-                let line = line.trim();
-                if let Some((key, value)) = line.split_once(':') {
-                    let key = key.trim().to_lowercase();
-                    let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
-                    match key.as_str() {
-                        "name" => frontmatter.name = Some(value),
-                        "description" => frontmatter.description = Some(value),
-                        _ => {}
-                    }
+        && let Some(end) = after_open.find("---")
+    {
+        let fm_str = &after_open[..end];
+        // Accumulate every recognized key across all frontmatter lines
+        // instead of returning on the first match — a file with both
+        // `name:` and `description:` used to silently drop whichever
+        // key came second.
+        for line in fm_str.lines() {
+            let line = line.trim();
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim().to_lowercase();
+                let value = value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                match key.as_str() {
+                    "name" => frontmatter.name = Some(value),
+                    "description" => frontmatter.description = Some(value),
+                    _ => {}
                 }
             }
         }
+    }
 
     frontmatter
 }

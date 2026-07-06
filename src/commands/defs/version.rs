@@ -19,9 +19,7 @@ impl Command for VersionCommand {
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         let version = env!("CARGO_PKG_VERSION");
-        let info = format!(
-            "Pooprusteek v{version}\nRust TUI coding agent powered by DeepSeek"
-        );
+        let info = format!("Pooprusteek v{version}\nRust TUI coding agent powered by DeepSeek");
         state.push_system(&info);
         CommandResult::Handled
     }

@@ -1,11 +1,11 @@
-pub mod jsonrpc;
-pub mod transport;
 pub mod client;
-pub mod manager;
 pub mod config;
-pub mod types;
+pub mod jsonrpc;
+pub mod manager;
 pub mod oauth;
 pub mod oauth_store;
+pub mod transport;
+pub mod types;
 
 pub use manager::MCPManager;
 

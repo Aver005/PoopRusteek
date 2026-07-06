@@ -8,23 +8,36 @@ use super::util::{highlight_json, truncate};
 use crate::app::AppState;
 use crate::app::events::{ConfirmState, Modal, PickerMode, PickerState, QuestionState};
 use crate::tui::theme::Theme;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     match modal {
-        Modal::ToolApproval { tool_name, arguments, scroll_offset, always_allow } => {
-            render_tool_approval(frame, area, tool_name, arguments, *scroll_offset, *always_allow, theme)
-        }
+        Modal::ToolApproval {
+            tool_name,
+            arguments,
+            scroll_offset,
+            always_allow,
+        } => render_tool_approval(
+            frame,
+            area,
+            tool_name,
+            arguments,
+            *scroll_offset,
+            *always_allow,
+            theme,
+        ),
         Modal::Picker(picker) => render_picker(frame, area, picker, theme),
         Modal::Question(qs) => render_question(frame, area, qs, theme),
         Modal::DeleteSessions(st) => render_delete_sessions(frame, area, st, theme),
         Modal::Confirm(cs) => render_confirm(frame, area, cs, theme),
         Modal::McpAdd(state) => super::mcp::render_mcp_add(frame, area, state, theme),
-        Modal::ProviderAdd(state) => super::providers::render_provider_add(frame, area, state, theme),
+        Modal::ProviderAdd(state) => {
+            super::providers::render_provider_add(frame, area, state, theme)
+        }
     }
 }
 
@@ -39,7 +52,11 @@ fn render_tool_approval(
 ) {
     let popup_width = area.width.clamp(50, 72);
     let max_height = area.height.saturating_sub(4);
-    let content_height = arguments.lines().count().max(4).min(max_height.saturating_sub(6) as usize);
+    let content_height = arguments
+        .lines()
+        .count()
+        .max(4)
+        .min(max_height.saturating_sub(6) as usize);
     let popup_height = (content_height + 8).min(max_height as usize) as u16;
     let popup_area = center_popup(area, popup_width, popup_height);
 
@@ -57,15 +74,18 @@ fn render_tool_approval(
         Span::styled(" ", Style::default().fg(theme.fg)),
         Span::styled(
             tool_name.to_string(),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     all_lines.push(Line::from(""));
 
     // Arguments header
-    all_lines.push(Line::from(vec![
-        Span::styled("  \u{1F4CB} Arguments:", Style::default().fg(theme.text_dim)),
-    ]));
+    all_lines.push(Line::from(vec![Span::styled(
+        "  \u{1F4CB} Arguments:",
+        Style::default().fg(theme.text_dim),
+    )]));
 
     // Parse and format arguments with JSON highlighting
     let arg_lines = highlight_json(arguments, theme);
@@ -82,10 +102,7 @@ fn render_tool_approval(
     for line in &display_lines {
         let mut line_spans = vec![Span::styled("  ", Style::default().fg(theme.fg))];
         for span in &line.spans {
-            line_spans.push(Span::styled(
-                span.content.clone(),
-                span.style,
-            ));
+            line_spans.push(Span::styled(span.content.clone(), span.style));
         }
         all_lines.push(Line::from(line_spans));
     }
@@ -98,12 +115,10 @@ fn render_tool_approval(
             0
         };
         let indicator = format!("\u{2191}\u{2193} {:.0}%", pct.min(100));
-        all_lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}", indicator),
-                Style::default().fg(theme.text_dim),
-            ),
-        ]));
+        all_lines.push(Line::from(vec![Span::styled(
+            format!("  {}", indicator),
+            Style::default().fg(theme.text_dim),
+        )]));
     }
 
     fill_panel_space(&mut all_lines, inner_h.saturating_sub(3));
@@ -111,25 +126,38 @@ fn render_tool_approval(
 
     // Always allow checkbox
     let check = if always_allow { "\u{2611}" } else { "\u{2610}" };
-    all_lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {} Always allow for this session", check),
-            if always_allow {
-                Style::default().fg(theme.success)
-            } else {
-                Style::default().fg(theme.text_dim)
-            },
-        ),
-    ]));
+    all_lines.push(Line::from(vec![Span::styled(
+        format!("  {} Always allow for this session", check),
+        if always_allow {
+            Style::default().fg(theme.success)
+        } else {
+            Style::default().fg(theme.text_dim)
+        },
+    )]));
 
     // Key bindings
     all_lines.push(Line::from(vec![
         Span::styled("  ", Style::default().fg(theme.fg)),
-        Span::styled("Y", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Y",
+            Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" allow  ", Style::default().fg(theme.text_dim)),
-        Span::styled("N", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "N",
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" deny  ", Style::default().fg(theme.text_dim)),
-        Span::styled("A", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "A",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" toggle  ", Style::default().fg(theme.text_dim)),
         Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
         Span::styled(" scroll", Style::default().fg(theme.text_dim)),
@@ -265,7 +293,11 @@ fn render_delete_sessions(
     {
         let is_cursor = i == st.cursor;
         let is_checked = st.checked.contains(&entry.id);
-        let bg = if is_cursor { theme.selection } else { theme.panel };
+        let bg = if is_cursor {
+            theme.selection
+        } else {
+            theme.panel
+        };
 
         let checkbox = if is_checked { "\u{2611} " } else { "\u{2610} " };
         let badge = match (entry.local, entry.remote) {
@@ -283,7 +315,11 @@ fn render_delete_sessions(
             Span::styled(
                 checkbox,
                 Style::default()
-                    .fg(if is_checked { theme.warning } else { theme.text_dim })
+                    .fg(if is_checked {
+                        theme.warning
+                    } else {
+                        theme.text_dim
+                    })
                     .bg(bg),
             ),
             Span::styled(
@@ -336,7 +372,9 @@ fn render_confirm(frame: &mut Frame, area: Rect, cs: &ConfirmState, theme: &Them
     let hint = " Enter/y \u{2014} confirm    n/Esc \u{2014} cancel";
     let content_lines = cs.lines.len() + 2; // lines + blank + hint
     let popup_h = (content_lines as u16 + 4).clamp(6, area.height.saturating_sub(2));
-    let max_line_w = cs.lines.iter()
+    let max_line_w = cs
+        .lines
+        .iter()
         .map(|l| l.text.len())
         .chain(std::iter::once(hint.len()))
         .max()
@@ -347,15 +385,21 @@ fn render_confirm(frame: &mut Frame, area: Rect, cs: &ConfirmState, theme: &Them
     let block = modal_block(format!(" {} ", cs.title), theme.error, theme);
     let inner = block.inner(popup_area);
 
-    let mut lines: Vec<Line> = cs.lines.iter().map(|cl| {
-        let style = match cl.kind {
-            ConfirmLineKind::Normal => Style::default().fg(theme.fg),
-            ConfirmLineKind::Soft => Style::default().fg(theme.text_soft),
-            ConfirmLineKind::Dim => Style::default().fg(theme.text_dim),
-            ConfirmLineKind::Danger => Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
-        };
-        Line::from(Span::styled(format!(" {}", cl.text), style))
-    }).collect();
+    let mut lines: Vec<Line> = cs
+        .lines
+        .iter()
+        .map(|cl| {
+            let style = match cl.kind {
+                ConfirmLineKind::Normal => Style::default().fg(theme.fg),
+                ConfirmLineKind::Soft => Style::default().fg(theme.text_soft),
+                ConfirmLineKind::Dim => Style::default().fg(theme.text_dim),
+                ConfirmLineKind::Danger => Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            };
+            Line::from(Span::styled(format!(" {}", cl.text), style))
+        })
+        .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!(" {hint}"),
@@ -397,8 +441,20 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         picker.search.clone()
     };
     lines.push(Line::from(vec![
-        Span::styled(" \u{1F50D} ", Style::default().fg(theme.text_dim).bg(theme.panel)),
-        Span::styled(search_display, Style::default().fg(if picker.search.is_empty() { theme.text_dim } else { theme.fg }).bg(theme.panel)),
+        Span::styled(
+            " \u{1F50D} ",
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        ),
+        Span::styled(
+            search_display,
+            Style::default()
+                .fg(if picker.search.is_empty() {
+                    theme.text_dim
+                } else {
+                    theme.fg
+                })
+                .bg(theme.panel),
+        ),
     ]));
 
     // Separator after search
@@ -408,9 +464,10 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
     let end = (picker.scroll_offset + visible).min(picker.items.len());
 
     if picker.scroll_offset > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("  \u{2191} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "  \u{2191} more ",
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        )]));
     }
 
     for i in picker.scroll_offset..end {
@@ -424,7 +481,11 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         };
 
         let item = &picker.items[i];
-        let bg = if is_cursor { theme.selection } else { theme.panel };
+        let bg = if is_cursor {
+            theme.selection
+        } else {
+            theme.panel
+        };
         let fg = if is_cursor {
             theme.fg
         } else if item.warn {
@@ -437,7 +498,11 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
 
         let row_style = Style::default().fg(fg).bg(bg);
         let ind_style = Style::default()
-            .fg(if is_cursor { theme.accent } else { theme.text_dim })
+            .fg(if is_cursor {
+                theme.accent
+            } else {
+                theme.text_dim
+            })
             .bg(bg);
 
         lines.push(Line::from(vec![
@@ -449,9 +514,10 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
     }
 
     if picker.scroll_offset + visible < picker.items.len() {
-        lines.push(Line::from(vec![
-            Span::styled("  \u{2193} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "  \u{2193} more ",
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        )]));
     }
 
     fill_panel_space(&mut lines, inner.height.saturating_sub(3) as usize);
@@ -473,7 +539,12 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
 
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default().fg(theme.fg)),
-        Span::styled(count_str, Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            count_str,
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(pad_str, Style::default().fg(theme.fg)),
         Span::styled(hints, Style::default().fg(theme.text_dim)),
     ]));
@@ -514,7 +585,10 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         let prefix = if i == 0 { "  " } else { "    " };
         lines.push(Line::from(vec![
             Span::styled(prefix, Style::default().fg(theme.fg)),
-            Span::styled(wline.to_string(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                wline.to_string(),
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
         ]));
     }
     lines.push(Line::from(""));
@@ -534,21 +608,40 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
             let after_cursor: String = qs.custom_input.chars().skip(qs.custom_cursor).collect();
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default().fg(theme.fg)),
-                Span::styled(before_cursor, Style::default().fg(theme.fg).bg(theme.input_bg)),
                 Span::styled(
-                    qs.custom_input.chars().nth(qs.custom_cursor).map(|c| c.to_string()).unwrap_or_default(),
+                    before_cursor,
+                    Style::default().fg(theme.fg).bg(theme.input_bg),
+                ),
+                Span::styled(
+                    qs.custom_input
+                        .chars()
+                        .nth(qs.custom_cursor)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
                     Style::default()
                         .fg(theme.bg)
                         .bg(theme.accent)
                         .add_modifier(Modifier::REVERSED),
                 ),
-                Span::styled(after_cursor, Style::default().fg(theme.fg).bg(theme.input_bg)),
+                Span::styled(
+                    after_cursor,
+                    Style::default().fg(theme.fg).bg(theme.input_bg),
+                ),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default().fg(theme.fg)),
-                Span::styled(before_cursor, Style::default().fg(theme.fg).bg(theme.input_bg)),
-                Span::styled(" ", Style::default().fg(theme.fg).bg(theme.accent).add_modifier(Modifier::REVERSED)),
+                Span::styled(
+                    before_cursor,
+                    Style::default().fg(theme.fg).bg(theme.input_bg),
+                ),
+                Span::styled(
+                    " ",
+                    Style::default()
+                        .fg(theme.fg)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::REVERSED),
+                ),
             ]));
         }
 
@@ -556,9 +649,19 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         lines.push(separator_line(inner_w, theme));
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default().fg(theme.fg)),
-            Span::styled("Enter", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" submit  ", Style::default().fg(theme.text_dim)),
-            Span::styled("Esc", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" cancel", Style::default().fg(theme.text_dim)),
         ]));
     } else if is_yes_no {
@@ -566,9 +669,19 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         let pad = inner_w.saturating_sub(14) / 2;
         lines.push(Line::from(vec![
             Span::styled(" ".repeat(pad), Style::default().fg(theme.fg)),
-            Span::styled("Y", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Y",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Yes  ", Style::default().fg(theme.text_dim)),
-            Span::styled("N", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "N",
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" No", Style::default().fg(theme.text_dim)),
         ]));
     } else {
@@ -577,15 +690,20 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         let end = (qs.scroll_offset + visible).min(qs.options.len());
 
         if qs.scroll_offset > 0 {
-            lines.push(Line::from(vec![
-                Span::styled("  \u{2191} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "  \u{2191} more ",
+                Style::default().fg(theme.text_dim).bg(theme.panel),
+            )]));
         }
 
         for i in qs.scroll_offset..end {
             let is_cursor = i == qs.selected;
             let is_custom_entry = qs.allow_custom && i >= qs.options.len().saturating_sub(1);
-            let bg = if is_cursor { theme.selection } else { theme.panel };
+            let bg = if is_cursor {
+                theme.selection
+            } else {
+                theme.panel
+            };
             let fg = if is_cursor { theme.fg } else { theme.text_soft };
 
             let indicator = if is_cursor { "\u{25B6} " } else { "  " };
@@ -600,7 +718,11 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
                 Span::styled(
                     indicator,
                     Style::default()
-                        .fg(if is_cursor { theme.accent } else { theme.text_dim })
+                        .fg(if is_cursor {
+                            theme.accent
+                        } else {
+                            theme.text_dim
+                        })
                         .bg(bg),
                 ),
                 Span::styled(label, Style::default().fg(fg).bg(bg)),
@@ -609,9 +731,10 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         }
 
         if qs.scroll_offset + visible < qs.options.len() {
-            lines.push(Line::from(vec![
-                Span::styled("  \u{2193} more ", Style::default().fg(theme.text_dim).bg(theme.panel)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "  \u{2193} more ",
+                Style::default().fg(theme.text_dim).bg(theme.panel),
+            )]));
         }
 
         fill_panel_space(&mut lines, inner.height.saturating_sub(3) as usize);
@@ -621,17 +744,26 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {}/{}", qs.selected + 1, count),
-                Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "    ".to_string(),
-                Style::default().fg(theme.fg),
-            ),
+            Span::styled("    ".to_string(), Style::default().fg(theme.fg)),
             Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
             Span::styled(" nav  ", Style::default().fg(theme.text_dim)),
-            Span::styled("Enter", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" select  ", Style::default().fg(theme.text_dim)),
-            Span::styled("Esc", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" cancel", Style::default().fg(theme.text_dim)),
         ]));
     }
@@ -646,7 +778,12 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;
 
-pub(super) fn render_autocomplete(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
+pub(super) fn render_autocomplete(
+    frame: &mut Frame,
+    input_area: Rect,
+    state: &AppState,
+    theme: &Theme,
+) {
     let items = &state.autocomplete.items;
     if items.is_empty() {
         return;
@@ -654,7 +791,10 @@ pub(super) fn render_autocomplete(frame: &mut Frame, input_area: Rect, state: &A
     let total = items.len();
 
     let visible_count = total.min(AUTOCOMPLETE_VISIBLE);
-    let scroll_off = state.autocomplete.scroll_offset.min(total.saturating_sub(1));
+    let scroll_off = state
+        .autocomplete
+        .scroll_offset
+        .min(total.saturating_sub(1));
     let view_end = (scroll_off + visible_count).min(total);
     let vis_items = &items[scroll_off..view_end];
 
@@ -713,9 +853,7 @@ pub(super) fn render_autocomplete(frame: &mut Frame, input_area: Rect, state: &A
             let indicator = if is_sel { "▸ " } else { "  " };
             let prefix = if is_file { "@" } else { "/" };
             let name_full = format!("{prefix}{}", item.name);
-            let padding = max_name_w
-                .saturating_sub(item.name.chars().count())
-                .max(1);
+            let padding = max_name_w.saturating_sub(item.name.chars().count()).max(1);
             let pad_str = " ".repeat(padding);
 
             let mut spans: Vec<Span> = Vec::new();

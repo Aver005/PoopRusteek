@@ -4,16 +4,17 @@
 //! frame, so a config save is the whole effect.
 
 use super::apply_text_key;
-use crate::app::events::View;
-use crate::app::themes::{
-    theme_rows, ThemeRowKind, ThemeWizardState, ThemeWizardStep,
-};
 use crate::app::App;
+use crate::app::events::View;
+use crate::app::themes::{ThemeRowKind, ThemeWizardState, ThemeWizardStep, theme_rows};
 use crate::error::AppResult;
 use crate::tui::theme::{PRESETS, ROLES};
 
 impl App {
-    pub(super) async fn handle_themes_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+    pub(super) async fn handle_themes_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> AppResult<bool> {
         use crossterm::event::KeyCode;
 
         if self.state.themes.wizard.is_some() {
@@ -71,7 +72,8 @@ impl App {
                     }
                     ThemeRowKind::Preset => {
                         self.state.themes.status_message =
-                            "Built-in themes can't be edited — press n to create one based on it".to_string();
+                            "Built-in themes can't be edited — press n to create one based on it"
+                                .to_string();
                     }
                     ThemeRowKind::Create => {}
                 }
@@ -87,7 +89,10 @@ impl App {
                 }
                 let name = row.name.clone();
                 let was_active = row.active;
-                self.config.ui.custom_themes.retain(|theme| theme.name != name);
+                self.config
+                    .ui
+                    .custom_themes
+                    .retain(|theme| theme.name != name);
                 if was_active {
                     self.config.ui.theme = "default".to_string();
                 }
@@ -95,7 +100,11 @@ impl App {
                     Ok(()) => {
                         self.state.themes.status_message = format!(
                             "{name} deleted{}",
-                            if was_active { " — back on Midnight" } else { "" },
+                            if was_active {
+                                " — back on Midnight"
+                            } else {
+                                ""
+                            },
                         );
                     }
                     Err(error) => {
@@ -242,7 +251,11 @@ impl App {
             self.config.ui.theme = previous_active;
             match (replaced_index, previous_entry) {
                 (Some(index), Some(original)) => self.config.ui.custom_themes[index] = original,
-                _ => self.config.ui.custom_themes.retain(|theme| theme.name != name),
+                _ => self
+                    .config
+                    .ui
+                    .custom_themes
+                    .retain(|theme| theme.name != name),
             }
             return Err(format!("Failed to save config: {error}"));
         }

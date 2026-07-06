@@ -1,7 +1,7 @@
 //! Autocomplete: dropdown navigation interception, suggestion refresh (both
 //! `/command` and `@file` modes), and acceptance of the selected entry.
 
-use crate::app::{format_size, App, AutocompleteState, AUTOCOMPLETE_VISIBLE};
+use crate::app::{AUTOCOMPLETE_VISIBLE, App, AutocompleteState, format_size};
 use crate::commands::CommandSuggestion;
 
 impl App {
@@ -20,15 +20,13 @@ impl App {
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
                 let n = self.state.autocomplete.items.len();
-                self.state.autocomplete.selected =
-                    (self.state.autocomplete.selected + 1) % n;
+                self.state.autocomplete.selected = (self.state.autocomplete.selected + 1) % n;
                 self.clamp_autocomplete_scroll();
                 true
             }
             KeyCode::BackTab | KeyCode::Up => {
                 let n = self.state.autocomplete.items.len();
-                self.state.autocomplete.selected =
-                    (self.state.autocomplete.selected + n - 1) % n;
+                self.state.autocomplete.selected = (self.state.autocomplete.selected + n - 1) % n;
                 self.clamp_autocomplete_scroll();
                 true
             }
@@ -47,7 +45,10 @@ impl App {
         if let Some(at_pos) = buf.rfind('@') {
             let after_at = &buf[at_pos + 1..];
             let path_part = after_at.split_whitespace().next().unwrap_or("");
-            if !path_part.is_empty() && !self.state.focused_mut().generation.active && self.state.modal.is_none() {
+            if !path_part.is_empty()
+                && !self.state.focused_mut().generation.active
+                && self.state.modal.is_none()
+            {
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let search_path = if path_part.contains('/') || path_part.contains('\\') {
                     std::path::Path::new(path_part).to_path_buf()
@@ -62,8 +63,8 @@ impl App {
                     .to_lowercase();
 
                 let mut items = Vec::new();
-                if let Ok(read_dir) = std::fs::read_dir(
-                    if path_part.contains('/') || path_part.contains('\\') {
+                if let Ok(read_dir) =
+                    std::fs::read_dir(if path_part.contains('/') || path_part.contains('\\') {
                         if parent.is_absolute() {
                             parent.to_path_buf()
                         } else {
@@ -71,8 +72,8 @@ impl App {
                         }
                     } else {
                         cwd.clone()
-                    },
-                ) {
+                    })
+                {
                     for entry in read_dir.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
                         if name.to_lowercase().starts_with(&prefix) {
@@ -186,8 +187,10 @@ impl App {
                         .and_then(|e| e.to_str())
                         .unwrap_or("")
                         .to_lowercase();
-                    let is_image =
-                        matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg");
+                    let is_image = matches!(
+                        ext.as_str(),
+                        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
+                    );
                     self.state
                         .attached_files
                         .push(crate::provider::AttachedFile {

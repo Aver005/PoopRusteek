@@ -35,7 +35,9 @@ pub async fn build(
     } else {
         builtin_tools
             .iter()
-            .map(|tool| crate::util::format_tool_definition(&tool.name, &tool.description, &tool.parameters))
+            .map(|tool| {
+                crate::util::format_tool_definition(&tool.name, &tool.description, &tool.parameters)
+            })
             .collect::<Vec<_>>()
             .join("\n\n")
     };

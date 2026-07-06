@@ -47,7 +47,11 @@ impl OpenAiCompatProvider {
         format!("{}/chat/completions", self.base_url)
     }
 
-    async fn send(&self, request: &CompletionRequest, stream: bool) -> AppResult<reqwest::Response> {
+    async fn send(
+        &self,
+        request: &CompletionRequest,
+        stream: bool,
+    ) -> AppResult<reqwest::Response> {
         let mut body = openai_compat::request_to_openai(request);
         body["stream"] = serde_json::json!(stream);
         // The entry's model wins over whatever the internal request carries —
@@ -60,7 +64,11 @@ impl OpenAiCompatProvider {
         }
         debug_log::log(
             "openai_compat.request",
-            format!("url={} stream={stream} model={}", self.completions_url(), self.model),
+            format!(
+                "url={} stream={stream} model={}",
+                self.completions_url(),
+                self.model
+            ),
         );
 
         let response = http_request.send().await.map_err(AppError::Http)?;
@@ -72,7 +80,10 @@ impl OpenAiCompatProvider {
             let message = serde_json::from_str::<openai_compat::ErrorResponse>(&text)
                 .map(|envelope| envelope.error.message)
                 .unwrap_or_else(|_| crate::util::truncate_at_char_boundary(&text, 300).to_string());
-            debug_log::log("openai_compat.error", format!("status={status} message={message}"));
+            debug_log::log(
+                "openai_compat.error",
+                format!("status={status} message={message}"),
+            );
             return Err(AppError::Provider(format!("{status}: {message}")));
         }
         Ok(response)

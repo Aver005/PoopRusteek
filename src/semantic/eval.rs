@@ -32,18 +32,66 @@ fn skill(slug: &str, name: &str, description: &str) -> SkillDefinition {
 
 fn fixture_skills() -> Vec<SkillDefinition> {
     vec![
-        skill("code-review", "Code Review", "Review code changes for security, performance, and correctness before merging"),
-        skill("security-review", "Security Review", "Audit code for vulnerabilities, injection risks, and unsafe patterns"),
-        skill("rust-best-practices", "Rust Best Practices", "Guide for writing idiomatic Rust: ownership, borrowing, error handling with Result"),
-        skill("tailwind", "Tailwind CSS", "Utility-first CSS styling, responsive layouts, and design tokens with Tailwind"),
-        skill("playwright-expert", "Playwright Expert", "Browser automation and end-to-end testing with Playwright"),
-        skill("telegram-bot", "Telegram Bot", "Build Telegram bots: commands, inline keyboards, webhooks"),
-        skill("api-design-principles", "API Design Principles", "REST and GraphQL API design: resources, versioning, pagination, error contracts"),
-        skill("frontend-design", "Frontend Design", "Create distinctive, production-grade web interfaces and landing pages"),
-        skill("uv-package-manager", "UV Package Manager", "Python dependency management and virtual environments with uv"),
-        skill("capacitor-push-notifications", "Capacitor Push Notifications", "Implement push notifications in mobile apps with FCM and APNs"),
-        skill("zod", "Zod", "TypeScript schema validation and type-safe parsing with Zod"),
-        skill("changelog-automation", "Changelog Automation", "Generate changelogs and release notes from commits and pull requests"),
+        skill(
+            "code-review",
+            "Code Review",
+            "Review code changes for security, performance, and correctness before merging",
+        ),
+        skill(
+            "security-review",
+            "Security Review",
+            "Audit code for vulnerabilities, injection risks, and unsafe patterns",
+        ),
+        skill(
+            "rust-best-practices",
+            "Rust Best Practices",
+            "Guide for writing idiomatic Rust: ownership, borrowing, error handling with Result",
+        ),
+        skill(
+            "tailwind",
+            "Tailwind CSS",
+            "Utility-first CSS styling, responsive layouts, and design tokens with Tailwind",
+        ),
+        skill(
+            "playwright-expert",
+            "Playwright Expert",
+            "Browser automation and end-to-end testing with Playwright",
+        ),
+        skill(
+            "telegram-bot",
+            "Telegram Bot",
+            "Build Telegram bots: commands, inline keyboards, webhooks",
+        ),
+        skill(
+            "api-design-principles",
+            "API Design Principles",
+            "REST and GraphQL API design: resources, versioning, pagination, error contracts",
+        ),
+        skill(
+            "frontend-design",
+            "Frontend Design",
+            "Create distinctive, production-grade web interfaces and landing pages",
+        ),
+        skill(
+            "uv-package-manager",
+            "UV Package Manager",
+            "Python dependency management and virtual environments with uv",
+        ),
+        skill(
+            "capacitor-push-notifications",
+            "Capacitor Push Notifications",
+            "Implement push notifications in mobile apps with FCM and APNs",
+        ),
+        skill(
+            "zod",
+            "Zod",
+            "TypeScript schema validation and type-safe parsing with Zod",
+        ),
+        skill(
+            "changelog-automation",
+            "Changelog Automation",
+            "Generate changelogs and release notes from commits and pull requests",
+        ),
     ]
 }
 
@@ -51,22 +99,40 @@ fn fixture_skills() -> Vec<SkillDefinition> {
 /// keyword hits with purely semantic phrasing.
 fn skill_queries() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("сделай ревью этого пулл-реквеста перед мержем", "code-review"),
-        ("проверь мой код на уязвимости и инъекции", "security-review"),
-        ("как идиоматично обработать ошибки в расте", "rust-best-practices"),
+        (
+            "сделай ревью этого пулл-реквеста перед мержем",
+            "code-review",
+        ),
+        (
+            "проверь мой код на уязвимости и инъекции",
+            "security-review",
+        ),
+        (
+            "как идиоматично обработать ошибки в расте",
+            "rust-best-practices",
+        ),
         ("свёрстай адаптивную страницу на тейлвинде", "tailwind"),
         ("нужны e2e тесты в браузере", "playwright-expert"),
         ("напиши телеграм-бота с кнопками", "telegram-bot"),
         ("спроектируй REST API с пагинацией", "api-design-principles"),
         ("сделай красивый лендинг", "frontend-design"),
-        ("настрой виртуальное окружение для питона", "uv-package-manager"),
-        ("пуш-уведомления в мобильном приложении", "capacitor-push-notifications"),
+        (
+            "настрой виртуальное окружение для питона",
+            "uv-package-manager",
+        ),
+        (
+            "пуш-уведомления в мобильном приложении",
+            "capacitor-push-notifications",
+        ),
         ("валидация данных по схеме в typescript", "zod"),
         ("собери release notes из коммитов", "changelog-automation"),
         ("review this diff for correctness", "code-review"),
         ("find vulnerabilities in my endpoint", "security-review"),
         ("style this component with utility classes", "tailwind"),
-        ("automate the browser to click through the signup flow", "playwright-expert"),
+        (
+            "automate the browser to click through the signup flow",
+            "playwright-expert",
+        ),
     ]
 }
 
@@ -85,38 +151,128 @@ fn mcp_tool(server: &str, name: &str, description: &str) -> FullMCPTool {
 /// A realistic mixed catalog: browser automation + docs + filesystem-ish.
 fn fixture_mcp_tools() -> Vec<FullMCPTool> {
     vec![
-        mcp_tool("playwright", "browser_click", "Click an element on the current page"),
-        mcp_tool("playwright", "browser_navigate", "Navigate the browser to a URL"),
-        mcp_tool("playwright", "browser_take_screenshot", "Take a screenshot of the current page or element"),
-        mcp_tool("playwright", "browser_fill_form", "Fill multiple form fields on the page"),
-        mcp_tool("playwright", "browser_console_messages", "Read console messages from the page"),
-        mcp_tool("playwright", "browser_network_requests", "List network requests made by the page"),
-        mcp_tool("outline", "search_documents", "Full-text search across knowledge-base documents"),
-        mcp_tool("outline", "create_document", "Create a new document in a collection"),
-        mcp_tool("outline", "update_document", "Update an existing document's title or content"),
-        mcp_tool("outline", "list_collections", "List all document collections"),
-        mcp_tool("context7", "resolve_library_id", "Resolve a package or library name to a documentation library id"),
-        mcp_tool("context7", "query_docs", "Fetch up-to-date documentation and code examples for a library"),
-        mcp_tool("chrome", "performance_start_trace", "Start recording a performance trace of the page"),
-        mcp_tool("chrome", "take_heapsnapshot", "Capture a V8 heap snapshot for memory analysis"),
-        mcp_tool("chrome", "emulate", "Emulate device, network throttling, or CPU slowdown"),
+        mcp_tool(
+            "playwright",
+            "browser_click",
+            "Click an element on the current page",
+        ),
+        mcp_tool(
+            "playwright",
+            "browser_navigate",
+            "Navigate the browser to a URL",
+        ),
+        mcp_tool(
+            "playwright",
+            "browser_take_screenshot",
+            "Take a screenshot of the current page or element",
+        ),
+        mcp_tool(
+            "playwright",
+            "browser_fill_form",
+            "Fill multiple form fields on the page",
+        ),
+        mcp_tool(
+            "playwright",
+            "browser_console_messages",
+            "Read console messages from the page",
+        ),
+        mcp_tool(
+            "playwright",
+            "browser_network_requests",
+            "List network requests made by the page",
+        ),
+        mcp_tool(
+            "outline",
+            "search_documents",
+            "Full-text search across knowledge-base documents",
+        ),
+        mcp_tool(
+            "outline",
+            "create_document",
+            "Create a new document in a collection",
+        ),
+        mcp_tool(
+            "outline",
+            "update_document",
+            "Update an existing document's title or content",
+        ),
+        mcp_tool(
+            "outline",
+            "list_collections",
+            "List all document collections",
+        ),
+        mcp_tool(
+            "context7",
+            "resolve_library_id",
+            "Resolve a package or library name to a documentation library id",
+        ),
+        mcp_tool(
+            "context7",
+            "query_docs",
+            "Fetch up-to-date documentation and code examples for a library",
+        ),
+        mcp_tool(
+            "chrome",
+            "performance_start_trace",
+            "Start recording a performance trace of the page",
+        ),
+        mcp_tool(
+            "chrome",
+            "take_heapsnapshot",
+            "Capture a V8 heap snapshot for memory analysis",
+        ),
+        mcp_tool(
+            "chrome",
+            "emulate",
+            "Emulate device, network throttling, or CPU slowdown",
+        ),
     ]
 }
 
 fn mcp_queries() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("кликни по кнопке на странице", "mcp__playwright__browser_click"),
-        ("сделай скриншот страницы", "mcp__playwright__browser_take_screenshot"),
-        ("открой сайт в браузере", "mcp__playwright__browser_navigate"),
-        ("заполни форму регистрации", "mcp__playwright__browser_fill_form"),
-        ("что в консоли браузера, есть ли ошибки", "mcp__playwright__browser_console_messages"),
-        ("найди документ в базе знаний", "mcp__outline__search_documents"),
+        (
+            "кликни по кнопке на странице",
+            "mcp__playwright__browser_click",
+        ),
+        (
+            "сделай скриншот страницы",
+            "mcp__playwright__browser_take_screenshot",
+        ),
+        (
+            "открой сайт в браузере",
+            "mcp__playwright__browser_navigate",
+        ),
+        (
+            "заполни форму регистрации",
+            "mcp__playwright__browser_fill_form",
+        ),
+        (
+            "что в консоли браузера, есть ли ошибки",
+            "mcp__playwright__browser_console_messages",
+        ),
+        (
+            "найди документ в базе знаний",
+            "mcp__outline__search_documents",
+        ),
         ("заведи новый документ", "mcp__outline__create_document"),
-        ("свежая документация по библиотеке react", "mcp__context7__query_docs"),
-        ("память течёт, нужен снапшот кучи", "mcp__chrome__take_heapsnapshot"),
+        (
+            "свежая документация по библиотеке react",
+            "mcp__context7__query_docs",
+        ),
+        (
+            "память течёт, нужен снапшот кучи",
+            "mcp__chrome__take_heapsnapshot",
+        ),
         ("замедли сеть для теста", "mcp__chrome__emulate"),
-        ("record a performance trace", "mcp__chrome__performance_start_trace"),
-        ("what http calls did the page make", "mcp__playwright__browser_network_requests"),
+        (
+            "record a performance trace",
+            "mcp__chrome__performance_start_trace",
+        ),
+        (
+            "what http calls did the page make",
+            "mcp__playwright__browser_network_requests",
+        ),
     ]
 }
 
@@ -186,8 +342,8 @@ fn mrr_over_mcp_tool_fixture_is_acceptable() {
 #[test]
 #[ignore = "needs the ~120 MB embedding model; run manually with --ignored --nocapture"]
 fn history_index_search_and_persistence_roundtrip() {
-    use crate::provider::ChatMessage;
     use super::history::HistoryStore;
+    use crate::provider::ChatMessage;
 
     let mut embedder = Embedder::init(Config::data_dir().join("models"))
         .expect("embedder init (model download?) failed");
@@ -199,9 +355,13 @@ fn history_index_search_and_persistence_roundtrip() {
 
     let messages = vec![
         ChatMessage::user("Как починить утечку памяти в tokio-задаче?"),
-        ChatMessage::assistant("Утечка была из-за незакрытого JoinHandle — надо вызывать abort() при дропе."),
+        ChatMessage::assistant(
+            "Утечка была из-за незакрытого JoinHandle — надо вызывать abort() при дропе.",
+        ),
         ChatMessage::user("What linker flags does wasmtime need on Windows?"),
-        ChatMessage::assistant("wasmtime needs no special linker flags; the ittapi native lib is built by its build script."),
+        ChatMessage::assistant(
+            "wasmtime needs no special linker flags; the ittapi native lib is built by its build script.",
+        ),
     ];
     let mut store = HistoryStore::open(path.clone());
     let added = store
@@ -210,13 +370,17 @@ fn history_index_search_and_persistence_roundtrip() {
     assert_eq!(added, 4);
     // Re-indexing the same list is a no-op (watermark).
     assert_eq!(
-        store.index_session(&mut embedder, "sess-1", "Debugging session", &messages).unwrap(),
+        store
+            .index_session(&mut embedder, "sess-1", "Debugging session", &messages)
+            .unwrap(),
         0
     );
 
     // Cross-language: an English query must surface the Russian
     // memory-leak exchange (question or answer) as the top hit.
-    let hits = store.search(&mut embedder, "memory leak fix in async task", 3).unwrap();
+    let hits = store
+        .search(&mut embedder, "memory leak fix in async task", 3)
+        .unwrap();
     assert!(
         hits[0].text.contains("утечку памяти") || hits[0].text.contains("JoinHandle"),
         "expected the memory-leak exchange on top, got: {:?}",
@@ -228,9 +392,12 @@ fn history_index_search_and_persistence_roundtrip() {
     assert_eq!(reopened.record_count(), 4);
     assert_eq!(reopened.watermark("sess-1"), 4);
     let mut embedder2 = embedder;
-    let hits = reopened.search(&mut embedder2, "флаги линковщика для wasmtime", 2).unwrap();
+    let hits = reopened
+        .search(&mut embedder2, "флаги линковщика для wasmtime", 2)
+        .unwrap();
     assert!(
-        hits.iter().any(|h| h.text.to_lowercase().contains("wasmtime")),
+        hits.iter()
+            .any(|h| h.text.to_lowercase().contains("wasmtime")),
         "expected the wasmtime answer, got: {:?}",
         hits.iter().map(|h| &h.text).collect::<Vec<_>>()
     );

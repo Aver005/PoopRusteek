@@ -14,11 +14,11 @@ use crate::app::AppState;
 use crate::config::Config;
 use crate::tui::theme::Theme;
 use crate::tui::widgets;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
@@ -39,16 +39,24 @@ fn landing_sessions_cached() -> Vec<crate::session::SessionSummary> {
     LANDING_SESSIONS_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some((fetched_at, sessions)) = cache.as_ref()
-            && fetched_at.elapsed() < LANDING_SESSIONS_TTL {
-                return sessions.clone();
-            }
+            && fetched_at.elapsed() < LANDING_SESSIONS_TTL
+        {
+            return sessions.clone();
+        }
         let sessions = crate::session::list_sessions().unwrap_or_default();
         *cache = Some((Instant::now(), sessions.clone()));
         sessions
     })
 }
 
-pub(super) fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, config: &Config, theme: &Theme, cursor_cell: &Cell<Option<(u16, u16)>>) {
+pub(super) fn render_landing(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    config: &Config,
+    theme: &Theme,
+    cursor_cell: &Cell<Option<(u16, u16)>>,
+) {
     let input_width = area.width.min(76);
     let x = (area.width - input_width) / 2;
 
@@ -57,18 +65,27 @@ pub(super) fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, co
     let show_sessions = session_count > 0;
 
     // Logo(3) + gap(1) + input(4) + border(1) + shortcuts(1) + gap(1) + sessions(if any: 1+count.min(5)+1) + gap + status(1)
-    let center_h = 3 + 1 + 4 + 1 + 1 + 1
-        + if show_sessions { 1 + sessions.len().min(5) as u16 + 1 } else { 0 };
+    let center_h = 3
+        + 1
+        + 4
+        + 1
+        + 1
+        + 1
+        + if show_sessions {
+            1 + sessions.len().min(5) as u16 + 1
+        } else {
+            0
+        };
     let top_pad = (area.height.saturating_sub(center_h)) / 2;
 
     let mut constraints: Vec<Constraint> = vec![
         Constraint::Length(top_pad),
-        Constraint::Length(3),   // logo block
-        Constraint::Length(1),   // gap
-        Constraint::Length(4),   // input
-        Constraint::Length(1),   // border
-        Constraint::Length(1),   // shortcuts
-        Constraint::Length(1),   // gap
+        Constraint::Length(3), // logo block
+        Constraint::Length(1), // gap
+        Constraint::Length(4), // input
+        Constraint::Length(1), // border
+        Constraint::Length(1), // shortcuts
+        Constraint::Length(1), // gap
     ];
     if show_sessions {
         let count = sessions.len().min(5) as u16;
@@ -118,33 +135,58 @@ pub(super) fn render_landing(frame: &mut Frame, area: Rect, state: &AppState, co
     let mut shortcut_spans = vec![
         Span::styled(model, Style::default().fg(theme.text_soft).bg(theme.bg)),
         Span::styled("  ", Style::default().bg(theme.bg)),
-        Span::styled("Enter ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Enter ",
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("send  ", Style::default().fg(theme.text_dim)),
-        Span::styled("/ ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "/ ",
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("commands  ", Style::default().fg(theme.text_dim)),
-        Span::styled("Esc ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Esc ",
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("home  ", Style::default().fg(theme.text_dim)),
-        Span::styled("Ctrl+C ", Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Ctrl+C ",
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("quit", Style::default().fg(theme.text_dim)),
     ];
     if state.goal.mode {
         let goal_label = match state.goal.stage {
             crate::app::events::GoalStage::Inactive => "[GOAL ON]".to_string(),
             crate::app::events::GoalStage::WaitForGoal => "[WAITING FOR GOAL]".to_string(),
-            crate::app::events::GoalStage::RunAgent1 => format!("[GOAL iter#{}]", state.goal.iteration),
+            crate::app::events::GoalStage::RunAgent1 => {
+                format!("[GOAL iter#{}]", state.goal.iteration)
+            }
             crate::app::events::GoalStage::RunEvaluator => "[EVALUATING]".to_string(),
             crate::app::events::GoalStage::Done => "[GOAL DONE]".to_string(),
         };
         shortcut_spans.push(Span::styled("  ", Style::default().bg(theme.bg)));
         shortcut_spans.push(Span::styled(
             goal_label,
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.bg),
         ));
     }
     frame.render_widget(
         Paragraph::new(vec![Line::from(shortcut_spans)])
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(theme.bg)),
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(theme.bg)),
         info_area,
     );
 
@@ -180,11 +222,18 @@ fn render_sessions_table(
     let mut lines: Vec<Line> = Vec::new();
 
     // Header
-    lines.push(Line::from(vec![
-        Span::styled(" Recent sessions ", header_style),
-    ]));
     lines.push(Line::from(vec![Span::styled(
-        format!("  {} {} {}  {}", "──".repeat(8), "──".repeat(15), "──".repeat(8), "──".repeat(6)),
+        " Recent sessions ",
+        header_style,
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  {} {} {}  {}",
+            "──".repeat(8),
+            "──".repeat(15),
+            "──".repeat(8),
+            "──".repeat(6)
+        ),
         sep_style,
     )]));
 
@@ -192,7 +241,11 @@ fn render_sessions_table(
         let id_short = truncate(&s.id, 16);
         let title = truncate(&s.title, 30);
         let date = format_date(&s.updated_at);
-        let model_tag = if s.model_type.is_empty() { String::new() } else { format!(" [{}]", s.model_type) };
+        let model_tag = if s.model_type.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", s.model_type)
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("  {id_short}"), id_style),
             Span::styled("  ", Style::default().bg(theme.bg)),

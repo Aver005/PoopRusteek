@@ -27,9 +27,10 @@ impl BackgroundCounters {
     /// counts changed (drives the dirty flag).
     pub async fn refresh(&mut self) -> bool {
         if let Some(last) = self.last_refresh
-            && last.elapsed().as_millis() < Self::REFRESH_INTERVAL_MS {
-                return false;
-            }
+            && last.elapsed().as_millis() < Self::REFRESH_INTERVAL_MS
+        {
+            return false;
+        }
         self.refresh_now().await
     }
 
@@ -40,9 +41,8 @@ impl BackgroundCounters {
         let _ = crate::tools::background::prune_finished_processes().await;
         let (total, interactive, persistent) =
             crate::tools::background::running_process_counts().await;
-        let changed = total != self.total
-            || interactive != self.interactive
-            || persistent != self.persistent;
+        let changed =
+            total != self.total || interactive != self.interactive || persistent != self.persistent;
         self.total = total;
         self.interactive = interactive;
         self.persistent = persistent;

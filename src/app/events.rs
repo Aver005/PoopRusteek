@@ -105,7 +105,10 @@ pub enum AppEvent {
     Mouse(crossterm::event::MouseEvent),
     // The new size only triggers a redraw (ratatui re-queries the terminal
     // size when rendering); the dimensions themselves aren't read anywhere.
-    #[expect(dead_code, reason = "resize payload unused — redraw reads terminal size directly")]
+    #[expect(
+        dead_code,
+        reason = "resize payload unused — redraw reads terminal size directly"
+    )]
     Resize(u16, u16),
     Tick,
 
@@ -120,15 +123,24 @@ pub enum AppEvent {
     AddMessage(ConversationId, ChatMessage),
 
     // Tool events
-    ToolStarted { conversation: ConversationId, name: String },
+    ToolStarted {
+        conversation: ConversationId,
+        name: String,
+    },
     ToolDone {
         conversation: ConversationId,
         // Every receiver currently discards this with `result: _` — the
         // status line shows a generic "Tool finished" rather than a preview.
-        #[expect(dead_code, reason = "tool-result preview not surfaced by any receiver yet")]
+        #[expect(
+            dead_code,
+            reason = "tool-result preview not surfaced by any receiver yet"
+        )]
         result: String,
     },
-    ToolError { conversation: ConversationId, error: String },
+    ToolError {
+        conversation: ConversationId,
+        error: String,
+    },
     RequestToolApproval(ToolApprovalRequest),
     RequestQuestion(QuestionRequest, QuestionState),
 
@@ -160,7 +172,9 @@ pub enum AppEvent {
     },
 
     /// A detached MCP admin operation (reload / toggle / reconnect) finished.
-    McpOperationDone { message: String },
+    McpOperationDone {
+        message: String,
+    },
 
     /// The background MCP startup (spawned in `App::new`) finished
     /// connecting every discovered server — refresh the cached counts and
@@ -173,7 +187,10 @@ pub enum AppEvent {
     /// `Ok`, the token is already persisted and the handler kicks off a
     /// `reconnect_server` for `server` itself — that reconnect's own
     /// `McpOperationDone` reports the final connect outcome.
-    McpOAuthResult { server: String, result: Result<(), String> },
+    McpOAuthResult {
+        server: String,
+        result: Result<(), String>,
+    },
 
     /// Background fetch of the remote session list for the `/delete` picker.
     RemoteSessionsListed {
@@ -188,7 +205,10 @@ pub enum AppEvent {
         switch_to: Option<String>,
     },
     /// A background session-deletion batch finished.
-    SessionsDeleted { deleted: usize, failed: Vec<String> },
+    SessionsDeleted {
+        deleted: usize,
+        failed: Vec<String>,
+    },
 
     /// Progress/status from the semantic skill-matcher background init
     /// (first-run model download, readiness, failure). Status-line only.
@@ -206,19 +226,32 @@ pub enum AppEvent {
     // launch generation so a replaced server's late events can't clobber
     // the handle of its successor.
     /// The server task bound its listener and is accepting requests.
-    ServerStarted { generation: u64, addr: std::net::SocketAddr },
+    ServerStarted {
+        generation: u64,
+        addr: std::net::SocketAddr,
+    },
     /// The server task could not start (bind failure).
-    ServerFailed { generation: u64, error: String },
+    ServerFailed {
+        generation: u64,
+        error: String,
+    },
     /// The server's accept loop exited (shutdown request or handle drop).
-    ServerStopped { generation: u64 },
+    ServerStopped {
+        generation: u64,
+    },
     /// One access-log line from the API server. Only emitted when the
     /// server was spawned with `request_log` on (proxy mode) — the TUI
     /// never receives it.
-    ServerRequestLog { line: String },
+    ServerRequestLog {
+        line: String,
+    },
 
     /// A background provider-model refresh (startup, periodic refetch,
     /// provider add) finished — see `provider::model_cache`.
-    ProviderModelsRefreshed { summary: String, failed: usize },
+    ProviderModelsRefreshed {
+        summary: String,
+        failed: usize,
+    },
 }
 
 // Populated at the `AgentDone` send site but every current receiver
@@ -227,14 +260,20 @@ pub enum AppEvent {
 // this. Kept for future use rather than deleted in this pass. `allow`, not
 // `expect`: under `cargo test` the fields count as read (test-only paths),
 // so an `expect` is unfulfilled in that build.
-#[allow(dead_code, reason = "AgentDone payload not read by any current receiver")]
+#[allow(
+    dead_code,
+    reason = "AgentDone payload not read by any current receiver"
+)]
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     pub text: String,
     pub tool_calls: Vec<ToolCallInfo>,
 }
 
-#[expect(dead_code, reason = "AgentDone payload not read by any current receiver")]
+#[expect(
+    dead_code,
+    reason = "AgentDone payload not read by any current receiver"
+)]
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
     pub name: String,
@@ -357,7 +396,11 @@ impl OnboardingState {
 
     /// Returns the model string for the selected option.
     pub fn model_str(&self) -> &'static str {
-        if self.model_reasoner { "deepseek-reasoner" } else { "deepseek-chat" }
+        if self.model_reasoner {
+            "deepseek-reasoner"
+        } else {
+            "deepseek-chat"
+        }
     }
 
     /// Validate and return the trimmed token, or set the error and return None.
@@ -475,7 +518,11 @@ pub struct PickerItem {
 
 impl PickerItem {
     pub fn new(text: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { text: text.into(), value: value.into(), warn: false }
+        Self {
+            text: text.into(),
+            value: value.into(),
+            warn: false,
+        }
     }
 
     pub fn warn(mut self, on: bool) -> Self {
@@ -532,7 +579,12 @@ impl PickerState {
         }
     }
 
-    pub fn new_with_kind(title: impl Into<String>, items: Vec<PickerItem>, mode: PickerMode, kind: PickerKind) -> Self {
+    pub fn new_with_kind(
+        title: impl Into<String>,
+        items: Vec<PickerItem>,
+        mode: PickerMode,
+        kind: PickerKind,
+    ) -> Self {
         let all_items = items.clone();
         Self {
             title: title.into(),
@@ -550,7 +602,9 @@ impl PickerState {
 
     pub fn sync_checked(&mut self) {
         let set: HashSet<&str> = self.persistent_checked.iter().map(|s| s.as_str()).collect();
-        self.checked = self.items.iter()
+        self.checked = self
+            .items
+            .iter()
             .enumerate()
             .filter(|(_, item)| set.contains(item.value.as_str()))
             .map(|(i, _)| i)
@@ -563,7 +617,9 @@ impl PickerState {
         if q.is_empty() {
             self.items = self.all_items.clone();
         } else {
-            self.items = self.all_items.iter()
+            self.items = self
+                .all_items
+                .iter()
                 .filter(|item| item.text.to_lowercase().contains(&q))
                 .cloned()
                 .collect();
@@ -589,47 +645,43 @@ pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCod
     const VISIBLE: usize = 12;
     match key {
         crossterm::event::KeyCode::Esc => PickerAction::Cancelled,
-        crossterm::event::KeyCode::Enter => {
-            match picker.mode {
-                PickerMode::Single => {
-                    if !picker.items.is_empty() {
-                        PickerAction::Selected(vec![picker.cursor])
-                    } else {
-                        PickerAction::Cancelled
-                    }
-                }
-                PickerMode::Multi => {
-                    let mut sel = picker.checked.clone();
-                    sel.sort();
-                    sel.dedup();
-                    PickerAction::Selected(sel)
+        crossterm::event::KeyCode::Enter => match picker.mode {
+            PickerMode::Single => {
+                if !picker.items.is_empty() {
+                    PickerAction::Selected(vec![picker.cursor])
+                } else {
+                    PickerAction::Cancelled
                 }
             }
-        }
-        crossterm::event::KeyCode::Char(' ') => {
-            match picker.mode {
-                PickerMode::Single => {
-                    if !picker.items.is_empty() {
-                        PickerAction::Selected(vec![picker.cursor])
-                    } else {
-                        PickerAction::None
-                    }
-                }
-                PickerMode::Multi => {
-                    let pos = picker.cursor;
-                    if let Some(item) = picker.items.get(pos) {
-                        let v = &item.value;
-                        if let Some(p) = picker.persistent_checked.iter().position(|x| x == v) {
-                            picker.persistent_checked.remove(p);
-                        } else {
-                            picker.persistent_checked.push(v.clone());
-                        }
-                    }
-                    picker.sync_checked();
+            PickerMode::Multi => {
+                let mut sel = picker.checked.clone();
+                sel.sort();
+                sel.dedup();
+                PickerAction::Selected(sel)
+            }
+        },
+        crossterm::event::KeyCode::Char(' ') => match picker.mode {
+            PickerMode::Single => {
+                if !picker.items.is_empty() {
+                    PickerAction::Selected(vec![picker.cursor])
+                } else {
                     PickerAction::None
                 }
             }
-        }
+            PickerMode::Multi => {
+                let pos = picker.cursor;
+                if let Some(item) = picker.items.get(pos) {
+                    let v = &item.value;
+                    if let Some(p) = picker.persistent_checked.iter().position(|x| x == v) {
+                        picker.persistent_checked.remove(p);
+                    } else {
+                        picker.persistent_checked.push(v.clone());
+                    }
+                }
+                picker.sync_checked();
+                PickerAction::None
+            }
+        },
         crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
             picker.cursor = picker.cursor.saturating_sub(1);
             if picker.cursor < picker.scroll_offset {
@@ -683,10 +735,30 @@ pub struct ConfirmLine {
 }
 
 impl ConfirmLine {
-    pub fn normal(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Normal } }
-    pub fn soft(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Soft } }
-    pub fn dim(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Dim } }
-    pub fn danger(text: impl Into<String>) -> Self { Self { text: text.into(), kind: ConfirmLineKind::Danger } }
+    pub fn normal(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ConfirmLineKind::Normal,
+        }
+    }
+    pub fn soft(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ConfirmLineKind::Soft,
+        }
+    }
+    pub fn dim(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ConfirmLineKind::Dim,
+        }
+    }
+    pub fn danger(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ConfirmLineKind::Danger,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -713,9 +785,13 @@ impl ConfirmState {
             title: "Wipe all local data".to_string(),
             lines: vec![
                 ConfirmLine::normal("This deletes ALL Pooprusteek data on this machine:"),
-                ConfirmLine::soft("  config.toml (incl. token) \u{00B7} sessions/ \u{00B7} history.json"),
+                ConfirmLine::soft(
+                    "  config.toml (incl. token) \u{00B7} sessions/ \u{00B7} history.json",
+                ),
                 ConfirmLine::soft("  mcp.json \u{00B7} whitelist.json"),
-                ConfirmLine::dim("Foreign configs (.claude, .cursor, VS Code\u{2026}) are not touched."),
+                ConfirmLine::dim(
+                    "Foreign configs (.claude, .cursor, VS Code\u{2026}) are not touched.",
+                ),
                 ConfirmLine::danger("This action is irreversible."),
             ],
             action: ConfirmAction::Wipe,
@@ -901,7 +977,10 @@ impl DeleteSessionsState {
 pub enum DeleteAction {
     None,
     Close,
-    Execute { ids: Vec<String>, scope: SessionScope },
+    Execute {
+        ids: Vec<String>,
+        scope: SessionScope,
+    },
 }
 
 pub fn handle_delete_sessions_key(
@@ -945,9 +1024,10 @@ pub fn handle_delete_sessions_key(
             }
             KeyCode::Char(' ') => {
                 if let Some(id) = state.visible().get(state.cursor).map(|e| e.id.clone())
-                    && !state.checked.remove(&id) {
-                        state.checked.insert(id);
-                    }
+                    && !state.checked.remove(&id)
+                {
+                    state.checked.insert(id);
+                }
                 DeleteAction::None
             }
             KeyCode::Tab | KeyCode::Right => {
@@ -991,13 +1071,18 @@ pub fn handle_delete_sessions_key(
     }
 }
 
-pub fn handle_question_key(qs: &mut QuestionState, key: crossterm::event::KeyCode) -> Option<String> {
+pub fn handle_question_key(
+    qs: &mut QuestionState,
+    key: crossterm::event::KeyCode,
+) -> Option<String> {
     match qs.options.is_empty() {
         true => match key {
-            crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') | crossterm::event::KeyCode::Enter =>
-                Some("yes".to_string()),
-            crossterm::event::KeyCode::Char('n') | crossterm::event::KeyCode::Char('N') | crossterm::event::KeyCode::Esc =>
-                Some("no".to_string()),
+            crossterm::event::KeyCode::Char('y')
+            | crossterm::event::KeyCode::Char('Y')
+            | crossterm::event::KeyCode::Enter => Some("yes".to_string()),
+            crossterm::event::KeyCode::Char('n')
+            | crossterm::event::KeyCode::Char('N')
+            | crossterm::event::KeyCode::Esc => Some("no".to_string()),
             _ => None,
         },
         false => {
@@ -1011,12 +1096,18 @@ pub fn handle_question_key(qs: &mut QuestionState, key: crossterm::event::KeyCod
                     }
                     crossterm::event::KeyCode::Enter => {
                         let trimmed = qs.custom_input.trim().to_string();
-                        if trimmed.is_empty() { None } else { Some(trimmed) }
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
                     }
                     crossterm::event::KeyCode::Backspace => {
                         if qs.custom_cursor > 0 {
                             qs.custom_cursor -= 1;
-                            let byte_pos = qs.custom_input.char_indices()
+                            let byte_pos = qs
+                                .custom_input
+                                .char_indices()
                                 .nth(qs.custom_cursor)
                                 .map(|(i, _)| i)
                                 .unwrap_or(qs.custom_input.len());
@@ -1025,7 +1116,9 @@ pub fn handle_question_key(qs: &mut QuestionState, key: crossterm::event::KeyCod
                         None
                     }
                     crossterm::event::KeyCode::Delete => {
-                        let byte_pos = qs.custom_input.char_indices()
+                        let byte_pos = qs
+                            .custom_input
+                            .char_indices()
                             .nth(qs.custom_cursor)
                             .map(|(i, _)| i)
                             .unwrap_or(qs.custom_input.len());
@@ -1043,10 +1136,18 @@ pub fn handle_question_key(qs: &mut QuestionState, key: crossterm::event::KeyCod
                         qs.custom_cursor = (qs.custom_cursor + 1).min(max);
                         None
                     }
-                    crossterm::event::KeyCode::Home => { qs.custom_cursor = 0; None }
-                    crossterm::event::KeyCode::End => { qs.custom_cursor = qs.custom_input.chars().count(); None }
+                    crossterm::event::KeyCode::Home => {
+                        qs.custom_cursor = 0;
+                        None
+                    }
+                    crossterm::event::KeyCode::End => {
+                        qs.custom_cursor = qs.custom_input.chars().count();
+                        None
+                    }
                     crossterm::event::KeyCode::Char(c) => {
-                        let byte_pos = qs.custom_input.char_indices()
+                        let byte_pos = qs
+                            .custom_input
+                            .char_indices()
                             .nth(qs.custom_cursor)
                             .map(|(i, _)| i)
                             .unwrap_or(qs.custom_input.len());
@@ -1069,8 +1170,16 @@ pub fn handle_question_key(qs: &mut QuestionState, key: crossterm::event::KeyCod
                         qs.update_scroll();
                         None
                     }
-                    crossterm::event::KeyCode::Home => { qs.selected = 0; qs.update_scroll(); None }
-                    crossterm::event::KeyCode::End => { qs.selected = qs.options.len().saturating_sub(1); qs.update_scroll(); None }
+                    crossterm::event::KeyCode::Home => {
+                        qs.selected = 0;
+                        qs.update_scroll();
+                        None
+                    }
+                    crossterm::event::KeyCode::End => {
+                        qs.selected = qs.options.len().saturating_sub(1);
+                        qs.update_scroll();
+                        None
+                    }
                     crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char(' ') => {
                         if qs.allow_custom && qs.selected >= qs.options.len().saturating_sub(1) {
                             qs.is_custom_mode = true;
@@ -1117,7 +1226,11 @@ mod delete_picker_tests {
 
     fn state(filter: SessionScope) -> DeleteSessionsState {
         DeleteSessionsState::new(
-            vec![entry("both", true, true), entry("loc", true, false), entry("rem", false, true)],
+            vec![
+                entry("both", true, true),
+                entry("loc", true, false),
+                entry("rem", false, true),
+            ],
             filter,
             RemoteListStatus::Ready,
         )
@@ -1128,16 +1241,31 @@ mod delete_picker_tests {
         let mut s = state(SessionScope::All);
         assert_eq!(s.visible().len(), 3);
         s.filter = SessionScope::Local;
-        assert_eq!(s.visible().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["both", "loc"]);
+        assert_eq!(
+            s.visible()
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["both", "loc"]
+        );
         s.filter = SessionScope::Remote;
-        assert_eq!(s.visible().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["both", "rem"]);
+        assert_eq!(
+            s.visible()
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["both", "rem"]
+        );
     }
 
     #[test]
     fn tab_cycles_filter_and_resets_cursor() {
         let mut s = state(SessionScope::All);
         s.cursor = 2;
-        assert_eq!(handle_delete_sessions_key(&mut s, KeyCode::Tab), DeleteAction::None);
+        assert_eq!(
+            handle_delete_sessions_key(&mut s, KeyCode::Tab),
+            DeleteAction::None
+        );
         assert_eq!(s.filter, SessionScope::Local);
         assert_eq!(s.cursor, 0);
         handle_delete_sessions_key(&mut s, KeyCode::Tab);
@@ -1167,7 +1295,10 @@ mod delete_picker_tests {
         let action = handle_delete_sessions_key(&mut s, KeyCode::Enter);
         assert_eq!(
             action,
-            DeleteAction::Execute { ids: vec!["both".to_string()], scope: SessionScope::Remote }
+            DeleteAction::Execute {
+                ids: vec!["both".to_string()],
+                scope: SessionScope::Remote
+            }
         );
     }
 
@@ -1184,7 +1315,10 @@ mod delete_picker_tests {
         let mut s = state(SessionScope::All);
         handle_delete_sessions_key(&mut s, KeyCode::Enter);
         assert_eq!(s.stage, DeleteStage::Confirming);
-        assert_eq!(handle_delete_sessions_key(&mut s, KeyCode::Char('n')), DeleteAction::None);
+        assert_eq!(
+            handle_delete_sessions_key(&mut s, KeyCode::Char('n')),
+            DeleteAction::None
+        );
         assert_eq!(s.stage, DeleteStage::Selecting);
         assert!(s.confirm_ids.is_empty());
     }
@@ -1193,7 +1327,9 @@ mod delete_picker_tests {
     fn select_all_toggles_within_filter_view() {
         let mut s = state(SessionScope::Local);
         handle_delete_sessions_key(&mut s, KeyCode::Char('a'));
-        assert!(s.checked.contains("both") && s.checked.contains("loc") && !s.checked.contains("rem"));
+        assert!(
+            s.checked.contains("both") && s.checked.contains("loc") && !s.checked.contains("rem")
+        );
         handle_delete_sessions_key(&mut s, KeyCode::Char('a'));
         assert!(s.checked.is_empty());
     }
@@ -1201,7 +1337,10 @@ mod delete_picker_tests {
     #[test]
     fn merge_remote_marks_existing_and_appends_new() {
         let mut s = DeleteSessionsState::new(
-            vec![entry("shared", true, false), entry("local-only", true, false)],
+            vec![
+                entry("shared", true, false),
+                entry("local-only", true, false),
+            ],
             SessionScope::All,
             RemoteListStatus::Loading,
         );
@@ -1228,7 +1367,10 @@ mod delete_picker_tests {
     #[test]
     fn escape_closes_from_selecting() {
         let mut s = state(SessionScope::All);
-        assert_eq!(handle_delete_sessions_key(&mut s, KeyCode::Esc), DeleteAction::Close);
+        assert_eq!(
+            handle_delete_sessions_key(&mut s, KeyCode::Esc),
+            DeleteAction::Close
+        );
     }
 }
 

@@ -199,9 +199,7 @@ pub fn save_local(session: &Session, _config: &Config) -> AppResult<()> {
 pub fn derive_title(messages: &[ChatMessage]) -> String {
     for msg in messages.iter().rev() {
         let text = match msg.role {
-            crate::provider::Role::User | crate::provider::Role::Assistant => {
-                msg.visible_content()
-            }
+            crate::provider::Role::User | crate::provider::Role::Assistant => msg.visible_content(),
             _ => continue,
         };
         let trimmed = text.trim();
@@ -292,8 +290,14 @@ mod tests {
 
         let err = result.expect_err("session with a newer version must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains(&future_version.to_string()), "error should mention the file's version: {msg}");
-        assert!(msg.contains(&SESSION_VERSION.to_string()), "error should mention the expected version: {msg}");
+        assert!(
+            msg.contains(&future_version.to_string()),
+            "error should mention the file's version: {msg}"
+        );
+        assert!(
+            msg.contains(&SESSION_VERSION.to_string()),
+            "error should mention the expected version: {msg}"
+        );
     }
 
     #[test]
@@ -357,6 +361,9 @@ mod tests {
 
         // A single corrupt file must not fail the whole listing — it should
         // be skipped (and, per session.rs, warned about via tracing).
-        assert!(result.is_ok(), "list_sessions should not error on a corrupt file: {result:?}");
+        assert!(
+            result.is_ok(),
+            "list_sessions should not error on a corrupt file: {result:?}"
+        );
     }
 }

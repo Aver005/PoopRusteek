@@ -39,7 +39,9 @@ impl GenerationState {
     /// Take the elapsed seconds since [`begin`](Self::begin), clearing the
     /// timer. Returns `None` if no generation was in progress.
     pub fn take_elapsed(&mut self) -> Option<f64> {
-        self.start_time.take().map(|start| start.elapsed().as_secs_f64())
+        self.start_time
+            .take()
+            .map(|start| start.elapsed().as_secs_f64())
     }
 }
 

@@ -163,7 +163,15 @@ impl SemanticService {
                 }
                 this_blocking.rebuild_mcp_corpus();
                 this_blocking.backfill_history();
-                Ok::<usize, String>(this_blocking.inner.lock().unwrap().skills.as_ref().map_or(0, SkillCorpus::len))
+                Ok::<usize, String>(
+                    this_blocking
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .skills
+                        .as_ref()
+                        .map_or(0, SkillCorpus::len),
+                )
             })
             .await;
 
@@ -271,8 +279,14 @@ impl SemanticService {
             mcp_indexed: inner.mcp.as_ref().map_or(0, McpCorpus::len),
             mcp_known: inner.raw_mcp.len(),
             deferred: self.mcp_deferred.load(Ordering::Relaxed),
-            history_chunks: inner.history.as_ref().map_or(0, history::HistoryStore::record_count),
-            history_sessions: inner.history.as_ref().map_or(0, history::HistoryStore::session_count),
+            history_chunks: inner
+                .history
+                .as_ref()
+                .map_or(0, history::HistoryStore::record_count),
+            history_sessions: inner
+                .history
+                .as_ref()
+                .map_or(0, history::HistoryStore::session_count),
         })
     }
 
@@ -337,7 +351,9 @@ impl SemanticService {
         for summary in &summaries {
             {
                 let inner = self.inner.lock().unwrap();
-                let Some(store) = inner.history.as_ref() else { return };
+                let Some(store) = inner.history.as_ref() else {
+                    return;
+                };
                 if store.watermark(&summary.id) == summary.message_count {
                     continue;
                 }
@@ -348,8 +364,12 @@ impl SemanticService {
                 continue;
             };
             let mut inner = self.inner.lock().unwrap();
-            let Inner { embedder, history, .. } = &mut *inner;
-            let (Some(emb), Some(store)) = (embedder, history) else { return };
+            let Inner {
+                embedder, history, ..
+            } = &mut *inner;
+            let (Some(emb), Some(store)) = (embedder, history) else {
+                return;
+            };
             match store.index_session(emb, &session.id, &summary.title, &session.messages) {
                 Ok(0) => {}
                 Ok(n) => {
@@ -382,8 +402,12 @@ impl SemanticService {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let mut inner = this.inner.lock().unwrap();
-            let Inner { embedder, history, .. } = &mut *inner;
-            let (Some(emb), Some(store)) = (embedder, history) else { return };
+            let Inner {
+                embedder, history, ..
+            } = &mut *inner;
+            let (Some(emb), Some(store)) = (embedder, history) else {
+                return;
+            };
             if let Err(e) = store.index_session(emb, &session_id, &title, &messages) {
                 tracing::warn!("semantic: indexing session {session_id} failed: {e}");
             }
@@ -398,7 +422,9 @@ impl SemanticService {
             return Vec::new();
         }
         let mut inner = self.inner.lock().unwrap();
-        let Inner { embedder, history, .. } = &mut *inner;
+        let Inner {
+            embedder, history, ..
+        } = &mut *inner;
         let (Some(emb), Some(store)) = (embedder, history) else {
             return Vec::new();
         };
@@ -418,7 +444,12 @@ impl SemanticService {
     /// goes out without a hint.
     fn rebuild_mcp_corpus(&self) {
         let mut inner = self.inner.lock().unwrap();
-        let Inner { embedder, mcp, raw_mcp, .. } = &mut *inner;
+        let Inner {
+            embedder,
+            mcp,
+            raw_mcp,
+            ..
+        } = &mut *inner;
         let Some(emb) = embedder else { return };
         if raw_mcp.is_empty() {
             *mcp = None;
@@ -448,7 +479,12 @@ impl SemanticService {
             tracing::debug!("semantic: hint skipped — index lock busy (indexing in progress)");
             return PromptMatches::default();
         };
-        let Inner { embedder, skills, mcp, .. } = &mut *inner;
+        let Inner {
+            embedder,
+            skills,
+            mcp,
+            ..
+        } = &mut *inner;
         let Some(emb) = embedder else {
             return PromptMatches::default();
         };
@@ -481,7 +517,12 @@ impl SemanticService {
     /// `spawn_blocking`.
     pub fn search_tools(&self, query: &str, limit: usize) -> Vec<McpToolMatch> {
         let mut inner = self.inner.lock().unwrap();
-        let Inner { embedder, mcp, raw_mcp, .. } = &mut *inner;
+        let Inner {
+            embedder,
+            mcp,
+            raw_mcp,
+            ..
+        } = &mut *inner;
 
         // Semantic path only while enabled — `/rag off` means off; the
         // lexical fallback below stays as the dumb-but-working baseline.
@@ -506,7 +547,10 @@ impl SemanticService {
             .iter()
             .map(|t| {
                 let haystack = format!("{} {}", t.full_name, t.tool.description).to_lowercase();
-                let hits = needles.iter().filter(|n| haystack.contains(n.as_str())).count();
+                let hits = needles
+                    .iter()
+                    .filter(|n| haystack.contains(n.as_str()))
+                    .count();
                 (hits, t)
             })
             .filter(|(hits, _)| *hits > 0)
@@ -534,8 +578,7 @@ impl SemanticService {
         if matches.is_empty() {
             return None;
         }
-        let mut lines =
-            vec!["[Hint — automatic semantic match, may be irrelevant]".to_string()];
+        let mut lines = vec!["[Hint — automatic semantic match, may be irrelevant]".to_string()];
         if !matches.skills.is_empty() {
             lines.push("Skills that may apply to the user's request:".to_string());
             for m in &matches.skills {
@@ -566,7 +609,6 @@ impl SemanticService {
     }
 }
 
-
 #[cfg(test)]
 mod lock_tests {
     use super::*;
@@ -590,7 +632,10 @@ mod lock_tests {
         let service = enabled_service_without_init();
         let guard = service.inner.lock().unwrap();
 
-        assert!(service.status().is_none(), "status must decline while the lock is held");
+        assert!(
+            service.status().is_none(),
+            "status must decline while the lock is held"
+        );
 
         let start = Instant::now();
         let matches = service.match_prompt("anything");
@@ -603,6 +648,9 @@ mod lock_tests {
 
         drop(guard);
         let status = service.status().expect("status once the lock is free");
-        assert!(!status.ready, "no embedder was ever initialized in this test");
+        assert!(
+            !status.ready,
+            "no embedder was ever initialized in this test"
+        );
     }
 }

@@ -6,14 +6,14 @@
 //! than recomputed on every redraw. See [`MSG_CACHE`] for the cache design.
 
 use crate::app::AppState;
-use crate::provider::{estimate_tokens, ChatMessage, Role};
+use crate::provider::{ChatMessage, Role, estimate_tokens};
 use crate::tui::theme::Theme;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
-    Frame,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -90,7 +90,11 @@ thread_local! {
 /// panel. Falls back to computing directly (and populating the cache) on a
 /// miss, so callers don't need `msg` to have already gone through
 /// [`render_assistant_cached`].
-pub(crate) fn cached_token_estimate(conversation_id: u64, message_index: usize, msg: &ChatMessage) -> u32 {
+pub(crate) fn cached_token_estimate(
+    conversation_id: u64,
+    message_index: usize,
+    msg: &ChatMessage,
+) -> u32 {
     let content = msg.visible_content();
     let key = (conversation_id, message_index, content.len());
     let fp = fingerprint(content);
@@ -98,13 +102,16 @@ pub(crate) fn cached_token_estimate(conversation_id: u64, message_index: usize, 
     TOKEN_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some((tokens, cached_fp)) = cache.get(&key)
-            && *cached_fp == fp {
-                return *tokens;
-            }
+            && *cached_fp == fp
+        {
+            return *tokens;
+        }
         if cache.len() > MAX_CACHE_ENTRIES {
             cache.clear();
         }
-        let tokens = msg.total_tokens.unwrap_or_else(|| estimate_tokens(&msg.content));
+        let tokens = msg
+            .total_tokens
+            .unwrap_or_else(|| estimate_tokens(&msg.content));
         cache.insert(key, (tokens, fp));
         tokens
     })
@@ -200,9 +207,10 @@ fn with_assistant_cached<R>(
         let mut cache = cache.borrow_mut();
 
         if let Some(cached) = cache.get(&key)
-            && cached.fingerprint == fp {
-                return f(cached, token_estimate);
-            }
+            && cached.fingerprint == fp
+        {
+            return f(cached, token_estimate);
+        }
 
         if cache.len() > MAX_CACHE_ENTRIES {
             cache.clear();
@@ -222,12 +230,15 @@ fn with_assistant_cached<R>(
         // Plain `insert`, not `entry().or_insert()` — a fingerprint
         // mismatch above means the existing entry is stale for this slot
         // and must be replaced, not kept.
-        cache.insert(key, CachedMsg {
-            lines: rendered_lines,
-            wrapped_rows,
-            meta_rows,
-            fingerprint: fp,
-        });
+        cache.insert(
+            key,
+            CachedMsg {
+                lines: rendered_lines,
+                wrapped_rows,
+                meta_rows,
+                fingerprint: fp,
+            },
+        );
         let entry = cache.get(&key).expect("entry inserted just above");
         f(entry, token_estimate)
     })
@@ -272,10 +283,7 @@ fn build_segment_lines(
             // markdown path is `with_assistant_cached`.
             lines.push(Line::from(vec![
                 assistant_header(msg, theme),
-                Span::styled(
-                    " Thinking...",
-                    Style::default().fg(theme.text_dim),
-                ),
+                Span::styled(" Thinking...", Style::default().fg(theme.text_dim)),
             ]));
         }
         Role::System => {
@@ -295,10 +303,7 @@ fn build_segment_lines(
                 for (i, line_text) in body_lines.iter().enumerate() {
                     let prefix = if i == 0 { " \u{2139} " } else { "   " };
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            prefix,
-                            Style::default().fg(theme.warning).bg(theme.bg),
-                        ),
+                        Span::styled(prefix, Style::default().fg(theme.warning).bg(theme.bg)),
                         Span::styled(
                             (*line_text).to_string(),
                             Style::default().fg(theme.text_dim).bg(theme.bg),
@@ -309,8 +314,16 @@ fn build_segment_lines(
         }
         Role::Tool => {
             let tool_name = msg.name.as_deref().unwrap_or("unknown");
-            let icon = if msg.tool_error { "\u{2717}" } else { "\u{2713}" };
-            let status_color = if msg.tool_error { theme.error } else { theme.success };
+            let icon = if msg.tool_error {
+                "\u{2717}"
+            } else {
+                "\u{2713}"
+            };
+            let status_color = if msg.tool_error {
+                theme.error
+            } else {
+                theme.success
+            };
 
             lines.push(Line::from(vec![
                 Span::styled(
@@ -324,7 +337,11 @@ fn build_segment_lines(
                     format!(" {tool_name} "),
                     Style::default()
                         .fg(theme.bg)
-                        .bg(if msg.tool_error { theme.error } else { theme.accent })
+                        .bg(if msg.tool_error {
+                            theme.error
+                        } else {
+                            theme.accent
+                        })
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -336,12 +353,10 @@ fn build_segment_lines(
             let body = msg.visible_content();
             let body_lines: Vec<&str> = body.lines().collect();
             if body_lines.iter().all(|l| l.trim().is_empty()) {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "  (no output)",
-                        Style::default().fg(theme.text_dim).bg(theme.tool_bg),
-                    ),
-                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    "  (no output)",
+                    Style::default().fg(theme.text_dim).bg(theme.tool_bg),
+                )]));
             } else {
                 for line_text in &body_lines {
                     lines.push(Line::from(vec![
@@ -352,7 +367,11 @@ fn build_segment_lines(
                         Span::styled(
                             (*line_text).to_string(),
                             Style::default()
-                                .fg(if msg.tool_error { theme.error } else { theme.text_soft })
+                                .fg(if msg.tool_error {
+                                    theme.error
+                                } else {
+                                    theme.text_soft
+                                })
                                 .bg(theme.tool_bg),
                         ),
                     ]));
@@ -403,9 +422,14 @@ fn message_rows(
     theme: &Theme,
 ) -> usize {
     if is_markdown_assistant(msg) {
-        return with_assistant_cached(conversation_id, index, msg, wrap_width, theme, |cached, _| {
-            1 + cached.wrapped_rows + cached.meta_rows + 1
-        });
+        return with_assistant_cached(
+            conversation_id,
+            index,
+            msg,
+            wrap_width,
+            theme,
+            |cached, _| 1 + cached.wrapped_rows + cached.meta_rows + 1,
+        );
     }
 
     let content = msg.visible_content();
@@ -420,9 +444,10 @@ fn message_rows(
     ROWS_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some((cached_fp, rows)) = cache.get(&key)
-            && *cached_fp == fp {
-                return *rows;
-            }
+            && *cached_fp == fp
+        {
+            return *rows;
+        }
         if cache.len() > MAX_CACHE_ENTRIES {
             cache.clear();
         }
@@ -478,10 +503,14 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
 
         if is_markdown_assistant(msg) {
-            let (md_lines, tokens) =
-                with_assistant_cached(conversation_id, index, msg, wrap_width, theme, |cached, tokens| {
-                    (cached.lines.clone(), tokens)
-                });
+            let (md_lines, tokens) = with_assistant_cached(
+                conversation_id,
+                index,
+                msg,
+                wrap_width,
+                theme,
+                |cached, tokens| (cached.lines.clone(), tokens),
+            );
             lines.push(Line::from(vec![assistant_header(msg, theme)]));
             lines.extend(md_lines);
             lines.push(meta_line(msg, tokens, theme));
@@ -555,7 +584,10 @@ mod tests {
         // A single word longer than the width must still produce >1 row.
         let lines = vec![Line::from("supercalifragilisticexpialidocious")];
         let rows = wrapped_row_count(lines, 10);
-        assert!(rows > 1, "expected long word to force-break, got {rows} rows");
+        assert!(
+            rows > 1,
+            "expected long word to force-break, got {rows} rows"
+        );
     }
 
     #[test]
@@ -591,7 +623,10 @@ mod tests {
     #[test]
     fn cached_token_estimate_falls_back_to_estimate_when_absent() {
         let msg = ChatMessage::user("hello world");
-        assert_eq!(cached_token_estimate(999_002, 0, &msg), estimate_tokens(&msg.content));
+        assert_eq!(
+            cached_token_estimate(999_002, 0, &msg),
+            estimate_tokens(&msg.content)
+        );
     }
 
     /// Manual perf probe: `cargo test --release --bin pooprusteek
@@ -601,7 +636,7 @@ mod tests {
     #[test]
     #[ignore = "manual perf probe, prints timings"]
     fn render_chat_perf_probe() {
-        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui::{Terminal, backend::TestBackend};
 
         let theme = Theme::default_dark();
         let mut state = AppState {
@@ -632,15 +667,21 @@ mod tests {
         };
 
         for i in 0..100 {
-            state.focused_mut().messages.push(ChatMessage::user(&format!(
-                "question number {i}: how do I make this considerably faster please?"
-            )));
+            state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::user(&format!(
+                    "question number {i}: how do I make this considerably faster please?"
+                )));
             state.focused_mut().messages.push(ChatMessage::assistant(&format!(
                 "Answer {i} with some prose that wraps.\n\n```rust\nfn main() {{\n    println!(\"case {i}\");\n}}\n```\n\nAnd a closing paragraph with **bold** and `inline code` to exercise markdown."
             )));
-            state.focused_mut().messages.push(ChatMessage::system(&format!(
-                "system note {i}\nsecond line of the note"
-            )));
+            state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::system(&format!(
+                    "system note {i}\nsecond line of the note"
+                )));
         }
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();

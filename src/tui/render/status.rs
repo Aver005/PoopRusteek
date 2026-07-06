@@ -6,11 +6,11 @@ use crate::app::AppState;
 use crate::config::Config;
 use crate::tui::theme::Theme;
 use crate::tui::view_model;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 pub(super) fn render_separator(frame: &mut Frame, area: Rect, theme: &Theme) {
     let line = "─".repeat(area.width as usize);
@@ -34,7 +34,13 @@ pub(super) fn render_input_border(frame: &mut Frame, area: Rect, theme: &Theme) 
     );
 }
 
-pub(super) fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState, config: &Config, theme: &Theme) {
+pub(super) fn render_mini_status(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    config: &Config,
+    theme: &Theme,
+) {
     let provider_name = provider_label(config);
     let model = config.active_model();
     let msg_count = state.focused().messages.len();
@@ -92,38 +98,68 @@ pub(super) fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState
         String::new()
     };
     let goal_tag = if state.goal.mode {
-        format!(" GOAL:{} ", match state.goal.stage {
-            crate::app::events::GoalStage::Inactive => "standby",
-            crate::app::events::GoalStage::WaitForGoal => "need-goal",
-            crate::app::events::GoalStage::RunAgent1 => "build",
-            crate::app::events::GoalStage::RunEvaluator => "eval",
-            crate::app::events::GoalStage::Done => "done",
-        })
+        format!(
+            " GOAL:{} ",
+            match state.goal.stage {
+                crate::app::events::GoalStage::Inactive => "standby",
+                crate::app::events::GoalStage::WaitForGoal => "need-goal",
+                crate::app::events::GoalStage::RunAgent1 => "build",
+                crate::app::events::GoalStage::RunEvaluator => "eval",
+                crate::app::events::GoalStage::Done => "done",
+            }
+        )
     } else {
         String::new()
     };
-    let left = format!(" {}{} · {}{}{}{}{}{} ", goal_tag, provider_name, model, model_tag, mcp_status, bg_status, btw_status, chats_status);
+    let left = format!(
+        " {}{} · {}{}{}{}{}{} ",
+        goal_tag, provider_name, model, model_tag, mcp_status, bg_status, btw_status, chats_status
+    );
 
-    let status_tag = state.focused().generation.last_status.as_deref().unwrap_or("");
+    let status_tag = state
+        .focused()
+        .generation
+        .last_status
+        .as_deref()
+        .unwrap_or("");
 
     let center = if state.focused().generation.active {
-
         if let Some(start) = state.focused().generation.start_time {
             let elapsed = start.elapsed().as_secs_f64();
             let tps = view_model::tokens_per_sec(state.focused().generation.last_tokens, elapsed);
-            format!(" {} {} ", view_model::spinner_char(state.focused().generation.animation_tick), state.status_message)
-                + &format!("({} tok, {:.1}s, {:.0} t/s)", state.focused().generation.last_tokens, elapsed, tps)
+            format!(
+                " {} {} ",
+                view_model::spinner_char(state.focused().generation.animation_tick),
+                state.status_message
+            ) + &format!(
+                "({} tok, {:.1}s, {:.0} t/s)",
+                state.focused().generation.last_tokens,
+                elapsed,
+                tps
+            )
         } else {
-            format!(" {} {} ", view_model::spinner_char(state.focused().generation.animation_tick), state.status_message)
+            format!(
+                " {} {} ",
+                view_model::spinner_char(state.focused().generation.animation_tick),
+                state.status_message
+            )
         }
     } else {
         let mut parts = vec![state.status_message.clone()];
         if !status_tag.is_empty() {
             parts.push(status_tag.to_string());
         }
-        let tps = view_model::tokens_per_sec(state.focused().generation.last_tokens, state.focused().generation.last_duration_secs);
+        let tps = view_model::tokens_per_sec(
+            state.focused().generation.last_tokens,
+            state.focused().generation.last_duration_secs,
+        );
         if tps > 0.0 {
-            parts.push(format!("{} tok in {:.1}s ({:.0} t/s)", state.focused().generation.last_tokens, state.focused().generation.last_duration_secs, tps));
+            parts.push(format!(
+                "{} tok in {:.1}s ({:.0} t/s)",
+                state.focused().generation.last_tokens,
+                state.focused().generation.last_duration_secs,
+                tps
+            ));
         }
         format!(" {} ", parts.join(" · "))
     };
@@ -140,8 +176,14 @@ pub(super) fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState
     } else {
         String::new()
     };
-    let session_prefix = format!(" {}", view_model::session_prefix(&state.focused().session_id));
-    let right = format!("{} msgs:{} tot:{} | {} ", goal_tag, msg_count, total_tokens, session_prefix);
+    let session_prefix = format!(
+        " {}",
+        view_model::session_prefix(&state.focused().session_id)
+    );
+    let right = format!(
+        "{} msgs:{} tot:{} | {} ",
+        goal_tag, msg_count, total_tokens, session_prefix
+    );
 
     let gap = status_bar_gap(&left, &center, &right, area.width);
 
@@ -152,16 +194,15 @@ pub(super) fn render_mini_status(frame: &mut Frame, area: Rect, state: &AppState
             Span::styled(
                 center,
                 if state.focused().generation.active {
-                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.text_dim)
                 }
                 .bg(theme.bg),
             ),
-            Span::styled(
-                right,
-                Style::default().fg(theme.text_dim).bg(theme.bg),
-            ),
+            Span::styled(right, Style::default().fg(theme.text_dim).bg(theme.bg)),
         ])),
         area,
     );

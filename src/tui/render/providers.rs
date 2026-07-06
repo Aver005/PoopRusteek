@@ -1,15 +1,19 @@
 //! The `/providers` management screen (list of the built-in DeepSeek
 //! provider + OpenAI-compatible entries) and the add-wizard modal.
 
-use super::popup::{center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line};
-use crate::app::providers::{provider_rows, ProviderAddState, ProviderWizardStep, ProvidersViewState};
+use super::popup::{
+    center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
+};
+use crate::app::providers::{
+    ProviderAddState, ProviderWizardStep, ProvidersViewState, provider_rows,
+};
 use crate::config::Config;
 use crate::tui::theme::Theme;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 pub(super) fn render_providers_view(
     frame: &mut Frame,
@@ -53,14 +57,21 @@ pub(super) fn render_providers_view(
         let selected = i == view.selected;
         let bg = if selected { theme.accent_dim } else { theme.bg };
         let marker = if row.active { " ● " } else { " ○ " };
-        let marker_color = if row.active { theme.success } else { theme.text_dim };
+        let marker_color = if row.active {
+            theme.success
+        } else {
+            theme.text_dim
+        };
 
         let line = Line::from(vec![
             Span::styled(marker, Style::default().fg(marker_color).bg(bg)),
             Span::styled(
                 format!("{:<16} ", row.name),
                 if selected {
-                    Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.fg).bg(bg)
                 },
@@ -69,7 +80,10 @@ pub(super) fn render_providers_view(
                 format!("{:<18} ", format!("[{}]", row.tag)),
                 Style::default().fg(theme.accent_soft).bg(bg),
             ),
-            Span::styled(row.detail.clone(), Style::default().fg(theme.text_dim).bg(bg)),
+            Span::styled(
+                row.detail.clone(),
+                Style::default().fg(theme.text_dim).bg(bg),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(line),
@@ -85,7 +99,12 @@ pub(super) fn render_providers_view(
                 Style::default().fg(theme.success),
             )))
             .alignment(Alignment::Center),
-            Rect::new(body.x, body.y + body.height.saturating_sub(1), body.width, 1),
+            Rect::new(
+                body.x,
+                body.y + body.height.saturating_sub(1),
+                body.width,
+                1,
+            ),
         );
     }
 
@@ -137,16 +156,27 @@ pub(super) fn render_provider_add(
     lines.push(Line::from(""));
 
     match wizard.step {
-        ProviderWizardStep::Name => {
-            push_text_box_lines(&mut lines, &wizard.name.buffer, wizard.name.cursor, theme, max_rows)
-        }
+        ProviderWizardStep::Name => push_text_box_lines(
+            &mut lines,
+            &wizard.name.buffer,
+            wizard.name.cursor,
+            theme,
+            max_rows,
+        ),
         ProviderWizardStep::Protocol => {
             for (i, protocol) in crate::app::providers::PROTOCOL_CHOICES.iter().enumerate() {
                 let is_cursor = i == wizard.protocol_selected;
                 let indicator = if is_cursor { "\u{25B6} " } else { "  " };
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().fg(theme.fg)),
-                    Span::styled(indicator, Style::default().fg(if is_cursor { theme.accent } else { theme.text_dim })),
+                    Span::styled(
+                        indicator,
+                        Style::default().fg(if is_cursor {
+                            theme.accent
+                        } else {
+                            theme.text_dim
+                        }),
+                    ),
                     Span::styled(
                         crate::app::providers::protocol_choice_label(*protocol),
                         if is_cursor {
@@ -160,20 +190,33 @@ pub(super) fn render_provider_add(
         }
         ProviderWizardStep::BaseUrl => {
             lines.push(Line::from(Span::styled(
-                format!("  {}", crate::app::providers::base_url_example(wizard.protocol())),
+                format!(
+                    "  {}",
+                    crate::app::providers::base_url_example(wizard.protocol())
+                ),
                 Style::default().fg(theme.text_dim),
             )));
             lines.push(Line::from(""));
-            push_text_box_lines(&mut lines, &wizard.base_url.buffer, wizard.base_url.cursor, theme, max_rows)
+            push_text_box_lines(
+                &mut lines,
+                &wizard.base_url.buffer,
+                wizard.base_url.cursor,
+                theme,
+                max_rows,
+            )
         }
         ProviderWizardStep::ApiKey => {
             // Mask the key like the token input — it's a secret on screen.
             let masked = "\u{2022}".repeat(wizard.api_key.buffer.chars().count());
             push_text_box_lines(&mut lines, &masked, wizard.api_key.cursor, theme, max_rows)
         }
-        ProviderWizardStep::Model => {
-            push_text_box_lines(&mut lines, &wizard.model.buffer, wizard.model.cursor, theme, max_rows)
-        }
+        ProviderWizardStep::Model => push_text_box_lines(
+            &mut lines,
+            &wizard.model.buffer,
+            wizard.model.cursor,
+            theme,
+            max_rows,
+        ),
         ProviderWizardStep::Confirm => {
             lines.push(Line::from(Span::styled(
                 format!("  Name:     {}", wizard.name.buffer.trim()),
@@ -190,7 +233,11 @@ pub(super) fn render_provider_add(
             lines.push(Line::from(Span::styled(
                 format!(
                     "  API key:  {}",
-                    if wizard.api_key.buffer.trim().is_empty() { "(none)" } else { "(set)" },
+                    if wizard.api_key.buffer.trim().is_empty() {
+                        "(none)"
+                    } else {
+                        "(set)"
+                    },
                 ),
                 Style::default().fg(theme.text_soft),
             )));
@@ -224,9 +271,15 @@ pub(super) fn render_provider_add(
 
     fill_panel_space(&mut lines, inner.height.saturating_sub(2) as usize);
     lines.push(separator_line(inner_w, theme));
-    lines.push(Line::from(Span::styled(hint, Style::default().fg(theme.text_dim))));
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(theme.text_dim),
+    )));
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(block, popup_area);
-    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.panel)), inner);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+        inner,
+    );
 }

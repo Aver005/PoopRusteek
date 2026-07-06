@@ -84,7 +84,10 @@ mod tests {
         // SSE uses blank lines as event separators; callers may rely on them.
         let mut buf = SseLineBuffer::new();
         let lines = buf.push_bytes(b"data: a\n\ndata: b\n");
-        assert_eq!(lines, vec!["data: a".to_string(), String::new(), "data: b".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["data: a".to_string(), String::new(), "data: b".to_string()]
+        );
     }
 
     #[test]

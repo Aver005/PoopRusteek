@@ -1,4 +1,4 @@
-use super::{parse_skill_content, SkillDefinition, SkillSource};
+use super::{SkillDefinition, SkillSource, parse_skill_content};
 use crate::config::Config;
 use std::path::{Path, PathBuf};
 
@@ -11,13 +11,34 @@ const SKILL_FILE_NAME: &str = "SKILL.md";
 /// `tools.prompt.md` are excluded: they are injected into the system prompt
 /// via `PromptFiles`, not exposed as skills.
 const EMBEDDED_BUILTIN_PROMPTS: &[(&str, &str)] = &[
-    ("compact.prompt.md", include_str!("../../assets/prompts/compact.prompt.md")),
-    ("figma.prompt.md", include_str!("../../assets/prompts/figma.prompt.md")),
-    ("goal-evaluator.prompt.md", include_str!("../../assets/prompts/goal-evaluator.prompt.md")),
-    ("poet.prompt.md", include_str!("../../assets/prompts/poet.prompt.md")),
-    ("refactor.prompt.md", include_str!("../../assets/prompts/refactor.prompt.md")),
-    ("review.prompt.md", include_str!("../../assets/prompts/review.prompt.md")),
-    ("role-creator.prompt.md", include_str!("../../assets/prompts/role-creator.prompt.md")),
+    (
+        "compact.prompt.md",
+        include_str!("../../assets/prompts/compact.prompt.md"),
+    ),
+    (
+        "figma.prompt.md",
+        include_str!("../../assets/prompts/figma.prompt.md"),
+    ),
+    (
+        "goal-evaluator.prompt.md",
+        include_str!("../../assets/prompts/goal-evaluator.prompt.md"),
+    ),
+    (
+        "poet.prompt.md",
+        include_str!("../../assets/prompts/poet.prompt.md"),
+    ),
+    (
+        "refactor.prompt.md",
+        include_str!("../../assets/prompts/refactor.prompt.md"),
+    ),
+    (
+        "review.prompt.md",
+        include_str!("../../assets/prompts/review.prompt.md"),
+    ),
+    (
+        "role-creator.prompt.md",
+        include_str!("../../assets/prompts/role-creator.prompt.md"),
+    ),
 ];
 
 fn home() -> Option<PathBuf> {
@@ -52,7 +73,10 @@ fn collect_skill_dirs() -> Vec<(PathBuf, SkillSource)> {
         dirs.push((h.join(".cline").join("skills"), SkillSource::Installed));
         dirs.push((h.join(".cursor").join("skills"), SkillSource::Installed));
         dirs.push((h.join(".codex").join("skills"), SkillSource::Installed));
-        dirs.push((h.join(".github").join("copilot").join("skills"), SkillSource::Installed));
+        dirs.push((
+            h.join(".github").join("copilot").join("skills"),
+            SkillSource::Installed,
+        ));
     }
 
     // ── Config-level directories ──
@@ -76,10 +100,13 @@ fn collect_skill_dirs() -> Vec<(PathBuf, SkillSource)> {
 
     // ── Built-in prompts from assets/prompts/ ──
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            dirs.push((dir.join("assets").join("prompts"), SkillSource::BuiltIn));
-        }
-    let cargo_prompts = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("prompts");
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push((dir.join("assets").join("prompts"), SkillSource::BuiltIn));
+    }
+    let cargo_prompts = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("prompts");
     if !dirs.iter().any(|(p, _)| p == &cargo_prompts) {
         dirs.push((cargo_prompts, SkillSource::BuiltIn));
     }
@@ -110,9 +137,10 @@ pub fn discover_all_skills(config_paths: &[String]) -> Vec<SkillDefinition> {
     for (filename, content) in EMBEDDED_BUILTIN_PROMPTS {
         if let Some(skill) =
             prompt_skill_from_content(filename, (*content).to_string(), SkillSource::BuiltIn)
-            && seen_slugs.insert(skill.slug.clone()) {
-                skills.push(skill);
-            }
+            && seen_slugs.insert(skill.slug.clone())
+        {
+            skills.push(skill);
+        }
     }
 
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -141,9 +169,10 @@ fn scan_directory(
             let skill_file = path.join(SKILL_FILE_NAME);
             if skill_file.exists() {
                 if let Some(skill) = load_skill_from_file(&skill_file, source, &path)
-                    && seen_slugs.insert(skill.slug.clone()) {
-                        skills.push(skill);
-                    }
+                    && seen_slugs.insert(skill.slug.clone())
+                {
+                    skills.push(skill);
+                }
                 continue;
             }
 
@@ -154,8 +183,7 @@ fn scan_directory(
                     .ok()
                     .map(|e| {
                         e.flatten().any(|child| {
-                            child.path().is_dir()
-                                && child.path().join(SKILL_FILE_NAME).exists()
+                            child.path().is_dir() && child.path().join(SKILL_FILE_NAME).exists()
                         })
                     })
                     .unwrap_or(false);
@@ -171,18 +199,23 @@ fn scan_directory(
         // by PromptFiles and injected directly into the system prompt.
         if source == SkillSource::BuiltIn
             && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.ends_with(".prompt.md")
-                    && name != SKILL_FILE_NAME
-                    && name != "base.prompt.md"
-                    && name != "tools.prompt.md"
-                    && let Some(skill) = load_prompt_file(&path, source)
-                        && seen_slugs.insert(skill.slug.clone()) {
-                            skills.push(skill);
-                        }
+            && name.ends_with(".prompt.md")
+            && name != SKILL_FILE_NAME
+            && name != "base.prompt.md"
+            && name != "tools.prompt.md"
+            && let Some(skill) = load_prompt_file(&path, source)
+            && seen_slugs.insert(skill.slug.clone())
+        {
+            skills.push(skill);
+        }
     }
 }
 
-fn load_skill_from_file(path: &Path, source: SkillSource, skill_dir: &Path) -> Option<SkillDefinition> {
+fn load_skill_from_file(
+    path: &Path,
+    source: SkillSource,
+    skill_dir: &Path,
+) -> Option<SkillDefinition> {
     let content = std::fs::read_to_string(path).ok()?;
     let frontmatter = parse_skill_content(path, &content);
 
@@ -204,7 +237,9 @@ fn load_skill_from_file(path: &Path, source: SkillSource, skill_dir: &Path) -> O
             .join(" ")
     });
 
-    let description = frontmatter.description.unwrap_or_else(|| format!("{source} skill: {name}"));
+    let description = frontmatter
+        .description
+        .unwrap_or_else(|| format!("{source} skill: {name}"));
 
     Some(SkillDefinition {
         name,
@@ -320,9 +355,12 @@ mod tests {
 
     #[test]
     fn prompt_skill_slug_and_name_derivation() {
-        let skill =
-            prompt_skill_from_content("role-creator.prompt.md", "body".into(), SkillSource::BuiltIn)
-                .expect("skill should parse");
+        let skill = prompt_skill_from_content(
+            "role-creator.prompt.md",
+            "body".into(),
+            SkillSource::BuiltIn,
+        )
+        .expect("skill should parse");
         assert_eq!(skill.slug, "role-creator");
         assert_eq!(skill.name, "Role Creator");
         assert_eq!(skill.content, "body");

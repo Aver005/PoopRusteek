@@ -45,10 +45,22 @@ mod tests {
     #[test]
     fn subcommands_map_to_the_right_actions() {
         assert!(matches!(parse(""), CommandResult::Rag(RagAction::Status)));
-        assert!(matches!(parse("status"), CommandResult::Rag(RagAction::Status)));
-        assert!(matches!(parse("on"), CommandResult::Rag(RagAction::SetEnabled(true))));
-        assert!(matches!(parse("OFF"), CommandResult::Rag(RagAction::SetEnabled(false))));
-        assert!(matches!(parse(" reload "), CommandResult::Rag(RagAction::Reload)));
+        assert!(matches!(
+            parse("status"),
+            CommandResult::Rag(RagAction::Status)
+        ));
+        assert!(matches!(
+            parse("on"),
+            CommandResult::Rag(RagAction::SetEnabled(true))
+        ));
+        assert!(matches!(
+            parse("OFF"),
+            CommandResult::Rag(RagAction::SetEnabled(false))
+        ));
+        assert!(matches!(
+            parse(" reload "),
+            CommandResult::Rag(RagAction::Reload)
+        ));
     }
 
     #[test]

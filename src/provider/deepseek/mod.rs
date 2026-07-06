@@ -26,8 +26,8 @@ use futures::StreamExt;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 use session::SessionState;
 
@@ -115,7 +115,10 @@ impl LLMProvider for DeepseekProvider {
         // The web API has no model-listing endpoint; these are the two
         // model types the completion endpoint accepts (see prompt.rs's
         // `resolve_model_type`).
-        Ok(vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()])
+        Ok(vec![
+            "deepseek-chat".to_string(),
+            "deepseek-reasoner".to_string(),
+        ])
     }
 
     async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
@@ -134,7 +137,9 @@ impl LLMProvider for DeepseekProvider {
                     let _ = self.mark_session_after_success(&session_id, parent_message_id);
                     debug_log::log(
                         "completion.collect.error",
-                        format!("stream_read_error={error} parent_message_id={parent_message_id:?}"),
+                        format!(
+                            "stream_read_error={error} parent_message_id={parent_message_id:?}"
+                        ),
                     );
                     return Err(error.into());
                 }
@@ -162,10 +167,7 @@ impl LLMProvider for DeepseekProvider {
                     let _ = self.mark_session_after_success(&session_id, parent_message_id);
                 }
                 if let Some(text) = event.text {
-                    debug_log::log(
-                        "completion.collect.chunk",
-                        format!("text_chunk={}", text),
-                    );
+                    debug_log::log("completion.collect.chunk", format!("text_chunk={}", text));
                     content.push_str(&text);
                 }
                 if event.finished {
@@ -221,7 +223,9 @@ impl LLMProvider for DeepseekProvider {
                     let _ = self.mark_session_after_success(&session_id, parent_message_id);
                     debug_log::log(
                         "completion.stream.error",
-                        format!("stream_read_error={error} parent_message_id={parent_message_id:?}"),
+                        format!(
+                            "stream_read_error={error} parent_message_id={parent_message_id:?}"
+                        ),
                     );
                     return Err(error.into());
                 }
@@ -251,10 +255,7 @@ impl LLMProvider for DeepseekProvider {
                 }
 
                 if let Some(text) = event.text {
-                    debug_log::log(
-                        "completion.stream.chunk",
-                        format!("text_chunk={}", text),
-                    );
+                    debug_log::log("completion.stream.chunk", format!("text_chunk={}", text));
                     streamed_bytes += text.len();
                     let _ = tx.send(CompletionChunk {
                         content: text,
@@ -332,16 +333,16 @@ impl LLMProvider for DeepseekProvider {
         Ok(())
     }
 
-    async fn fetch_remote_session_messages(
-        &self,
-        session_id: &str,
-    ) -> AppResult<Vec<ChatMessage>> {
+    async fn fetch_remote_session_messages(&self, session_id: &str) -> AppResult<Vec<ChatMessage>> {
         self.fetch_remote_history(session_id).await
     }
 
     fn session_identity(&self) -> Option<(String, Option<i64>)> {
         let state = self.session_state.lock().ok()?;
-        state.session_id.clone().map(|id| (id, state.parent_message_id))
+        state
+            .session_id
+            .clone()
+            .map(|id| (id, state.parent_message_id))
     }
 
     async fn session_is_alive(&self, session_id: &str) -> bool {
@@ -353,7 +354,11 @@ impl LLMProvider for DeepseekProvider {
         self.fetch_remote_history(session_id).await.is_ok()
     }
 
-    async fn adopt_session(&self, session_id: &str, parent_message_id: Option<i64>) -> AppResult<()> {
+    async fn adopt_session(
+        &self,
+        session_id: &str,
+        parent_message_id: Option<i64>,
+    ) -> AppResult<()> {
         let mut state = self
             .session_state
             .lock()
@@ -384,8 +389,7 @@ impl LLMProvider for DeepseekProvider {
                 RemoteSessionInfo {
                     id: s.id,
                     title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
-                    updated_at: chrono::DateTime::from_timestamp(secs, 0)
-                        .map(|dt| dt.to_rfc3339()),
+                    updated_at: chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.to_rfc3339()),
                 }
             })
             .collect())
@@ -439,7 +443,9 @@ mod tests {
     fn fork_has_independent_session_state() {
         let parent = provider();
         parent.session_state.lock().unwrap().session_id = Some("parent-sess".to_string());
-        parent.mark_session_after_success("parent-sess", Some(42)).unwrap();
+        parent
+            .mark_session_after_success("parent-sess", Some(42))
+            .unwrap();
 
         // The fork must NOT inherit the parent's session/thread id — otherwise
         // two parallel conversations would corrupt each other's message tree.
@@ -468,7 +474,8 @@ mod tests {
         }
         // A late event referring to a previous/reset session must not rewrite
         // the current session's thread id.
-        p.mark_session_after_success("old-session", Some(999)).unwrap();
+        p.mark_session_after_success("old-session", Some(999))
+            .unwrap();
         assert_eq!(p.session_state.lock().unwrap().parent_message_id, Some(7));
     }
 

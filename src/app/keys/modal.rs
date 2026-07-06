@@ -6,7 +6,7 @@
 //! below only apply effects.
 
 use crate::app::events::{self, Modal};
-use crate::app::{conversation, App};
+use crate::app::{App, conversation};
 use crate::error::AppResult;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::collections::HashSet;
@@ -46,12 +46,20 @@ impl App {
     /// Route a keystroke to the currently-open modal. Takes the modal out of
     /// state and moves it back when it stays open — no per-keystroke clone
     /// of the modal payload (tool-approval `arguments` can be large).
-    pub(super) async fn handle_modal_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+    pub(super) async fn handle_modal_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> AppResult<bool> {
         let Some(modal) = self.state.modal.take() else {
             return Ok(false);
         };
         match modal {
-            Modal::ToolApproval { tool_name, arguments, scroll_offset, always_allow } => {
+            Modal::ToolApproval {
+                tool_name,
+                arguments,
+                scroll_offset,
+                always_allow,
+            } => {
                 match approval_key(key.code) {
                     Some(ApprovalKey::Approve) => {
                         if always_allow {
@@ -75,14 +83,16 @@ impl App {
                     }
                     Some(ApprovalKey::ToggleAlways) => {
                         self.state.modal = Some(Modal::ToolApproval {
-                            tool_name, arguments,
+                            tool_name,
+                            arguments,
                             scroll_offset,
                             always_allow: !always_allow,
                         });
                     }
                     Some(ApprovalKey::ScrollUp) => {
                         self.state.modal = Some(Modal::ToolApproval {
-                            tool_name, arguments,
+                            tool_name,
+                            arguments,
                             scroll_offset: scroll_offset.saturating_sub(3),
                             always_allow,
                         });
@@ -92,14 +102,18 @@ impl App {
                         let max_visible = 12usize;
                         let max_scroll = arg_lines.saturating_sub(max_visible);
                         self.state.modal = Some(Modal::ToolApproval {
-                            tool_name, arguments,
+                            tool_name,
+                            arguments,
                             scroll_offset: (scroll_offset + 3).min(max_scroll),
                             always_allow,
                         });
                     }
                     None => {
                         self.state.modal = Some(Modal::ToolApproval {
-                            tool_name, arguments, scroll_offset, always_allow,
+                            tool_name,
+                            arguments,
+                            scroll_offset,
+                            always_allow,
                         });
                     }
                 }
@@ -114,7 +128,8 @@ impl App {
                     if filtered_count > 0 && picker.persistent_checked.len() >= filtered_count {
                         picker.persistent_checked.clear();
                     } else {
-                        picker.persistent_checked = picker.items.iter().map(|item| item.value.clone()).collect();
+                        picker.persistent_checked =
+                            picker.items.iter().map(|item| item.value.clone()).collect();
                     }
                     picker.sync_checked();
                     self.state.modal = Some(Modal::Picker(picker));
@@ -267,10 +282,11 @@ impl App {
             }
             _ => {
                 if let Some(idx) = indices.first()
-                    && let Some(item) = picker.items.get(*idx) {
-                        let id = item.value.clone();
-                        self.handle_load_session(&id).await?;
-                    }
+                    && let Some(item) = picker.items.get(*idx)
+                {
+                    let id = item.value.clone();
+                    self.handle_load_session(&id).await?;
+                }
             }
         }
         Ok(())
@@ -289,7 +305,10 @@ mod tests {
         for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
             assert_eq!(approval_key(code), Some(ApprovalKey::Deny));
         }
-        assert_eq!(approval_key(KeyCode::Char('a')), Some(ApprovalKey::ToggleAlways));
+        assert_eq!(
+            approval_key(KeyCode::Char('a')),
+            Some(ApprovalKey::ToggleAlways)
+        );
         assert_eq!(approval_key(KeyCode::Up), Some(ApprovalKey::ScrollUp));
         assert_eq!(approval_key(KeyCode::Down), Some(ApprovalKey::ScrollDown));
         assert_eq!(approval_key(KeyCode::Char('x')), None);

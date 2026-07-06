@@ -1,13 +1,15 @@
+use crate::agent::stream::{StreamEnd, collect_stream};
+use crate::agent::tool_parser::{StreamTextTracker, parse_tool_calls, strip_tool_calls};
 use crate::app::conversation::ConversationId;
-use crate::app::events::{AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo};
+use crate::app::events::{
+    AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo,
+};
 use crate::debug_log;
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::semantic::SemanticService;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
-use crate::agent::stream::{collect_stream, StreamEnd};
-use crate::agent::tool_parser::{parse_tool_calls, strip_tool_calls, StreamTextTracker};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -54,17 +56,21 @@ pub async fn run_agent_loop(
             .await
             .unwrap_or_default();
         if let Some(hint) = semantic.render_hint(&matches) {
-            let described: Vec<String> = matches
-                .skills
-                .iter()
-                .map(|m| format!("skill:{}(d={:.3},s={:.3})", m.slug, m.dense, m.sparse))
-                .chain(matches.mcp_tools.iter().map(|m| {
-                    format!("mcp:{}(d={:.3},s={:.3})", m.full_name, m.dense, m.sparse)
-                }))
-                .collect();
+            let described: Vec<String> =
+                matches
+                    .skills
+                    .iter()
+                    .map(|m| format!("skill:{}(d={:.3},s={:.3})", m.slug, m.dense, m.sparse))
+                    .chain(matches.mcp_tools.iter().map(|m| {
+                        format!("mcp:{}(d={:.3},s={:.3})", m.full_name, m.dense, m.sparse)
+                    }))
+                    .collect();
             debug_log::log(
                 "agent.semantic_hint",
-                format!("conversation={conversation} matches={}", described.join(", ")),
+                format!(
+                    "conversation={conversation} matches={}",
+                    described.join(", ")
+                ),
             );
             messages.push(ChatMessage::system(&hint));
         }
@@ -108,9 +114,10 @@ pub async fn run_agent_loop(
                     let _ = progress_tx.send(AppEvent::AgentChunk(conversation, delta.to_string()));
                 }
             } else if !next_visible.is_empty() {
-                let _ = progress_tx.send(AppEvent::AddMessage(conversation, ChatMessage::system(
-                    "⚠ Streaming sync issue — agent will continue",
-                )));
+                let _ = progress_tx.send(AppEvent::AddMessage(
+                    conversation,
+                    ChatMessage::system("⚠ Streaming sync issue — agent will continue"),
+                ));
             }
             streamed_visible = next_visible;
         })
@@ -264,10 +271,13 @@ pub async fn run_agent_loop(
                     collected_tool_calls.len()
                 ),
             );
-            let _ = event_tx.send(AppEvent::AgentDone(conversation, AgentResult {
-                text: visible_text,
-                tool_calls: collected_tool_calls,
-            }));
+            let _ = event_tx.send(AppEvent::AgentDone(
+                conversation,
+                AgentResult {
+                    text: visible_text,
+                    tool_calls: collected_tool_calls,
+                },
+            ));
             return;
         }
 
@@ -332,45 +342,41 @@ pub async fn run_agent_loop(
             let (tool_result, is_error) = if tool_call.name == QUESTION_TOOL_NAME {
                 // Background turns (auto_approve) have no user to answer.
                 if auto_approve {
-                    ("Cannot ask the user from a background agent.".to_string(), true)
+                    (
+                        "Cannot ask the user from a background agent.".to_string(),
+                        true,
+                    )
                 } else {
-                let question_text = tool_call.arguments["question"]
-                    .as_str()
-                    .unwrap_or("(no question)");
-                let options: Vec<String> = tool_call.arguments["options"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let allow_custom = tool_call.arguments["allow_custom"]
-                    .as_bool()
-                    .unwrap_or(false);
+                    let question_text = tool_call.arguments["question"]
+                        .as_str()
+                        .unwrap_or("(no question)");
+                    let options: Vec<String> = tool_call.arguments["options"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let allow_custom = tool_call.arguments["allow_custom"]
+                        .as_bool()
+                        .unwrap_or(false);
 
-                let qs = QuestionState::new(
-                    question_text.to_string(),
-                    options,
-                    allow_custom,
-                );
-                let request = QuestionRequest::new();
-                let _ = event_tx
-                    .send(AppEvent::RequestQuestion(request.clone(), qs));
+                    let qs = QuestionState::new(question_text.to_string(), options, allow_custom);
+                    let request = QuestionRequest::new();
+                    let _ = event_tx.send(AppEvent::RequestQuestion(request.clone(), qs));
 
-                let _ = event_tx.send(AppEvent::ToolStarted {
-                    conversation,
-                    name: tool_call.name.clone(),
-                });
+                    let _ = event_tx.send(AppEvent::ToolStarted {
+                        conversation,
+                        name: tool_call.name.clone(),
+                    });
 
-                match request.wait().await {
-                    Some(answer) if !answer.is_empty() => {
-                        (format!("User answered: {answer}"), false)
+                    match request.wait().await {
+                        Some(answer) if !answer.is_empty() => {
+                            (format!("User answered: {answer}"), false)
+                        }
+                        _ => ("User cancelled the question".to_string(), true),
                     }
-                    _ => {
-                        ("User cancelled the question".to_string(), true)
-                    }
-                }
                 }
             } else if tool_call.name == TASK_TOOL_NAME {
                 // Only the foreground (interactive) loop may spawn sub-agents;
@@ -378,7 +384,11 @@ pub async fn run_agent_loop(
                 if auto_approve {
                     ("Nested sub-agents are not allowed.".to_string(), true)
                 } else {
-                    let prompt = tool_call.arguments["prompt"].as_str().unwrap_or("").trim().to_string();
+                    let prompt = tool_call.arguments["prompt"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     let label = tool_call.arguments["description"]
                         .as_str()
                         .filter(|s| !s.trim().is_empty())
@@ -386,7 +396,10 @@ pub async fn run_agent_loop(
                         .to_string();
                     let background = tool_call.arguments["background"].as_bool().unwrap_or(false);
                     if prompt.is_empty() {
-                        ("The 'task' tool requires a non-empty 'prompt'.".to_string(), true)
+                        (
+                            "The 'task' tool requires a non-empty 'prompt'.".to_string(),
+                            true,
+                        )
                     } else if background {
                         let _ = event_tx.send(AppEvent::SpawnSubAgent {
                             parent: conversation,
@@ -430,16 +443,14 @@ pub async fn run_agent_loop(
                 let approved = if auto_approve {
                     true
                 } else {
-                    let arguments_preview =
-                        serde_json::to_string_pretty(&tool_call.arguments)
-                            .unwrap_or_else(|_| tool_call.arguments.to_string());
+                    let arguments_preview = serde_json::to_string_pretty(&tool_call.arguments)
+                        .unwrap_or_else(|_| tool_call.arguments.to_string());
                     let approval = ToolApprovalRequest::new(
                         conversation,
                         tool_call.name.clone(),
                         arguments_preview,
                     );
-                    let _ = event_tx
-                        .send(AppEvent::RequestToolApproval(approval.clone()));
+                    let _ = event_tx.send(AppEvent::RequestToolApproval(approval.clone()));
                     approval.wait().await
                 };
 
@@ -472,10 +483,7 @@ pub async fn run_agent_loop(
                         }
                     } else {
                         let result = tools
-                            .execute(
-                                &tool_call.name,
-                                tool_call.arguments.clone(),
-                            )
+                            .execute(&tool_call.name, tool_call.arguments.clone())
                             .await;
                         (result.content, result.is_error)
                     }
@@ -630,8 +638,11 @@ mod tests {
 
     #[tokio::test]
     async fn agent_loop_reports_error_when_stream_ends_without_stop() {
-        let provider: Arc<dyn LLMProvider> =
-            Arc::new(FakeProvider::with_response("partial").chunked(2).abrupt_eof());
+        let provider: Arc<dyn LLMProvider> = Arc::new(
+            FakeProvider::with_response("partial")
+                .chunked(2)
+                .abrupt_eof(),
+        );
         let tools = Arc::new(ToolRegistry::new());
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();

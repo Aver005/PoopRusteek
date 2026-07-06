@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{with_args, Command, CommandResult};
+use crate::commands::{Command, CommandResult, with_args};
 use crate::config::Config;
 
 pub struct SkillsCommand;

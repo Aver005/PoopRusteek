@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{with_args, Command, CommandResult};
+use crate::commands::{Command, CommandResult, with_args};
 use crate::config::Config;
 use crate::provider::AttachedFile;
 
@@ -55,11 +55,15 @@ impl Command for AttachCommand {
                     .unwrap_or(raw_path)
                     .to_string();
 
-                let ext = resolved.extension()
+                let ext = resolved
+                    .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg");
+                let is_image = matches!(
+                    ext.as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
+                );
 
                 state.attached_files.push(AttachedFile {
                     display_name,

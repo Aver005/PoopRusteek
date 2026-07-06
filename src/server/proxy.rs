@@ -8,7 +8,7 @@
 //! loop (the TUI drives refetch off its Tick; here a plain interval does
 //! it). First Ctrl+C shuts down gracefully, second one hard-exits.
 
-use super::{spawn, ServerSettings};
+use super::{ServerSettings, spawn};
 use crate::app::events::AppEvent;
 use crate::config::Config;
 use crate::error::AppResult;
@@ -29,7 +29,11 @@ pub async fn run(config: Config) -> AppResult<()> {
         settings.api.label(),
         settings.host,
         settings.port,
-        if settings.api_key.is_some() { "bearer" } else { "off" },
+        if settings.api_key.is_some() {
+            "bearer"
+        } else {
+            "off"
+        },
     ));
     if settings.deepseek.is_none() && settings.entries.is_empty() {
         log_line("warning: no providers configured — the API will expose no models");

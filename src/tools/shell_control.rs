@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Parse the `id` argument, accepting both JSON integers and floats — LLMs
 /// sometimes emit `12.0` for an integer id.
@@ -63,7 +63,9 @@ impl Tool for ShellKillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "shell_kill".to_string(),
-            description: "Terminate a background shell process started with bash/powershell background=true.".to_string(),
+            description:
+                "Terminate a background shell process started with bash/powershell background=true."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -130,13 +132,21 @@ impl Tool for ShellListTool {
         let mut msg = String::from("Jobs:\n");
         for proc in procs {
             let preview: String = proc.command.chars().take(80).collect();
-            let kind = if proc.interactive { "interactive" } else { "background" };
+            let kind = if proc.interactive {
+                "interactive"
+            } else {
+                "background"
+            };
             let persist = if proc.persistent { " persistent" } else { "" };
             let age = crate::app::format_duration_secs(
-                now.signed_duration_since(proc.started_at).num_seconds().max(0) as u64,
+                now.signed_duration_since(proc.started_at)
+                    .num_seconds()
+                    .max(0) as u64,
             );
             let idle = crate::app::format_duration_secs(
-                now.signed_duration_since(proc.last_activity_at).num_seconds().max(0) as u64,
+                now.signed_duration_since(proc.last_activity_at)
+                    .num_seconds()
+                    .max(0) as u64,
             );
             let ttl = match proc.ttl_secs {
                 Some(0) => " ttl=off".to_string(),
@@ -146,7 +156,9 @@ impl Tool for ShellListTool {
             msg.push_str(&format!(
                 "- #{} pid={} [{}] {}{} {} age={} idle={}{}: {}\n",
                 proc.id,
-                proc.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "-".to_string()),
+                proc.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 proc.shell,
                 kind,
                 persist,
@@ -266,7 +278,9 @@ impl Tool for ShellInputTool {
                     }
                     summary.push_str(&format!("keys=[{}]", names.join(", ")));
                 }
-                ToolResult::success(&format!("Sent input to job #{id}: {summary}. Poll with `shell_output` to see the result."))
+                ToolResult::success(&format!(
+                    "Sent input to job #{id}: {summary}. Poll with `shell_output` to see the result."
+                ))
             }
             Err(e) => ToolResult::error(&e),
         }

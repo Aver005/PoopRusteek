@@ -20,7 +20,7 @@ pub use registry::{
     shutdown_nonpersistent, write_input,
 };
 pub use spawn::{spawn_background, spawn_interactive};
-pub use types::{ProcessStatus, DEFAULT_PERSISTENT_TTL_SECS};
+pub use types::{DEFAULT_PERSISTENT_TTL_SECS, ProcessStatus};
 // `force_kill_pid` is `pub(crate)` on the item itself (see types.rs); this
 // re-export just makes it reachable as `background::force_kill_pid` from
 // sibling tool modules (e.g. shell.rs's foreground timeout path) without

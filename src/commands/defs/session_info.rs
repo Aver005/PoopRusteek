@@ -33,16 +33,40 @@ impl Command for SessionInfoCommand {
         };
 
         let msg_stats = if count > 0 {
-            let user_msgs = conv.messages.iter().filter(|m| m.role == Role::User).count();
-            let asst_msgs = conv.messages.iter().filter(|m| m.role == Role::Assistant).count();
-            let tool_msgs = conv.messages.iter().filter(|m| m.role == Role::Tool).count();
-            let finished = conv.messages.iter().filter(|m| m.status.as_deref() == Some("FINISHED")).count();
-            let aborted = conv.messages.iter().filter(|m| m.status.as_deref() == Some("ABORTED")).count();
-            let think_total: f64 = conv.messages.iter()
+            let user_msgs = conv
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .count();
+            let asst_msgs = conv
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .count();
+            let tool_msgs = conv
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Tool)
+                .count();
+            let finished = conv
+                .messages
+                .iter()
+                .filter(|m| m.status.as_deref() == Some("FINISHED"))
+                .count();
+            let aborted = conv
+                .messages
+                .iter()
+                .filter(|m| m.status.as_deref() == Some("ABORTED"))
+                .count();
+            let think_total: f64 = conv
+                .messages
+                .iter()
                 .filter(|m| m.role == Role::Assistant)
                 .map(|m| m.think_elapsed_secs)
                 .sum();
-            let total_tokens: u32 = conv.messages.iter()
+            let total_tokens: u32 = conv
+                .messages
+                .iter()
                 .filter(|m| m.role == Role::Assistant)
                 .flat_map(|m| m.total_tokens)
                 .sum();

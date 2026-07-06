@@ -59,9 +59,8 @@ pub async fn collect_stream(
 ) -> StreamOutcome {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let stream_provider = Arc::clone(provider);
-    let stream_task = tokio::spawn(async move {
-        stream_provider.complete_stream(request, tx).await
-    });
+    let stream_task =
+        tokio::spawn(async move { stream_provider.complete_stream(request, tx).await });
 
     let mut text = String::new();
     let mut got_stop = false;
@@ -69,7 +68,11 @@ pub async fn collect_stream(
         match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
             Err(_) => {
                 stream_task.abort();
-                return StreamOutcome { text, got_stop, end: StreamEnd::IdleTimeout };
+                return StreamOutcome {
+                    text,
+                    got_stop,
+                    end: StreamEnd::IdleTimeout,
+                };
             }
             Ok(None) => break,
             Ok(Some(chunk)) => {
@@ -103,7 +106,11 @@ pub async fn collect_stream(
         Ok(Err(error)) => StreamEnd::ProviderError(error.to_string()),
         Err(join_error) => StreamEnd::TaskFailed(join_error.to_string()),
     };
-    StreamOutcome { text, got_stop, end }
+    StreamOutcome {
+        text,
+        got_stop,
+        end,
+    }
 }
 
 #[cfg(test)]
@@ -150,14 +157,18 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_stream_is_aborted() {
-        let provider: Arc<dyn LLMProvider> =
-            Arc::new(FakeProvider::with_response("x".repeat(MAX_STREAM_BYTES + 1)));
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_response(
+            "x".repeat(MAX_STREAM_BYTES + 1),
+        ));
         let outcome = collect_stream(&provider, request(), |_| {}).await;
 
         assert!(!outcome.got_stop);
         match outcome.end {
             StreamEnd::ProviderError(message) => {
-                assert!(message.contains("exceeded"), "unexpected message: {message}");
+                assert!(
+                    message.contains("exceeded"),
+                    "unexpected message: {message}"
+                );
             }
             _ => panic!("oversized stream must surface as a provider error"),
         }

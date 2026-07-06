@@ -136,7 +136,10 @@ pub(crate) fn build_prompt(
 /// Map a model name + session position to DeepSeek's `model_type` field.
 /// Reasoner/expert models think; the first message of a session uses
 /// `default`; continuations omit the field.
-pub(crate) fn resolve_model_type(model: &str, parent_message_id: Option<i64>) -> Option<&'static str> {
+pub(crate) fn resolve_model_type(
+    model: &str,
+    parent_message_id: Option<i64>,
+) -> Option<&'static str> {
     let lower = model.to_ascii_lowercase();
     if lower.contains("reasoner") || lower.contains("expert") {
         Some("expert")
@@ -220,10 +223,7 @@ mod tests {
     #[test]
     fn long_code_blocks_collapse_in_history() {
         let big = format!("```\n{}\n```", "x".repeat(400));
-        let messages = vec![
-            ChatMessage::assistant(&big),
-            ChatMessage::user("now"),
-        ];
+        let messages = vec![ChatMessage::assistant(&big), ChatMessage::user("now")];
         let prompt = build_prompt(&messages, "", false);
         assert!(prompt.contains("[...]"));
         assert!(!prompt.contains(&"x".repeat(400)));
@@ -231,7 +231,10 @@ mod tests {
 
     #[test]
     fn model_type_resolution() {
-        assert_eq!(resolve_model_type("deepseek-reasoner", None), Some("expert"));
+        assert_eq!(
+            resolve_model_type("deepseek-reasoner", None),
+            Some("expert")
+        );
         assert_eq!(resolve_model_type("some-expert", Some(5)), Some("expert"));
         assert_eq!(resolve_model_type("deepseek-chat", None), Some("default"));
         assert_eq!(resolve_model_type("deepseek-chat", Some(5)), None);

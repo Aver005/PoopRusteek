@@ -45,7 +45,12 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.lock().unwrap().values().map(|t| t.definition()).collect()
+        self.tools
+            .lock()
+            .unwrap()
+            .values()
+            .map(|t| t.definition())
+            .collect()
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult {
@@ -74,7 +79,10 @@ impl ToolRegistry {
             skills: Arc::clone(&shared),
         });
         *self.skill_tool.lock().unwrap() = Some(Arc::clone(&skill_tool));
-        self.tools.lock().unwrap().insert("skill".to_string(), skill_tool);
+        self.tools
+            .lock()
+            .unwrap()
+            .insert("skill".to_string(), skill_tool);
     }
 }
 

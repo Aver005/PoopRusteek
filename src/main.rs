@@ -1,27 +1,27 @@
+mod acp;
+mod agent;
 mod app;
+mod cli;
+mod commands;
 mod config;
 mod debug_log;
 mod error;
+mod mcp;
+mod prompts;
 mod provider;
-mod agent;
+mod semantic;
+mod server;
+mod session;
+mod skills;
 mod tools;
 mod tui;
-mod mcp;
-mod commands;
-mod session;
-mod cli;
-mod acp;
-mod prompts;
-mod server;
-mod whitelist;
 mod util;
-mod skills;
-mod semantic;
+mod whitelist;
 
-use std::sync::Arc;
-use color_eyre::Result;
 use clap::Parser;
+use color_eyre::Result;
 use config::Config;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "pooprusteek")]
@@ -102,7 +102,10 @@ async fn main() -> Result<()> {
     // TUI-only (never in --acp mode, where stdout is the JSON-RPC channel):
     // name the window before the slow parts of startup (MCP connects) run;
     // the render loop takes over the title from the first frame on.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("Starting..."));
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::SetTitle("Starting...")
+    );
 
     let mut app = app::App::new(config).await?;
     if args.serve {

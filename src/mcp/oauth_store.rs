@@ -42,7 +42,10 @@ fn ensure_default_store() {
         if let Ok(store) = apple_native_keyring_store::keychain::Store::new() {
             keyring_core::set_default_store(store);
         }
-        #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+        #[cfg(all(
+            unix,
+            not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+        ))]
         if let Ok(store) = zbus_secret_service_keyring_store::Store::new() {
             keyring_core::set_default_store(store);
         }
@@ -63,9 +66,11 @@ pub async fn save(server_name: &str, tokens: &TokenSet) -> AppResult<()> {
     let tokens = tokens.clone();
     tokio::task::spawn_blocking(move || {
         let json = serde_json::to_string(&tokens)?;
-        entry(&server_name)?.set_password(&json)
+        entry(&server_name)?
+            .set_password(&json)
             .map_err(|e| AppError::Mcp(format!("Failed to save token for '{server_name}': {e}")))
-    }).await?
+    })
+    .await?
 }
 
 /// Load stored tokens for `server_name`. `None` on *any* failure — missing
@@ -79,7 +84,10 @@ pub async fn load(server_name: &str) -> Option<TokenSet> {
         let entry = entry(&server_name).ok()?;
         let json = entry.get_password().ok()?;
         serde_json::from_str::<TokenSet>(&json).ok()
-    }).await.ok().flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Best-effort: load `server_name`'s stored token, refreshing it first if
@@ -89,8 +97,13 @@ pub async fn load(server_name: &str) -> Option<TokenSet> {
 /// unavailable) just returns `headers` unchanged, which reproduces the
 /// existing 401 → `AuthRequired` path and is self-healing once the user
 /// re-authorizes via `/mcp auth`.
-pub async fn with_bearer_header(server_name: &str, mut headers: HashMap<String, String>) -> HashMap<String, String> {
-    let Some(mut tokens) = load(server_name).await else { return headers };
+pub async fn with_bearer_header(
+    server_name: &str,
+    mut headers: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let Some(mut tokens) = load(server_name).await else {
+        return headers;
+    };
 
     if tokens.is_expiring_soon() {
         match oauth::refresh(&tokens).await {
@@ -99,11 +112,16 @@ pub async fn with_bearer_header(server_name: &str, mut headers: HashMap<String, 
                 tokens = fresh;
             }
             Err(e) => {
-                tracing::debug!("MCP '{server_name}' OAuth token refresh failed (best-effort): {e}");
+                tracing::debug!(
+                    "MCP '{server_name}' OAuth token refresh failed (best-effort): {e}"
+                );
             }
         }
     }
 
-    headers.insert("Authorization".to_string(), format!("Bearer {}", tokens.access_token));
+    headers.insert(
+        "Authorization".to_string(),
+        format!("Bearer {}", tokens.access_token),
+    );
     headers
 }

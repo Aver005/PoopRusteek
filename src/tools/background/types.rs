@@ -4,8 +4,8 @@
 
 use regex::Regex;
 use std::io::Write;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]

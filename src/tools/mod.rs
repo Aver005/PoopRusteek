@@ -1,12 +1,12 @@
+pub mod background;
+pub mod history_search;
+pub mod question;
 pub mod registry;
 pub mod shell;
-pub mod question;
-pub mod task;
-pub mod background;
 pub mod shell_control;
 pub mod skill;
+pub mod task;
 pub mod tool_search;
-pub mod history_search;
 
 use async_trait::async_trait;
 use serde_json::Value;

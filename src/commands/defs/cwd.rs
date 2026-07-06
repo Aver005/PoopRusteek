@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{with_args, Command, CommandResult};
+use crate::commands::{Command, CommandResult, with_args};
 use crate::config::Config;
 
 fn strip_verbatim(path: &str) -> String {
@@ -34,8 +34,7 @@ impl Command for CwdCommand {
             let target = crate::util::expand_tilde(path);
 
             // Convert to absolute without requiring existence (Rust 1.79+)
-            let absolute = std::path::absolute(&target)
-                .unwrap_or_else(|_| target.clone());
+            let absolute = std::path::absolute(&target).unwrap_or_else(|_| target.clone());
 
             match std::env::set_current_dir(&absolute) {
                 Ok(()) => {
@@ -46,10 +45,9 @@ impl Command for CwdCommand {
                     state.workspace_path = cwd.clone();
                     CommandResult::Handled
                 }
-                Err(e) => CommandResult::Error(format!(
-                    "Cannot change to {}: {e}",
-                    absolute.display()
-                )),
+                Err(e) => {
+                    CommandResult::Error(format!("Cannot change to {}: {e}", absolute.display()))
+                }
             }
         })
     }

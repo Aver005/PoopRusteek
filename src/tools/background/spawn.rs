@@ -4,15 +4,15 @@
 
 use super::registry::insert_handle;
 use super::types::{
-    force_kill_pid, sanitize_terminal_output, ActivitySlot, BgCmd, OutputBuffer, ProcessStatus,
-    SpawnOutcome, StatusSlot, StdinWriter, MAX_BUFFER_BYTES,
+    ActivitySlot, BgCmd, MAX_BUFFER_BYTES, OutputBuffer, ProcessStatus, SpawnOutcome, StatusSlot,
+    StdinWriter, force_kill_pid, sanitize_terminal_output,
 };
+use std::io::Read;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::io::Read;
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -203,9 +203,7 @@ pub async fn spawn_interactive(
     persistent: bool,
     ttl_secs: Option<u64>,
 ) -> Result<SpawnOutcome, String> {
-    use portable_pty::{
-        ChildKiller, CommandBuilder, PtySize, PtySystem, native_pty_system,
-    };
+    use portable_pty::{ChildKiller, CommandBuilder, PtySize, PtySystem, native_pty_system};
 
     let pty_system: Box<dyn PtySystem + Send> = native_pty_system();
     let pair = pty_system

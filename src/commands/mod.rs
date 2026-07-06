@@ -172,11 +172,7 @@ fn parse_input(input: &str) -> Option<(&str, &str)> {
 /// Run `body` with the trimmed, non-empty `args`. If the command was invoked
 /// without an argument, return the canonical `Usage: {usage}` error instead —
 /// the shared prologue for every command that requires one.
-fn with_args(
-    args: &str,
-    usage: &str,
-    body: impl FnOnce(&str) -> CommandResult,
-) -> CommandResult {
+fn with_args(args: &str, usage: &str, body: impl FnOnce(&str) -> CommandResult) -> CommandResult {
     let args = args.trim();
     if args.is_empty() {
         return CommandResult::Error(format!("Usage: {usage}"));

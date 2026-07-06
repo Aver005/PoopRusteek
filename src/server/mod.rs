@@ -30,8 +30,8 @@ use crate::app::events::AppEvent;
 use crate::config::{Config, ProviderConfig, ProviderEntry, ServerApi};
 use crate::provider::model_cache::ProviderModelCache;
 use crate::provider::openai_compat::RequestDefaults;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{mpsc, watch};
 
 /// Everything the server task needs, snapshotted from `Config` at launch.
@@ -141,7 +141,14 @@ pub fn spawn(
     let stats = Arc::new(ServerStats::default());
     let handle_stats = Arc::clone(&stats);
     let (host, port, api) = (settings.host.clone(), settings.port, settings.api);
-    let task = tokio::spawn(http::run(settings, models, generation, event_tx, shutdown_rx, stats));
+    let task = tokio::spawn(http::run(
+        settings,
+        models,
+        generation,
+        event_tx,
+        shutdown_rx,
+        stats,
+    ));
     ServerHandle {
         generation,
         host,

@@ -35,7 +35,9 @@ impl TokenSet {
     /// True once fewer than 60s remain (or already past `expires_at`).
     /// `None` (unknown expiry) is treated as never-expiring.
     pub fn is_expiring_soon(&self) -> bool {
-        let Some(exp) = self.expires_at else { return false };
+        let Some(exp) = self.expires_at else {
+            return false;
+        };
         let now = unix_now();
         exp - now < 60
     }
@@ -109,18 +111,34 @@ fn append_after_path(base: &Url, well_known: &str) -> Url {
     url
 }
 
-async fn fetch_json<T: for<'de> Deserialize<'de>>(client: &reqwest::Client, url: &Url) -> AppResult<T> {
-    let resp = client.get(url.clone()).header("Accept", "application/json").send().await?;
+async fn fetch_json<T: for<'de> Deserialize<'de>>(
+    client: &reqwest::Client,
+    url: &Url,
+) -> AppResult<T> {
+    let resp = client
+        .get(url.clone())
+        .header("Accept", "application/json")
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(AppError::Mcp(format!("GET {url} returned {}", resp.status())));
+        return Err(AppError::Mcp(format!(
+            "GET {url} returned {}",
+            resp.status()
+        )));
     }
-    resp.json::<T>().await.map_err(|e| AppError::Mcp(format!("Failed to parse JSON from {url}: {e}")))
+    resp.json::<T>()
+        .await
+        .map_err(|e| AppError::Mcp(format!("Failed to parse JSON from {url}: {e}")))
 }
 
 /// Discover the authorization endpoints for an MCP server at `base_url`.
 /// `hint` is the `resource_metadata` URL from a `WWW-Authenticate` header,
 /// if the 401 that triggered this carried one.
-async fn discover(client: &reqwest::Client, base_url: &str, hint: Option<&str>) -> AppResult<AuthMetadata> {
+async fn discover(
+    client: &reqwest::Client,
+    base_url: &str,
+    hint: Option<&str>,
+) -> AppResult<AuthMetadata> {
     let base = Url::parse(base_url)
         .map_err(|e| AppError::Mcp(format!("Invalid MCP server URL '{base_url}': {e}")))?;
 
@@ -129,26 +147,45 @@ async fn discover(client: &reqwest::Client, base_url: &str, hint: Option<&str>) 
         None => insert_before_path(&base, "oauth-protected-resource"),
     };
 
-    let authorization_servers = match fetch_json::<ProtectedResourceMetadata>(client, &resource_metadata_url).await {
-        Ok(meta) if !meta.authorization_servers.is_empty() => meta.authorization_servers,
-        _ => {
-            let root_url = well_known_root(&base, "oauth-protected-resource");
-            match fetch_json::<ProtectedResourceMetadata>(client, &root_url).await {
-                Ok(meta) if !meta.authorization_servers.is_empty() => meta.authorization_servers,
-                // Last resort: the MCP server doesn't implement RFC 9728 at
-                // all — assume it's its own authorization server.
-                _ => vec![base_url.to_string()],
+    let authorization_servers =
+        match fetch_json::<ProtectedResourceMetadata>(client, &resource_metadata_url).await {
+            Ok(meta) if !meta.authorization_servers.is_empty() => meta.authorization_servers,
+            _ => {
+                let root_url = well_known_root(&base, "oauth-protected-resource");
+                match fetch_json::<ProtectedResourceMetadata>(client, &root_url).await {
+                    Ok(meta) if !meta.authorization_servers.is_empty() => {
+                        meta.authorization_servers
+                    }
+                    // Last resort: the MCP server doesn't implement RFC 9728 at
+                    // all — assume it's its own authorization server.
+                    _ => vec![base_url.to_string()],
+                }
             }
-        }
-    };
+        };
     let as_origin = &authorization_servers[0];
-    let as_base = Url::parse(as_origin)
-        .map_err(|e| AppError::Mcp(format!("Invalid authorization server URL '{as_origin}': {e}")))?;
+    let as_base = Url::parse(as_origin).map_err(|e| {
+        AppError::Mcp(format!(
+            "Invalid authorization server URL '{as_origin}': {e}"
+        ))
+    })?;
 
-    let as_meta = match fetch_json::<AuthorizationServerMetadata>(client, &insert_before_path(&as_base, "oauth-authorization-server")).await {
+    let as_meta = match fetch_json::<AuthorizationServerMetadata>(
+        client,
+        &insert_before_path(&as_base, "oauth-authorization-server"),
+    )
+    .await
+    {
         Ok(m) => m,
-        Err(_) => fetch_json::<AuthorizationServerMetadata>(client, &append_after_path(&as_base, "openid-configuration")).await
-            .map_err(|e| AppError::Mcp(format!("Could not discover OAuth metadata for {as_origin}: {e}")))?,
+        Err(_) => fetch_json::<AuthorizationServerMetadata>(
+            client,
+            &append_after_path(&as_base, "openid-configuration"),
+        )
+        .await
+        .map_err(|e| {
+            AppError::Mcp(format!(
+                "Could not discover OAuth metadata for {as_origin}: {e}"
+            ))
+        })?,
     };
 
     Ok(AuthMetadata {
@@ -175,7 +212,11 @@ struct ClientRegistrationResponse {
 /// RFC 7591 dynamic client registration — registers `pooprusteek` as a
 /// public client (no secret; PKCE carries the proof-of-possession instead,
 /// standard practice for native/desktop apps per RFC 8252).
-async fn register_client(client: &reqwest::Client, registration_endpoint: &str, redirect_uri: &str) -> AppResult<String> {
+async fn register_client(
+    client: &reqwest::Client,
+    registration_endpoint: &str,
+    redirect_uri: &str,
+) -> AppResult<String> {
     let body = ClientRegistrationRequest {
         redirect_uris: [redirect_uri],
         client_name: "pooprusteek",
@@ -183,13 +224,20 @@ async fn register_client(client: &reqwest::Client, registration_endpoint: &str, 
         response_types: ["code"],
         token_endpoint_auth_method: "none",
     };
-    let resp = client.post(registration_endpoint).json(&body).send().await?;
+    let resp = client
+        .post(registration_endpoint)
+        .json(&body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Mcp(format!("Dynamic client registration failed ({status}): {text}")));
+        return Err(AppError::Mcp(format!(
+            "Dynamic client registration failed ({status}): {text}"
+        )));
     }
-    resp.json::<ClientRegistrationResponse>().await
+    resp.json::<ClientRegistrationResponse>()
+        .await
         .map(|r| r.client_id)
         .map_err(|e| AppError::Mcp(format!("Failed to parse client registration response: {e}")))
 }
@@ -217,8 +265,11 @@ fn authorization_url(
     state: &str,
     code_challenge: &str,
 ) -> AppResult<Url> {
-    let mut url = Url::parse(authorization_endpoint)
-        .map_err(|e| AppError::Mcp(format!("Invalid authorization endpoint '{authorization_endpoint}': {e}")))?;
+    let mut url = Url::parse(authorization_endpoint).map_err(|e| {
+        AppError::Mcp(format!(
+            "Invalid authorization endpoint '{authorization_endpoint}': {e}"
+        ))
+    })?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", client_id)
@@ -236,7 +287,9 @@ fn authorization_url(
 async fn await_callback(listener: TcpListener, expected_state: &str) -> AppResult<String> {
     let (mut stream, _) = tokio::time::timeout(Duration::from_secs(300), listener.accept())
         .await
-        .map_err(|_| AppError::Mcp("Timed out waiting for the OAuth callback (5 min)".to_string()))??;
+        .map_err(|_| {
+            AppError::Mcp("Timed out waiting for the OAuth callback (5 min)".to_string())
+        })??;
 
     let mut reader = BufReader::new(&mut stream);
     let mut request_line = String::new();
@@ -252,7 +305,9 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> AppResul
         }
     }
 
-    let path = request_line.split_whitespace().nth(1)
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
         .ok_or_else(|| AppError::Mcp("Malformed OAuth callback request".to_string()))?;
     // Parsed via `Url` (not hand-rolled percent-decoding) so multi-byte
     // UTF-8 in e.g. `error_description` decodes correctly instead of being
@@ -261,7 +316,8 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> AppResul
         .map_err(|e| AppError::Mcp(format!("Malformed OAuth callback path: {e}")))?;
     let params: HashMap<String, String> = full.query_pairs().into_owned().collect();
 
-    let html = "<html><body>Authorization complete \u{2014} you can close this window.</body></html>";
+    let html =
+        "<html><body>Authorization complete \u{2014} you can close this window.</body></html>";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         html.len(),
@@ -271,12 +327,18 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> AppResul
     stream.flush().await?;
 
     if let Some(err) = params.get("error") {
-        return Err(AppError::Mcp(format!("Authorization server returned error: {err}")));
+        return Err(AppError::Mcp(format!(
+            "Authorization server returned error: {err}"
+        )));
     }
     if params.get("state").map(String::as_str) != Some(expected_state) {
-        return Err(AppError::Mcp("OAuth state mismatch (possible CSRF) \u{2014} aborting".to_string()));
+        return Err(AppError::Mcp(
+            "OAuth state mismatch (possible CSRF) \u{2014} aborting".to_string(),
+        ));
     }
-    params.get("code").cloned()
+    params
+        .get("code")
+        .cloned()
         .ok_or_else(|| AppError::Mcp("OAuth callback missing 'code' parameter".to_string()))
 }
 
@@ -307,21 +369,35 @@ async fn exchange_code(
     post_form(client, token_endpoint, &params).await
 }
 
-async fn post_form(client: &reqwest::Client, url: &str, params: &[(&str, &str)]) -> AppResult<TokenResponse> {
+async fn post_form(
+    client: &reqwest::Client,
+    url: &str,
+    params: &[(&str, &str)],
+) -> AppResult<TokenResponse> {
     let resp = client.post(url).form(params).send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Mcp(format!("Token request to {url} failed ({status}): {text}")));
+        return Err(AppError::Mcp(format!(
+            "Token request to {url} failed ({status}): {text}"
+        )));
     }
-    resp.json::<TokenResponse>().await.map_err(|e| AppError::Mcp(format!("Failed to parse token response from {url}: {e}")))
+    resp.json::<TokenResponse>()
+        .await
+        .map_err(|e| AppError::Mcp(format!("Failed to parse token response from {url}: {e}")))
 }
 
 fn http_client() -> AppResult<reqwest::Client> {
-    Ok(reqwest::Client::builder().timeout(Duration::from_secs(15)).build()?)
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?)
 }
 
-fn token_response_to_set(resp: TokenResponse, token_endpoint: String, client_id: String) -> TokenSet {
+fn token_response_to_set(
+    resp: TokenResponse,
+    token_endpoint: String,
+    client_id: String,
+) -> TokenSet {
     let expires_at = resp.expires_in.map(|secs| unix_now() + secs);
     TokenSet {
         access_token: resp.access_token,
@@ -343,7 +419,8 @@ fn token_response_to_set(resp: TokenResponse, token_endpoint: String, client_id:
 pub async fn run_flow(base_url: &str, hint: Option<String>) -> AppResult<TokenSet> {
     let client = http_client()?;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
         .map_err(|e| AppError::Mcp(format!("Failed to bind local OAuth callback listener: {e}")))?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
@@ -360,13 +437,32 @@ pub async fn run_flow(base_url: &str, hint: Option<String>) -> AppResult<TokenSe
     let challenge = code_challenge_s256(&code_verifier);
     let state = uuid::Uuid::new_v4().to_string();
 
-    let auth_url = authorization_url(&metadata.authorization_endpoint, &client_id, &redirect_uri, &state, &challenge)?;
-    open::that(auth_url.as_str()).map_err(|e| AppError::Mcp(format!("Failed to open browser: {e}")))?;
+    let auth_url = authorization_url(
+        &metadata.authorization_endpoint,
+        &client_id,
+        &redirect_uri,
+        &state,
+        &challenge,
+    )?;
+    open::that(auth_url.as_str())
+        .map_err(|e| AppError::Mcp(format!("Failed to open browser: {e}")))?;
 
     let code = await_callback(listener, &state).await?;
-    let token_resp = exchange_code(&client, &metadata.token_endpoint, &code, &redirect_uri, &client_id, &code_verifier).await?;
+    let token_resp = exchange_code(
+        &client,
+        &metadata.token_endpoint,
+        &code,
+        &redirect_uri,
+        &client_id,
+        &code_verifier,
+    )
+    .await?;
 
-    Ok(token_response_to_set(token_resp, metadata.token_endpoint, client_id))
+    Ok(token_response_to_set(
+        token_resp,
+        metadata.token_endpoint,
+        client_id,
+    ))
 }
 
 /// Exchange a refresh token for a fresh access token at the same
@@ -383,7 +479,11 @@ pub async fn refresh(tokens: &TokenSet) -> AppResult<TokenSet> {
         ("client_id", tokens.client_id.as_str()),
     ];
     let resp = post_form(&client, &tokens.token_endpoint, &params).await?;
-    let mut set = token_response_to_set(resp, tokens.token_endpoint.clone(), tokens.client_id.clone());
+    let mut set = token_response_to_set(
+        resp,
+        tokens.token_endpoint.clone(),
+        tokens.client_id.clone(),
+    );
     if set.refresh_token.is_none() {
         set.refresh_token = tokens.refresh_token.clone();
     }
@@ -413,34 +513,50 @@ mod tests {
     fn insert_before_path_prefixes_well_known_before_existing_path() {
         let base = Url::parse("https://example.com/tenant1").unwrap();
         let url = insert_before_path(&base, "oauth-authorization-server");
-        assert_eq!(url.as_str(), "https://example.com/.well-known/oauth-authorization-server/tenant1");
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/.well-known/oauth-authorization-server/tenant1"
+        );
     }
 
     #[test]
     fn insert_before_path_no_existing_path_is_bare_well_known() {
         let base = Url::parse("https://example.com").unwrap();
         let url = insert_before_path(&base, "oauth-protected-resource");
-        assert_eq!(url.as_str(), "https://example.com/.well-known/oauth-protected-resource");
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/.well-known/oauth-protected-resource"
+        );
     }
 
     #[test]
     fn append_after_path_suffixes_well_known_after_existing_path() {
         let base = Url::parse("https://example.com/tenant1").unwrap();
         let url = append_after_path(&base, "openid-configuration");
-        assert_eq!(url.as_str(), "https://example.com/tenant1/.well-known/openid-configuration");
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/tenant1/.well-known/openid-configuration"
+        );
     }
 
     #[test]
     fn code_challenge_s256_matches_known_pkce_test_vector() {
         // RFC 7636 appendix B test vector.
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        assert_eq!(code_challenge_s256(verifier), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            code_challenge_s256(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 
     #[test]
     fn generate_verifier_is_within_pkce_length_bounds() {
         let v = generate_verifier();
-        assert!(v.len() >= 43 && v.len() <= 128, "verifier length {} out of PKCE bounds", v.len());
+        assert!(
+            v.len() >= 43 && v.len() <= 128,
+            "verifier length {} out of PKCE bounds",
+            v.len()
+        );
     }
 
     #[test]
@@ -492,13 +608,26 @@ mod tests {
             "http://127.0.0.1:4321/callback",
             "state-abc",
             "challenge-xyz",
-        ).unwrap();
+        )
+        .unwrap();
         let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
         assert_eq!(pairs.get("response_type").map(String::as_str), Some("code"));
-        assert_eq!(pairs.get("client_id").map(String::as_str), Some("client-123"));
-        assert_eq!(pairs.get("redirect_uri").map(String::as_str), Some("http://127.0.0.1:4321/callback"));
+        assert_eq!(
+            pairs.get("client_id").map(String::as_str),
+            Some("client-123")
+        );
+        assert_eq!(
+            pairs.get("redirect_uri").map(String::as_str),
+            Some("http://127.0.0.1:4321/callback")
+        );
         assert_eq!(pairs.get("state").map(String::as_str), Some("state-abc"));
-        assert_eq!(pairs.get("code_challenge").map(String::as_str), Some("challenge-xyz"));
-        assert_eq!(pairs.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert_eq!(
+            pairs.get("code_challenge").map(String::as_str),
+            Some("challenge-xyz")
+        );
+        assert_eq!(
+            pairs.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
     }
 }

@@ -47,7 +47,8 @@ impl Embedder {
     /// Embed a search input (`query: ` prefix). Blocking ONNX inference.
     pub fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, String> {
         let mut out = self.embed_with_prefix("query: ", std::slice::from_ref(&text.to_string()))?;
-        out.pop().ok_or_else(|| "embedder returned no vector".to_string())
+        out.pop()
+            .ok_or_else(|| "embedder returned no vector".to_string())
     }
 
     /// Embed corpus documents (`passage: ` prefix). Blocking ONNX inference.
@@ -55,7 +56,11 @@ impl Embedder {
         self.embed_with_prefix("passage: ", texts)
     }
 
-    fn embed_with_prefix(&mut self, prefix: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    fn embed_with_prefix(
+        &mut self,
+        prefix: &str,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }

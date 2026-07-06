@@ -38,8 +38,14 @@ impl Command for ExportCommand {
         let mut md = String::new();
         md.push_str("# Pooprusteek Chat Export\n\n");
         md.push_str(&format!("- **Session:** {}\n", state.focused().session_id));
-        md.push_str(&format!("- **Exported:** {}\n", chrono::Utc::now().to_rfc3339()));
-        md.push_str(&format!("- **Messages:** {}\n", state.focused_mut().messages.len()));
+        md.push_str(&format!(
+            "- **Exported:** {}\n",
+            chrono::Utc::now().to_rfc3339()
+        ));
+        md.push_str(&format!(
+            "- **Messages:** {}\n",
+            state.focused_mut().messages.len()
+        ));
         md.push_str("\n---\n\n");
 
         for msg in &state.focused_mut().messages {

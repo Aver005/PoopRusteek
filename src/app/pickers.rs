@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 impl App {
     pub(super) async fn open_whitelist_picker(&mut self) {
-        use crate::app::events::{PickerItem, PickerMode, PickerKind, PickerState};
+        use crate::app::events::{PickerItem, PickerKind, PickerMode, PickerState};
         let mut items: Vec<PickerItem> = Vec::new();
         let mut checked: Vec<usize> = Vec::new();
         let whitelist: HashSet<String> = crate::whitelist::load();
@@ -17,7 +17,11 @@ impl App {
         for def in self.tools.definitions() {
             let in_list = whitelist.contains(&def.name);
             items.push(PickerItem::new(
-                format!("{}  {}", if in_list { "\u{2611}" } else { "\u{2610}" }, def.name),
+                format!(
+                    "{}  {}",
+                    if in_list { "\u{2611}" } else { "\u{2610}" },
+                    def.name
+                ),
                 def.name.clone(),
             ));
             if in_list {
@@ -30,7 +34,11 @@ impl App {
         for full in mcp.get_all_tools() {
             let in_list = whitelist.contains(&full.full_name);
             items.push(PickerItem::new(
-                format!("{}  {}", if in_list { "\u{2611}" } else { "\u{2610}" }, full.full_name),
+                format!(
+                    "{}  {}",
+                    if in_list { "\u{2611}" } else { "\u{2610}" },
+                    full.full_name
+                ),
                 full.full_name.clone(),
             ));
             if in_list {
@@ -40,9 +48,12 @@ impl App {
         drop(mcp);
 
         if items.is_empty() {
-            self.state.focused_mut().messages.push(crate::provider::ChatMessage::system(
-                "No tools available to whitelist.",
-            ));
+            self.state
+                .focused_mut()
+                .messages
+                .push(crate::provider::ChatMessage::system(
+                    "No tools available to whitelist.",
+                ));
             return;
         }
 
@@ -58,13 +69,14 @@ impl App {
     }
 
     pub(super) async fn open_skill_picker(&mut self) {
-        use crate::app::events::{PickerItem, PickerMode, PickerKind, PickerState};
+        use crate::app::events::{PickerItem, PickerKind, PickerMode, PickerState};
         let mut items: Vec<PickerItem> = Vec::new();
         let mut checked: Vec<usize> = Vec::new();
         let enabled_slugs: HashSet<String> = self.config.skills.enabled.iter().cloned().collect();
 
         for skill in &self.skills {
-            let is_enabled = enabled_slugs.contains(&skill.slug) || enabled_slugs.contains(&skill.name);
+            let is_enabled =
+                enabled_slugs.contains(&skill.slug) || enabled_slugs.contains(&skill.name);
             let status = if is_enabled { "\u{2611}" } else { "\u{2610}" };
             items.push(PickerItem::new(
                 format!(
@@ -110,7 +122,9 @@ impl App {
         }
 
         if changed {
-            let enabled: Vec<String> = self.skills.iter()
+            let enabled: Vec<String> = self
+                .skills
+                .iter()
                 .filter(|s| s.enabled)
                 .map(|s| s.slug.clone())
                 .collect();
@@ -126,15 +140,23 @@ impl App {
             self.tools.update_skills(self.skills.clone());
 
             let msg = if enable {
-                format!("Skill '{name}' enabled. Its content will be included in the system prompt on next request.")
+                format!(
+                    "Skill '{name}' enabled. Its content will be included in the system prompt on next request."
+                )
             } else {
                 format!("Skill '{name}' disabled.")
             };
-            self.state.focused_mut().messages.push(crate::provider::ChatMessage::system(&msg));
+            self.state
+                .focused_mut()
+                .messages
+                .push(crate::provider::ChatMessage::system(&msg));
         } else if enable {
-            self.state.focused_mut().messages.push(crate::provider::ChatMessage::system(
-                &format!("Skill '{name}' not found. Use /skills list to see available skills."),
-            ));
+            self.state
+                .focused_mut()
+                .messages
+                .push(crate::provider::ChatMessage::system(&format!(
+                    "Skill '{name}' not found. Use /skills list to see available skills."
+                )));
         }
     }
 
@@ -148,7 +170,11 @@ impl App {
         } else {
             lines.push(format!("\n### Built-in tools ({})", builtin.len()));
             for tool in &builtin {
-                lines.push(crate::util::format_tool_definition(&tool.name, &tool.description, &tool.parameters));
+                lines.push(crate::util::format_tool_definition(
+                    &tool.name,
+                    &tool.description,
+                    &tool.parameters,
+                ));
             }
         }
 
@@ -160,19 +186,20 @@ impl App {
         } else {
             let servers = mcp.get_servers_info();
             let enabled_count = servers.iter().filter(|s| s.enabled).count();
-            lines.push(format!("\n### MCP tools ({all} total, {enabled} enabled, {conn} connected)",
+            lines.push(format!(
+                "\n### MCP tools ({all} total, {enabled} enabled, {conn} connected)",
                 all = all_mcp.len(),
                 enabled = enabled_count,
-                conn = servers.iter().filter(|s| s.enabled && s.status == "connected").count(),
+                conn = servers
+                    .iter()
+                    .filter(|s| s.enabled && s.status == "connected")
+                    .count(),
             ));
             for full in &all_mcp {
                 let server_name = &full.tool.server_name;
                 let server_info = servers.iter().find(|s| s.name == *server_name);
                 let status = server_info.map(|s| s.status.as_str()).unwrap_or("unknown");
-                lines.push(format!(
-                    "  *Server: `{}` ({status})*",
-                    server_name
-                ));
+                lines.push(format!("  *Server: `{}` ({status})*", server_name));
                 lines.push(crate::util::format_tool_definition(
                     &full.full_name,
                     &full.tool.description,
@@ -194,7 +221,12 @@ impl App {
         let now = chrono::Utc::now();
         let running = snapshots
             .iter()
-            .filter(|proc| matches!(proc.status, crate::tools::background::ProcessStatus::Running))
+            .filter(|proc| {
+                matches!(
+                    proc.status,
+                    crate::tools::background::ProcessStatus::Running
+                )
+            })
             .count();
         let interactive = snapshots.iter().filter(|proc| proc.interactive).count();
         let persistent = snapshots.iter().filter(|proc| proc.persistent).count();
@@ -212,10 +244,22 @@ impl App {
                 .pid
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let kind = if proc.interactive { "interactive" } else { "background" };
+            let kind = if proc.interactive {
+                "interactive"
+            } else {
+                "background"
+            };
             let persist = if proc.persistent { " persistent" } else { "" };
-            let age = format_duration_secs(now.signed_duration_since(proc.started_at).num_seconds().max(0) as u64);
-            let idle = format_duration_secs(now.signed_duration_since(proc.last_activity_at).num_seconds().max(0) as u64);
+            let age = format_duration_secs(
+                now.signed_duration_since(proc.started_at)
+                    .num_seconds()
+                    .max(0) as u64,
+            );
+            let idle = format_duration_secs(
+                now.signed_duration_since(proc.last_activity_at)
+                    .num_seconds()
+                    .max(0) as u64,
+            );
             let ttl = match proc.ttl_secs {
                 Some(0) => " ttl=off".to_string(),
                 Some(ttl) => format!(" ttl={}", format_duration_secs(ttl)),

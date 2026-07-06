@@ -6,8 +6,8 @@
 //! fields on the `AppState` god-object. The counts are mirrored here from the
 //! manager on a throttled poll so rendering never has to take the manager lock.
 
-use crate::mcp::types::McpViewState;
 use crate::mcp::MCPManager;
+use crate::mcp::types::McpViewState;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
@@ -36,9 +36,10 @@ impl McpStatus {
     /// Stale counts for a poll interval are invisible; a frozen TUI is not.
     pub async fn update_stats(&mut self, mcp: &Mutex<MCPManager>) -> bool {
         if let Some(last) = self.last_stats_update
-            && last.elapsed().as_secs() < Self::STATS_INTERVAL_SECS {
-                return false;
-            }
+            && last.elapsed().as_secs() < Self::STATS_INTERVAL_SECS
+        {
+            return false;
+        }
         let Ok(manager) = mcp.try_lock() else {
             return false;
         };

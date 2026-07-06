@@ -69,9 +69,9 @@ mod tests {
     #[test]
     fn token_total_sums_only_assistant_with_tokens() {
         let msgs = vec![
-            ChatMessage::user("q"),                 // ignored (user)
+            ChatMessage::user("q"), // ignored (user)
             assistant_with_tokens(Some(10)),
-            assistant_with_tokens(None),            // ignored (no count)
+            assistant_with_tokens(None), // ignored (no count)
             assistant_with_tokens(Some(5)),
         ];
         assert_eq!(assistant_token_total(&msgs), 15);

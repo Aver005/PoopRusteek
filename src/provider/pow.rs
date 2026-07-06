@@ -1,6 +1,6 @@
-use base64::Engine as _;
 use crate::debug_log;
 use crate::error::{AppError, AppResult};
+use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -146,7 +146,11 @@ impl WasmPowRuntime {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &bytes).map_err(|error| error.to_string())?;
 
-        Ok(Self { engine, module, source })
+        Ok(Self {
+            engine,
+            module,
+            source,
+        })
     }
 
     fn solve(&self, challenge: &str, prefix: &str, difficulty: f64) -> Result<Option<u64>, String> {

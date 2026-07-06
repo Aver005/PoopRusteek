@@ -26,9 +26,7 @@ impl Command for ProvidersCommand {
         }
         if let Some(rest) = args.strip_prefix("add") {
             let rest = rest.trim();
-            return CommandResult::OpenProviderAdd(
-                (!rest.is_empty()).then(|| rest.to_string()),
-            );
+            return CommandResult::OpenProviderAdd((!rest.is_empty()).then(|| rest.to_string()));
         }
         CommandResult::Error(format!("Usage: {USAGE}"))
     }

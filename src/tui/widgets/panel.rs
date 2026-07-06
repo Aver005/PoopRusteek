@@ -4,11 +4,11 @@ use crate::provider::Role;
 use crate::session;
 use crate::tui::theme::Theme;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
-    Frame,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -50,16 +50,25 @@ fn cached_session_tag(session_id: &str, config: &Config) -> Option<String> {
     SESSION_TAG_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some((fetched_at, tag)) = cache.get(session_id)
-            && fetched_at.elapsed() < SESSION_TAG_TTL {
-                return tag.clone();
-            }
-        let tag = session::load_local(session_id, config).ok().and_then(|s| s.tag);
+            && fetched_at.elapsed() < SESSION_TAG_TTL
+        {
+            return tag.clone();
+        }
+        let tag = session::load_local(session_id, config)
+            .ok()
+            .and_then(|s| s.tag);
         cache.insert(session_id.to_string(), (Instant::now(), tag.clone()));
         tag
     })
 }
 
-pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, config: &Config, theme: &Theme) {
+pub fn render_stats_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    config: &Config,
+    theme: &Theme,
+) {
     if !state.show_stats_panel {
         return;
     }
@@ -67,7 +76,12 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
     if panel_w < 20 {
         return;
     }
-    let panel_area = Rect::new(area.x + area.width - panel_w as u16, area.y, panel_w as u16, area.height);
+    let panel_area = Rect::new(
+        area.x + area.width - panel_w as u16,
+        area.y,
+        panel_w as u16,
+        area.height,
+    );
 
     // Clear first: `Block`/`Paragraph` styles only recolor cells, they don't
     // overwrite glyphs, so without this any chat text drawn under the panel
@@ -98,7 +112,12 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
     // ── Model ──
     section_header(&mut lines, "Model", panel_w, theme);
     data_row(&mut lines, "Model", config.active_model(), theme);
-    data_row(&mut lines, "Provider", &config.active_provider_name(), theme);
+    data_row(
+        &mut lines,
+        "Provider",
+        &config.active_provider_name(),
+        theme,
+    );
     let sid = &state.focused().session_id;
     let short_sid = if sid.len() > 17 {
         format!("{}..", crate::util::truncate_at_char_boundary(sid, 17))
@@ -106,7 +125,12 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
         sid.clone()
     };
     data_row(&mut lines, "Session", &short_sid, theme);
-    data_row(&mut lines, "Rate", &config.agent.rate_limit_display(), theme);
+    data_row(
+        &mut lines,
+        "Rate",
+        &config.agent.rate_limit_display(),
+        theme,
+    );
     blank(&mut lines);
 
     // ── Session ──
@@ -116,9 +140,19 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
     }
     let started = format_time_short(&state.focused().session_started_at);
     data_row(&mut lines, "Started", &started, theme);
-    let latest = state.focused().messages.last().map(|m| format_time_short(&m.created_at)).unwrap_or_default();
+    let latest = state
+        .focused()
+        .messages
+        .last()
+        .map(|m| format_time_short(&m.created_at))
+        .unwrap_or_default();
     data_row(&mut lines, "Latest", &latest, theme);
-    data_row(&mut lines, "Messages", &state.focused().messages.len().to_string(), theme);
+    data_row(
+        &mut lines,
+        "Messages",
+        &state.focused().messages.len().to_string(),
+        theme,
+    );
     blank(&mut lines);
 
     // ── Tokens ──
@@ -142,21 +176,41 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 
     // ── Activity ──
     section_header(&mut lines, "Activity", panel_w, theme);
-    let tool_calls = state.focused().messages.iter().filter(|m| m.role == Role::Tool).count();
-    data_row(&mut lines, "Tools", &tool_calls.to_string(), theme);
-    let file_ops = state.focused().messages.iter()
+    let tool_calls = state
+        .focused()
+        .messages
+        .iter()
         .filter(|m| m.role == Role::Tool)
-        .filter(|m| m.name.as_deref().is_some_and(|n| matches!(n, "Bash" | "PowerShell" | "ShellInput")))
+        .count();
+    data_row(&mut lines, "Tools", &tool_calls.to_string(), theme);
+    let file_ops = state
+        .focused()
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter(|m| {
+            m.name
+                .as_deref()
+                .is_some_and(|n| matches!(n, "Bash" | "PowerShell" | "ShellInput"))
+        })
         .count();
     data_row(&mut lines, "Files", &file_ops.to_string(), theme);
-    let think_total: f64 = state.focused().messages.iter()
+    let think_total: f64 = state
+        .focused()
+        .messages
+        .iter()
         .filter(|m| m.role == Role::Assistant)
         .map(|m| m.think_elapsed_secs)
         .sum();
     if think_total > 0.0 {
         data_row(&mut lines, "Think", &format!("{:.1}s", think_total), theme);
     }
-    let search_count = state.focused().messages.iter().filter(|m| m.search_triggered).count();
+    let search_count = state
+        .focused()
+        .messages
+        .iter()
+        .filter(|m| m.search_triggered)
+        .count();
     if search_count > 0 {
         data_row(&mut lines, "Search", &search_count.to_string(), theme);
     }
@@ -164,7 +218,13 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 
     // ── MCP Servers ──
     section_header(&mut lines, "MCP", panel_w, theme);
-    let enabled_servers: Vec<_> = state.mcp_status.view.servers.iter().filter(|s| s.enabled).collect();
+    let enabled_servers: Vec<_> = state
+        .mcp_status
+        .view
+        .servers
+        .iter()
+        .filter(|s| s.enabled)
+        .collect();
     if enabled_servers.is_empty() {
         data_row(&mut lines, "\u{2713}", "none", theme);
     } else {
@@ -174,7 +234,10 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
             lines.push(Line::from(vec![
                 Span::styled(left, Style::default().fg(theme.fg)),
                 Span::styled(" ".repeat(gap), Style::default().fg(theme.fg)),
-                Span::styled(right, Style::default().fg(if ok { theme.success } else { theme.warning })),
+                Span::styled(
+                    right,
+                    Style::default().fg(if ok { theme.success } else { theme.warning }),
+                ),
             ]));
         }
     }
@@ -189,8 +252,17 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
 /// gap, and `gap` is the padding between them. Pulled out of
 /// `render_stats_panel` so the width arithmetic — the site of a past
 /// underflow panic on long server names — is independently testable.
-fn mcp_row_layout(server_name: &str, tool_count: usize, ok: bool, panel_w: usize) -> (String, usize, String) {
-    let right = format!(" {} {}", tool_count, if ok { "\u{2713}" } else { "\u{26A0}" });
+fn mcp_row_layout(
+    server_name: &str,
+    tool_count: usize,
+    ok: bool,
+    panel_w: usize,
+) -> (String, usize, String) {
+    let right = format!(
+        " {} {}",
+        tool_count,
+        if ok { "\u{2713}" } else { "\u{26A0}" }
+    );
     let right_len = right.chars().count();
     let left_budget = panel_w.saturating_sub(right_len + 4);
     let left_full = format!(" - {}", server_name);
@@ -211,22 +283,25 @@ fn section_header(lines: &mut Vec<Line<'static>>, title: &str, width: usize, the
     let suffix = "\u{2501}".repeat(suffix_len);
     lines.push(Line::from(vec![Span::styled(
         format!("{}{} {}", prefix, title, suffix),
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
     )]));
 }
 
 fn data_row(lines: &mut Vec<Line<'static>>, label: &str, value: &str, theme: &Theme) {
     let label_w = label.chars().count().min(10);
-    let pad = if label_w < 10 { " ".repeat(10 - label_w) } else { String::new() };
+    let pad = if label_w < 10 {
+        " ".repeat(10 - label_w)
+    } else {
+        String::new()
+    };
     lines.push(Line::from(vec![
         Span::styled(
             format!("  {}{}", label, pad),
             Style::default().fg(theme.text_dim),
         ),
-        Span::styled(
-            value.to_string(),
-            Style::default().fg(theme.fg),
-        ),
+        Span::styled(value.to_string(), Style::default().fg(theme.fg)),
     ]));
 }
 
@@ -251,7 +326,8 @@ fn compute_totals(state: &AppState) -> (u64, u64) {
     let mut input = 0u64;
     let mut output = 0u64;
     for (index, msg) in state.focused().messages.iter().enumerate() {
-        let tokens = crate::tui::widgets::chat::cached_token_estimate(conversation_id, index, msg) as u64;
+        let tokens =
+            crate::tui::widgets::chat::cached_token_estimate(conversation_id, index, msg) as u64;
         match msg.role {
             Role::User => input += tokens,
             Role::Assistant => output += tokens,
@@ -303,7 +379,10 @@ mod tests {
         let long_name = "a".repeat(40);
         let (left, gap, right) = mcp_row_layout(&long_name, 12, false, 34);
         assert!(left.chars().count() + gap + right.chars().count() <= 34);
-        assert!(left.chars().count() < long_name.len() + 3, "left label should be truncated");
+        assert!(
+            left.chars().count() < long_name.len() + 3,
+            "left label should be truncated"
+        );
     }
 
     #[test]
@@ -334,7 +413,11 @@ mod tests {
         // this is the invariant whose violation let chat text bleed onto the
         // panel (the old layout reserved `34.min(width/4)` instead).
         for available in [40u16, 80, 120, 136, 200] {
-            assert_eq!(panel_width(available), PANEL_W as u16, "available={available}");
+            assert_eq!(
+                panel_width(available),
+                PANEL_W as u16,
+                "available={available}"
+            );
         }
     }
 

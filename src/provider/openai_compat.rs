@@ -25,7 +25,10 @@
 //!
 //! Everything here is pure data mapping — no I/O, no `App`, no network.
 
-use crate::provider::{estimate_tokens, ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, Role, Usage};
+use crate::provider::{
+    ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, Role, Usage,
+    estimate_tokens,
+};
 use serde::{Deserialize, Serialize};
 
 // ── Wire types: request ────────────────────────────────────────────────
@@ -290,10 +293,7 @@ fn message_to_internal(message: ChatCompletionMessage) -> Result<ChatMessage, St
         Role::System => ChatMessage::system(&text),
         Role::User => ChatMessage::user(&text),
         Role::Assistant => ChatMessage::assistant(&text),
-        Role::Tool => ChatMessage::tool(
-            message.tool_call_id.as_deref().unwrap_or_default(),
-            &text,
-        ),
+        Role::Tool => ChatMessage::tool(message.tool_call_id.as_deref().unwrap_or_default(), &text),
     };
     converted.name = message.name;
     Ok(converted)
@@ -319,9 +319,10 @@ pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
                 object["name"] = serde_json::json!(name);
             }
             if message.role == Role::Tool
-                && let Some(id) = &message.tool_call_id {
-                    object["tool_call_id"] = serde_json::json!(id);
-                }
+                && let Some(id) = &message.tool_call_id
+            {
+                object["tool_call_id"] = serde_json::json!(id);
+            }
             object
         })
         .collect();
@@ -376,7 +377,10 @@ pub fn response_to_openai(
                 reasoning_content: reasoning,
             },
             finish_reason: Some(
-                response.finish_reason.clone().unwrap_or_else(|| "stop".to_string()),
+                response
+                    .finish_reason
+                    .clone()
+                    .unwrap_or_else(|| "stop".to_string()),
             ),
         }],
         usage: response.usage.clone().unwrap_or(fallback_usage),
@@ -446,9 +450,17 @@ pub fn chunk_from_openai(chunk: ChatCompletionChunk) -> CompletionChunk {
         .choices
         .into_iter()
         .next()
-        .map(|choice| (choice.delta.content.unwrap_or_default(), choice.finish_reason))
+        .map(|choice| {
+            (
+                choice.delta.content.unwrap_or_default(),
+                choice.finish_reason,
+            )
+        })
         .unwrap_or_default();
-    CompletionChunk { content, finish_reason }
+    CompletionChunk {
+        content,
+        finish_reason,
+    }
 }
 
 // ── Reasoning extraction (`<think>` → `reasoning_content`) ──────────────
@@ -478,7 +490,10 @@ const THINK_CLOSERS: [&str; 2] = ["</think>", "</thinking>"];
 /// content. No leading think block → `(None, content unchanged)`.
 pub fn split_reasoning(content: &str) -> (Option<String>, String) {
     let trimmed = content.trim_start();
-    let Some(opener) = THINK_OPENERS.iter().find(|open| trimmed.starts_with(**open)) else {
+    let Some(opener) = THINK_OPENERS
+        .iter()
+        .find(|open| trimmed.starts_with(**open))
+    else {
         return (None, content.to_string());
     };
     let after_open = &trimmed[opener.len()..];
@@ -502,7 +517,12 @@ pub fn split_reasoning(content: &str) -> (Option<String>, String) {
 /// tail a streaming splitter must hold back in case a tag is split across
 /// deltas. `0` when no suffix could extend into a token.
 fn holdback_len(buffer: &str, tokens: &[&str]) -> usize {
-    let max = tokens.iter().map(|token| token.len()).max().unwrap_or(0).saturating_sub(1);
+    let max = tokens
+        .iter()
+        .map(|token| token.len())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
     for k in (1..=max.min(buffer.len())).rev() {
         let start = buffer.len() - k;
         if !buffer.is_char_boundary(start) {
@@ -539,7 +559,10 @@ pub struct ReasoningStreamSplitter {
 
 impl Default for ReasoningStreamSplitter {
     fn default() -> Self {
-        Self { phase: SplitPhase::Start, buffer: String::new() }
+        Self {
+            phase: SplitPhase::Start,
+            buffer: String::new(),
+        }
     }
 }
 
@@ -558,8 +581,9 @@ impl ReasoningStreamSplitter {
             match self.phase {
                 SplitPhase::Start => {
                     let trimmed = self.buffer.trim_start();
-                    if let Some(opener) =
-                        THINK_OPENERS.iter().find(|open| trimmed.starts_with(**open))
+                    if let Some(opener) = THINK_OPENERS
+                        .iter()
+                        .find(|open| trimmed.starts_with(**open))
                     {
                         // Drop the leading whitespace + opener; the rest is
                         // reasoning to classify next iteration.
@@ -639,7 +663,10 @@ mod tests {
     use super::*;
 
     fn defaults() -> RequestDefaults {
-        RequestDefaults { temperature: 0.7, max_tokens: 4096 }
+        RequestDefaults {
+            temperature: 0.7,
+            max_tokens: 4096,
+        }
     }
 
     fn meta() -> CompletionMeta {
@@ -799,7 +826,11 @@ mod tests {
             model: "m".to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: None, content: Some("tok".to_string()), reasoning_content: None },
+                delta: Delta {
+                    role: None,
+                    content: Some("tok".to_string()),
+                    reasoning_content: None,
+                },
                 finish_reason: Some("stop".to_string()),
             }],
         };
@@ -893,7 +924,11 @@ mod tests {
             got_content.push_str(&c);
             // The pure fn trims; the streaming one preserves interior text
             // verbatim, so compare on trimmed reasoning and exact content.
-            assert_eq!(got_reasoning.trim(), want_reasoning, "reasoning for {whole:?}");
+            assert_eq!(
+                got_reasoning.trim(),
+                want_reasoning,
+                "reasoning for {whole:?}"
+            );
             assert_eq!(got_content, want_content, "content for {whole:?}");
         }
     }

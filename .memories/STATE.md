@@ -22,9 +22,11 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **383 passing** + 4 `#[ignore]`d (semantic evals + perf probe, need the model / a terminal) (`cargo test --bin pooprusteek`) |
+| Tests | **386 passing** + 4 `#[ignore]`d (semantic evals + perf probe, need the model / a terminal) (`cargo test --bin pooprusteek`) |
+| `cargo fmt` | Clean — whole `src/` reformatted 2026-07-06 (was never run before; 127/161 files had drift). No fmt step in `ci.yml` yet (only enforced locally via the pre-commit hook). |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
 | Dev-build release | `.github/workflows/dev-release.yml` (live) — rolling `v<version>-dev` GitHub Release on qualifying `develop` pushes; `.gitlab-ci.yml` (unverified, no GitLab remote yet). Release notes rendered from `scripts/dev-release.template.md` via `scripts/render-release-notes.sh` (shared, 24 `{{VAR}}` placeholders — tag/commit/author/changelog-since-last-build/artifacts). |
+| Pre-commit hook | `.githooks/pre-commit` (fmt --check + clippy -D warnings + test), enabled locally via `git config core.hooksPath .githooks` — not yet wired into `ci.yml`. Bypass: `git commit --no-verify`. |
 
 ## CURRENT FOCUS
 

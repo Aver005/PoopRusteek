@@ -46,7 +46,12 @@ impl AgentRuntime {
         semantic: Arc<crate::semantic::SemanticService>,
         event_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Self {
-        Self { tools, mcp, semantic, event_tx }
+        Self {
+            tools,
+            mcp,
+            semantic,
+            event_tx,
+        }
     }
 
     /// Launch a turn on its own task; the returned handle drives cancellation.

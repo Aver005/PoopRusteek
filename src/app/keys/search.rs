@@ -4,13 +4,16 @@
 //! can be hotkeys without fighting the input field.
 
 use super::apply_text_key;
+use crate::app::App;
 use crate::app::events::View;
 use crate::app::search::SearchFocus;
-use crate::app::App;
 use crate::error::AppResult;
 
 impl App {
-    pub(super) async fn handle_search_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+    pub(super) async fn handle_search_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> AppResult<bool> {
         use crossterm::event::KeyCode;
 
         match self.state.search.focus {

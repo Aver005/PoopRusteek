@@ -6,7 +6,7 @@
 //! (no user is watching), and `task`/`question` are refused so a sub-agent
 //! can't spawn sub-agents or block on a prompt (depth limit of 1).
 
-use crate::agent::stream::{collect_stream, StreamEnd};
+use crate::agent::stream::{StreamEnd, collect_stream};
 use crate::agent::tool_parser::{parse_tool_calls, strip_tool_calls};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
@@ -81,7 +81,8 @@ pub async fn run_sub_agent(
                 ));
                 continue;
             }
-            let result = if tool_call.name == TASK_TOOL_NAME || tool_call.name == QUESTION_TOOL_NAME {
+            let result = if tool_call.name == TASK_TOOL_NAME || tool_call.name == QUESTION_TOOL_NAME
+            {
                 format!("'{}' is not available inside a sub-agent.", tool_call.name)
             } else if tool_call.name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
                 // Same lock discipline as the main loop: never hold the
@@ -89,7 +90,10 @@ pub async fn run_sub_agent(
                 let client = { mcp.lock().await.client_for(&tool_call.name) };
                 match client {
                     Some((client, bare_name)) => {
-                        match client.call_tool(&bare_name, tool_call.arguments.clone()).await {
+                        match client
+                            .call_tool(&bare_name, tool_call.arguments.clone())
+                            .await
+                        {
                             Ok(r) => r.content,
                             Err(e) => e.to_string(),
                         }
@@ -100,7 +104,10 @@ pub async fn run_sub_agent(
                     ),
                 }
             } else {
-                tools.execute(&tool_call.name, tool_call.arguments.clone()).await.content
+                tools
+                    .execute(&tool_call.name, tool_call.arguments.clone())
+                    .await
+                    .content
             };
             messages.push(ChatMessage::tool(&tool_id, &result));
         }
@@ -145,4 +152,3 @@ mod tests {
         assert_eq!(out.unwrap(), "Done: 42");
     }
 }
-

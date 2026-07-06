@@ -45,7 +45,10 @@ mod tests {
         assert!(matches!(parse(""), CommandResult::OpenThemes));
         assert!(matches!(parse("  "), CommandResult::OpenThemes));
         for alias in ["new", "add", "create"] {
-            assert!(matches!(parse(alias), CommandResult::OpenThemeWizard), "{alias}");
+            assert!(
+                matches!(parse(alias), CommandResult::OpenThemeWizard),
+                "{alias}"
+            );
         }
     }
 

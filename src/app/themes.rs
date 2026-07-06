@@ -9,7 +9,7 @@
 
 use crate::app::input::InputState;
 use crate::config::{Config, CustomTheme};
-use crate::tui::theme::{self, Theme, PRESETS, ROLES};
+use crate::tui::theme::{self, PRESETS, ROLES, Theme};
 
 /// Live state of the `/themes` full-screen panel.
 #[derive(Debug, Clone, Default)]
@@ -59,7 +59,11 @@ pub fn theme_rows(config: &Config) -> Vec<ThemeRow> {
             label: custom.name.clone(),
             detail: format!(
                 "custom · based on {}",
-                if custom.base.is_empty() { "default" } else { custom.base.as_str() },
+                if custom.base.is_empty() {
+                    "default"
+                } else {
+                    custom.base.as_str()
+                },
             ),
             active: custom.name == active,
         });
@@ -274,7 +278,11 @@ pub fn validate_theme_name(
         return Err(format!("'{name}' is a built-in theme"));
     }
     if editing != Some(name)
-        && config.ui.custom_themes.iter().any(|theme| theme.name == name)
+        && config
+            .ui
+            .custom_themes
+            .iter()
+            .any(|theme| theme.name == name)
     {
         return Err(format!("'{name}' already exists"));
     }
@@ -309,7 +317,11 @@ mod tests {
         config.ui.theme = "mine".to_string();
         let rows = theme_rows(&config);
         assert_eq!(rows.len(), PRESETS.len() + 2);
-        assert!(rows[..PRESETS.len()].iter().all(|row| row.kind == ThemeRowKind::Preset));
+        assert!(
+            rows[..PRESETS.len()]
+                .iter()
+                .all(|row| row.kind == ThemeRowKind::Preset)
+        );
         assert_eq!(rows[PRESETS.len()].kind, ThemeRowKind::Custom);
         assert!(rows[PRESETS.len()].active);
         assert_eq!(rows.last().unwrap().kind, ThemeRowKind::Create);
@@ -336,7 +348,10 @@ mod tests {
             .position(|row| row.name == "dracula")
             .unwrap();
         view.selected = dracula_index;
-        assert_eq!(view.preview_theme(&config), Theme::preset("dracula").unwrap());
+        assert_eq!(
+            view.preview_theme(&config),
+            Theme::preset("dracula").unwrap()
+        );
         // The create row previews the currently configured theme.
         view.selected = theme_rows(&config).len() - 1;
         assert_eq!(view.preview_theme(&config), Theme::resolve(&config.ui));
@@ -385,10 +400,7 @@ mod tests {
         );
         // A half-typed value leaves the accepted color in place.
         wizard.hex_input.buffer = "#123".to_string();
-        assert_eq!(
-            wizard.preview_theme().accent,
-            (PRESETS[0].build)().accent,
-        );
+        assert_eq!(wizard.preview_theme().accent, (PRESETS[0].build)().accent,);
     }
 
     #[test]

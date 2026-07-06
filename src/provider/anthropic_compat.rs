@@ -20,7 +20,7 @@
 
 use crate::provider::{CompletionRequest, CompletionResponse, Role, Usage};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Build the Messages-API request body. `ui_only` messages are filtered
 /// for the same reason `provider/prompt.rs` filters them: UI chrome must
@@ -311,7 +311,10 @@ mod tests {
     fn max_tokens_stop_reason_maps_to_length() {
         let parsed: MessagesResponse =
             serde_json::from_str(r#"{"content": [], "stop_reason": "max_tokens"}"#).unwrap();
-        assert_eq!(response_from_anthropic(parsed).finish_reason.as_deref(), Some("length"));
+        assert_eq!(
+            response_from_anthropic(parsed).finish_reason.as_deref(),
+            Some("length")
+        );
     }
 
     #[test]
@@ -330,17 +333,27 @@ mod tests {
     #[test]
     fn stream_events_decode() {
         assert_eq!(
-            parse_stream_event(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tok"}}"#),
+            parse_stream_event(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tok"}}"#
+            ),
             StreamEvent::Text("tok".to_string()),
         );
-        assert_eq!(parse_stream_event(r#"{"type":"message_stop"}"#), StreamEvent::Done);
-        assert_eq!(parse_stream_event(r#"{"type":"ping"}"#), StreamEvent::Ignore);
+        assert_eq!(
+            parse_stream_event(r#"{"type":"message_stop"}"#),
+            StreamEvent::Done
+        );
+        assert_eq!(
+            parse_stream_event(r#"{"type":"ping"}"#),
+            StreamEvent::Ignore
+        );
         assert_eq!(
             parse_stream_event(r#"{"type":"message_start","message":{"id":"x"}}"#),
             StreamEvent::Ignore,
         );
         assert_eq!(
-            parse_stream_event(r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#),
+            parse_stream_event(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#
+            ),
             StreamEvent::Error("busy".to_string()),
         );
         assert_eq!(parse_stream_event("not json"), StreamEvent::Ignore);

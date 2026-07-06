@@ -103,7 +103,10 @@ impl ProviderModelCache {
             .and_then(|text| serde_json::from_str::<CacheFile>(&text).ok())
             .map(|file| file.providers)
             .unwrap_or_default();
-        Arc::new(Self { path, inner: Mutex::new(providers) })
+        Arc::new(Self {
+            path,
+            inner: Mutex::new(providers),
+        })
     }
 
     #[cfg(test)]
@@ -131,10 +134,10 @@ impl ProviderModelCache {
 
     /// Age of one entry's cached list, if present.
     pub fn age_ms(&self, name: &str) -> Option<u64> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|map| map.get(name).map(|cached| now_ms().saturating_sub(cached.fetched_at_ms)))
+        self.inner.lock().ok().and_then(|map| {
+            map.get(name)
+                .map(|cached| now_ms().saturating_sub(cached.fetched_at_ms))
+        })
     }
 
     fn is_fresh(&self, name: &str, cache_ttl_ms: u64) -> bool {
@@ -143,7 +146,13 @@ impl ProviderModelCache {
 
     fn store(&self, name: &str, models: Vec<String>) {
         if let Ok(mut map) = self.inner.lock() {
-            map.insert(name.to_string(), CachedModels { models, fetched_at_ms: now_ms() });
+            map.insert(
+                name.to_string(),
+                CachedModels {
+                    models,
+                    fetched_at_ms: now_ms(),
+                },
+            );
         }
         self.persist();
     }
@@ -244,7 +253,10 @@ mod tests {
         // Insert directly (bypassing persist-to-temp is fine — same path).
         cache.inner.lock().unwrap().insert(
             "lm".to_string(),
-            CachedModels { models: vec!["a".into(), "b".into()], fetched_at_ms: now_ms() },
+            CachedModels {
+                models: vec!["a".into(), "b".into()],
+                fetched_at_ms: now_ms(),
+            },
         );
         assert_eq!(cache.snapshot().get("lm").map(Vec::len), Some(2));
         assert!(cache.is_fresh("lm", 60_000));
@@ -257,7 +269,10 @@ mod tests {
         let cache = ProviderModelCache::empty_for_tests();
         cache.inner.lock().unwrap().insert(
             "cached".to_string(),
-            CachedModels { models: vec!["kept".into()], fetched_at_ms: now_ms() },
+            CachedModels {
+                models: vec!["kept".into()],
+                fetched_at_ms: now_ms(),
+            },
         );
 
         // "cached" is fresh → skipped; "dead" points at a closed port → fails.
@@ -283,7 +298,10 @@ mod tests {
             failed: vec![("ollama".into(), "boom".into())],
             skipped: 2,
         };
-        assert_eq!(outcome.summary(), "provider models: lm 14, ollama failed, 2 cached");
+        assert_eq!(
+            outcome.summary(),
+            "provider models: lm 14, ollama failed, 2 cached"
+        );
         assert_eq!(RefreshOutcome::default().summary(), "no providers to fetch");
     }
 }

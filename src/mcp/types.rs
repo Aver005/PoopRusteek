@@ -38,7 +38,10 @@ pub enum MCPServerStatus {
     // await with no intermediate progress point, so nothing constructs this
     // today. The status-label match in manager.rs already handles it, so
     // it's kept rather than removed.
-    #[expect(dead_code, reason = "no intermediate progress point in the current connect path")]
+    #[expect(
+        dead_code,
+        reason = "no intermediate progress point in the current connect path"
+    )]
     Connecting,
     Connected,
     /// The server answered with HTTP 401 during connect. The `Option<String>`
@@ -108,7 +111,9 @@ pub struct McpServerDef {
     pub config: MCPServerConfig,
 }
 
-fn default_enabled() -> bool { true }
+fn default_enabled() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct McpViewState {
@@ -161,7 +166,11 @@ mod tests {
         ServerDisplayInfo {
             name: name.to_string(),
             transport: "http".to_string(),
-            status: if needs_auth { "auth required".to_string() } else { "connected".to_string() },
+            status: if needs_auth {
+                "auth required".to_string()
+            } else {
+                "connected".to_string()
+            },
             tool_count: 0,
             resource_count: 0,
             enabled: true,

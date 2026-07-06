@@ -7,9 +7,9 @@
 //! the event loop (`App::spawn_history_search` → blocking thread →
 //! `AppEvent::HistorySearchDone`).
 
+use crate::app::App;
 use crate::app::events::AppEvent;
 use crate::app::input::InputState;
-use crate::app::App;
 use crate::semantic::history::HistoryMatch;
 use std::sync::Arc;
 
@@ -115,7 +115,12 @@ impl SearchViewState {
 
     /// Indices into `matches`, filtered and sorted for display.
     pub fn visible(&self) -> Vec<usize> {
-        visible_indices(&self.matches, self.sort, self.role_filter, self.unique_sessions)
+        visible_indices(
+            &self.matches,
+            self.sort,
+            self.role_filter,
+            self.unique_sessions,
+        )
     }
 
     /// Reset list position after anything that changes the visible set.
@@ -213,7 +218,11 @@ mod tests {
     #[test]
     fn unique_sessions_keeps_most_relevant_chunk() {
         let v = visible_indices(&fixture(), SearchSort::Relevance, RoleFilter::All, true);
-        assert_eq!(v, vec![0, 1, 3], "s1's second (less relevant) chunk must drop");
+        assert_eq!(
+            v,
+            vec![0, 1, 3],
+            "s1's second (less relevant) chunk must drop"
+        );
     }
 
     #[test]

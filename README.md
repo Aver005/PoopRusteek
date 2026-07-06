@@ -265,6 +265,23 @@ cargo test semantic::eval -- --ignored --nocapture        # retrieval-quality ev
                                                           # downloads the embedding model once
 ```
 
+## 🛡️ Git hooks
+
+A pre-commit hook (`.githooks/pre-commit`) blocks commits that fail `cargo
+fmt -- --check`, `cargo clippy -D warnings`, or `cargo test`. Not wired up
+by default — enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Skip it for one commit (CI runs the same gates, so this only delays the
+failure, not avoids it):
+
+```bash
+git commit --no-verify
+```
+
 ## 🙏 Acknowledgements
 
 - [**Poopseek**](https://github.com/aver005/poopseek) — the original TypeScript project this is a rewrite of.

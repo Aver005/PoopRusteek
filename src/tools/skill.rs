@@ -1,6 +1,6 @@
 use super::*;
 use crate::skills::SkillDefinition;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct SkillTool {
     pub skills: std::sync::Arc<std::sync::RwLock<Vec<SkillDefinition>>>,
@@ -58,22 +58,21 @@ impl Tool for SkillTool {
             "load" => {
                 let name = args["name"].as_str().unwrap_or("");
                 if name.is_empty() {
-                    return ToolResult::error("Missing 'name' argument for action=load. Specify the skill name or slug.");
+                    return ToolResult::error(
+                        "Missing 'name' argument for action=load. Specify the skill name or slug.",
+                    );
                 }
 
                 let name_lower = name.to_lowercase();
                 let skills = self.skills.read().unwrap();
                 let skill = skills.iter().find(|s| {
-                    s.name.to_lowercase() == name_lower
-                        || s.slug.to_lowercase() == name_lower
+                    s.name.to_lowercase() == name_lower || s.slug.to_lowercase() == name_lower
                 });
 
                 match skill {
-                    Some(s) => ToolResult::success(&format!(
-                        "# Skill: {}\n{}",
-                        s.name,
-                        s.content.trim()
-                    )),
+                    Some(s) => {
+                        ToolResult::success(&format!("# Skill: {}\n{}", s.name, s.content.trim()))
+                    }
                     None => {
                         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
                         ToolResult::error(&format!(
@@ -83,7 +82,9 @@ impl Tool for SkillTool {
                     }
                 }
             }
-            _ => ToolResult::error(&format!("Unknown action: '{action}'. Use 'list' or 'load'.")),
+            _ => ToolResult::error(&format!(
+                "Unknown action: '{action}'. Use 'list' or 'load'."
+            )),
         }
     }
 }

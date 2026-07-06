@@ -76,9 +76,10 @@ fn parse_path_with_lines(s: &str) -> (PathBuf, Option<(usize, usize)>) {
                 return (PathBuf::from(path_part), Some((start, end)));
             }
         } else if let Ok(line) = line_part.parse::<usize>()
-            && line > 0 {
-                return (PathBuf::from(path_part), Some((line, line)));
-            }
+            && line > 0
+        {
+            return (PathBuf::from(path_part), Some((line, line)));
+        }
 
         (PathBuf::from(s), None)
     } else {

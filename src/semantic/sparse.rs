@@ -20,7 +20,9 @@ pub fn tokenize_stems(text: &str) -> Vec<String> {
         if token.chars().count() < 2 {
             continue;
         }
-        let is_cyrillic = token.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+        let is_cyrillic = token
+            .chars()
+            .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
         let stemmer = if is_cyrillic { &russian } else { &english };
         stems.push(stemmer.stem(token).into_owned());
     }
@@ -53,7 +55,10 @@ impl SparseIndex {
             .map(|(term, d)| (term, ((n - d + 0.5) / (d + 0.5) + 1.0).ln()))
             .collect();
 
-        let docs = tokenized.iter().map(|tokens| weighted(tokens, &idf)).collect();
+        let docs = tokenized
+            .iter()
+            .map(|tokens| weighted(tokens, &idf))
+            .collect();
         Self { docs, idf }
     }
 
@@ -114,14 +119,20 @@ mod tests {
         // "fix" this test by expecting that.)
         let a = tokenize_stems("уязвимостями");
         let b = tokenize_stems("уязвимость");
-        assert_eq!(a, b, "case forms of the same Russian word must stem equally");
+        assert_eq!(
+            a, b,
+            "case forms of the same Russian word must stem equally"
+        );
     }
 
     #[test]
     fn english_word_forms_share_a_stem() {
         let a = tokenize_stems("testing");
         let b = tokenize_stems("tests");
-        assert_eq!(a, b, "different forms of the same English word must stem equally");
+        assert_eq!(
+            a, b,
+            "different forms of the same English word must stem equally"
+        );
     }
 
     #[test]

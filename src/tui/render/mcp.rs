@@ -1,14 +1,16 @@
 //! MCP-related screens: the full-screen server-management view
 //! (`View::Mcp`, list + details) and the `/mcp add` modal.
 
-use super::popup::{center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line};
+use super::popup::{
+    center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
+};
 use crate::mcp::types::McpViewState;
 use crate::tui::theme::Theme;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
     let chunks = Layout::default()
@@ -23,7 +25,11 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
     // Header
     let header = Block::default()
         .borders(Borders::ALL)
-        .title(if mcp.auth_mode { " MCP Authorization " } else { " MCP Server Management " })
+        .title(if mcp.auth_mode {
+            " MCP Authorization "
+        } else {
+            " MCP Server Management "
+        })
         .border_style(Style::default().fg(theme.accent));
     let header_inner = header.inner(chunks[0]);
     frame.render_widget(header, chunks[0]);
@@ -64,8 +70,11 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
     let footer_inner = footer.inner(chunks[2]);
     frame.render_widget(footer, chunks[2]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(theme.text_dim))))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::from(Span::styled(
+            hints,
+            Style::default().fg(theme.text_dim),
+        )))
+        .alignment(Alignment::Center),
         footer_inner,
     );
 }
@@ -91,12 +100,28 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
     let visible = visible_indices.len().min(list_height);
 
     let header_line = Line::from(vec![
-        Span::styled("  STATUS  ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled("SERVER", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::raw(" ".repeat(area.width.saturating_sub(30) as usize).min(
-            " ".repeat(20).to_string(),
-        )),
-        Span::styled("TYPE   TOOLS", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  STATUS  ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "SERVER",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(
+            " ".repeat(area.width.saturating_sub(30) as usize)
+                .min(" ".repeat(20).to_string()),
+        ),
+        Span::styled(
+            "TYPE   TOOLS",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
     frame.render_widget(Paragraph::new(header_line), area);
 
@@ -139,20 +164,26 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
         let dim_style = Style::default().fg(theme.text_dim).bg(bg);
 
         let line = Line::from(vec![
-            Span::styled(format!(" {} ", status_short), Style::default().fg(status_color).bg(bg).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {} ", status_short),
+                Style::default()
+                    .fg(status_color)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" {} ", status_icon), dim_style),
             Span::styled(
                 format!("{:<20} ", server.name),
                 if selected {
-                    Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.fg).bg(bg)
                 },
             ),
-            Span::styled(
-                format!("{:<6}", server.transport),
-                dim_style,
-            ),
+            Span::styled(format!("{:<6}", server.transport), dim_style),
             Span::styled(
                 format!("{}t", server.tool_count),
                 Style::default().fg(theme.fg).bg(bg),
@@ -177,7 +208,13 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
     }
 }
 
-fn render_mcp_details(frame: &mut Frame, area: Rect, mcp: &McpViewState, server_name: &str, theme: &Theme) {
+fn render_mcp_details(
+    frame: &mut Frame,
+    area: Rect,
+    mcp: &McpViewState,
+    server_name: &str,
+    theme: &Theme,
+) {
     let Some(server) = mcp.servers.iter().find(|s| s.name == server_name) else {
         return;
     };
@@ -186,10 +223,20 @@ fn render_mcp_details(frame: &mut Frame, area: Rect, mcp: &McpViewState, server_
         let mut out = Vec::new();
         out.push(Line::from(Span::styled(
             format!(" Server: {}", server.name),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         )));
         out.push(Line::from(Span::styled(
-            format!(" Status: {} ({})", server.status, if server.enabled { "enabled" } else { "disabled" }),
+            format!(
+                " Status: {} ({})",
+                server.status,
+                if server.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
             Style::default().fg(theme.fg),
         )));
         out.push(Line::from(Span::styled(
@@ -204,7 +251,10 @@ fn render_mcp_details(frame: &mut Frame, area: Rect, mcp: &McpViewState, server_
             format!(" Resources: {}", server.resource_count),
             Style::default().fg(theme.fg),
         )));
-        out.push(Line::from(Span::styled("─".repeat(area.width as usize), Style::default().fg(theme.border))));
+        out.push(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(theme.border),
+        )));
         out.push(Line::from(Span::styled(
             " j/k scroll  Enter back ",
             Style::default().fg(theme.text_dim),
@@ -222,7 +272,12 @@ fn render_mcp_details(frame: &mut Frame, area: Rect, mcp: &McpViewState, server_
     frame.render_widget(paragraph, area);
 }
 
-pub(super) fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::mcp_add::McpAddState, theme: &Theme) {
+pub(super) fn render_mcp_add(
+    frame: &mut Frame,
+    area: Rect,
+    state: &crate::app::mcp_add::McpAddState,
+    theme: &Theme,
+) {
     use crate::app::mcp_add::{McpAddState, TransportChoice, WizardStep};
 
     let popup_width = area.width.clamp(52, 76);
@@ -238,14 +293,27 @@ pub(super) fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::
 
     let hint: &str = match state {
         McpAddState::ChooseMethod { selected } => {
-            lines.push(Line::from(Span::styled("  Pick a method:", Style::default().fg(theme.text_dim))));
+            lines.push(Line::from(Span::styled(
+                "  Pick a method:",
+                Style::default().fg(theme.text_dim),
+            )));
             lines.push(Line::from(""));
-            for (i, opt) in ["Paste a JSON config", "Step-by-step wizard"].iter().enumerate() {
+            for (i, opt) in ["Paste a JSON config", "Step-by-step wizard"]
+                .iter()
+                .enumerate()
+            {
                 let is_cursor = i == *selected;
                 let indicator = if is_cursor { "\u{25B6} " } else { "  " };
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().fg(theme.fg)),
-                    Span::styled(indicator, Style::default().fg(if is_cursor { theme.accent } else { theme.text_dim })),
+                    Span::styled(
+                        indicator,
+                        Style::default().fg(if is_cursor {
+                            theme.accent
+                        } else {
+                            theme.text_dim
+                        }),
+                    ),
                     Span::styled(
                         opt.to_string(),
                         if is_cursor {
@@ -267,7 +335,10 @@ pub(super) fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::
             push_text_box_lines(&mut lines, &input.buffer, input.cursor, theme, max_rows);
             if let Some(err) = error {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(format!("  \u{26A0} {err}"), Style::default().fg(theme.error))));
+                lines.push(Line::from(Span::styled(
+                    format!("  \u{26A0} {err}"),
+                    Style::default().fg(theme.error),
+                )));
             }
             " Enter add    Shift+Enter newline    Esc back "
         }
@@ -275,25 +346,56 @@ pub(super) fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::
             let (step_num, step_label) = match wiz.step {
                 WizardStep::Name => (1, "Server name".to_string()),
                 WizardStep::Transport => (2, "Transport".to_string()),
-                WizardStep::Primary => (3, wiz.transport.map(TransportChoice::primary_label).unwrap_or("Value").to_string()),
-                WizardStep::Extra => (4, wiz.transport.map(TransportChoice::extra_label).unwrap_or("Extra").to_string()),
+                WizardStep::Primary => (
+                    3,
+                    wiz.transport
+                        .map(TransportChoice::primary_label)
+                        .unwrap_or("Value")
+                        .to_string(),
+                ),
+                WizardStep::Extra => (
+                    4,
+                    wiz.transport
+                        .map(TransportChoice::extra_label)
+                        .unwrap_or("Extra")
+                        .to_string(),
+                ),
                 WizardStep::Confirm => (5, "Confirm".to_string()),
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  Step {step_num}/5 \u{2014} "), Style::default().fg(theme.text_dim)),
-                Span::styled(step_label, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("  Step {step_num}/5 \u{2014} "),
+                    Style::default().fg(theme.text_dim),
+                ),
+                Span::styled(
+                    step_label,
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                ),
             ]));
             lines.push(Line::from(""));
 
             match wiz.step {
-                WizardStep::Name => push_text_box_lines(&mut lines, &wiz.name.buffer, wiz.name.cursor, theme, max_rows),
+                WizardStep::Name => push_text_box_lines(
+                    &mut lines,
+                    &wiz.name.buffer,
+                    wiz.name.cursor,
+                    theme,
+                    max_rows,
+                ),
                 WizardStep::Transport => {
                     for (i, choice) in TransportChoice::ALL.iter().enumerate() {
                         let is_cursor = i == wiz.transport_selected;
                         let indicator = if is_cursor { "\u{25B6} " } else { "  " };
                         lines.push(Line::from(vec![
                             Span::styled("  ", Style::default().fg(theme.fg)),
-                            Span::styled(indicator, Style::default().fg(if is_cursor { theme.accent } else { theme.text_dim })),
+                            Span::styled(
+                                indicator,
+                                Style::default().fg(if is_cursor {
+                                    theme.accent
+                                } else {
+                                    theme.text_dim
+                                }),
+                            ),
                             Span::styled(
                                 choice.label(),
                                 if is_cursor {
@@ -305,8 +407,20 @@ pub(super) fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::
                         ]));
                     }
                 }
-                WizardStep::Primary => push_text_box_lines(&mut lines, &wiz.primary.buffer, wiz.primary.cursor, theme, max_rows),
-                WizardStep::Extra => push_text_box_lines(&mut lines, &wiz.extra.buffer, wiz.extra.cursor, theme, max_rows),
+                WizardStep::Primary => push_text_box_lines(
+                    &mut lines,
+                    &wiz.primary.buffer,
+                    wiz.primary.cursor,
+                    theme,
+                    max_rows,
+                ),
+                WizardStep::Extra => push_text_box_lines(
+                    &mut lines,
+                    &wiz.extra.buffer,
+                    wiz.extra.cursor,
+                    theme,
+                    max_rows,
+                ),
                 WizardStep::Confirm => {
                     lines.push(Line::from(Span::styled(
                         format!("  Name:      {}", wiz.name.buffer.trim()),
@@ -323,19 +437,27 @@ pub(super) fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::
                         Style::default().fg(theme.text_soft),
                     )));
                     if !wiz.extra.buffer.trim().is_empty() {
-                        lines.push(Line::from(Span::styled("  (+ extra env/headers)", Style::default().fg(theme.text_dim))));
+                        lines.push(Line::from(Span::styled(
+                            "  (+ extra env/headers)",
+                            Style::default().fg(theme.text_dim),
+                        )));
                     }
                 }
             }
 
             if let Some(err) = &wiz.error {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(format!("  \u{26A0} {err}"), Style::default().fg(theme.error))));
+                lines.push(Line::from(Span::styled(
+                    format!("  \u{26A0} {err}"),
+                    Style::default().fg(theme.error),
+                )));
             }
 
             match wiz.step {
                 WizardStep::Name | WizardStep::Primary => " Enter next    Esc back ",
-                WizardStep::Extra => " Enter next (blank = skip)    Shift+Enter newline    Esc back ",
+                WizardStep::Extra => {
+                    " Enter next (blank = skip)    Shift+Enter newline    Esc back "
+                }
                 WizardStep::Transport => " \u{2191}\u{2193} navigate    Enter select    Esc back ",
                 WizardStep::Confirm => " Enter add server    Esc back ",
             }
@@ -344,9 +466,15 @@ pub(super) fn render_mcp_add(frame: &mut Frame, area: Rect, state: &crate::app::
 
     fill_panel_space(&mut lines, inner.height.saturating_sub(2) as usize);
     lines.push(separator_line(inner_w, theme));
-    lines.push(Line::from(Span::styled(hint, Style::default().fg(theme.text_dim))));
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(theme.text_dim),
+    )));
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(block, popup_area);
-    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.panel)), inner);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+        inner,
+    );
 }

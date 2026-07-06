@@ -8,8 +8,8 @@
 //! - MCP details / tool-approval modal — `scroll_offset` counts from the top,
 //!   so wheel up decreases it.
 
-use crate::app::events::{Modal, View};
 use crate::app::App;
+use crate::app::events::{Modal, View};
 
 /// Rows moved per wheel notch — a little faster than a single arrow press.
 const WHEEL_STEP: usize = 3;
@@ -25,7 +25,12 @@ impl App {
         };
 
         // A modal owns the screen when present — scroll it, not the chat behind.
-        if let Some(Modal::ToolApproval { arguments, scroll_offset, .. }) = self.state.modal.as_mut() {
+        if let Some(Modal::ToolApproval {
+            arguments,
+            scroll_offset,
+            ..
+        }) = self.state.modal.as_mut()
+        {
             if up {
                 *scroll_offset = scroll_offset.saturating_sub(WHEEL_STEP);
             } else {
@@ -43,7 +48,11 @@ impl App {
         match self.state.view {
             View::Mcp => {
                 let off = &mut self.state.mcp_status.view.scroll_offset;
-                *off = if up { off.saturating_sub(1) } else { off.saturating_add(1) };
+                *off = if up {
+                    off.saturating_sub(1)
+                } else {
+                    off.saturating_add(1)
+                };
             }
             View::Search => {
                 // The results list is selection-driven; move the cursor like j/k.

@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `task` — spawn an isolated sub-agent. This struct only carries the schema the
 /// model sees; the actual spawn is special-cased in the agent loop (like

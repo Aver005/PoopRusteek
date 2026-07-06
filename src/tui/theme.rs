@@ -43,23 +43,74 @@ pub struct ThemeRole {
 
 /// Every role, in `Theme` field order — the wizard walks this list.
 pub const ROLES: &[ThemeRole] = &[
-    ThemeRole { key: "bg", label: "App background" },
-    ThemeRole { key: "panel", label: "Panel / popup background" },
-    ThemeRole { key: "fg", label: "Primary text" },
-    ThemeRole { key: "accent", label: "Accent (titles, focused elements)" },
-    ThemeRole { key: "accent_dim", label: "Accent dim (selected row background)" },
-    ThemeRole { key: "accent_soft", label: "Accent soft (tags, secondary highlights)" },
-    ThemeRole { key: "border", label: "Borders" },
-    ThemeRole { key: "border_focus", label: "Focused border" },
-    ThemeRole { key: "text_dim", label: "Dim text (hints, metadata)" },
-    ThemeRole { key: "text_soft", label: "Soft text (secondary content)" },
-    ThemeRole { key: "error", label: "Errors" },
-    ThemeRole { key: "success", label: "Success" },
-    ThemeRole { key: "warning", label: "Warnings" },
-    ThemeRole { key: "user_bg", label: "User message background" },
-    ThemeRole { key: "tool_bg", label: "Tool message background" },
-    ThemeRole { key: "input_bg", label: "Input box background" },
-    ThemeRole { key: "selection", label: "Selection background" },
+    ThemeRole {
+        key: "bg",
+        label: "App background",
+    },
+    ThemeRole {
+        key: "panel",
+        label: "Panel / popup background",
+    },
+    ThemeRole {
+        key: "fg",
+        label: "Primary text",
+    },
+    ThemeRole {
+        key: "accent",
+        label: "Accent (titles, focused elements)",
+    },
+    ThemeRole {
+        key: "accent_dim",
+        label: "Accent dim (selected row background)",
+    },
+    ThemeRole {
+        key: "accent_soft",
+        label: "Accent soft (tags, secondary highlights)",
+    },
+    ThemeRole {
+        key: "border",
+        label: "Borders",
+    },
+    ThemeRole {
+        key: "border_focus",
+        label: "Focused border",
+    },
+    ThemeRole {
+        key: "text_dim",
+        label: "Dim text (hints, metadata)",
+    },
+    ThemeRole {
+        key: "text_soft",
+        label: "Soft text (secondary content)",
+    },
+    ThemeRole {
+        key: "error",
+        label: "Errors",
+    },
+    ThemeRole {
+        key: "success",
+        label: "Success",
+    },
+    ThemeRole {
+        key: "warning",
+        label: "Warnings",
+    },
+    ThemeRole {
+        key: "user_bg",
+        label: "User message background",
+    },
+    ThemeRole {
+        key: "tool_bg",
+        label: "Tool message background",
+    },
+    ThemeRole {
+        key: "input_bg",
+        label: "Input box background",
+    },
+    ThemeRole {
+        key: "selection",
+        label: "Selection background",
+    },
 ];
 
 /// A built-in theme: stable config name, display label, one-line pitch.
@@ -496,7 +547,11 @@ mod tests {
     fn roles_cover_every_field_and_set_works() {
         let mut theme = Theme::default_dark();
         for role in ROLES {
-            assert!(theme.set(role.key, Color::Rgb(1, 2, 3)), "role {}", role.key);
+            assert!(
+                theme.set(role.key, Color::Rgb(1, 2, 3)),
+                "role {}",
+                role.key
+            );
             assert_eq!(theme.get(role.key), Some(Color::Rgb(1, 2, 3)));
         }
         assert!(!theme.set("nonsense", Color::Rgb(0, 0, 0)));
@@ -527,7 +582,10 @@ mod tests {
         // Untouched roles come from the base preset.
         assert_eq!(resolved.bg, Theme::preset("dracula").unwrap().bg);
 
-        assert_eq!(Theme::resolve_name("nord", &customs), Theme::preset("nord").unwrap());
+        assert_eq!(
+            Theme::resolve_name("nord", &customs),
+            Theme::preset("nord").unwrap()
+        );
         assert_eq!(Theme::resolve_name("gone", &customs), Theme::default_dark());
     }
 

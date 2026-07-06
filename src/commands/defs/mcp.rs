@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{save_config_then, Command, CommandResult};
+use crate::commands::{Command, CommandResult, save_config_then};
 use crate::config::{self, Config};
 
 pub struct McpCommand;
@@ -60,10 +60,12 @@ impl Command for McpCommand {
                     config.mcp.cache_ttl = ttl;
                     save_config_then(&config, || CommandResult::TtlUpdate(ttl))
                 }
-                Ok(_) => CommandResult::Error("TTL must be between 1 and 86400 seconds".to_string()),
-                Err(_) => CommandResult::Error(
-                    format!("Invalid TTL value: '{trimmed}'. Usage: /mcp ttl <seconds>")
-                ),
+                Ok(_) => {
+                    CommandResult::Error("TTL must be between 1 and 86400 seconds".to_string())
+                }
+                Err(_) => CommandResult::Error(format!(
+                    "Invalid TTL value: '{trimmed}'. Usage: /mcp ttl <seconds>"
+                )),
             }
         } else {
             CommandResult::Error(

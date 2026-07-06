@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Pre-commit gate: formatting, clippy, and tests must all pass before a
+# commit is allowed. Skip once with `git commit --no-verify` (not
+# recommended — CI runs the same gates anyway, so skipping just delays the
+# failure).
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "[pre-commit] cargo fmt -- --check"
+cargo fmt --all -- --check
+
+echo "[pre-commit] cargo clippy -- -D warnings"
+cargo clippy --bin pooprusteek -- -D warnings
+
+echo "[pre-commit] cargo test --bin pooprusteek"
+cargo test --bin pooprusteek
+
+echo "[pre-commit] all checks passed"

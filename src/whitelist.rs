@@ -14,9 +14,7 @@ pub fn load() -> HashSet<String> {
         return HashSet::new();
     }
     match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            serde_json::from_str(&content).unwrap_or_default()
-        }
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(e) => {
             tracing::warn!("Failed to read whitelist: {e}");
             HashSet::new()
@@ -40,7 +38,8 @@ pub fn save(tools: &HashSet<String>) -> AppResult<()> {
 pub fn persist_approval(tool_name: &str) {
     let mut tools = load();
     if tools.insert(tool_name.to_string())
-        && let Err(e) = save(&tools) {
-            tracing::warn!("Failed to persist tool approval for {tool_name}: {e}");
-        }
+        && let Err(e) = save(&tools)
+    {
+        tracing::warn!("Failed to persist tool approval for {tool_name}: {e}");
+    }
 }

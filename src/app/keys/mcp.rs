@@ -5,17 +5,20 @@
 //! via `AppEvent::McpOperationDone` / `McpOAuthResult`.
 
 use super::apply_text_key;
+use crate::app::App;
 use crate::app::events::{self, Modal, View};
 use crate::app::input::InputState;
 use crate::app::mcp_add::{self, McpAddState, TransportChoice, WizardStep};
-use crate::app::App;
 use crate::error::AppResult;
 use crate::mcp::types::MCPServerConfig;
 use crate::provider::ChatMessage;
 use std::sync::Arc;
 
 impl App {
-    pub(super) async fn handle_mcp_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+    pub(super) async fn handle_mcp_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> AppResult<bool> {
         use crossterm::event::KeyCode;
 
         if self.state.mcp_status.view.servers.is_empty() {
@@ -36,7 +39,8 @@ impl App {
                 self.state.view = View::Chat;
             }
             KeyCode::Up | KeyCode::Char('k') if !details_open => {
-                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.saturating_sub(1);
+                self.state.mcp_status.view.selected =
+                    self.state.mcp_status.view.selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') if !details_open => {
                 let max = self.state.mcp_status.view.servers.len().saturating_sub(1);
@@ -47,13 +51,26 @@ impl App {
             KeyCode::Enter => {
                 if details_open {
                     self.state.mcp_status.view.details_server = None;
-                } else if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected) {
+                } else if let Some(info) = self
+                    .state
+                    .mcp_status
+                    .view
+                    .servers
+                    .get(self.state.mcp_status.view.selected)
+                {
                     self.state.mcp_status.view.details_server = Some(info.name.clone());
                     self.state.mcp_status.view.scroll_offset = 0;
                 }
             }
             KeyCode::Char(' ') if !details_open => {
-                if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
+                if let Some(info) = self
+                    .state
+                    .mcp_status
+                    .view
+                    .servers
+                    .get(self.state.mcp_status.view.selected)
+                    .cloned()
+                {
                     let name = info.name.clone();
                     let was_enabled = info.enabled;
                     self.state.mcp_status.view.status_message = format!(
@@ -76,7 +93,14 @@ impl App {
                 }
             }
             KeyCode::Char('r') if !details_open => {
-                if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
+                if let Some(info) = self
+                    .state
+                    .mcp_status
+                    .view
+                    .servers
+                    .get(self.state.mcp_status.view.selected)
+                    .cloned()
+                {
                     let name = info.name.clone();
                     self.state.mcp_status.view.status_message = format!("Reconnecting {name}...");
                     let mcp = Arc::clone(&self.mcp);
@@ -91,7 +115,14 @@ impl App {
                 }
             }
             KeyCode::Char('d') if !details_open => {
-                if let Some(info) = self.state.mcp_status.view.servers.get(self.state.mcp_status.view.selected).cloned() {
+                if let Some(info) = self
+                    .state
+                    .mcp_status
+                    .view
+                    .servers
+                    .get(self.state.mcp_status.view.selected)
+                    .cloned()
+                {
                     let name = info.name.clone();
                     let mut mcp = self.mcp.lock().await;
                     if let Err(e) = mcp.remove_server(&name).await {
@@ -100,13 +131,17 @@ impl App {
                         self.state.mcp_status.view.status_message = format!("{name} removed");
                     }
                     self.state.mcp_status.view.servers = mcp.get_servers_info();
-                    self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.min(
-                        self.state.mcp_status.view.servers.len().saturating_sub(1),
-                    );
+                    self.state.mcp_status.view.selected = self
+                        .state
+                        .mcp_status
+                        .view
+                        .selected
+                        .min(self.state.mcp_status.view.servers.len().saturating_sub(1));
                 }
             }
             KeyCode::Up | KeyCode::Char('k') if details_open => {
-                self.state.mcp_status.view.scroll_offset = self.state.mcp_status.view.scroll_offset.saturating_sub(1);
+                self.state.mcp_status.view.scroll_offset =
+                    self.state.mcp_status.view.scroll_offset.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') if details_open => {
                 self.state.mcp_status.view.scroll_offset += 1;
@@ -131,15 +166,18 @@ impl App {
                 self.state.view = View::Chat;
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.saturating_sub(1);
+                self.state.mcp_status.view.selected =
+                    self.state.mcp_status.view.selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let max = visible.len().saturating_sub(1);
-                self.state.mcp_status.view.selected = (self.state.mcp_status.view.selected + 1).min(max);
+                self.state.mcp_status.view.selected =
+                    (self.state.mcp_status.view.selected + 1).min(max);
             }
             KeyCode::Enter => {
                 let selected = self.state.mcp_status.view.selected;
-                let Some(name) = visible.get(selected)
+                let Some(name) = visible
+                    .get(selected)
                     .and_then(|&idx| self.state.mcp_status.view.servers.get(idx))
                     .map(|info| info.name.clone())
                 else {
@@ -148,7 +186,8 @@ impl App {
 
                 let context = { self.mcp.lock().await.oauth_context(&name) };
                 let Some((config, hint)) = context else {
-                    self.state.mcp_status.view.status_message = format!("{name} no longer requires authorization");
+                    self.state.mcp_status.view.status_message =
+                        format!("{name} no longer requires authorization");
                     return Ok(false);
                 };
 
@@ -156,20 +195,26 @@ impl App {
                     crate::mcp::types::MCPServerConfig::Http { url, .. } => url,
                     crate::mcp::types::MCPServerConfig::Sse { url, .. } => url,
                     crate::mcp::types::MCPServerConfig::Stdio { .. } => {
-                        self.state.mcp_status.view.status_message = "stdio servers don't use OAuth".to_string();
+                        self.state.mcp_status.view.status_message =
+                            "stdio servers don't use OAuth".to_string();
                         return Ok(false);
                     }
                 };
 
-                self.state.mcp_status.view.status_message = format!("Opening browser for {name}...");
+                self.state.mcp_status.view.status_message =
+                    format!("Opening browser for {name}...");
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
                     let result = match crate::mcp::oauth::run_flow(&base_url, hint).await {
-                        Ok(tokens) => crate::mcp::oauth_store::save(&name, &tokens).await
+                        Ok(tokens) => crate::mcp::oauth_store::save(&name, &tokens)
+                            .await
                             .map_err(|e| e.to_string()),
                         Err(e) => Err(e.to_string()),
                     };
-                    let _ = event_tx.send(events::AppEvent::McpOAuthResult { server: name, result });
+                    let _ = event_tx.send(events::AppEvent::McpOAuthResult {
+                        server: name,
+                        result,
+                    });
                 });
             }
             _ => {}
@@ -194,7 +239,9 @@ impl App {
                     Err(e) => format!("{name}: {e}"),
                 });
             }
-            let _ = event_tx.send(events::AppEvent::McpOperationDone { message: lines.join("\n") });
+            let _ = event_tx.send(events::AppEvent::McpOperationDone {
+                message: lines.join("\n"),
+            });
         });
     }
 
@@ -220,7 +267,10 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(1),
                     KeyCode::Enter => {
                         let next = if selected == 0 {
-                            McpAddState::PasteJson { input: InputState::default(), error: None }
+                            McpAddState::PasteJson {
+                                input: InputState::default(),
+                                error: None,
+                            }
                         } else {
                             McpAddState::Wizard(Box::new(mcp_add::WizardState::new()))
                         };
@@ -231,7 +281,10 @@ impl App {
                 }
                 self.state.modal = Some(Modal::McpAdd(McpAddState::ChooseMethod { selected }));
             }
-            McpAddState::PasteJson { mut input, mut error } => {
+            McpAddState::PasteJson {
+                mut input,
+                mut error,
+            } => {
                 if !apply_text_key(&mut input, key, true) {
                     match key.code {
                         KeyCode::Esc => {
@@ -241,9 +294,13 @@ impl App {
                         KeyCode::Enter => match mcp_add::parse_pasted_json(&input.buffer) {
                             Ok(entries) => {
                                 self.state.modal = None;
-                                self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                                    &format!("Adding {} MCP server(s)...", entries.len()),
-                                ));
+                                self.state
+                                    .focused_mut()
+                                    .messages
+                                    .push(ChatMessage::ui_system(&format!(
+                                        "Adding {} MCP server(s)...",
+                                        entries.len()
+                                    )));
                                 self.spawn_mcp_add(entries);
                                 return Ok(false);
                             }
@@ -267,7 +324,8 @@ impl App {
                         KeyCode::Esc => {
                             match wiz.step {
                                 WizardStep::Name => {
-                                    self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
+                                    self.state.modal =
+                                        Some(Modal::McpAdd(McpAddState::choose_method()));
                                     return Ok(false);
                                 }
                                 WizardStep::Transport => wiz.step = WizardStep::Name,
@@ -304,7 +362,8 @@ impl App {
                             WizardStep::Primary => {
                                 let result: Result<(), String> = match wiz.transport {
                                     Some(TransportChoice::Stdio) => {
-                                        mcp_add::split_command_line(wiz.primary.buffer.trim()).map(|_| ())
+                                        mcp_add::split_command_line(wiz.primary.buffer.trim())
+                                            .map(|_| ())
                                     }
                                     _ => {
                                         let url = wiz.primary.buffer.trim();
@@ -344,9 +403,10 @@ impl App {
                                 Ok(config) => {
                                     let name = wiz.name.buffer.trim().to_string();
                                     self.state.modal = None;
-                                    self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                                        &format!("Adding {name}..."),
-                                    ));
+                                    self.state
+                                        .focused_mut()
+                                        .messages
+                                        .push(ChatMessage::ui_system(&format!("Adding {name}...")));
                                     self.spawn_mcp_add(vec![(name, config)]);
                                     return Ok(false);
                                 }

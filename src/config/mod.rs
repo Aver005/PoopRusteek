@@ -278,8 +278,8 @@ impl AgentConfig {
     /// never drift out of sync (e.g. "500ms, 10/min" or "off").
     pub fn rate_limit_display(&self) -> String {
         let ms = (self.rate_limit_ms > 0).then(|| format!("{}ms", self.rate_limit_ms));
-        let per_min = (self.rate_limit_per_minute > 0)
-            .then(|| format!("{}/min", self.rate_limit_per_minute));
+        let per_min =
+            (self.rate_limit_per_minute > 0).then(|| format!("{}/min", self.rate_limit_per_minute));
         match (ms, per_min) {
             (None, None) => "off".to_string(),
             (Some(a), None) => a,

@@ -7,17 +7,16 @@ use super::DeepseekProvider;
 use crate::debug_log;
 use crate::error::{AppError, AppResult};
 use reqwest::{
-    header::{HeaderMap, HeaderValue},
     Response,
+    header::{HeaderMap, HeaderValue},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::sleep;
 
 const DEEPSEEK_HOST: &str = "chat.deepseek.com";
 
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
 
 impl DeepseekProvider {
     pub(super) fn auth_headers(&self) -> AppResult<HeaderMap> {
@@ -79,7 +78,13 @@ impl DeepseekProvider {
         Value::Object(map)
     }
 
-    pub(super) fn log_http_request(&self, action: &str, url: &str, headers: &HeaderMap, body: &Value) {
+    pub(super) fn log_http_request(
+        &self,
+        action: &str,
+        url: &str,
+        headers: &HeaderMap,
+        body: &Value,
+    ) {
         debug_log::log_json(
             action,
             &json!({
@@ -107,7 +112,10 @@ impl DeepseekProvider {
                 sleep(min_interval - elapsed).await;
             }
         }
-        let _ = self.last_request.lock().map(|mut last| *last = std::time::Instant::now());
+        let _ = self
+            .last_request
+            .lock()
+            .map(|mut last| *last = std::time::Instant::now());
 
         if self.rate_limit_per_minute > 0 {
             let window = Duration::from_secs(60);
@@ -169,12 +177,22 @@ impl DeepseekProvider {
         loop {
             self.log_http_request(action, url, headers, body);
 
-            match self.client.post(url).headers(headers.clone()).json(body).send().await {
+            match self
+                .client
+                .post(url)
+                .headers(headers.clone())
+                .json(body)
+                .send()
+                .await
+            {
                 Ok(response) => {
                     let status = response.status();
                     debug_log::log(
                         action,
-                        format!("response status={status} headers={}", Self::headers_to_debug_json(response.headers())),
+                        format!(
+                            "response status={status} headers={}",
+                            Self::headers_to_debug_json(response.headers())
+                        ),
                     );
 
                     if !status.is_server_error() || attempt + 1 >= max_attempts {
@@ -183,7 +201,9 @@ impl DeepseekProvider {
 
                     attempt += 1;
                     let capped = Self::retry_backoff(attempt);
-                    tracing::warn!("{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}");
+                    tracing::warn!(
+                        "{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}"
+                    );
                     sleep(capped).await;
                 }
                 Err(error) => {
@@ -196,14 +216,20 @@ impl DeepseekProvider {
                     }
                     attempt += 1;
                     let capped = Self::retry_backoff(attempt);
-                    tracing::warn!("{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}");
+                    tracing::warn!(
+                        "{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}"
+                    );
                     sleep(capped).await;
                 }
             }
         }
     }
 
-    pub(super) async fn read_error_response(action: &str, response: Response, label: &str) -> AppError {
+    pub(super) async fn read_error_response(
+        action: &str,
+        response: Response,
+        label: &str,
+    ) -> AppError {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         debug_log::log(
@@ -236,10 +262,7 @@ impl DeepseekProvider {
             match self.client.get(url).headers(headers.clone()).send().await {
                 Ok(response) => {
                     let status = response.status();
-                    debug_log::log(
-                        action,
-                        format!("response status={status}"),
-                    );
+                    debug_log::log(action, format!("response status={status}"));
 
                     if !status.is_server_error() || attempt + 1 >= max_attempts {
                         return Ok(response);
@@ -247,7 +270,9 @@ impl DeepseekProvider {
 
                     attempt += 1;
                     let capped = Self::retry_backoff(attempt);
-                    tracing::warn!("{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}");
+                    tracing::warn!(
+                        "{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}"
+                    );
                     sleep(capped).await;
                 }
                 Err(error) => {
@@ -256,7 +281,9 @@ impl DeepseekProvider {
                     }
                     attempt += 1;
                     let capped = Self::retry_backoff(attempt);
-                    tracing::warn!("{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}");
+                    tracing::warn!(
+                        "{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}"
+                    );
                     sleep(capped).await;
                 }
             }

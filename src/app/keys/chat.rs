@@ -18,7 +18,10 @@ enum SubmitOutcome {
 }
 
 impl App {
-    pub(super) async fn handle_chat_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+    pub(super) async fn handle_chat_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> AppResult<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         match key.code {
@@ -100,21 +103,27 @@ impl App {
                 self.state.input.move_right(shift, ctrl);
             }
             KeyCode::Home => {
-                self.state.input.move_home(key.modifiers.contains(KeyModifiers::SHIFT));
+                self.state
+                    .input
+                    .move_home(key.modifiers.contains(KeyModifiers::SHIFT));
             }
             KeyCode::End => {
-                self.state.input.move_end(key.modifiers.contains(KeyModifiers::SHIFT));
+                self.state
+                    .input
+                    .move_end(key.modifiers.contains(KeyModifiers::SHIFT));
             }
             // History recall lives on Ctrl+Up/Down everywhere so plain
             // Up/Down can always scroll the message window without the old
             // cursor-position disambiguation fighting the scroll.
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL)
-                && !self.state.focused_mut().generation.active =>
+            KeyCode::Up
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !self.state.focused_mut().generation.active =>
             {
                 self.state.input.history_prev();
             }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL)
-                && !self.state.focused_mut().generation.active =>
+            KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !self.state.focused_mut().generation.active =>
             {
                 self.state.input.history_next();
             }
@@ -142,10 +151,7 @@ impl App {
     /// model but not the chat view).
     async fn submit_input(&mut self) -> AppResult<SubmitOutcome> {
         let buf = &self.state.input.buffer;
-        let ends_with_backslash = buf
-            .chars()
-            .last()
-            .is_some_and(|c| c == '\\')
+        let ends_with_backslash = buf.chars().last().is_some_and(|c| c == '\\')
             && self.state.input.cursor == buf.chars().count();
         if ends_with_backslash {
             // Replace the trailing backslash with a newline (line continuation).
@@ -159,7 +165,10 @@ impl App {
         // Empty submission while defining a goal: nudge instead of silently ignoring it.
         if input.is_empty()
             && self.state.goal.mode
-            && matches!(self.state.goal.stage, GoalStage::Inactive | GoalStage::WaitForGoal)
+            && matches!(
+                self.state.goal.stage,
+                GoalStage::Inactive | GoalStage::WaitForGoal
+            )
         {
             let what = if matches!(self.state.goal.stage, GoalStage::Inactive) {
                 "prompt"
@@ -186,9 +195,10 @@ impl App {
         // persist worker — this used to be a blocking read-modify-write of
         // history.json right here on the event loop.
         crate::session::push_history_entry(&mut self.state.input.history, &input);
-        self.persister.enqueue(crate::app::persist::PersistJob::WriteHistory(
-            self.state.input.history.clone(),
-        ));
+        self.persister
+            .enqueue(crate::app::persist::PersistJob::WriteHistory(
+                self.state.input.history.clone(),
+            ));
 
         // --- GOAL mode: intercept non-command input ---
         if self.state.goal.mode && !input.starts_with('/') {
@@ -202,9 +212,12 @@ impl App {
                     let mut echo = ChatMessage::user(&input);
                     echo.ui_only = true;
                     self.state.focused_mut().messages.push(echo);
-                    self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                        "🎯 Goal mode: now define your GOAL (what must be achieved)",
-                    ));
+                    self.state
+                        .focused_mut()
+                        .messages
+                        .push(ChatMessage::ui_system(
+                            "🎯 Goal mode: now define your GOAL (what must be achieved)",
+                        ));
                     return Ok(SubmitOutcome::Consumed);
                 }
                 GoalStage::WaitForGoal => {
@@ -275,11 +288,17 @@ impl App {
             } else {
                 "\n\n".to_string()
             };
-            let attach_section: String = self.state.attached_files
+            let attach_section: String = self
+                .state
+                .attached_files
                 .iter()
                 .filter_map(|f| {
                     let content = std::fs::read_to_string(&f.path).ok()?;
-                    let header = format!("File: {} ({}):", f.display_name, crate::app::format_size(f.size));
+                    let header = format!(
+                        "File: {} ({}):",
+                        f.display_name,
+                        crate::app::format_size(f.size)
+                    );
                     attached_names.push(f.display_name.clone());
                     Some(format!("```\n{}\n{}\n```", header, content))
                 })

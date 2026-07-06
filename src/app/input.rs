@@ -191,7 +191,10 @@ impl InputState {
 /// Byte offset of the `char_pos`-th character, or the string's length if
 /// `char_pos` is past the end.
 pub fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
-    s.char_indices().nth(char_pos).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 fn char_is_word(ch: char) -> bool {
@@ -242,7 +245,11 @@ mod tests {
     use super::*;
 
     fn at(buffer: &str, cursor: usize) -> InputState {
-        InputState { buffer: buffer.to_string(), cursor, ..Default::default() }
+        InputState {
+            buffer: buffer.to_string(),
+            cursor,
+            ..Default::default()
+        }
     }
 
     #[test]

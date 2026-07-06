@@ -35,7 +35,9 @@ pub(super) fn centered_h(area: Rect, width: u16) -> Rect {
 /// status text, emoji in the goal/MCP tags — doesn't overstate how much
 /// horizontal space a segment occupies and push `right` off-screen.
 pub(super) fn status_bar_gap(left: &str, center: &str, right: &str, width: u16) -> usize {
-    let segments_width = UnicodeWidthStr::width(left) + UnicodeWidthStr::width(center) + UnicodeWidthStr::width(right);
+    let segments_width = UnicodeWidthStr::width(left)
+        + UnicodeWidthStr::width(center)
+        + UnicodeWidthStr::width(right);
     width.saturating_sub(segments_width as u16).max(1) as usize
 }
 
@@ -79,7 +81,10 @@ pub(super) fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 let has_comma = after_colon.ends_with(',');
                 let val_str = after_colon.trim_end_matches(',');
 
-                let mut spans = vec![Span::styled(indent.to_string(), Style::default().fg(theme.fg))];
+                let mut spans = vec![Span::styled(
+                    indent.to_string(),
+                    Style::default().fg(theme.fg),
+                )];
                 spans.push(Span::styled(
                     key_part.to_string(),
                     Style::default().fg(theme.accent),
@@ -149,16 +154,17 @@ mod tests {
         let right = " right ";
         let gap_by_width = status_bar_gap(left, center, right, 40);
 
-        let byte_len_gap = 40usize.saturating_sub(
-            (left.len() + center.len() + right.len()).min(40),
-        );
+        let byte_len_gap =
+            40usize.saturating_sub((left.len() + center.len() + right.len()).min(40));
         assert_ne!(
             gap_by_width, byte_len_gap,
             "multibyte content should make the width- and byte-length-based gaps diverge"
         );
 
         let expected = 40usize.saturating_sub(
-            UnicodeWidthStr::width(left) + UnicodeWidthStr::width(center) + UnicodeWidthStr::width(right),
+            UnicodeWidthStr::width(left)
+                + UnicodeWidthStr::width(center)
+                + UnicodeWidthStr::width(right),
         );
         assert_eq!(gap_by_width, expected);
     }
@@ -189,7 +195,11 @@ mod tests {
         let lines = highlight_json(text, &theme());
         assert_eq!(lines.len(), 1);
         let first_span = &lines[0].spans[0];
-        assert_eq!(first_span.content.as_ref(), "  ", "indent span must be exactly the 2 leading spaces");
+        assert_eq!(
+            first_span.content.as_ref(),
+            "  ",
+            "indent span must be exactly the 2 leading spaces"
+        );
 
         let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rendered, "  \"key\": \"value\",");

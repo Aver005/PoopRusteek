@@ -3,11 +3,14 @@
 //! provider and lands on the chat view.
 
 use crate::app::events::View;
-use crate::app::{conversation, App};
+use crate::app::{App, conversation};
 use crate::error::AppResult;
 
 impl App {
-    pub(super) async fn handle_onboarding_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+    pub(super) async fn handle_onboarding_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> AppResult<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         match key.code {
@@ -21,8 +24,9 @@ impl App {
             KeyCode::Backspace => {
                 self.state.onboarding.backspace();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT) =>
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.state.onboarding.insert(c);
             }

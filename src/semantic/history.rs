@@ -12,12 +12,12 @@
 //! All mutation/search runs on `spawn_blocking` threads under the
 //! service's inner lock, like every other corpus.
 
-use super::embedder::{dot, Embedder, EMBEDDING_DIM, MODEL_ID};
+use super::embedder::{EMBEDDING_DIM, Embedder, MODEL_ID, dot};
 use super::index::rrf_fuse;
 use super::sparse::SparseIndex;
 use crate::provider::{ChatMessage, Role};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -182,7 +182,8 @@ impl HistoryStore {
             }
         }
 
-        self.watermarks.insert(session_id.to_string(), messages.len());
+        self.watermarks
+            .insert(session_id.to_string(), messages.len());
         if texts.is_empty() {
             return Ok(0);
         }

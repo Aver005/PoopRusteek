@@ -5,8 +5,8 @@
 //! today, but the *pure* pieces — parsing the evaluator's verdict out of its
 //! free-text reply — belong here where they can be tested in isolation.
 
-use super::events::{AppEvent, GoalEvalOutcome, GoalStage, GoalVerdict};
 use super::App;
+use super::events::{AppEvent, GoalEvalOutcome, GoalStage, GoalVerdict};
 use crate::provider::ChatMessage;
 use std::sync::Arc;
 
@@ -160,11 +160,26 @@ pub(crate) fn parse_goal_verdict(text: &str) -> GoalVerdict {
         if trimmed.contains("**Status:**") {
             success = trimmed.contains("SUCCESS");
         } else if trimmed.contains("**Summary:**") {
-            summary = trimmed.split_once("**Summary:**").map(|x| x.1).unwrap_or("").trim().to_string();
+            summary = trimmed
+                .split_once("**Summary:**")
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
         } else if trimmed.contains("**Issues:**") {
-            issues = trimmed.split_once("**Issues:**").map(|x| x.1).unwrap_or("").trim().to_string();
+            issues = trimmed
+                .split_once("**Issues:**")
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
         } else if trimmed.contains("**Feedback:**") {
-            feedback = trimmed.split_once("**Feedback:**").map(|x| x.1).unwrap_or("").trim().to_string();
+            feedback = trimmed
+                .split_once("**Feedback:**")
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
         }
     }
 
@@ -173,7 +188,12 @@ pub(crate) fn parse_goal_verdict(text: &str) -> GoalVerdict {
         success = true;
     }
 
-    GoalVerdict { success, summary, issues, feedback }
+    GoalVerdict {
+        success,
+        summary,
+        issues,
+        feedback,
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +235,8 @@ mod tests {
     fn structured_summary_suppresses_fallback() {
         // A summary is present, so the SUCCESS-word fallback must not fire;
         // the explicit FAILURE status stands.
-        let v = parse_goal_verdict("**Status:** FAILURE\n**Summary:** partial — SUCCESS not reached");
+        let v =
+            parse_goal_verdict("**Status:** FAILURE\n**Summary:** partial — SUCCESS not reached");
         assert!(!v.success);
         assert_eq!(v.summary, "partial — SUCCESS not reached");
     }
@@ -260,7 +281,13 @@ mod tests {
         assert_eq!(g.agent1_failures, 1);
         assert_eq!(g.agent2_failures, 1);
         match outcome {
-            GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
+            GoalOutcome::Retry {
+                iteration,
+                issues,
+                feedback,
+                swapped_agent1,
+                swapped_agent2,
+            } => {
                 assert_eq!(iteration, 0); // pre-increment attempt number
                 assert_eq!(issues, "tests red");
                 assert_eq!(feedback, "fix tests");
@@ -275,14 +302,19 @@ mod tests {
         let mut g = GoalState::default();
         let outcome = g.apply_verdict(verdict(false, "", "", ""));
         match outcome {
-            GoalOutcome::Retry { feedback, .. } => assert!(feedback.starts_with("No specific feedback")),
+            GoalOutcome::Retry { feedback, .. } => {
+                assert!(feedback.starts_with("No specific feedback"))
+            }
             _ => panic!("expected Retry"),
         }
     }
 
     #[test]
     fn evaluator_swaps_after_fifth_failure() {
-        let mut g = GoalState { agent2_failures: 4, ..Default::default() };
+        let mut g = GoalState {
+            agent2_failures: 4,
+            ..Default::default()
+        };
         let outcome = g.apply_verdict(verdict(false, "", "", ""));
         // 4 + 1 == 5 → swap and reset the evaluator session.
         assert_eq!(g.agent2_failures, 0);
@@ -295,7 +327,10 @@ mod tests {
 
     #[test]
     fn worker_swaps_when_already_at_three_failures() {
-        let mut g = GoalState { agent1_failures: 3, ..Default::default() };
+        let mut g = GoalState {
+            agent1_failures: 3,
+            ..Default::default()
+        };
         let outcome = g.apply_verdict(verdict(false, "", "", ""));
         // Check is before increment: swap, reset to 0, then count this round → 1.
         assert_eq!(g.agent1_failures, 1);
@@ -308,7 +343,10 @@ mod tests {
 
     #[test]
     fn gives_up_at_iteration_cap() {
-        let mut g = GoalState { iteration: MAX_GOAL_ITERATIONS, ..Default::default() };
+        let mut g = GoalState {
+            iteration: MAX_GOAL_ITERATIONS,
+            ..Default::default()
+        };
         match g.apply_verdict(verdict(false, "", "", "")) {
             GoalOutcome::GaveUp { iteration } => assert_eq!(iteration, MAX_GOAL_ITERATIONS),
             _ => panic!("expected GaveUp at the cap"),
@@ -319,8 +357,14 @@ mod tests {
 
     #[test]
     fn keeps_retrying_just_below_cap() {
-        let mut g = GoalState { iteration: MAX_GOAL_ITERATIONS - 1, ..Default::default() };
-        assert!(matches!(g.apply_verdict(verdict(false, "", "", "")), GoalOutcome::Retry { .. }));
+        let mut g = GoalState {
+            iteration: MAX_GOAL_ITERATIONS - 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            g.apply_verdict(verdict(false, "", "", "")),
+            GoalOutcome::Retry { .. }
+        ));
     }
 
     #[test]
@@ -333,7 +377,10 @@ mod tests {
             (GoalStage::Done, false),
         ];
         for (stage, expected) in stages {
-            let g = GoalState { stage, ..Default::default() };
+            let g = GoalState {
+                stage,
+                ..Default::default()
+            };
             assert_eq!(g.is_running(), expected);
         }
     }
@@ -378,7 +425,10 @@ impl App {
         if !self.state.goal.mode {
             return;
         }
-        self.state.focused_mut().messages.push(ChatMessage::system(reason));
+        self.state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::system(reason));
         self.state.goal.deactivate();
     }
 
@@ -422,7 +472,10 @@ impl App {
                     let verdict = parse_goal_verdict(&response.content);
                     // Persist the evaluator's answer with its transcript.
                     eval_messages.push(ChatMessage::assistant(&response.content));
-                    GoalEvalOutcome::Verdict { verdict, eval_messages }
+                    GoalEvalOutcome::Verdict {
+                        verdict,
+                        eval_messages,
+                    }
                 }
                 Err(e) => GoalEvalOutcome::Failed(e.to_string()),
             };
@@ -440,7 +493,10 @@ impl App {
         }
 
         let (verdict, eval_messages) = match outcome {
-            GoalEvalOutcome::Verdict { verdict, eval_messages } => (verdict, eval_messages),
+            GoalEvalOutcome::Verdict {
+                verdict,
+                eval_messages,
+            } => (verdict, eval_messages),
             GoalEvalOutcome::Failed(e) => {
                 self.state.push_message(ChatMessage::ui_system(&format!(
                     "⚠ Evaluation failed: {e}. Retrying agent 1..."
@@ -478,7 +534,13 @@ impl App {
                     "🛑 Goal not achieved after {iteration} attempts — stopping. Use /goal to try a different approach."
                 ));
             }
-            GoalOutcome::Retry { iteration, issues, feedback, swapped_agent1, swapped_agent2 } => {
+            GoalOutcome::Retry {
+                iteration,
+                issues,
+                feedback,
+                swapped_agent1,
+                swapped_agent2,
+            } => {
                 if swapped_agent2 {
                     self.state.push_message(ChatMessage::ui_system(
                         "🔄 Swapping evaluator (agent 2) to new session after 5 failures.",
@@ -512,9 +574,12 @@ impl App {
             &prompt,
             &format!("[Continuing goal cycle — attempt {iteration}]"),
         );
-        self.send_focused_turn(Some(message)).await.unwrap_or_else(|e| {
-            self.state.push_system(&format!("⚠ Failed to retry agent: {e}"));
-        });
+        self.send_focused_turn(Some(message))
+            .await
+            .unwrap_or_else(|e| {
+                self.state
+                    .push_system(&format!("⚠ Failed to retry agent: {e}"));
+            });
     }
 
     pub(crate) async fn retry_agent1_with_feedback(&mut self, feedback: &str) {
@@ -530,8 +595,11 @@ impl App {
             &prompt,
             &format!("[Goal retry — attempt {iteration}: applying evaluator feedback]"),
         );
-        self.send_focused_turn(Some(message)).await.unwrap_or_else(|e| {
-            self.state.push_system(&format!("⚠ Failed to retry agent: {e}"));
-        });
+        self.send_focused_turn(Some(message))
+            .await
+            .unwrap_or_else(|e| {
+                self.state
+                    .push_system(&format!("⚠ Failed to retry agent: {e}"));
+            });
     }
 }

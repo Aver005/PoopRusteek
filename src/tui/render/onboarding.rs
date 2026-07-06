@@ -3,11 +3,11 @@
 
 use crate::app::events::OnboardingState;
 use crate::tui::theme::Theme;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 use std::cell::Cell;
 
 pub(super) fn render_onboarding(
@@ -33,19 +33,19 @@ pub(super) fn render_onboarding(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(top_pad),   // 0 — top padding
-            Constraint::Length(1),          // 1 — logo
-            Constraint::Length(1),          // 2 — gap
-            Constraint::Length(1),          // 3 — tagline
-            Constraint::Length(1),          // 4 — gap
-            Constraint::Length(7),          // 5 — steps panel
-            Constraint::Length(1),          // 6 — gap
-            Constraint::Length(3),          // 7 — token input box
-            Constraint::Length(1),          // 8 — model selector
-            Constraint::Length(1),          // 9 — gap
-            Constraint::Length(1),          // 10 — footer
-            Constraint::Length(1),          // 11 — error line
-            Constraint::Min(0),             // 12 — remaining
+            Constraint::Length(top_pad), // 0 — top padding
+            Constraint::Length(1),       // 1 — logo
+            Constraint::Length(1),       // 2 — gap
+            Constraint::Length(1),       // 3 — tagline
+            Constraint::Length(1),       // 4 — gap
+            Constraint::Length(7),       // 5 — steps panel
+            Constraint::Length(1),       // 6 — gap
+            Constraint::Length(3),       // 7 — token input box
+            Constraint::Length(1),       // 8 — model selector
+            Constraint::Length(1),       // 9 — gap
+            Constraint::Length(1),       // 10 — footer
+            Constraint::Length(1),       // 11 — error line
+            Constraint::Min(0),          // 12 — remaining
         ])
         .split(col_area);
 
@@ -81,7 +81,10 @@ pub(super) fn render_onboarding(
 
     let steps = [
         ("1.", "Log in at chat.deepseek.com in your browser"),
-        ("2.", "DevTools (F12) → Application → Local Storage → copy userToken"),
+        (
+            "2.",
+            "DevTools (F12) → Application → Local Storage → copy userToken",
+        ),
         ("3.", "Paste it below and press Enter"),
     ];
     let step_chunks = Layout::default()
@@ -97,7 +100,10 @@ pub(super) fn render_onboarding(
         let line = Line::from(vec![
             Span::styled(
                 format!("{num} "),
-                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(theme.bg),
             ),
             Span::styled(*text, Style::default().fg(theme.text_soft).bg(theme.bg)),
         ]);
@@ -120,7 +126,11 @@ pub(super) fn render_onboarding(
     // cursor is clamped to [0, total_chars]
     let cursor = ob.cursor.min(total_chars);
     // How many chars fit before the cursor (clipped from the left).
-    let visible_start = if cursor >= box_w { cursor - (box_w - 1) } else { 0 };
+    let visible_start = if cursor >= box_w {
+        cursor - (box_w - 1)
+    } else {
+        0
+    };
     let visible_chars: String = input_chars[visible_start..total_chars].iter().collect();
     // Truncate to box width using char-aware slicing (never byte-slice — invariant).
     let display: String = visible_chars.chars().take(box_w).collect();
@@ -141,13 +151,19 @@ pub(super) fn render_onboarding(
     let (chat_style, reasoner_style, chat_dot, reasoner_dot) = if ob.model_reasoner {
         (
             Style::default().fg(theme.text_dim).bg(theme.bg),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.bg),
             "○",
             "●",
         )
     } else {
         (
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD).bg(theme.bg),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.bg),
             Style::default().fg(theme.text_dim).bg(theme.bg),
             "●",
             "○",
@@ -158,7 +174,10 @@ pub(super) fn render_onboarding(
         Span::styled(format!("{chat_dot} deepseek-chat"), chat_style),
         Span::styled("   ", Style::default().bg(theme.bg)),
         Span::styled(format!("{reasoner_dot} deepseek-reasoner"), reasoner_style),
-        Span::styled("   (Tab to switch)", Style::default().fg(theme.text_dim).bg(theme.bg)),
+        Span::styled(
+            "   (Tab to switch)",
+            Style::default().fg(theme.text_dim).bg(theme.bg),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(model_line).alignment(Alignment::Center),
@@ -169,12 +188,21 @@ pub(super) fn render_onboarding(
     let footer = Line::from(vec![
         Span::styled(
             "Enter",
-            Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD).bg(theme.bg),
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.bg),
         ),
-        Span::styled(" — save & start    ", Style::default().fg(theme.text_dim).bg(theme.bg)),
+        Span::styled(
+            " — save & start    ",
+            Style::default().fg(theme.text_dim).bg(theme.bg),
+        ),
         Span::styled(
             "Ctrl+C",
-            Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD).bg(theme.bg),
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.bg),
         ),
         Span::styled(" — quit", Style::default().fg(theme.text_dim).bg(theme.bg)),
     ]);

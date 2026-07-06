@@ -3,7 +3,7 @@
 //! TF-IDF, fused with Reciprocal Rank Fusion. Corpus-specific typing
 //! (what a document *is*) lives in `matcher.rs`; this file only ranks.
 
-use super::embedder::{dot, Embedder};
+use super::embedder::{Embedder, dot};
 use super::sparse::SparseIndex;
 
 /// RRF smoothing constant — the standard value from the original paper;

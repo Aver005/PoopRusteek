@@ -49,10 +49,17 @@ impl GeminiProvider {
         }
     }
 
-    async fn send(&self, request: &CompletionRequest, stream: bool) -> AppResult<reqwest::Response> {
+    async fn send(
+        &self,
+        request: &CompletionRequest,
+        stream: bool,
+    ) -> AppResult<reqwest::Response> {
         let body = gemini_compat::request_to_gemini(request);
         let url = if stream {
-            format!("{}/models/{}:streamGenerateContent?alt=sse", self.base_url, self.model)
+            format!(
+                "{}/models/{}:streamGenerateContent?alt=sse",
+                self.base_url, self.model
+            )
         } else {
             format!("{}/models/{}:generateContent", self.base_url, self.model)
         };
@@ -111,7 +118,10 @@ impl LLMProvider for GeminiProvider {
                 };
                 let (text, finish) = gemini_compat::extract_piece(&chunk);
                 if !text.is_empty() {
-                    let _ = tx.send(CompletionChunk { content: text, finish_reason: None });
+                    let _ = tx.send(CompletionChunk {
+                        content: text,
+                        finish_reason: None,
+                    });
                 }
                 if let Some(reason) = finish {
                     let _ = tx.send(CompletionChunk {

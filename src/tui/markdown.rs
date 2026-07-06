@@ -1,11 +1,11 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use ratatui::text::{Line, Span};
-use ratatui::style::{Color, Modifier, Style};
 use crate::tui::theme::Theme;
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{ThemeSet, Style as SynStyle};
+use syntect::highlighting::{Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 /// Memoized syntect output per code block.
@@ -20,7 +20,10 @@ use syntect::parsing::SyntaxSet;
 /// over `HIGHLIGHT_CACHE_MAX_BYTES` are never cached — the live working
 /// set is just the streaming message's blocks, since finished messages are
 /// served whole from the message cache.
-#[expect(clippy::type_complexity, reason = "internal cache map, not an API surface")]
+#[expect(
+    clippy::type_complexity,
+    reason = "internal cache map, not an API surface"
+)]
 static HIGHLIGHT_CACHE: LazyLock<Mutex<HashMap<(String, String, Color), Vec<Line<'static>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 const HIGHLIGHT_CACHE_CAP: usize = 128;
@@ -75,9 +78,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                         HeadingLevel::H2 => Style::default()
                             .fg(theme.accent)
                             .add_modifier(Modifier::BOLD),
-                        _ => Style::default()
-                            .fg(theme.fg)
-                            .add_modifier(Modifier::BOLD),
+                        _ => Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                     };
                     let prefix = match level {
                         HeadingLevel::H1 => "# ",
@@ -100,10 +101,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 }
                 Tag::List(_) => {}
                 Tag::Item => {
-                    current_line.push(Span::styled(
-                        "  * ",
-                        Style::default().fg(theme.accent),
-                    ));
+                    current_line.push(Span::styled("  * ", Style::default().fg(theme.accent)));
                 }
                 Tag::Emphasis => {
                     style_stack.push(Modifier::ITALIC);
@@ -115,15 +113,14 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                     style_stack.push(Modifier::CROSSED_OUT);
                 }
                 Tag::BlockQuote(_) => {
-                    current_line.push(Span::styled(
-                        "  | ",
-                        Style::default().fg(theme.text_dim),
-                    ));
+                    current_line.push(Span::styled("  | ", Style::default().fg(theme.text_dim)));
                 }
                 Tag::Link { dest_url, .. } => {
                     current_line.push(Span::styled(
                         format!("[{dest_url}]"),
-                        Style::default().fg(theme.accent).add_modifier(Modifier::UNDERLINED),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::UNDERLINED),
                     ));
                 }
                 _ => {}
@@ -140,10 +137,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 }
                 TagEnd::TableCell => {
                     if in_table {
-                        current_line.push(Span::styled(
-                            " | ",
-                            Style::default().fg(theme.text_dim),
-                        ));
+                        current_line.push(Span::styled(" | ", Style::default().fg(theme.text_dim)));
                     }
                 }
                 TagEnd::Heading(_) => {
@@ -151,7 +145,8 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     if !code_buffer.is_empty() {
-                        let highlighted = highlight_code(&code_buffer.join("\n"), &code_block_lang, theme);
+                        let highlighted =
+                            highlight_code(&code_buffer.join("\n"), &code_block_lang, theme);
                         lines.extend(highlighted);
                     }
                     in_code_block = false;
@@ -193,9 +188,10 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
             Event::Rule => {
                 flush_line(&mut lines, &mut current_line);
                 let rule = "─".repeat(40);
-                lines.push(Line::from(vec![
-                    Span::styled(rule, Style::default().fg(theme.text_dim)),
-                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    rule,
+                    Style::default().fg(theme.text_dim),
+                )]));
             }
             Event::Html(html) => {
                 current_line.push(Span::styled(
@@ -216,24 +212,29 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 
 fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
     if lang.is_empty() {
-        return code.lines().map(|line| {
-            Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(theme.warning),
-            ))
-        }).collect();
+        return code
+            .lines()
+            .map(|line| {
+                Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(theme.warning),
+                ))
+            })
+            .collect();
     }
 
     let cache_key = (code.to_string(), lang.to_string(), theme.warning);
     if let Ok(cache) = HIGHLIGHT_CACHE.lock()
-        && let Some(lines) = cache.get(&cache_key) {
-            return lines.clone();
-        }
+        && let Some(lines) = cache.get(&cache_key)
+    {
+        return lines.clone();
+    }
 
     let ss = syntax_set();
     let ts = theme_set();
 
-    let syntax = ss.find_syntax_by_token(lang)
+    let syntax = ss
+        .find_syntax_by_token(lang)
         .or_else(|| ss.find_syntax_by_extension(lang))
         .unwrap_or_else(|| ss.find_syntax_plain_text());
 
@@ -262,10 +263,7 @@ fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
 
         if let Ok(highlighted) = h.highlight_line(line, ss) {
             for (style, text) in highlighted {
-                spans.push(Span::styled(
-                    text.to_string(),
-                    syntect_to_ratatui(style),
-                ));
+                spans.push(Span::styled(text.to_string(), syntect_to_ratatui(style)));
             }
         } else {
             spans.push(Span::styled(
@@ -278,12 +276,13 @@ fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
     }
 
     if code.len() <= HIGHLIGHT_CACHE_MAX_BYTES
-        && let Ok(mut cache) = HIGHLIGHT_CACHE.lock() {
-            if cache.len() >= HIGHLIGHT_CACHE_CAP {
-                cache.clear();
-            }
-            cache.insert(cache_key, result.clone());
+        && let Ok(mut cache) = HIGHLIGHT_CACHE.lock()
+    {
+        if cache.len() >= HIGHLIGHT_CACHE_CAP {
+            cache.clear();
         }
+        cache.insert(cache_key, result.clone());
+    }
 
     result
 }
@@ -301,7 +300,10 @@ fn flush_line(lines: &mut Vec<Line<'static>>, current_line: &mut Vec<Span<'stati
 mod tests {
     use super::*;
 
-    fn find_span_containing<'a>(lines: &'a [Line<'static>], needle: &str) -> Option<&'a Span<'static>> {
+    fn find_span_containing<'a>(
+        lines: &'a [Line<'static>],
+        needle: &str,
+    ) -> Option<&'a Span<'static>> {
         lines
             .iter()
             .flat_map(|l| l.spans.iter())

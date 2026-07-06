@@ -4,8 +4,8 @@
 //! back through `AppEvent`s (`SessionFetched`, `SessionAvailabilityChecked`,
 //! `RemoteSessionsListed`, `SessionsDeleted`).
 
-use super::{App, conversation, events};
 use super::events::{AppEvent, Modal};
+use super::{App, conversation, events};
 use crate::error::AppResult;
 use crate::provider::ChatMessage;
 use crate::session;
@@ -31,9 +31,8 @@ impl App {
                 }
 
                 let count = s.messages.len();
-                self.state.status_message = format!(
-                    "Loaded local session {session_id} ({count} messages)"
-                );
+                self.state.status_message =
+                    format!("Loaded local session {session_id} ({count} messages)");
 
                 if s.broken {
                     self.state.focused_mut().messages.push(ChatMessage::system(
@@ -85,8 +84,7 @@ impl App {
                     let conversation = self.state.conversations.focused_id();
                     let sid = session_id.to_string();
                     let event_tx = self.event_tx.clone();
-                    self.state.status_message =
-                        format!("Fetching remote session {session_id}...");
+                    self.state.status_message = format!("Fetching remote session {session_id}...");
                     tokio::spawn(async move {
                         let result = provider
                             .fetch_remote_session_messages(&sid)
@@ -99,9 +97,12 @@ impl App {
                         });
                     });
                 } else {
-                    self.state.focused_mut().messages.push(ChatMessage::system(
-                        &format!("Session {session_id} not found locally"),
-                    ));
+                    self.state
+                        .focused_mut()
+                        .messages
+                        .push(ChatMessage::system(&format!(
+                            "Session {session_id} not found locally"
+                        )));
                 }
             }
         }
@@ -149,7 +150,11 @@ impl App {
     /// known broken" path calling this because `handle_load_session` skips
     /// the network check entirely once a session has no remote id left to
     /// verify.
-    fn finalize_broken_session(&mut self, conversation: conversation::ConversationId, mut session: session::Session) {
+    fn finalize_broken_session(
+        &mut self,
+        conversation: conversation::ConversationId,
+        mut session: session::Session,
+    ) {
         session.broken = true;
         session.provider_session_id = None;
         session.provider_parent_message_id = None;
@@ -378,10 +383,9 @@ impl App {
         // The focused chat's session was among the targets — reset the
         // provider's threading so the next message starts a clean session
         // instead of posting onto a deleted remote thread.
-        if touched_focused
-            && let Some(provider) = self.state.focused().provider.clone() {
-                let _ = provider.reset().await;
-            }
+        if touched_focused && let Some(provider) = self.state.focused().provider.clone() {
+            let _ = provider.reset().await;
+        }
 
         if remote_ids.is_empty() {
             let _ = self
@@ -421,7 +425,11 @@ impl App {
         // so a previously-broken conversation is un-flagged here rather than
         // staying permanently yellow after it's actually recovered.
         let identity = conv.provider.as_ref().and_then(|p| p.session_identity());
-        let broken = if identity.is_some() { false } else { conv.broken };
+        let broken = if identity.is_some() {
+            false
+        } else {
+            conv.broken
+        };
         let meta = session::SessionMeta {
             tag: conv.tag.clone(),
             broken,
@@ -434,14 +442,15 @@ impl App {
         // pretty-JSON rewrite grows with conversation length and used to
         // block the event loop at the end of every turn. FIFO ordering on
         // the worker guarantees a later turn's save lands after this one.
-        self.persister.enqueue(super::persist::PersistJob::SaveSession {
-            session_id: conv.session_id.clone(),
-            created_at: session::timestamp_now(),
-            messages: conv.messages.clone(),
-            config: Box::new(self.config.clone()),
-            workspace_path: self.state.workspace_path.clone(),
-            meta,
-        });
+        self.persister
+            .enqueue(super::persist::PersistJob::SaveSession {
+                session_id: conv.session_id.clone(),
+                created_at: session::timestamp_now(),
+                messages: conv.messages.clone(),
+                config: Box::new(self.config.clone()),
+                workspace_path: self.state.workspace_path.clone(),
+                meta,
+            });
         self.state.focused_mut().broken = broken;
     }
 }

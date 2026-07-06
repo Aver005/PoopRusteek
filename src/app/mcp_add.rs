@@ -13,7 +13,9 @@ use std::collections::HashMap;
 pub fn status_label(status: &MCPServerStatus) -> String {
     match status {
         MCPServerStatus::Connected => "connected".to_string(),
-        MCPServerStatus::AuthRequired(_) => "requires authorization \u{2014} use /mcp auth".to_string(),
+        MCPServerStatus::AuthRequired(_) => {
+            "requires authorization \u{2014} use /mcp auth".to_string()
+        }
         MCPServerStatus::Error(e) => format!("failed to connect: {e}"),
         MCPServerStatus::Pending | MCPServerStatus::Connecting => "connecting...".to_string(),
         MCPServerStatus::Disabled => "disabled".to_string(),
@@ -26,7 +28,10 @@ pub enum McpAddState {
     /// `/mcp add` with no (usable) args: choose paste-JSON vs. the wizard.
     ChooseMethod { selected: usize },
     /// Free-form JSON paste box (multi-line via `InputState`).
-    PasteJson { input: InputState, error: Option<String> },
+    PasteJson {
+        input: InputState,
+        error: Option<String>,
+    },
     /// Step-by-step wizard. Boxed: `WizardState` (~376 bytes, 3 `InputState`
     /// fields) would otherwise make every `McpAddState` — including the
     /// tiny `ChooseMethod`/`PasteJson` variants — pay its size.
@@ -47,7 +52,11 @@ pub enum TransportChoice {
 }
 
 impl TransportChoice {
-    pub const ALL: [TransportChoice; 3] = [TransportChoice::Stdio, TransportChoice::Http, TransportChoice::Sse];
+    pub const ALL: [TransportChoice; 3] = [
+        TransportChoice::Stdio,
+        TransportChoice::Http,
+        TransportChoice::Sse,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -69,7 +78,9 @@ impl TransportChoice {
     pub fn extra_label(self) -> &'static str {
         match self {
             TransportChoice::Stdio => "Env vars, one KEY=VALUE per line (optional)",
-            TransportChoice::Http | TransportChoice::Sse => "Headers, one \"Name: value\" per line (optional)",
+            TransportChoice::Http | TransportChoice::Sse => {
+                "Headers, one \"Name: value\" per line (optional)"
+            }
         }
     }
 }
@@ -112,7 +123,9 @@ impl WizardState {
     /// step, so this should only fail if that validation and this parsing
     /// somehow disagree — kept fallible rather than assumed-infallible.
     pub fn build_config(&self) -> Result<MCPServerConfig, String> {
-        let transport = self.transport.ok_or_else(|| "no transport selected".to_string())?;
+        let transport = self
+            .transport
+            .ok_or_else(|| "no transport selected".to_string())?;
         match transport {
             TransportChoice::Stdio => {
                 let (command, args) = split_command_line(self.primary.buffer.trim())?;
@@ -154,7 +167,9 @@ pub fn parse_env_lines(text: &str) -> Result<HashMap<String, String>, String> {
         if line.is_empty() {
             continue;
         }
-        let (k, v) = line.split_once('=').ok_or_else(|| format!("line {}: expected KEY=VALUE", i + 1))?;
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| format!("line {}: expected KEY=VALUE", i + 1))?;
         let k = k.trim();
         if k.is_empty() {
             return Err(format!("line {}: empty key", i + 1));
@@ -173,7 +188,9 @@ pub fn parse_header_lines(text: &str) -> Result<HashMap<String, String>, String>
         if line.is_empty() {
             continue;
         }
-        let (k, v) = line.split_once(':').ok_or_else(|| format!("line {}: expected \"Name: value\"", i + 1))?;
+        let (k, v) = line
+            .split_once(':')
+            .ok_or_else(|| format!("line {}: expected \"Name: value\"", i + 1))?;
         let k = k.trim();
         if k.is_empty() {
             return Err(format!("line {}: empty header name", i + 1));
@@ -193,7 +210,8 @@ pub fn parse_pasted_json(raw: &str) -> Result<Vec<(String, MCPServerConfig)>, St
     if trimmed.is_empty() {
         return Err("empty input".to_string());
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON: {e}"))?;
 
     if let Some(servers) = value.get("mcpServers").and_then(|v| v.as_object()) {
         if servers.is_empty() {
@@ -201,17 +219,22 @@ pub fn parse_pasted_json(raw: &str) -> Result<Vec<(String, MCPServerConfig)>, St
         }
         let mut out = Vec::with_capacity(servers.len());
         for (name, def) in servers {
-            let def: McpServerDef = serde_json::from_value(def.clone()).map_err(|e| format!("server '{name}': {e}"))?;
+            let def: McpServerDef =
+                serde_json::from_value(def.clone()).map_err(|e| format!("server '{name}': {e}"))?;
             out.push((name.clone(), def.config));
         }
         return Ok(out);
     }
 
-    let name = value.get("name")
+    let name = value
+        .get("name")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "expected a top-level \"mcpServers\" object, or a \"name\" field".to_string())?
+        .ok_or_else(|| {
+            "expected a top-level \"mcpServers\" object, or a \"name\" field".to_string()
+        })?
         .to_string();
-    let config: MCPServerConfig = serde_json::from_value(value).map_err(|e| format!("invalid server config: {e}"))?;
+    let config: MCPServerConfig =
+        serde_json::from_value(value).map_err(|e| format!("invalid server config: {e}"))?;
     Ok(vec![(name, config)])
 }
 
@@ -225,10 +248,24 @@ pub fn parse_quick_add(raw: &str) -> Result<Vec<(String, MCPServerConfig)>, Stri
         return parse_pasted_json(trimmed);
     }
     let mut parts = trimmed.split_whitespace();
-    let name = parts.next().ok_or("expected \"<name> <command> [args...]\" or a JSON config")?.to_string();
-    let command = parts.next().ok_or("missing command \u{2014} expected \"<name> <command> [args...]\"")?.to_string();
+    let name = parts
+        .next()
+        .ok_or("expected \"<name> <command> [args...]\" or a JSON config")?
+        .to_string();
+    let command = parts
+        .next()
+        .ok_or("missing command \u{2014} expected \"<name> <command> [args...]\"")?
+        .to_string();
     let args: Vec<String> = parts.map(str::to_string).collect();
-    Ok(vec![(name, MCPServerConfig::Stdio { command, args, env: None, cwd: None })])
+    Ok(vec![(
+        name,
+        MCPServerConfig::Stdio {
+            command,
+            args,
+            env: None,
+            cwd: None,
+        },
+    )])
 }
 
 #[cfg(test)]
@@ -294,7 +331,10 @@ mod tests {
     #[test]
     fn parse_header_lines_parses_colon_pairs() {
         let map = parse_header_lines("Authorization: Bearer xyz\nX-Custom: 1").unwrap();
-        assert_eq!(map.get("Authorization").map(String::as_str), Some("Bearer xyz"));
+        assert_eq!(
+            map.get("Authorization").map(String::as_str),
+            Some("Bearer xyz")
+        );
         assert_eq!(map.get("X-Custom").map(String::as_str), Some("1"));
     }
 
@@ -355,7 +395,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "fetch");
         match &entries[0].1 {
-            MCPServerConfig::Stdio { command, args, env, cwd } => {
+            MCPServerConfig::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args, &vec!["-y".to_string(), "@x/fetch".to_string()]);
                 assert!(env.is_none());

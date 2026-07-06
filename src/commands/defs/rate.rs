@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::commands::{save_config_then, Command, CommandResult};
+use crate::commands::{Command, CommandResult, save_config_then};
 use crate::config::Config;
 
 pub struct RateCommand;

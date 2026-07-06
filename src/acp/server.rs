@@ -79,15 +79,17 @@ impl AcpServer {
                 };
                 let result_value = match serde_json::to_value(result) {
                     Ok(v) => v,
-                    Err(e) => return Some(AcpResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: request.id,
-                        result: None,
-                        error: Some(AcpError {
-                            code: -32603,
-                            message: format!("Internal error: {e}"),
-                        }),
-                    }),
+                    Err(e) => {
+                        return Some(AcpResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(AcpError {
+                                code: -32603,
+                                message: format!("Internal error: {e}"),
+                            }),
+                        });
+                    }
                 };
                 Some(AcpResponse {
                     jsonrpc: "2.0".to_string(),
@@ -98,12 +100,12 @@ impl AcpServer {
             }
             "initialized" => None,
             "prompt" => {
-                let params: PromptRequest = serde_json::from_value(
-                    request.params.unwrap_or(serde_json::json!({}))
-                ).unwrap_or(PromptRequest {
-                    prompt: String::new(),
-                    images: Vec::new(),
-                });
+                let params: PromptRequest =
+                    serde_json::from_value(request.params.unwrap_or(serde_json::json!({})))
+                        .unwrap_or(PromptRequest {
+                            prompt: String::new(),
+                            images: Vec::new(),
+                        });
 
                 // We're already inside #[tokio::main]'s runtime — creating a
                 // nested Runtime and block_on'ing it panics on first use.
@@ -115,15 +117,17 @@ impl AcpServer {
 
                 let result_value = match serde_json::to_value(result) {
                     Ok(v) => v,
-                    Err(e) => return Some(AcpResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: request.id,
-                        result: None,
-                        error: Some(AcpError {
-                            code: -32603,
-                            message: format!("Internal error: {e}"),
-                        }),
-                    }),
+                    Err(e) => {
+                        return Some(AcpResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(AcpError {
+                                code: -32603,
+                                message: format!("Internal error: {e}"),
+                            }),
+                        });
+                    }
                 };
                 Some(AcpResponse {
                     jsonrpc: "2.0".to_string(),
@@ -168,9 +172,12 @@ impl AcpServer {
 
         match self.provider.complete(request).await {
             Ok(response) => {
-                self.messages.push(ChatMessage::assistant(&response.content));
+                self.messages
+                    .push(ChatMessage::assistant(&response.content));
                 PromptResult {
-                    content: vec![ContentBlock::Text { text: response.content }],
+                    content: vec![ContentBlock::Text {
+                        text: response.content,
+                    }],
                 }
             }
             Err(e) => PromptResult {

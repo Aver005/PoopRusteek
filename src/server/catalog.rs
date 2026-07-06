@@ -17,7 +17,7 @@
 //!   clients that copy an id from upstream docs (`qwen2.5-coder`,
 //!   `claude-sonnet-4-5`, …) work unprefixed.
 
-use crate::config::{ProviderEntry, BUILTIN_PROVIDER_NAME};
+use crate::config::{BUILTIN_PROVIDER_NAME, ProviderEntry};
 use std::collections::HashMap;
 
 /// `entry name → fetched model ids` — a `ProviderModelCache::snapshot()`.
@@ -140,7 +140,9 @@ pub fn resolve_model(
         .find(|entry| entry.name.eq_ignore_ascii_case(model_id))
     {
         if !entry.model.is_empty() {
-            return Ok(ResolvedModel::Entry { entry: entry.clone() });
+            return Ok(ResolvedModel::Entry {
+                entry: entry.clone(),
+            });
         }
         if let Some(first) = fetched.get(&entry.name).and_then(|models| models.first()) {
             return Ok(entry_with_model(entry, first));
@@ -156,7 +158,9 @@ pub fn resolve_model(
         .iter()
         .find(|entry| !entry.model.is_empty() && entry.model.eq_ignore_ascii_case(model_id))
     {
-        return Ok(ResolvedModel::Entry { entry: entry.clone() });
+        return Ok(ResolvedModel::Entry {
+            entry: entry.clone(),
+        });
     }
 
     // Bare model id that appears in some entry's fetched list.
@@ -195,7 +199,10 @@ mod tests {
         pairs
             .iter()
             .map(|(name, models)| {
-                (name.to_string(), models.iter().map(|m| m.to_string()).collect())
+                (
+                    name.to_string(),
+                    models.iter().map(|m| m.to_string()).collect(),
+                )
             })
             .collect()
     }
@@ -207,7 +214,10 @@ mod tests {
     #[test]
     fn lists_deepseek_pair_then_entries() {
         let ids = list_model_ids(true, &[entry("lmstudio", "qwen")], &none());
-        assert_eq!(ids, vec!["deepseek-chat", "deepseek-reasoner", "lmstudio/qwen"]);
+        assert_eq!(
+            ids,
+            vec!["deepseek-chat", "deepseek-reasoner", "lmstudio/qwen"]
+        );
         // No token → the built-in pair disappears.
         assert_eq!(list_model_ids(false, &[], &none()), Vec::<String>::new());
     }
@@ -228,10 +238,23 @@ mod tests {
     #[test]
     fn resolves_builtin_deepseek_models() {
         let resolved = resolve_model("deepseek-chat", true, &[], &none()).unwrap();
-        assert_eq!(resolved, ResolvedModel::Deepseek { model: "deepseek-chat".into() });
+        assert_eq!(
+            resolved,
+            ResolvedModel::Deepseek {
+                model: "deepseek-chat".into()
+            }
+        );
         // Case-insensitive, and reachable under the reserved prefix too.
-        assert!(resolve_model("DeepSeek-Reasoner", true, &[], &none()).unwrap().is_deepseek());
-        assert!(resolve_model("deepseek/deepseek-chat", true, &[], &none()).unwrap().is_deepseek());
+        assert!(
+            resolve_model("DeepSeek-Reasoner", true, &[], &none())
+                .unwrap()
+                .is_deepseek()
+        );
+        assert!(
+            resolve_model("deepseek/deepseek-chat", true, &[], &none())
+                .unwrap()
+                .is_deepseek()
+        );
         // Without a token the built-in backend does not exist.
         assert!(resolve_model("deepseek-chat", false, &[], &none()).is_err());
     }

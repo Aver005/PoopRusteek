@@ -10,8 +10,8 @@
 
 use super::generation::GenerationState;
 use crate::provider::{ChatMessage, LLMProvider};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Stable, process-unique id for a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,7 +101,10 @@ impl Conversation {
     /// Is this a background-kind conversation (sidechat / sub-agent) whose
     /// terminal events must finalize-and-flush regardless of focus?
     pub fn is_background_kind(&self) -> bool {
-        matches!(self.kind, ConversationKind::Sidechat | ConversationKind::SubAgent)
+        matches!(
+            self.kind,
+            ConversationKind::Sidechat | ConversationKind::SubAgent
+        )
     }
 
     // ─── Shared agent-event reducer ────────────────────────────
@@ -123,9 +126,10 @@ impl Conversation {
     /// `AgentChunk`: append streamed content to the open assistant message.
     pub fn append_chunk(&mut self, chunk: &str) {
         if let Some(last) = self.messages.last_mut()
-            && last.role == crate::provider::Role::Assistant {
-                last.content.push_str(chunk);
-            }
+            && last.role == crate::provider::Role::Assistant
+        {
+            last.content.push_str(chunk);
+        }
     }
 
     /// Drop a trailing assistant message that never received content.
@@ -161,7 +165,10 @@ impl Conversations {
     /// Create the store seeded with its first (focused) conversation.
     pub fn new(initial: Conversation) -> Self {
         let focused = initial.id;
-        Self { items: vec![initial], focused }
+        Self {
+            items: vec![initial],
+            focused,
+        }
     }
 
     pub fn focused_id(&self) -> ConversationId {
@@ -215,9 +222,10 @@ impl Conversations {
         let pos = self.items.iter().position(|c| c.id == id)?;
         let removed = self.items.remove(pos);
         if self.focused == id
-            && let Some(first) = self.items.iter().map(|c| c.id).min_by_key(|c| c.0) {
-                self.focused = first;
-            }
+            && let Some(first) = self.items.iter().map(|c| c.id).min_by_key(|c| c.0)
+        {
+            self.focused = first;
+        }
         Some(removed)
     }
 
@@ -233,7 +241,10 @@ impl Conversations {
     // for callers that need a count or a stable cycling order. Not verified
     // dead against the same bar as the audited deletions elsewhere in this
     // pass, so annotated rather than removed.
-    #[expect(dead_code, reason = "small accessor pair, not part of this pass's verified-dead list")]
+    #[expect(
+        dead_code,
+        reason = "small accessor pair, not part of this pass's verified-dead list"
+    )]
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -243,7 +254,10 @@ impl Conversations {
     }
 
     /// Conversation ids in stable (id) order — for cycling focus.
-    #[expect(dead_code, reason = "small accessor pair, not part of this pass's verified-dead list")]
+    #[expect(
+        dead_code,
+        reason = "small accessor pair, not part of this pass's verified-dead list"
+    )]
     pub fn ordered_ids(&self) -> Vec<ConversationId> {
         let mut ids: Vec<ConversationId> = self.items.iter().map(|c| c.id).collect();
         ids.sort_by_key(|c| c.0);
