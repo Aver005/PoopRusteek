@@ -185,6 +185,11 @@ impl App {
             return Ok(SubmitOutcome::Continue);
         }
 
+        // Sending a message acknowledges any errors flagged since the last
+        // one — clear the red marker (the text stays in errors.log).
+        self.state.error_count = 0;
+        self.state.last_error = None;
+
         self.state.input.buffer.clear();
         self.state.input.cursor = 0;
         self.state.input.selection_anchor = None;

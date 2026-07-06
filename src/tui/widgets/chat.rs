@@ -645,6 +645,8 @@ mod tests {
             ),
             input: crate::app::input::InputState::default(),
             status_message: String::new(),
+            error_count: 0,
+            last_error: None,
             scroll_offset: 0,
             modal: None,
             approved_tools: std::collections::HashSet::new(),

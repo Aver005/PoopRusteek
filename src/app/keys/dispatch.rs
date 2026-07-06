@@ -315,7 +315,54 @@ impl App {
                     "RAG reloading: verifying the model (missing files are re-downloaded) and re-embedding skills + MCP tools in the background.",
                 );
             }
+            RagAction::LimitStatus => {
+                let text = self.rag_limit_status_text();
+                self.state.push_system(&text);
+            }
+            RagAction::SetLimit(limit) => {
+                self.config.semantic.rag_limit = limit;
+                if let Err(e) = crate::config::save(&self.config) {
+                    self.state
+                        .push_system(&format!("Failed to save config: {e}"));
+                    return;
+                }
+                let resolved = self.semantic.set_embed_batch(limit);
+                let effect = match resolved {
+                    Some(n) => format!("batch {n}"),
+                    None => "no cap (fastembed default)".to_string(),
+                };
+                let when = if self.semantic.is_ready() {
+                    "applied to the running embedder"
+                } else {
+                    "takes effect once the embedder loads"
+                };
+                self.state.push_system(&format!(
+                    "RAG embedder limit → {limit} = {effect} ({when})."
+                ));
+            }
         }
+    }
+
+    /// `/rag-limit` status: the configured mode, the batch it resolves to,
+    /// and the RAM that sizing is based on.
+    fn rag_limit_status_text(&self) -> String {
+        let mode = self.config.semantic.rag_limit;
+        let ram = match crate::util::total_ram_bytes() {
+            Some(b) => format!("{:.1} GB", b as f64 / 1e9),
+            None => "unknown".to_string(),
+        };
+        let effective = match self.semantic.resolved_batch() {
+            Some(n) => format!("batch {n}"),
+            None => "no cap (fastembed default 256)".to_string(),
+        };
+        format!(
+            "RAG embedder batch limit (ONNX memory guard)\n\
+             • mode: {mode}\n\
+             • detected RAM: {ram}\n\
+             • effective: {effective}\n\n\
+             Peak embed memory ≈ batch × ~13 MB. `auto` sizes it from RAM; \
+             `off` removes the cap; a number pins it. Change: /rag-limit <N|auto|off>"
+        )
     }
 
     fn rag_status_text(&self) -> String {

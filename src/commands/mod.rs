@@ -35,6 +35,11 @@ pub enum RagAction {
     /// `/rag reload` — re-verify the model (re-download missing files)
     /// and re-embed every corpus.
     Reload,
+    /// `/rag-limit` — show the embedder batch cap, its resolved value, and
+    /// detected RAM.
+    LimitStatus,
+    /// `/rag-limit <n|auto|off>` — set the embedder batch cap (memory guard).
+    SetLimit(crate::config::RagLimit),
 }
 
 /// `/serve` + `/server` intents — interpreted in `app/serve.rs`, which
@@ -239,6 +244,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::wipe::WipeCommand));
         self.register(Box::new(defs::debug::DebugCommand));
         self.register(Box::new(defs::rag::RagCommand));
+        self.register(Box::new(defs::rag_limit::RagLimitCommand));
         self.register(Box::new(defs::search::SearchCommand));
         self.register(Box::new(defs::themes::ThemesCommand));
         self.register(Box::new(defs::serve::ServeCommand));

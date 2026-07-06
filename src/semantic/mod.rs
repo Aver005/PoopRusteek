@@ -27,11 +27,11 @@ pub mod sparse;
 mod eval;
 
 use crate::app::events::AppEvent;
-use crate::config::{Config, SemanticConfig};
+use crate::config::{Config, RagLimit, SemanticConfig};
 use crate::mcp::manager::FullMCPTool;
 use crate::skills::SkillDefinition;
 use matcher::{McpCorpus, McpToolMatch, SkillCorpus, SkillMatch};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -102,6 +102,11 @@ pub struct SemanticService {
     /// in deferred mode a matched tool's full definition rides in the hint,
     /// because the system prompt no longer carries it.
     mcp_deferred: AtomicBool,
+    /// Resolved embedder batch cap (fastembed's `embed` batch arg). `0` is
+    /// the sentinel for "no cap" (`None`). Set from `[semantic] rag_limit` +
+    /// detected RAM at `start`, updated live by `/rag-limit`, and re-read by
+    /// `spawn_init` so a reload keeps the current setting.
+    embed_batch: AtomicUsize,
 }
 
 impl SemanticService {
@@ -112,12 +117,17 @@ impl SemanticService {
         skills: Vec<SkillDefinition>,
         event_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Arc<Self> {
+        let batch = config
+            .semantic
+            .rag_limit
+            .resolve(crate::util::total_ram_bytes());
         let service = Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             config: config.semantic.clone(),
             enabled: AtomicBool::new(config.semantic.enabled),
             init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
+            embed_batch: AtomicUsize::new(batch.unwrap_or(0)),
         });
         if config.semantic.enabled {
             service.spawn_init(skills, event_tx);
@@ -148,6 +158,7 @@ impl SemanticService {
             let this_blocking = Arc::clone(&this);
             let built = tokio::task::spawn_blocking(move || {
                 let mut emb = embedder::Embedder::init(cache_dir)?;
+                emb.set_batch_limit(this_blocking.resolved_batch());
                 let skill_corpus = SkillCorpus::build(&mut emb, &skills)?;
                 let history_store = history::HistoryStore::open(Self::history_path());
                 // Store under the lock, then embed any MCP tools that
@@ -186,7 +197,9 @@ impl SemanticService {
                     }
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!("semantic: init failed: {e}");
+                    // error! (not warn!) so it surfaces the red UI marker —
+                    // a dead embedder is exactly what the user should notice.
+                    tracing::error!("semantic: init failed: {e}");
                     let _ = event_tx.send(AppEvent::SemanticStatus(format!(
                         "Semantic matching unavailable: {e}"
                     )));
@@ -212,6 +225,26 @@ impl SemanticService {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// The resolved embedder batch cap in effect (`None` = no cap). Backs
+    /// `spawn_init` (so reloads keep the setting) and `/rag-limit` status.
+    pub fn resolved_batch(&self) -> Option<usize> {
+        let v = self.embed_batch.load(Ordering::Relaxed);
+        (v != 0).then_some(v)
+    }
+
+    /// `/rag-limit <n|auto|off>` — resolve `limit` against current RAM, store
+    /// it for future (re)inits, and apply it to the live embedder if one is
+    /// loaded. Returns the concrete batch that took effect (`None` = no cap).
+    pub fn set_embed_batch(&self, limit: RagLimit) -> Option<usize> {
+        let resolved = limit.resolve(crate::util::total_ram_bytes());
+        self.embed_batch
+            .store(resolved.unwrap_or(0), Ordering::Relaxed);
+        if let Some(emb) = self.inner.lock().unwrap().embedder.as_mut() {
+            emb.set_batch_limit(resolved);
+        }
+        resolved
     }
 
     pub fn is_ready(&self) -> bool {
@@ -299,6 +332,7 @@ impl SemanticService {
             enabled: AtomicBool::new(false),
             init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
+            embed_batch: AtomicUsize::new(0),
         })
     }
 
@@ -620,6 +654,7 @@ mod lock_tests {
             enabled: AtomicBool::new(true),
             init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
+            embed_batch: AtomicUsize::new(0),
         })
     }
 

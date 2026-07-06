@@ -214,6 +214,12 @@ pub enum AppEvent {
     /// (first-run model download, readiness, failure). Status-line only.
     SemanticStatus(String),
 
+    /// An ERROR-level log fired (forwarded by `logging::ErrorSignalLayer`).
+    /// Drives the red in-UI error marker; the full text is in `errors.log`.
+    ErrorLogged {
+        message: String,
+    },
+
     /// A `/search` lookup finished on its blocking thread. `query` echoes
     /// the request so stale replies (user already searched again) can be
     /// recognized and dropped.

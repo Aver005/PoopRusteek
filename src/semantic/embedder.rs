@@ -15,6 +15,11 @@ pub const EMBEDDING_DIM: usize = 384;
 
 pub struct Embedder {
     model: TextEmbedding,
+    /// Batch size handed to fastembed's `embed` (`None` = its default 256).
+    /// The memory guard: peak ONNX inference memory scales with this ×
+    /// seq². Set from `[semantic] rag_limit` (see `RagLimit`); MultilingualE5Small
+    /// is not dynamically quantized, so an arbitrary cap is safe here.
+    batch_limit: Option<usize>,
 }
 
 impl Embedder {
@@ -41,7 +46,16 @@ impl Embedder {
             .with_intra_threads(intra_threads);
         let model = TextEmbedding::try_new(options)
             .map_err(|e| format!("embedding model init failed: {e}"))?;
-        Ok(Self { model })
+        Ok(Self {
+            model,
+            batch_limit: None,
+        })
+    }
+
+    /// Set the batch cap used for corpus embedding. `None` restores
+    /// fastembed's default. Takes effect on the next `embed_passages` call.
+    pub fn set_batch_limit(&mut self, limit: Option<usize>) {
+        self.batch_limit = limit;
     }
 
     /// Embed a search input (`query: ` prefix). Blocking ONNX inference.
@@ -67,7 +81,7 @@ impl Embedder {
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
         let mut vectors = self
             .model
-            .embed(prefixed, None)
+            .embed(prefixed, self.batch_limit)
             .map_err(|e| format!("embedding failed: {e}"))?;
         for v in &mut vectors {
             l2_normalize(v);

@@ -242,6 +242,34 @@ pub fn render_stats_panel(
         }
     }
 
+    // ── Errors ── (only when something went wrong since the last message)
+    if state.error_count > 0 {
+        blank(&mut lines);
+        section_header(&mut lines, "Errors", panel_w, theme);
+        lines.push(Line::from(Span::styled(
+            format!("  \u{26A0} {} logged", state.error_count),
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if let Some(msg) = &state.last_error {
+            // One flattened, width-capped line — the full text is in errors.log.
+            let flat: String = msg
+                .chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            let shown: String = flat.chars().take(panel_w.saturating_sub(4)).collect();
+            lines.push(Line::from(Span::styled(
+                format!("  {shown}"),
+                Style::default().fg(theme.error),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "  see errors.log",
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+
     let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.panel));
     frame.render_widget(paragraph, panel_area);
 }

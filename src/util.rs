@@ -63,6 +63,63 @@ pub fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// Total physical RAM in bytes, or `None` when it can't be determined.
+/// Best-effort and platform-specific; never panics. Used to size
+/// memory-bounded work (the embedder batch) to the host it runs on.
+pub fn total_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: the documented calling convention is a zeroed
+        // MEMORYSTATUSEX with `dwLength` set to its size; the call only
+        // writes into the struct and returns nonzero on success.
+        unsafe {
+            let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+            status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 {
+                return Some(status.ullTotalPhys);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/meminfo, first line: `MemTotal:       16333764 kB`
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let rest = text.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut mem: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        let mut mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+        // SAFETY: sysctl reads hw.memsize into `mem`; `mib`/`size` describe a
+        // valid u64 output buffer and the query has no memory side effects.
+        let ok = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                &mut mem as *mut u64 as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (ok == 0 && mem > 0).then_some(mem)
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +135,19 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
         assert!(!path.with_extension("json.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_ram_is_plausible_on_this_host() {
+        // Exercises the platform FFI/parse path. Any real host this test
+        // runs on has well over 256 MB; a `None` (unsupported target /
+        // probe failure) is tolerated so exotic sandboxes don't fail here.
+        if let Some(bytes) = total_ram_bytes() {
+            assert!(
+                bytes > 256 * 1024 * 1024,
+                "implausibly small total RAM: {bytes} bytes"
+            );
+        }
     }
 
     #[test]

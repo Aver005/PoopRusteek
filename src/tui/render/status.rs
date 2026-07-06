@@ -40,6 +40,9 @@ pub(super) fn render_mini_status(
     state: &AppState,
     config: &Config,
     theme: &Theme,
+    // When the stats panel is hidden it can't carry the error marker, so the
+    // status bar shows a compact red segment instead.
+    panel_shown: bool,
 ) {
     let provider_name = provider_label(config);
     let model = config.active_model();
@@ -185,7 +188,15 @@ pub(super) fn render_mini_status(
         goal_tag, msg_count, total_tokens, session_prefix
     );
 
-    let gap = status_bar_gap(&left, &center, &right, area.width);
+    // Red error marker — only here when the panel (its primary home) is hidden.
+    let err_text = if !panel_shown && state.error_count > 0 {
+        format!(" \u{26A0} {} err ", state.error_count)
+    } else {
+        String::new()
+    };
+
+    // The marker sits between center and right; reserve its width in the gap.
+    let gap = status_bar_gap(&left, &center, &format!("{err_text}{right}"), area.width);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -201,6 +212,13 @@ pub(super) fn render_mini_status(
                     Style::default().fg(theme.text_dim)
                 }
                 .bg(theme.bg),
+            ),
+            Span::styled(
+                err_text,
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(theme.bg),
             ),
             Span::styled(right, Style::default().fg(theme.text_dim).bg(theme.bg)),
         ])),

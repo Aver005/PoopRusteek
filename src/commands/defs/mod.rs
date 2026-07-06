@@ -23,6 +23,7 @@ pub mod providers;
 pub mod ps;
 pub mod quit;
 pub mod rag;
+pub mod rag_limit;
 pub mod rate;
 pub mod reset;
 pub mod retry;

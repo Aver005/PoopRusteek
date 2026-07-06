@@ -93,9 +93,20 @@ rust-stemmers = "1.2.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1"
+# GlobalMemoryStatusEx (auto-size embedder batch) + SetStdHandle (redirect
+# stderr into errors.log so ONNX Runtime's output can't corrupt the TUI).
+windows-sys = { version = "0.60", features = [
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+# libc for: total physical RAM (macOS sysctl hw.memsize; auto-size embedder
+# batch) and stderr fd redirect into errors.log (dup2, all unix).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }

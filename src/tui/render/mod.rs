@@ -122,7 +122,7 @@ pub fn render(
             // Bottom status line — /logout and /wipe land here with their result.
             if area.height > 1 {
                 let status_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-                status::render_mini_status(frame, status_area, state, config, &theme);
+                status::render_mini_status(frame, status_area, state, config, &theme, false);
             }
         } else if state.view == View::Mcp {
             mcp::render_mcp_view(frame, area, &state.mcp_status.view, &theme);
@@ -206,7 +206,14 @@ pub fn render(
                 &cursor_cell,
             );
             status::render_input_border(frame, chunks[border_idx], &theme);
-            status::render_mini_status(frame, chunks[status_idx], state, config, &theme);
+            status::render_mini_status(
+                frame,
+                chunks[status_idx],
+                state,
+                config,
+                &theme,
+                show_panel,
+            );
 
             if state.autocomplete.visible {
                 modals::render_autocomplete(frame, chunks[2], state, &theme);

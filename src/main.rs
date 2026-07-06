@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod debug_log;
 mod error;
+mod logging;
 mod mcp;
 mod prompts;
 mod provider;
@@ -52,34 +53,18 @@ struct Args {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // Tracing goes to a file, never stdout/stderr: the TUI owns the
-    // terminal (an INFO line mid-frame paints garbage over the interface)
-    // and in --acp mode stdout is the JSON-RPC channel. Background tasks
-    // (semantic init/backfill, MCP reconnects) log mid-session, so "only
-    // startup logs" was never a safe assumption. Falls back to discarding
-    // logs if the file can't be opened — silence beats a corrupted frame.
-    let log_path = Config::data_dir().join("pooprusteek.log");
-    let _ = std::fs::create_dir_all(Config::data_dir());
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .ok();
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pooprusteek=info"));
-    match log_file {
-        Some(file) => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
-            .init(),
-        None => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::sink)
-            .init(),
-    }
-
     let args = Args::parse();
+
+    // Tracing goes to files, never stdout/stderr: the TUI owns the terminal
+    // (an INFO line mid-frame paints garbage over the interface) and in
+    // --acp mode stdout is the JSON-RPC channel. `logging::setup` also opens
+    // `errors.log` (ERROR-only + the in-UI red marker) and, in TUI mode,
+    // redirects the raw stderr fd there so dependency output that bypasses
+    // tracing (ONNX Runtime) can't corrupt a frame. Args are parsed first so
+    // the redirect decision is made before anything that loads ONNX.
+    let headless = args.acp || args.proxy || (args.serve && args.uiless);
+    logging::setup(!headless);
+
     debug_log::init(args.debug_log)?;
     let config: Config = match config::load() {
         Ok(c) => c,

@@ -322,6 +322,9 @@ pub struct SemanticConfig {
     /// How MCP tool schemas reach the system prompt — see [`McpSchemaMode`].
     #[serde(default)]
     pub mcp_schemas: McpSchemaMode,
+    /// Embedder batch cap — the ONNX memory guard. See [`RagLimit`].
+    #[serde(default)]
+    pub rag_limit: RagLimit,
 }
 
 impl Default for SemanticConfig {
@@ -331,7 +334,112 @@ impl Default for SemanticConfig {
             top_k: 3,
             min_dense_score: 0.80,
             mcp_schemas: McpSchemaMode::default(),
+            rag_limit: RagLimit::default(),
         }
+    }
+}
+
+/// How large a batch the embedder feeds ONNX at once. This is the memory
+/// guard: peak inference memory for one transformer layer is
+/// `batch × heads(12) × seq(512)² × 4 B ≈ batch × 12.6 MB`, so fastembed's
+/// default batch of 256 can demand multiple gigabytes and OOM on thin
+/// machines (embedded/IoT hosts, small VMs). Serializes as `"auto"`,
+/// `"off"`, or a bare integer in TOML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RagLimit {
+    /// Size the batch from total physical RAM (see [`RagLimit::resolve`]).
+    #[default]
+    Auto,
+    /// No cap — fastembed's own default. For machines with RAM to spare.
+    Off,
+    /// A fixed batch size, exactly as given (floored to 1).
+    Fixed(usize),
+}
+
+impl RagLimit {
+    /// Fraction of total RAM the embed transient is allowed to occupy.
+    const RAM_FRACTION: f64 = 0.05;
+    /// Conservative ONNX peak per batch item at seq=512 (over the ~12.6 MB
+    /// attention tensor to cover concurrent arena buffers + rounding).
+    const PER_ITEM_BYTES: f64 = 48.0 * 1024.0 * 1024.0;
+    /// Batch is clamped into this range regardless of RAM — 1 is the floor
+    /// (0 is invalid to fastembed), 64 the ceiling (throughput plateaus and
+    /// there is no reason to risk a huge allocation past it).
+    const MIN_BATCH: usize = 1;
+    const MAX_BATCH: usize = 64;
+    /// Used when RAM can't be detected: safe on any machine with ≥ ~3 GB.
+    const FALLBACK_BATCH: usize = 8;
+
+    /// Resolve to the concrete batch argument for fastembed. `None` means
+    /// "no cap" (pass fastembed its default). `total_ram_bytes` is the host's
+    /// physical RAM (`None` when it couldn't be probed).
+    pub fn resolve(self, total_ram_bytes: Option<u64>) -> Option<usize> {
+        match self {
+            RagLimit::Off => None,
+            RagLimit::Fixed(n) => Some(n.max(Self::MIN_BATCH)),
+            RagLimit::Auto => Some(Self::auto_batch(total_ram_bytes)),
+        }
+    }
+
+    /// The auto-sized batch for a given amount of RAM. Split out for testing.
+    pub fn auto_batch(total_ram_bytes: Option<u64>) -> usize {
+        let Some(ram) = total_ram_bytes else {
+            return Self::FALLBACK_BATCH;
+        };
+        let budget = ram as f64 * Self::RAM_FRACTION;
+        let batch = (budget / Self::PER_ITEM_BYTES) as usize;
+        batch.clamp(Self::MIN_BATCH, Self::MAX_BATCH)
+    }
+}
+
+impl std::fmt::Display for RagLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RagLimit::Auto => f.write_str("auto"),
+            RagLimit::Off => f.write_str("off"),
+            RagLimit::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl Serialize for RagLimit {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            RagLimit::Auto => serializer.serialize_str("auto"),
+            RagLimit::Off => serializer.serialize_str("off"),
+            RagLimit::Fixed(n) => serializer.serialize_u64(*n as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RagLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RagLimitVisitor;
+        impl<'de> serde::de::Visitor<'de> for RagLimitVisitor {
+            type Value = RagLimit;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#""auto", "off", or a positive integer"#)
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RagLimit, E> {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "auto" => Ok(RagLimit::Auto),
+                    "off" => Ok(RagLimit::Off),
+                    other => Err(E::custom(format!(
+                        "expected \"auto\", \"off\", or an integer, got {other:?}"
+                    ))),
+                }
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<RagLimit, E> {
+                Ok(RagLimit::Fixed(v.max(1) as usize))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<RagLimit, E> {
+                if v < 1 {
+                    return Err(E::custom("rag_limit integer must be ≥ 1"));
+                }
+                Ok(RagLimit::Fixed(v as usize))
+            }
+        }
+        deserializer.deserialize_any(RagLimitVisitor)
     }
 }
 
@@ -540,6 +648,53 @@ mod tests {
         let toml_text = "enabled = true\ntop_k = 3\nmin_dense_score = 0.8\n";
         let parsed: SemanticConfig = toml::from_str(toml_text).unwrap();
         assert_eq!(parsed.mcp_schemas, McpSchemaMode::Auto);
+        // Same for the newer `rag_limit` field.
+        assert_eq!(parsed.rag_limit, RagLimit::Auto);
+    }
+
+    #[test]
+    fn rag_limit_auto_scales_with_ram_and_clamps() {
+        // Unknown RAM → the conservative fallback.
+        assert_eq!(RagLimit::auto_batch(None), RagLimit::FALLBACK_BATCH);
+        // Bigger machines get bigger batches, monotonically…
+        let gb = |n: u64| Some(n * 1024 * 1024 * 1024);
+        let small = RagLimit::auto_batch(gb(4));
+        let big = RagLimit::auto_batch(gb(32));
+        assert!(small >= RagLimit::MIN_BATCH && small < big);
+        // …but never past the ceiling, even on a huge host.
+        assert_eq!(RagLimit::auto_batch(gb(512)), RagLimit::MAX_BATCH);
+        // A tiny machine still clears the floor (0 is invalid to fastembed).
+        assert!(RagLimit::auto_batch(Some(256 * 1024 * 1024)) >= RagLimit::MIN_BATCH);
+    }
+
+    #[test]
+    fn rag_limit_resolve_covers_all_modes() {
+        assert_eq!(RagLimit::Off.resolve(None), None);
+        assert_eq!(RagLimit::Fixed(20).resolve(None), Some(20));
+        // Fixed(0) is floored to a valid batch.
+        assert_eq!(RagLimit::Fixed(0).resolve(None), Some(1));
+        assert!(RagLimit::Auto.resolve(None).is_some());
+    }
+
+    #[test]
+    fn rag_limit_round_trips_through_toml() {
+        for mode in [RagLimit::Auto, RagLimit::Off, RagLimit::Fixed(12)] {
+            let mut cfg = SemanticConfig::default();
+            cfg.rag_limit = mode;
+            let text = toml::to_string_pretty(&cfg).unwrap();
+            let parsed: SemanticConfig = toml::from_str(&text).unwrap();
+            assert_eq!(parsed.rag_limit, mode, "round-trip failed for {mode}");
+        }
+        // Bare integer and keyword strings both parse.
+        let n: SemanticConfig =
+            toml::from_str("enabled = true\ntop_k = 3\nmin_dense_score = 0.8\nrag_limit = 8\n")
+                .unwrap();
+        assert_eq!(n.rag_limit, RagLimit::Fixed(8));
+        let off: SemanticConfig = toml::from_str(
+            "enabled = true\ntop_k = 3\nmin_dense_score = 0.8\nrag_limit = \"off\"\n",
+        )
+        .unwrap();
+        assert_eq!(off.rag_limit, RagLimit::Off);
     }
 
     #[test]

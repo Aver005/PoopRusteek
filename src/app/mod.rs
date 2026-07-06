@@ -123,6 +123,12 @@ pub struct AppState {
     pub conversations: conversation::Conversations,
     pub input: input::InputState,
     pub status_message: String,
+    /// Count of ERROR-level logs since the last message was sent, and the
+    /// most recent one's text. Drives the red error marker (panel / status
+    /// bar). Reset on submit — sending a message acknowledges them. Full
+    /// details always live in `errors.log`.
+    pub error_count: usize,
+    pub last_error: Option<String>,
     pub scroll_offset: u32,
     pub modal: Option<Modal>,
     pub approved_tools: std::collections::HashSet<String>,
@@ -196,6 +202,9 @@ const AUTOCOMPLETE_VISIBLE: usize = 8;
 impl App {
     pub async fn new(config: Config) -> AppResult<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        // Bridge ERROR-level logs to the in-UI red marker now that a channel
+        // exists (see logging::setup). Idempotent across App re-creation.
+        crate::logging::set_error_sink(event_tx.clone());
 
         let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
 
@@ -228,6 +237,8 @@ impl App {
                 "No token configured"
             }
             .to_string(),
+            error_count: 0,
+            last_error: None,
             scroll_offset: 0,
             modal: None,
             approved_tools: crate::whitelist::load(),
@@ -769,6 +780,10 @@ impl App {
             }
             AppEvent::SemanticStatus(message) => {
                 self.state.status_message = message;
+            }
+            AppEvent::ErrorLogged { message } => {
+                self.state.error_count += 1;
+                self.state.last_error = Some(message);
             }
             AppEvent::ServerStarted { generation, addr } => {
                 if let Some(handle) = &mut self.server

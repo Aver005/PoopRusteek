@@ -201,7 +201,7 @@ pub(super) fn render_landing(
 
     // Status at very bottom
     let status_area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
-    render_mini_status(frame, status_area, state, config, theme);
+    render_mini_status(frame, status_area, state, config, theme, false);
 }
 
 fn render_sessions_table(
