@@ -21,6 +21,7 @@ mod chat;
 mod dispatch;
 mod mcp;
 mod modal;
+mod mouse;
 mod onboarding;
 mod providers;
 mod search;

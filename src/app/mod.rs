@@ -375,6 +375,10 @@ impl App {
                                 return Ok(());
                             }
                         }
+                        crossterm::event::Event::Mouse(mouse) => {
+                            dirty = true;
+                            self.handle_event(AppEvent::Mouse(mouse)).await?;
+                        }
                         crossterm::event::Event::Resize(w, h) => {
                             dirty = true;
                             self.handle_event(AppEvent::Resize(w, h)).await?;
@@ -477,6 +481,7 @@ impl App {
         }
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
+            AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::AgentStarted(_) => {
                 self.state.focused_mut().generation.begin(std::time::Instant::now());
                 self.state.status_message = "Thinking...".to_string();

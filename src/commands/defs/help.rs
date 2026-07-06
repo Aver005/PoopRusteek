@@ -50,7 +50,9 @@ impl HelpCommand {
              \x20 Enter          — Send message\n\
              \x20 Shift+Enter    — New line in prompt\n\
              \x20 `\\` + Enter   — New line in prompt (line continuation)\n\
-             \x20 Up/Down        — Scroll chat\n\
+             \x20 Up/Down        — Scroll chat (wheel scrolls too)\n\
+             \x20 PageUp/PageDown — Scroll chat by a page\n\
+             \x20 Ctrl+Up/Down   — Recall previous/next prompt\n\
              \x20 Ctrl+Left/Right — Move by word\n\
              \x20 Ctrl+Shift+Left/Right — Select by word\n\
              \x20 Shift+Left/Right — Select by char\n\

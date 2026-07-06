@@ -100,6 +100,9 @@ pub enum GoalEvalOutcome {
 pub enum AppEvent {
     // TUI events
     Key(crossterm::event::KeyEvent),
+    // Mouse wheel scrolls the focused window (chat transcript, MCP details,
+    // approval modal, search results). Clicks are ignored for now.
+    Mouse(crossterm::event::MouseEvent),
     // The new size only triggers a redraw (ratatui re-queries the terminal
     // size when rendering); the dimensions themselves aren't read anywhere.
     #[expect(dead_code, reason = "resize payload unused — redraw reads terminal size directly")]

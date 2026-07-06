@@ -105,13 +105,16 @@ impl App {
             KeyCode::End => {
                 self.state.input.move_end(key.modifiers.contains(KeyModifiers::SHIFT));
             }
-            KeyCode::Up if !self.state.focused_mut().generation.active
-                && self.state.input.buffer.chars().take(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
+            // History recall lives on Ctrl+Up/Down everywhere so plain
+            // Up/Down can always scroll the message window without the old
+            // cursor-position disambiguation fighting the scroll.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !self.state.focused_mut().generation.active =>
             {
                 self.state.input.history_prev();
             }
-            KeyCode::Down if !self.state.focused_mut().generation.active
-                && self.state.input.buffer.chars().skip(self.state.input.cursor).filter(|&c| c == '\n').count() == 0 =>
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !self.state.focused_mut().generation.active =>
             {
                 self.state.input.history_next();
             }
