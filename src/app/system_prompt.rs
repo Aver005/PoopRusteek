@@ -11,11 +11,6 @@ use crate::prompts::PromptFiles;
 use crate::skills::SkillDefinition;
 use crate::tools::registry::ToolRegistry;
 
-/// Byte cap for one description line in the deferred MCP tool list — long
-/// MCP descriptions (Playwright's run for paragraphs) would defeat the
-/// point of deferring.
-const DEFERRED_DESC_MAX_BYTES: usize = 160;
-
 pub async fn build(
     prompts: &PromptFiles,
     skills: &[SkillDefinition],
@@ -48,20 +43,28 @@ pub async fn build(
     let mcp_tool_section = if all_mcp_tools.is_empty() {
         "- none".to_string()
     } else if mcp_schema_mode.deferred_for(all_mcp_tools.len()) {
-        // Deferred mode: names + first description line only. Full
-        // definitions arrive per-turn via semantic hints or on demand via
-        // the `tool_search` builtin — this saves thousands of prompt
-        // tokens once a couple of servers are connected.
-        let mut lines = vec![
-            "The MCP tools below are listed WITHOUT parameter schemas. Before calling one for the first time, call `tool_search` with a description of what you need — it returns the full definitions of the best-matching tools. Use the exact names as listed.".to_string(),
-        ];
+        // Deferred mode: a server-level summary ONLY — individual tools are
+        // not listed at all. Semantic hints attach full definitions of the
+        // tools relevant to each request, and `tool_search` covers explicit
+        // lookup, so up-front enumeration is pure context waste (a couple
+        // of servers is already 50+ lines).
+        let mut per_server: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
         for full in &all_mcp_tools {
-            let first_line = full.tool.description.lines().next().unwrap_or("");
-            lines.push(format!(
-                "- `{}`: {}",
-                full.full_name,
-                crate::util::truncate_with_ellipsis(first_line, DEFERRED_DESC_MAX_BYTES)
-            ));
+            let server = full
+                .full_name
+                .strip_prefix(crate::mcp::MCP_TOOL_PREFIX)
+                .and_then(|rest| rest.split("__").next())
+                .unwrap_or("?");
+            *per_server.entry(server).or_default() += 1;
+        }
+        let mut lines = vec![format!(
+            "{} MCP tools from {} connected server(s) are available but NOT listed here. Relevant tools (with full parameter schemas) are suggested to you automatically per request. To find one yourself, call `tool_search` with a short description of the capability you need (any language) — it returns exact tool names (`mcp__<server>__<tool>`) and their schemas. Never guess or invent MCP tool names.\n\nConnected servers:",
+            all_mcp_tools.len(),
+            per_server.len(),
+        )];
+        for (server, count) in &per_server {
+            lines.push(format!("- {server} ({count} tools)"));
         }
         lines.join("\n")
     } else {

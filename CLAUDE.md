@@ -86,8 +86,9 @@ Key subsystems added on top of that core:
   ephemeral hint (`match_prompt` in `run_agent_loop`) suggesting skills and
   MCP tools; the `tool_search` / `history_search` builtins expose the same
   index to the model on demand. **Deferred MCP schemas**: above 12 tools
-  (`[semantic] mcp_schemas = auto`), the system prompt lists MCP tools
-  name+one-liner only — full definitions come from hints or `tool_search`.
+  (`[semantic] mcp_schemas = auto`), the system prompt carries only a
+  server-level summary (`<server> (N tools)`) — individual tools are not
+  enumerated; full definitions come from hints or `tool_search`.
   The history index (`data_dir/semantic/history.json`) is a rebuildable cache
   over session files (per-session watermarks, model-stamp wipe); `/search`
   (View::Search) and `/rag` are the user-facing surfaces.
