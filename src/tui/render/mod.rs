@@ -143,15 +143,27 @@ pub fn render(terminal: &mut TuiTerminal, state: &AppState, config: &Config) -> 
 
             status::render_separator(frame, chunks[1], &theme);
 
-            // Split main content into chat + stats panel
+            // Split main content into chat + stats panel. The reserved panel
+            // width MUST equal what the panel actually draws (`panel_width`),
+            // otherwise the chat area overlaps it and chat text bleeds onto
+            // the panel — the panel only recolors backgrounds, it doesn't
+            // clear glyphs. A 1-column gap holds the panel's own separator.
             let pad_w = 2u16;
-            if state.show_stats_panel {
-                let panel_w = 34u16.min(chunks[0].width / 4);
+            let panel_w = if state.show_stats_panel {
+                widgets::panel::panel_width(chunks[0].width)
+            } else {
+                0
+            };
+            // Keep the panel only while it still leaves the chat a usable
+            // width; on very narrow terminals it collapses to the plain layout.
+            let show_panel = panel_w > 0 && chunks[0].width >= pad_w + 1 + panel_w + 24;
+            if show_panel {
                 let content_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
                         Constraint::Length(pad_w),
                         Constraint::Min(1),
+                        Constraint::Length(1),
                         Constraint::Length(panel_w),
                     ])
                     .split(chunks[0]);

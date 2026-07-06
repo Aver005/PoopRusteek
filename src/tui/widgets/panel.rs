@@ -7,7 +7,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Block},
+    widgets::{Block, Clear, Paragraph},
     Frame,
 };
 use std::cell::RefCell;
@@ -15,6 +15,22 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const PANEL_W: usize = 34;
+
+/// The number of columns the stats panel will actually occupy for a given
+/// available width, or `0` if it won't render (too narrow — see the
+/// `panel_w < 20` guard in [`render_stats_panel`]).
+///
+/// The layout in `tui::render` MUST reserve exactly this width so the chat
+/// area never overlaps the panel: the panel paints its background by
+/// *recoloring* cells (`Block`/`Paragraph` styles), which does not clear the
+/// glyphs already drawn there, so any chat text left under the panel bleeds
+/// through its blank/indented cells. Reserving a mismatched width (the old
+/// `34.min(width/4)`) is what let long chat lines climb onto the panel on
+/// terminals narrower than ~136 columns.
+pub fn panel_width(available: u16) -> u16 {
+    let w = PANEL_W.min(available as usize);
+    if w < 20 { 0 } else { w as u16 }
+}
 
 /// How long a cached session tag stays valid before `session::load_local`
 /// is asked to re-read the file. The panel repaints every frame while the
@@ -52,6 +68,12 @@ pub fn render_stats_panel(frame: &mut Frame, area: Rect, state: &AppState, confi
         return;
     }
     let panel_area = Rect::new(area.x + area.width - panel_w as u16, area.y, panel_w as u16, area.height);
+
+    // Clear first: `Block`/`Paragraph` styles only recolor cells, they don't
+    // overwrite glyphs, so without this any chat text drawn under the panel
+    // (e.g. after a layout width mismatch) would bleed through the panel's
+    // blank/indented cells. `Clear` writes spaces over the whole area.
+    frame.render_widget(Clear, panel_area);
 
     // Fill background
     frame.render_widget(
@@ -303,6 +325,34 @@ mod tests {
         assert_eq!(left, "");
         assert_eq!(gap, 0);
         assert!(!right.is_empty());
+    }
+
+    #[test]
+    fn panel_width_matches_drawn_width_on_normal_terminals() {
+        // On any terminal at least as wide as PANEL_W, the reserved width the
+        // layout uses must equal the fixed width the panel actually draws —
+        // this is the invariant whose violation let chat text bleed onto the
+        // panel (the old layout reserved `34.min(width/4)` instead).
+        for available in [40u16, 80, 120, 136, 200] {
+            assert_eq!(panel_width(available), PANEL_W as u16, "available={available}");
+        }
+    }
+
+    #[test]
+    fn panel_width_never_exceeds_available() {
+        for available in 0u16..=40 {
+            assert!(panel_width(available) <= available, "available={available}");
+        }
+    }
+
+    #[test]
+    fn panel_width_is_zero_when_too_narrow_to_render() {
+        // Mirrors the `panel_w < 20` early-return in render_stats_panel: below
+        // 20 columns the panel does not draw, so nothing must be reserved.
+        for available in 0u16..20 {
+            assert_eq!(panel_width(available), 0, "available={available}");
+        }
+        assert_eq!(panel_width(20), 20);
     }
 
     #[test]
