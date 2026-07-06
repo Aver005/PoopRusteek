@@ -1,0 +1,118 @@
+name: Dev build release
+
+# Rolling "dev-build" release: rebuilds and republishes on every push to
+# `develop` that touches the codebase or configs (not docs — see
+# paths-ignore). The release tag is `v<Cargo.toml version>-dev`, so it moves
+# forward with each push as long as the version stays the same, and a
+# Cargo.toml version bump produces a new tag/release instead of overwriting
+# the previous one.
+
+on:
+  push:
+    branches: [develop]
+    paths-ignore:
+      - '**/*.md'
+      - '.memories/**'
+      - 'LICENSE'
+
+concurrency:
+  group: dev-build-release
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x86_64
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin pooprusteek
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/pooprusteek dist/
+          strip dist/pooprusteek || true
+          tar -C dist -czf pooprusteek-${{ matrix.target }}.tar.gz pooprusteek
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/pooprusteek.exe dist/pooprusteek.exe
+          Compress-Archive -Path dist/pooprusteek.exe -DestinationPath pooprusteek-${{ matrix.target }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pooprusteek-${{ matrix.target }}
+          path: pooprusteek-${{ matrix.target }}.*
+          retention-days: 7
+
+  release:
+    name: Publish dev-build release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+      - name: Compute rolling tag from Cargo.toml version
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=v${VERSION}-dev" >> "$GITHUB_OUTPUT"
+
+      - name: Move tag to current commit
+        shell: bash
+        run: |
+          git tag -f "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}" --force
+
+      - name: Delete previous release for this tag (if any)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "${{ steps.ver.outputs.tag }}" --yes || true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "Dev build ${{ steps.ver.outputs.tag }}"
+          prerelease: true
+          body: |
+            Automated dev build from `develop` @ ${{ github.sha }}.
+            Not a stable release — always the latest build that passed CI on `develop`.
+          files: release-assets/*

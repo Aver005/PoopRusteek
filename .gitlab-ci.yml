@@ -1,0 +1,152 @@
+# CI/CD for pooprusteek.
+#
+# Rolling "dev-build" release: on every push to `develop` that touches the
+# codebase or build/CI config (the `changes:` allowlist below — GitLab's
+# `rules:changes` has no "ignore docs" negation, so this whitelists
+# code/config paths instead of blacklisting docs; keep it in sync with new
+# top-level source/config dirs), rebuild the binaries and move the
+# `vX.Y.Z-dev` release tag (X.Y.Z from Cargo.toml) to the new commit.
+# Bumping the Cargo.toml version produces a new tag/release instead of
+# overwriting the previous one.
+#
+# Requires a `GITLAB_TOKEN` CI/CD variable (project/group access token,
+# `api` scope) — used to delete the previous tag so it can be recreated on
+# the new commit. `CI_JOB_TOKEN` alone may not have tag-delete permission
+# depending on project settings.
+#
+# Only the Linux leg runs on a default shared runner. Windows/macOS need
+# GitLab SaaS runners (`saas-windows-medium-amd64` / `saas-macos-medium-m1`,
+# paid compute minutes) and are `when: manual` + `allow_failure: true` so
+# the pipeline doesn't block on a runner that may not exist for this
+# project yet — trigger them by hand, or drop the `when: manual` override
+# once those runners are actually available.
+
+stages:
+  - prepare
+  - build
+  - release
+
+variables:
+  CARGO_TERM_COLOR: always
+
+.dev_build_rules: &dev_build_rules
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes:
+        - "src/**/*"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "build.rs"
+        - ".gitlab-ci.yml"
+
+.dev_build_rules_manual: &dev_build_rules_manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes:
+        - "src/**/*"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "build.rs"
+        - ".gitlab-ci.yml"
+      when: manual
+      allow_failure: true
+
+prepare:version:
+  stage: prepare
+  image: alpine:3.20
+  <<: *dev_build_rules
+  script:
+    - VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+    - echo "VERSION=$VERSION" >> version.env
+    - echo "RELEASE_TAG=v${VERSION}-dev" >> version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+
+build:linux:
+  stage: build
+  image: rust:1.91
+  <<: *dev_build_rules
+  script:
+    - cargo build --release --bin pooprusteek
+    - strip target/release/pooprusteek || true
+    - mkdir -p dist
+    - tar -C target/release -czf dist/pooprusteek-linux-x86_64.tar.gz pooprusteek
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+
+build:windows:
+  stage: build
+  <<: *dev_build_rules_manual
+  tags:
+    - saas-windows-medium-amd64
+  before_script:
+    - choco install rust -y
+    - refreshenv
+  script:
+    - cargo build --release --bin pooprusteek
+    - New-Item -ItemType Directory -Force dist | Out-Null
+    - Copy-Item target/release/pooprusteek.exe dist/pooprusteek.exe
+    - Compress-Archive -Path dist/pooprusteek.exe -DestinationPath dist/pooprusteek-windows-x86_64.zip
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+
+build:macos:
+  stage: build
+  <<: *dev_build_rules_manual
+  tags:
+    - saas-macos-medium-m1
+  before_script:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - source "$HOME/.cargo/env"
+  script:
+    - cargo build --release --bin pooprusteek
+    - strip target/release/pooprusteek || true
+    - mkdir -p dist
+    - tar -C target/release -czf dist/pooprusteek-macos-arm64.tar.gz pooprusteek
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+
+release:dev-build:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  <<: *dev_build_rules
+  needs:
+    - job: prepare:version
+      artifacts: true
+    - job: build:linux
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+      optional: true
+    - job: build:macos
+      artifacts: true
+      optional: true
+  script:
+    - ls -la dist || true
+    - >
+      curl --silent --request DELETE --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}"
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags/${RELEASE_TAG}" || true
+    - |
+      ASSET_ARGS=""
+      for f in dist/*; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f")
+        url="${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/$f"
+        ASSET_ARGS="$ASSET_ARGS --assets-link {\"name\":\"$name\",\"url\":\"$url\"}"
+      done
+      release-cli create \
+        --tag-name "$RELEASE_TAG" \
+        --ref "$CI_COMMIT_SHA" \
+        --description "Automated dev build from develop @ $CI_COMMIT_SHORT_SHA. Not a stable release." \
+        $ASSET_ARGS
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days

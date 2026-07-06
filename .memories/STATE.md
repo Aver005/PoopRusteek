@@ -14,7 +14,7 @@
 | 3.7 Architecture | `[DONE]` | God-object `App` decomposed (mod.rs 2.4k→925): sub-state modules + controllers (`AgentRuntime`, `system_prompt::build`, `BackgroundCounters`, `McpStatus`). Provider split (prompt/sse/fake). |
 | 3.8 Stability & perf overhaul | `[DONE]` | 2026-07-02: all 7 audit criticals fixed (live streaming, MCP mutex freeze, GOAL evaluator off-loop, `/goal` registration, `--acp` panic, drain+dirty render with markdown/syntect cache, MCP stdio stderr+id-correlation) + ~30 majors (interaction queue, ui_only message split, atomic_write everywhere, CI, shell timeout/cap, background process-group kill, etc.) + dead-code sweep; clippy ~220→0, tests 84→189. See `reference/AUDIT-2026-07-02.md` + `JOURNAL/2026-07-02.md`. |
 | 4 Polish | `[WIP]` | Multi-theme `[DONE]` (2026-07-05: `/themes` — 10 presets, live preview, custom-theme wizard, `[[ui.custom_themes]]`), mouse, copy/paste, error recovery, rate limiting `[DONE]` (ms-interval + per-minute cap, both via `/rate`; retry/backoff exists), schema validation |
-| 5 Distribution | `[WIP]` | CI added (`.github/workflows/ci.yml`, build+test win+linux, clippy advisory); release builds, cross-compile, installers, man page still `[TODO]` |
+| 5 Distribution | `[WIP]` | CI added (`.github/workflows/ci.yml`, build+test win+linux, clippy advisory); rolling `dev-build` release CI added 2026-07-06 (`.github/workflows/dev-release.yml` — win/linux/macos binaries, tag `v<version>-dev`, GitHub Releases; `.gitlab-ci.yml` mirror, unverified, no GitLab remote yet); installers, man page still `[TODO]` |
 
 ## BUILD STATUS
 
@@ -24,6 +24,7 @@
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
 | Tests | **358 passing** + 3 `#[ignore]`d (semantic evals, need the ~120 MB model) (`cargo test --bin pooprusteek`) |
 | CI | `.github/workflows/ci.yml` — build+test on Windows and Linux; clippy runs advisory (`continue-on-error`) |
+| Dev-build release | `.github/workflows/dev-release.yml` (live) — rolling `v<version>-dev` GitHub Release on qualifying `develop` pushes; `.gitlab-ci.yml` (unverified, no GitLab remote yet) |
 
 ## CURRENT FOCUS
 
