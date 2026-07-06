@@ -1,6 +1,14 @@
 use crate::error::{AppError, AppResult};
 use std::path::{Path, PathBuf};
 
+/// Embedded copies of the core prompts so an installed binary works with no
+/// `assets/` folder nearby (same rationale as the embedded PoW wasm in
+/// `provider::pow`). A file on disk still wins — see [`load_asset_text`].
+const EMBEDDED_BASE_PROMPT: &str = include_str!("../assets/prompts/base.prompt.md");
+const EMBEDDED_TOOLS_PROMPT: &str = include_str!("../assets/prompts/tools.prompt.md");
+const EMBEDDED_GOAL_EVALUATOR_PROMPT: &str =
+    include_str!("../assets/prompts/goal-evaluator.prompt.md");
+
 #[derive(Debug, Clone)]
 pub struct PromptFiles {
     pub base_prompt: String,
@@ -8,20 +16,30 @@ pub struct PromptFiles {
     pub goal_evaluator_prompt: String,
 }
 
-pub fn load_prompt_files() -> AppResult<PromptFiles> {
-    let base_prompt = std::fs::read_to_string(resolve_existing_asset_path("assets/prompts/base.prompt.md")?)
-        .map_err(|error| AppError::Config(error.to_string()))?;
-    let tools_prompt = std::fs::read_to_string(resolve_existing_asset_path("assets/prompts/tools.prompt.md")?)
-        .map_err(|error| AppError::Config(error.to_string()))?;
-    let goal_evaluator_prompt = std::fs::read_to_string(
-        resolve_existing_asset_path("assets/prompts/goal-evaluator.prompt.md")?
-    ).map_err(|error| AppError::Config(error.to_string()))?;
+pub fn load_prompt_files() -> PromptFiles {
+    PromptFiles {
+        base_prompt: load_asset_text("assets/prompts/base.prompt.md", EMBEDDED_BASE_PROMPT),
+        tools_prompt: load_asset_text("assets/prompts/tools.prompt.md", EMBEDDED_TOOLS_PROMPT),
+        goal_evaluator_prompt: load_asset_text(
+            "assets/prompts/goal-evaluator.prompt.md",
+            EMBEDDED_GOAL_EVALUATOR_PROMPT,
+        ),
+    }
+}
 
-    Ok(PromptFiles {
-        base_prompt,
-        tools_prompt,
-        goal_evaluator_prompt,
-    })
+/// Read a prompt from disk when a copy exists (exe dir, repo checkout, or
+/// cwd — allows local overrides), otherwise fall back to the embedded copy.
+fn load_asset_text(relative_path: &str, embedded: &str) -> String {
+    if let Ok(path) = resolve_existing_asset_path(relative_path) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => return text,
+            Err(error) => tracing::warn!(
+                "Failed to read {}: {error}; using embedded copy",
+                path.display()
+            ),
+        }
+    }
+    embedded.to_string()
 }
 
 pub fn resolve_existing_asset_path(relative_path: &str) -> AppResult<PathBuf> {

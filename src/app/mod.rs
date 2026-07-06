@@ -194,7 +194,7 @@ impl App {
 
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let tools = Arc::new(ToolRegistry::new());
-        let prompts = prompts::load_prompt_files()?;
+        let prompts = prompts::load_prompt_files();
 
         let mut skills = discover_all_skills(&config.skills.paths);
         for skill in &mut skills {

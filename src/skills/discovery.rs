@@ -4,6 +4,22 @@ use std::path::{Path, PathBuf};
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 
+/// Embedded copies of the built-in prompt skills so an installed binary still
+/// offers them with no `assets/` folder nearby (same rationale as the embedded
+/// core prompts in `crate::prompts`). On-disk copies win — embedded entries
+/// are only added for slugs not already discovered. `base.prompt.md` and
+/// `tools.prompt.md` are excluded: they are injected into the system prompt
+/// via `PromptFiles`, not exposed as skills.
+const EMBEDDED_BUILTIN_PROMPTS: &[(&str, &str)] = &[
+    ("compact.prompt.md", include_str!("../../assets/prompts/compact.prompt.md")),
+    ("figma.prompt.md", include_str!("../../assets/prompts/figma.prompt.md")),
+    ("goal-evaluator.prompt.md", include_str!("../../assets/prompts/goal-evaluator.prompt.md")),
+    ("poet.prompt.md", include_str!("../../assets/prompts/poet.prompt.md")),
+    ("refactor.prompt.md", include_str!("../../assets/prompts/refactor.prompt.md")),
+    ("review.prompt.md", include_str!("../../assets/prompts/review.prompt.md")),
+    ("role-creator.prompt.md", include_str!("../../assets/prompts/role-creator.prompt.md")),
+];
+
 fn home() -> Option<PathBuf> {
     dirs::home_dir()
 }
@@ -89,6 +105,14 @@ pub fn discover_all_skills(config_paths: &[String]) -> Vec<SkillDefinition> {
             continue;
         }
         scan_directory(dir, *source, &mut skills, &mut seen_slugs);
+    }
+
+    for (filename, content) in EMBEDDED_BUILTIN_PROMPTS {
+        if let Some(skill) =
+            prompt_skill_from_content(filename, (*content).to_string(), SkillSource::BuiltIn)
+            && seen_slugs.insert(skill.slug.clone()) {
+                skills.push(skill);
+            }
     }
 
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -194,11 +218,19 @@ fn load_skill_from_file(path: &Path, source: SkillSource, skill_dir: &Path) -> O
 
 fn load_prompt_file(path: &Path, source: SkillSource) -> Option<SkillDefinition> {
     let content = std::fs::read_to_string(path).ok()?;
-    let filename = path.file_stem()?.to_str()?;
+    let filename = path.file_name()?.to_str()?;
+    prompt_skill_from_content(filename, content, source)
+}
 
-    let slug = filename
+fn prompt_skill_from_content(
+    filename: &str,
+    content: String,
+    source: SkillSource,
+) -> Option<SkillDefinition> {
+    let stem = filename.strip_suffix(".md").unwrap_or(filename);
+    let slug = stem
         .strip_suffix(".prompt")
-        .unwrap_or(filename)
+        .unwrap_or(stem)
         .to_lowercase()
         .replace(' ', "-");
 
@@ -245,4 +277,54 @@ pub fn load_enabled_skills_content(skills: &[SkillDefinition]) -> String {
 
     sections.push("\n---\n".to_string());
     sections.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every top-level `*.prompt.md` in `assets/prompts/` (except base/tools,
+    /// which ship embedded in `crate::prompts`) must be registered in
+    /// `EMBEDDED_BUILTIN_PROMPTS`, or a distributed binary silently loses it.
+    #[test]
+    fn embedded_builtin_prompts_cover_assets_dir() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("prompts");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&assets)
+            .expect("assets/prompts must exist in the repo")
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                (entry.path().is_file()
+                    && name.ends_with(".prompt.md")
+                    && name != "base.prompt.md"
+                    && name != "tools.prompt.md")
+                    .then_some(name)
+            })
+            .collect();
+        on_disk.sort();
+
+        let mut embedded: Vec<String> = EMBEDDED_BUILTIN_PROMPTS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        embedded.sort();
+
+        assert_eq!(
+            embedded, on_disk,
+            "EMBEDDED_BUILTIN_PROMPTS is out of sync with assets/prompts/ — \
+             add the missing include_str! entry (or remove the stale one)"
+        );
+    }
+
+    #[test]
+    fn prompt_skill_slug_and_name_derivation() {
+        let skill =
+            prompt_skill_from_content("role-creator.prompt.md", "body".into(), SkillSource::BuiltIn)
+                .expect("skill should parse");
+        assert_eq!(skill.slug, "role-creator");
+        assert_eq!(skill.name, "Role Creator");
+        assert_eq!(skill.content, "body");
+    }
 }
