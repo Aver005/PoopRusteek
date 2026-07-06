@@ -594,6 +594,77 @@ mod tests {
         assert_eq!(cached_token_estimate(999_002, 0, &msg), estimate_tokens(&msg.content));
     }
 
+    /// Manual perf probe: `cargo test --release --bin pooprusteek
+    /// render_chat_perf_probe -- --ignored --nocapture`. Renders a fat
+    /// transcript frame-by-frame the way fast typing does (one full render
+    /// per keystroke) and prints the per-frame cost.
+    #[test]
+    #[ignore = "manual perf probe, prints timings"]
+    fn render_chat_perf_probe() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let theme = Theme::default_dark();
+        let mut state = AppState {
+            conversations: crate::app::conversation::Conversations::new(
+                crate::app::conversation::Conversation::fresh_main(None),
+            ),
+            input: crate::app::input::InputState::default(),
+            status_message: String::new(),
+            scroll_offset: 0,
+            modal: None,
+            approved_tools: std::collections::HashSet::new(),
+            pending_tool_approval: None,
+            pending_question: None,
+            pending_interactions: std::collections::VecDeque::new(),
+            autocomplete: crate::app::AutocompleteState::default(),
+            view: crate::app::events::View::Chat,
+            onboarding: crate::app::events::OnboardingState::default(),
+            mcp_status: crate::app::mcp_status::McpStatus::default(),
+            providers_view: crate::app::providers::ProvidersViewState::default(),
+            search: crate::app::search::SearchViewState::default(),
+            themes: crate::app::themes::ThemesViewState::default(),
+            workspace_path: String::new(),
+            show_stats_panel: true,
+            attached_files: Vec::new(),
+            goal: Default::default(),
+            needs_terminal_restore: false,
+            background: crate::app::background_stats::BackgroundCounters::default(),
+        };
+
+        for i in 0..100 {
+            state.focused_mut().messages.push(ChatMessage::user(&format!(
+                "question number {i}: how do I make this considerably faster please?"
+            )));
+            state.focused_mut().messages.push(ChatMessage::assistant(&format!(
+                "Answer {i} with some prose that wraps.\n\n```rust\nfn main() {{\n    println!(\"case {i}\");\n}}\n```\n\nAnd a closing paragraph with **bold** and `inline code` to exercise markdown."
+            )));
+            state.focused_mut().messages.push(ChatMessage::system(&format!(
+                "system note {i}\nsecond line of the note"
+            )));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        // Warm the caches (first frame pays markdown+syntect for visible).
+        terminal
+            .draw(|f| render_chat(f, f.area(), &state, &theme))
+            .unwrap();
+
+        let frames = 200u32;
+        let start = std::time::Instant::now();
+        for _ in 0..frames {
+            terminal
+                .draw(|f| render_chat(f, f.area(), &state, &theme))
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "render_chat_perf_probe: {} messages, {:?} total for {frames} frames = {:?}/frame",
+            state.focused().messages.len(),
+            elapsed,
+            elapsed / frames
+        );
+    }
+
     #[test]
     fn message_rows_user_counts_content_meta_and_blank() {
         let theme = Theme::default_dark();

@@ -22,12 +22,23 @@ impl Embedder {
     /// Blocking (network + disk + ONNX session build) — call from
     /// `spawn_blocking`, never on the event loop.
     pub fn init(cache_dir: PathBuf) -> Result<Self, String> {
+        // ONNX Runtime defaults its intra-op pool to EVERY core, so the
+        // post-launch indexing burst (skills + MCP corpus + history
+        // backfill) saturated the whole machine for tens of seconds and
+        // starved the TUI event loop — felt as hard input lag right after
+        // startup. Cap it to half the cores (1..=4): background indexing
+        // merely takes longer, and per-turn single-query embeddings stay
+        // in the low milliseconds either way.
+        let intra_threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).clamp(1, 4))
+            .unwrap_or(1);
         let options = TextInitOptions::new(EmbeddingModel::MultilingualE5Small)
             .with_cache_dir(cache_dir)
             // fastembed's progress bar writes to stdout, which would corrupt
             // the ratatui frame — download status is surfaced via AppEvent
             // by the caller instead.
-            .with_show_download_progress(false);
+            .with_show_download_progress(false)
+            .with_intra_threads(intra_threads);
         let model = TextEmbedding::try_new(options)
             .map_err(|e| format!("embedding model init failed: {e}"))?;
         Ok(Self { model })
