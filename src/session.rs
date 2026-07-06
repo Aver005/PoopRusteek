@@ -232,15 +232,25 @@ pub fn load_history() -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn append_history(input: &str) {
-    let mut history = load_history();
+/// Append `input` to an in-memory history list with the file's rules:
+/// skip a consecutive duplicate, cap at 500 entries. Split from the disk
+/// write so the event loop can update its recall list synchronously (the
+/// up-arrow must see the new entry immediately) while the file write runs
+/// on the persist worker.
+pub fn push_history_entry(history: &mut Vec<String>, input: &str) {
     if history.last().map(|s| s.as_str()) != Some(input) {
         history.push(input.to_string());
     }
     if history.len() > 500 {
-        history.drain(0..history.len() - 500);
+        let excess = history.len() - 500;
+        history.drain(0..excess);
     }
-    if let Ok(json) = serde_json::to_string(&history) {
+}
+
+/// Serialize and atomically write the full history list. Blocking — call
+/// from the persist worker, not the event loop.
+pub fn write_history(history: &[String]) {
+    if let Ok(json) = serde_json::to_string(history) {
         let _ = crate::util::atomic_write(&history_path(), json.as_bytes());
     }
 }

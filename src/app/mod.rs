@@ -8,6 +8,7 @@ mod keys;
 pub mod mcp_add;
 pub mod mcp_status;
 mod multichat;
+mod persist;
 mod pickers;
 pub mod providers;
 mod runtime;
@@ -101,6 +102,9 @@ pub struct App {
     /// Launches agent turns (owns the tool registry / MCP / event channel for
     /// execution). The single place the agent loop is spawned.
     runtime: runtime::AgentRuntime,
+    /// Serialized off-loop writer for session/history files — see
+    /// `app::persist` for why ordering matters.
+    persister: persist::Persister,
     /// The running API server (`/serve on`, `--serve`), if any.
     server: Option<crate::server::ServerHandle>,
     /// Monotonic server-launch counter — see `AppEvent::ServerStarted`.
@@ -188,9 +192,7 @@ impl App {
 
         let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
 
-        let mut mcp_manager = MCPManager::new();
-        let mcp_init_ok = mcp_manager.initialize().await.is_ok();
-        let mcp = Arc::new(tokio::sync::Mutex::new(mcp_manager));
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let tools = Arc::new(ToolRegistry::new());
         let prompts = prompts::load_prompt_files()?;
 
@@ -205,7 +207,7 @@ impl App {
         let has_provider = provider.is_some();
         let main_conversation = conversation::Conversation::fresh_main(provider);
 
-        let mut state = AppState {
+        let state = AppState {
             conversations: conversation::Conversations::new(main_conversation),
             input: input::InputState {
                 history: crate::session::load_history(),
@@ -244,17 +246,24 @@ impl App {
             crate::semantic::SemanticService::start(&config, skills.clone(), event_tx.clone());
         tools.register_semantic_tools(Arc::clone(&semantic));
 
-        if mcp_init_ok {
-            let mgr = mcp.lock().await;
-            let servers = mgr.get_servers_info();
-            state.mcp_status.server_count = servers.len();
-            state.mcp_status.connected_count = servers
-                .iter()
-                .filter(|s| s.enabled && s.status == "connected")
-                .count();
-            state.mcp_status.view.servers = servers;
-            state.mcp_status.last_stats_update = Some(std::time::Instant::now());
-            semantic.update_mcp_tools(mgr.get_all_tools());
+        // MCP discovery + connect runs in the background so the first frame
+        // never waits on a slow or unreachable server (a synchronous
+        // `initialize().await` here used to hold a blank terminal for up to
+        // ~60s). `startup_initialize` takes the manager lock only for short
+        // await-free merges, so event-loop paths that `lock().await` the
+        // manager (sending a turn, the /mcp view) stay responsive while
+        // servers connect. Counts and the semantic MCP corpus catch up via
+        // the 2s stats poll and `McpInitialized`.
+        {
+            let mcp = Arc::clone(&mcp);
+            let semantic = Arc::clone(&semantic);
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                crate::mcp::manager::startup_initialize(&mcp).await;
+                let tools = mcp.lock().await.get_all_tools();
+                semantic.update_mcp_tools(tools);
+                let _ = event_tx.send(AppEvent::McpInitialized);
+            });
         }
 
         let runtime = runtime::AgentRuntime::new(
@@ -263,6 +272,8 @@ impl App {
             Arc::clone(&semantic),
             event_tx.clone(),
         );
+
+        let persister = persist::Persister::start(Arc::clone(&semantic));
 
         Ok(Self {
             config,
@@ -276,6 +287,7 @@ impl App {
             skills,
             semantic,
             runtime,
+            persister,
             server: None,
             server_generation: 0,
         })
@@ -317,6 +329,11 @@ impl App {
             )
             .await;
         }
+        // Queued session/history writes must land before exit — per-turn
+        // saves run on the persist worker now, and quitting right after a
+        // turn completes must not lose that turn's save. Bounded like the
+        // remote discards above: exiting must not hang on a wedged disk.
+        self.persister.flush(std::time::Duration::from_secs(3)).await;
         // Kill all background/PTY processes so spawn_blocking waiters unblock
         // and the tokio runtime can shut down cleanly.
         let _ = crate::tools::background::shutdown_all().await;
@@ -633,6 +650,14 @@ impl App {
                     semantic.update_mcp_tools(tools);
                 });
             }
+            AppEvent::McpInitialized => {
+                // Startup connects finished — force the next loop iteration
+                // to re-pull fresh server counts instead of waiting out the
+                // stats-poll throttle. The semantic MCP corpus was already
+                // updated by the startup task itself.
+                self.state.mcp_status.view.servers.clear();
+                self.state.mcp_status.last_stats_update = None;
+            }
             AppEvent::McpOAuthResult { server, result } => {
                 match result {
                     Ok(()) => {
@@ -926,6 +951,9 @@ impl App {
     /// Execute `/wipe`: delete all app-owned data dirs, factory-reset in memory.
     pub(crate) async fn execute_wipe(&mut self) {
         self.cancel_all_turns().await;
+        // Drain queued writes first — a still-in-flight session save could
+        // otherwise re-create files inside the directories deleted below.
+        self.persister.flush(std::time::Duration::from_secs(3)).await;
         let roots = wipe_roots();
         let mut errors: Vec<String> = Vec::new();
         for root in &roots {

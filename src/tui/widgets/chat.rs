@@ -49,6 +49,9 @@ struct CachedMsg {
     /// Word-wrapped row count of `lines` at the key's `wrap_width`, computed
     /// once via `Paragraph::line_count` instead of re-wrapping every frame.
     wrapped_rows: usize,
+    /// Word-wrapped row count of the message's meta line at the same width —
+    /// needed for scroll math even when the message is culled off-screen.
+    meta_rows: usize,
     /// Cheap fingerprint of the content this entry was built from. Messages
     /// can be popped (e.g. an empty assistant reply discarded mid-stream),
     /// which can shift a later message into an earlier one's `(index, len)`
@@ -72,6 +75,14 @@ thread_local! {
     /// stats panel (`widgets::panel::compute_totals`) so it doesn't need to
     /// know the chat viewport's wrap width just to look up a token count.
     static TOKEN_CACHE: RefCell<HashMap<TokenCacheKey, TokenCacheValue>> = RefCell::new(HashMap::new());
+    /// Wrapped row counts (value: `(fingerprint, rows)`) for non-assistant
+    /// bubbles — user/system/tool messages and the empty-assistant
+    /// "Thinking..." placeholder. Row counts don't depend on the theme
+    /// (styles never change wrapping), so entries survive theme switches.
+    /// Lets `render_chat`'s counting pass skip re-word-wrapping every
+    /// bubble on every frame, which together with viewport culling is what
+    /// keeps typing latency flat on long transcripts.
+    static ROWS_CACHE: RefCell<HashMap<CacheKey, (u64, usize)>> = RefCell::new(HashMap::new());
 }
 
 /// Resolved token count for message `index` in conversation `conversation_id`,
@@ -162,18 +173,18 @@ fn meta_line(msg: &ChatMessage, tokens: u32, theme: &Theme) -> Line<'static> {
     )])
 }
 
-/// Render (or reuse the cached render of) one assistant message's markdown,
-/// its word-wrapped row count, and its resolved token count.
-///
-/// Returns owned data (not a reference into the cache) so the caller can
-/// extend its line buffer without fighting the `RefCell` borrow.
-fn render_assistant_cached(
+/// Run `f` against the cached render of one assistant message (markdown
+/// lines + row counts), populating the cache on a miss. The closure shape
+/// lets the counting pass read row counts without deep-cloning the cached
+/// lines — only messages that actually reach the screen pay the clone.
+fn with_assistant_cached<R>(
     conversation_id: u64,
     message_index: usize,
     msg: &ChatMessage,
     wrap_width: u16,
     theme: &Theme,
-) -> (Vec<Line<'static>>, usize, u32) {
+    f: impl FnOnce(&CachedMsg, u32) -> R,
+) -> R {
     let content = msg.visible_content();
     let key = CacheKey {
         conversation_id,
@@ -190,7 +201,7 @@ fn render_assistant_cached(
 
         if let Some(cached) = cache.get(&key)
             && cached.fingerprint == fp {
-                return (cached.lines.clone(), cached.wrapped_rows, token_estimate);
+                return f(cached, token_estimate);
             }
 
         if cache.len() > MAX_CACHE_ENTRIES {
@@ -203,183 +214,287 @@ fn render_assistant_cached(
             md_lines
         };
         let wrapped_rows = wrapped_row_count(rendered_lines.clone(), wrap_width as usize);
-
-        cache.insert(
-            key,
-            CachedMsg {
-                lines: rendered_lines.clone(),
-                wrapped_rows,
-                fingerprint: fp,
-            },
+        let meta_rows = wrapped_row_count(
+            vec![meta_line(msg, token_estimate, theme)],
+            wrap_width as usize,
         );
 
-        (rendered_lines, wrapped_rows, token_estimate)
+        // Plain `insert`, not `entry().or_insert()` — a fingerprint
+        // mismatch above means the existing entry is stale for this slot
+        // and must be replaced, not kept.
+        cache.insert(key, CachedMsg {
+            lines: rendered_lines,
+            wrapped_rows,
+            meta_rows,
+            fingerprint: fp,
+        });
+        let entry = cache.get(&key).expect("entry inserted just above");
+        f(entry, token_estimate)
+    })
+}
+
+/// A role discriminant folded into [`ROWS_CACHE`] fingerprints so a popped
+/// slot refilled by a different-role message with coincidentally identical
+/// content can't serve a stale row count.
+fn role_tag(msg: &ChatMessage) -> u64 {
+    match msg.role {
+        Role::User => 1,
+        Role::Assistant => 2,
+        Role::System => 3,
+        Role::Tool => 4,
+    }
+}
+
+/// Build the display lines for a non-assistant bubble (user/system/tool)
+/// or the empty-assistant "Thinking..." placeholder — everything except the
+/// cached-markdown assistant path. Pure line construction; the caller
+/// appends the shared trailing blank line.
+fn build_segment_lines(
+    conversation_id: u64,
+    index: usize,
+    msg: &ChatMessage,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match msg.role {
+        Role::User => {
+            for line_text in msg.visible_content().lines() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!(" {} ", line_text),
+                    Style::default().fg(theme.fg).bg(theme.user_bg),
+                )]));
+            }
+            let tokens = cached_token_estimate(conversation_id, index, msg);
+            lines.push(meta_line(msg, tokens, theme));
+        }
+        Role::Assistant => {
+            // Only the empty-content placeholder goes through here; the
+            // markdown path is `with_assistant_cached`.
+            lines.push(Line::from(vec![
+                assistant_header(msg, theme),
+                Span::styled(
+                    " Thinking...",
+                    Style::default().fg(theme.text_dim),
+                ),
+            ]));
+        }
+        Role::System => {
+            let body = msg.visible_content();
+            let body_lines: Vec<&str> = body.lines().collect();
+            // A `Span`'s text is one terminal row — embedded `\n`s inside
+            // it don't create new rows, they just get glued onto the same
+            // line. Split on lines like `Role::Tool`/`Role::User` do, so
+            // multi-line system messages (e.g. `/rate`'s current-settings
+            // + usage) actually render as separate lines.
+            if body_lines.is_empty() {
+                lines.push(Line::from(vec![Span::styled(
+                    " \u{2139} ",
+                    Style::default().fg(theme.warning).bg(theme.bg),
+                )]));
+            } else {
+                for (i, line_text) in body_lines.iter().enumerate() {
+                    let prefix = if i == 0 { " \u{2139} " } else { "   " };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            prefix,
+                            Style::default().fg(theme.warning).bg(theme.bg),
+                        ),
+                        Span::styled(
+                            (*line_text).to_string(),
+                            Style::default().fg(theme.text_dim).bg(theme.bg),
+                        ),
+                    ]));
+                }
+            }
+        }
+        Role::Tool => {
+            let tool_name = msg.name.as_deref().unwrap_or("unknown");
+            let icon = if msg.tool_error { "\u{2717}" } else { "\u{2713}" };
+            let status_color = if msg.tool_error { theme.error } else { theme.success };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {icon} "),
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(status_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {tool_name} "),
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(if msg.tool_error { theme.error } else { theme.accent })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if msg.tool_error { " failed " } else { " done " },
+                    Style::default().fg(theme.text_dim).bg(theme.tool_bg),
+                ),
+            ]));
+
+            let body = msg.visible_content();
+            let body_lines: Vec<&str> = body.lines().collect();
+            if body_lines.iter().all(|l| l.trim().is_empty()) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  (no output)",
+                        Style::default().fg(theme.text_dim).bg(theme.tool_bg),
+                    ),
+                ]));
+            } else {
+                for line_text in &body_lines {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            " \u{2502} ",
+                            Style::default().fg(theme.accent_soft).bg(theme.tool_bg),
+                        ),
+                        Span::styled(
+                            (*line_text).to_string(),
+                            Style::default()
+                                .fg(if msg.tool_error { theme.error } else { theme.text_soft })
+                                .bg(theme.tool_bg),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// The colored ` pooprusteek (model) ` header span of an assistant bubble.
+fn assistant_header(msg: &ChatMessage, theme: &Theme) -> Span<'static> {
+    let header_color = match msg.status.as_deref() {
+        Some("ABORTED") => theme.error,
+        Some("WIP") => theme.warning,
+        _ => theme.success,
+    };
+    let model_tag = if !msg.model.is_empty() {
+        format!(" ({})", msg.model)
+    } else {
+        String::new()
+    };
+    Span::styled(
+        format!(" pooprusteek{} ", model_tag),
+        Style::default()
+            .fg(theme.bg)
+            .bg(header_color)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Whether `msg` renders through the cached-markdown assistant path (true)
+/// or as a plain segment bubble (false). One predicate so the counting and
+/// materializing passes can never disagree on a message's shape.
+fn is_markdown_assistant(msg: &ChatMessage) -> bool {
+    msg.role == Role::Assistant && !msg.content.is_empty()
+}
+
+/// Total wrapped rows one message occupies in the transcript, including its
+/// trailing blank separator line. Row counts are cached; the row math is
+/// identical to what the materializing pass produces (assistant header
+/// counted as one row, exactly as before).
+fn message_rows(
+    conversation_id: u64,
+    index: usize,
+    msg: &ChatMessage,
+    wrap_width: u16,
+    theme: &Theme,
+) -> usize {
+    if is_markdown_assistant(msg) {
+        return with_assistant_cached(conversation_id, index, msg, wrap_width, theme, |cached, _| {
+            1 + cached.wrapped_rows + cached.meta_rows + 1
+        });
+    }
+
+    let content = msg.visible_content();
+    let key = CacheKey {
+        conversation_id,
+        message_index: index,
+        content_len: content.len(),
+        wrap_width,
+    };
+    let fp = fingerprint(content) ^ (role_tag(msg) << 60);
+
+    ROWS_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((cached_fp, rows)) = cache.get(&key)
+            && *cached_fp == fp {
+                return *rows;
+            }
+        if cache.len() > MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
+        let segment = build_segment_lines(conversation_id, index, msg, theme);
+        let rows = wrapped_row_count(segment, wrap_width as usize) + 1;
+        cache.insert(key, (fp, rows));
+        rows
     })
 }
 
 pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let mut lines: Vec<Line> = Vec::new();
-    let mut total_rows = 0usize;
     let conversation_id = state.conversations.focused_id().0;
     let wrap_width = area.width;
+    let messages = &state.focused().messages;
 
-    for (index, msg) in state.focused().messages.iter().enumerate() {
-        let before = lines.len();
-        match msg.role {
-            Role::User => {
-                for line_text in msg.visible_content().lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!(" {} ", line_text),
-                        Style::default().fg(theme.fg).bg(theme.user_bg),
-                    )]));
-                }
-                let tokens = cached_token_estimate(conversation_id, index, msg);
-                lines.push(meta_line(msg, tokens, theme));
-            }
-            Role::Assistant => {
-                let header_color = match msg.status.as_deref() {
-                    Some("ABORTED") => theme.error,
-                    Some("WIP") => theme.warning,
-                    _ => theme.success,
-                };
-                let model_tag = if !msg.model.is_empty() {
-                    format!(" ({})", msg.model)
-                } else {
-                    String::new()
-                };
-                let header = Span::styled(
-                    format!(" pooprusteek{} ", model_tag),
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(header_color)
-                        .add_modifier(Modifier::BOLD),
-                );
-                if msg.content.is_empty() {
-                    lines.push(Line::from(vec![
-                        header,
-                        Span::styled(
-                            " Thinking...",
-                            Style::default().fg(theme.text_dim),
-                        ),
-                    ]));
-                } else {
-                    let (md_lines, md_rows, tokens) =
-                        render_assistant_cached(conversation_id, index, msg, wrap_width, theme);
-                    lines.push(Line::from(vec![header]));
-                    total_rows += 1;
-                    lines.extend(md_lines);
-                    total_rows += md_rows;
-                    let meta = meta_line(msg, tokens, theme);
-                    total_rows += wrapped_row_count(vec![meta.clone()], wrap_width as usize);
-                    lines.push(meta);
-                    lines.push(Line::from(""));
-                    total_rows += 1;
-                    continue;
-                }
-            }
-            Role::System => {
-                let body = msg.visible_content();
-                let body_lines: Vec<&str> = body.lines().collect();
-                // A `Span`'s text is one terminal row — embedded `\n`s inside
-                // it don't create new rows, they just get glued onto the same
-                // line. Split on lines like `Role::Tool`/`Role::User` do, so
-                // multi-line system messages (e.g. `/rate`'s current-settings
-                // + usage) actually render as separate lines.
-                if body_lines.is_empty() {
-                    lines.push(Line::from(vec![Span::styled(
-                        " \u{2139} ",
-                        Style::default().fg(theme.warning).bg(theme.bg),
-                    )]));
-                } else {
-                    for (i, line_text) in body_lines.iter().enumerate() {
-                        let prefix = if i == 0 { " \u{2139} " } else { "   " };
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                prefix,
-                                Style::default().fg(theme.warning).bg(theme.bg),
-                            ),
-                            Span::styled(
-                                (*line_text).to_string(),
-                                Style::default().fg(theme.text_dim).bg(theme.bg),
-                            ),
-                        ]));
-                    }
-                }
-            }
-            Role::Tool => {
-                let tool_name = msg.name.as_deref().unwrap_or("unknown");
-                let icon = if msg.tool_error { "\u{2717}" } else { "\u{2713}" };
-                let status_color = if msg.tool_error { theme.error } else { theme.success };
-
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(" {icon} "),
-                        Style::default()
-                            .fg(theme.bg)
-                            .bg(status_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" {tool_name} "),
-                        Style::default()
-                            .fg(theme.bg)
-                            .bg(if msg.tool_error { theme.error } else { theme.accent })
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if msg.tool_error { " failed " } else { " done " },
-                        Style::default().fg(theme.text_dim).bg(theme.tool_bg),
-                    ),
-                ]));
-
-                let body = msg.visible_content();
-                let body_lines: Vec<&str> = body.lines().collect();
-                if body_lines.iter().all(|l| l.trim().is_empty()) {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "  (no output)",
-                            Style::default().fg(theme.text_dim).bg(theme.tool_bg),
-                        ),
-                    ]));
-                } else {
-                    for line_text in &body_lines {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                " \u{2502} ",
-                                Style::default().fg(theme.accent_soft).bg(theme.tool_bg),
-                            ),
-                            Span::styled(
-                                (*line_text).to_string(),
-                                Style::default()
-                                    .fg(if msg.tool_error { theme.error } else { theme.text_soft })
-                                    .bg(theme.tool_bg),
-                            ),
-                        ]));
-                    }
-                }
-            }
-        }
-        // Non-assistant (or empty-assistant) segment: word-wrap row count is
-        // computed fresh each frame. These bubbles are short (a handful of
-        // lines) compared to assistant markdown blocks, so this isn't the
-        // per-frame cost fix 1/6 target — the cache above is. A structural
-        // clone (not a re-parse) is enough since `Paragraph` needs to own
-        // its line buffer.
-        let segment: Vec<Line> = lines[before..].to_vec();
-        total_rows += wrapped_row_count(segment, wrap_width as usize);
-        lines.push(Line::from(""));
-        total_rows += 1;
+    // Counting pass: cached wrapped row counts only — no line building, no
+    // cloning — so scroll math stays exact while off-screen messages cost
+    // one HashMap lookup each.
+    let mut row_starts = Vec::with_capacity(messages.len());
+    let mut rows_per_msg = Vec::with_capacity(messages.len());
+    let mut total_rows = 0usize;
+    for (index, msg) in messages.iter().enumerate() {
+        let rows = message_rows(conversation_id, index, msg, wrap_width, theme);
+        row_starts.push(total_rows);
+        rows_per_msg.push(rows);
+        total_rows += rows;
     }
 
     let visible_height = area.height as usize;
     let max_scroll = total_rows.saturating_sub(visible_height);
     let scroll_from_bottom = (state.scroll_offset as usize).min(max_scroll);
     let top_row = max_scroll.saturating_sub(scroll_from_bottom);
+    let bottom_row = top_row + visible_height;
+
+    // Materializing pass: build lines only for messages intersecting the
+    // viewport; the paragraph scrolls by the offset into the first visible
+    // message instead of into the whole transcript. (Also keeps the scroll
+    // argument within u16 even for transcripts longer than 65k rows.)
+    let mut lines: Vec<Line> = Vec::new();
+    let mut local_offset = 0usize;
+    let mut found_first_visible = false;
+    for (index, msg) in messages.iter().enumerate() {
+        let start = row_starts[index];
+        if start >= bottom_row {
+            break;
+        }
+        if start + rows_per_msg[index] <= top_row {
+            continue;
+        }
+        if !found_first_visible {
+            found_first_visible = true;
+            local_offset = top_row - start;
+        }
+
+        if is_markdown_assistant(msg) {
+            let (md_lines, tokens) =
+                with_assistant_cached(conversation_id, index, msg, wrap_width, theme, |cached, tokens| {
+                    (cached.lines.clone(), tokens)
+                });
+            lines.push(Line::from(vec![assistant_header(msg, theme)]));
+            lines.extend(md_lines);
+            lines.push(meta_line(msg, tokens, theme));
+        } else {
+            lines.extend(build_segment_lines(conversation_id, index, msg, theme));
+        }
+        lines.push(Line::from(""));
+    }
 
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(theme.bg))
         .wrap(Wrap { trim: false })
-        .scroll((top_row as u16, 0));
+        .scroll((local_offset as u16, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -477,6 +592,39 @@ mod tests {
     fn cached_token_estimate_falls_back_to_estimate_when_absent() {
         let msg = ChatMessage::user("hello world");
         assert_eq!(cached_token_estimate(999_002, 0, &msg), estimate_tokens(&msg.content));
+    }
+
+    #[test]
+    fn message_rows_user_counts_content_meta_and_blank() {
+        let theme = Theme::default_dark();
+        let msg = ChatMessage::user("one\ntwo");
+        // 2 content lines + meta line + trailing blank separator.
+        assert_eq!(message_rows(777_001, 0, &msg, 80, &theme), 4);
+    }
+
+    #[test]
+    fn message_rows_assistant_counts_header_body_meta_and_blank() {
+        let theme = Theme::default_dark();
+        let msg = ChatMessage::assistant("hello");
+        // header + 1 markdown line + meta line + trailing blank.
+        assert_eq!(message_rows(777_002, 0, &msg, 80, &theme), 4);
+    }
+
+    #[test]
+    fn message_rows_empty_assistant_is_thinking_placeholder() {
+        let theme = Theme::default_dark();
+        let msg = ChatMessage::assistant("");
+        // one "Thinking..." line + trailing blank.
+        assert_eq!(message_rows(777_003, 0, &msg, 80, &theme), 2);
+    }
+
+    #[test]
+    fn message_rows_stable_across_calls() {
+        let theme = Theme::default_dark();
+        let msg = ChatMessage::user("cached row count probe");
+        let first = message_rows(777_004, 0, &msg, 60, &theme);
+        let second = message_rows(777_004, 0, &msg, 60, &theme);
+        assert_eq!(first, second);
     }
 
     #[test]

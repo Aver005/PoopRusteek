@@ -199,20 +199,6 @@ impl MCPManager {
         self.cache_ttl = ttl;
     }
 
-    pub async fn initialize(&mut self) -> AppResult<()> {
-        let configs = load_mcp_config();
-        let own_enabled = load_own_enabled_map();
-        let foreign_overrides = load_overrides();
-
-        for (name, config) in configs {
-            let (enabled, source) = resolve_enabled_and_source(&name, &own_enabled, &foreign_overrides);
-            self.add_server(name, config, enabled, source).await;
-        }
-
-        self.connect_all().await;
-        Ok(())
-    }
-
     /// Re-discover and reconnect every server from disk.
     ///
     /// Every existing client is explicitly `close()`d before being dropped
@@ -360,6 +346,15 @@ impl MCPManager {
     /// map, tool-list cache (only for a freshly-fetched, non-cached,
     /// successful connect), and the server's own status/tools/resources.
     fn apply_connect_outcome(&mut self, outcome: ConnectOutcome) {
+        // The server can vanish or be disabled between a lock-free connect
+        // and this merge (`startup_initialize` phases 3→4 race a user's
+        // /mcp remove or toggle) — applying a stale outcome would resurrect
+        // it. Callers that connect under one continuous lock hold
+        // (`connect_all`, `connect_server`) can't hit either branch.
+        match self.servers.get(&outcome.name) {
+            Some(entry) if entry.enabled => {}
+            _ => return,
+        }
         // A cache-served outcome and a fresh successful connect both carry
         // usable tool entries; a failed connect maps nothing.
         if outcome.used_cache || matches!(outcome.status, MCPServerStatus::Connected) {
@@ -655,6 +650,111 @@ impl MCPManager {
         if let Err(e) = save_mcp_config(&own_servers, &foreign_overrides) {
             tracing::warn!("Failed to save MCP config: {e}");
         }
+    }
+}
+
+/// Startup discovery + connect that never holds the manager lock across I/O.
+///
+/// `reload_all` (an explicit user action) runs under the caller's lock for
+/// its whole duration; doing that at startup would freeze the UI in
+/// disguise — the first frame now renders before any server has connected,
+/// and event-loop paths (`system_prompt::build`, the /mcp view, the
+/// resource picker) take `lock().await` on the manager. So this runs in
+/// four phases and only ever locks for short, await-free merges:
+///
+/// 1. **no lock** — discover configs and build every enabled server's
+///    client *concurrently* (`build_client` needs no manager state;
+///    previously each `add_server` was awaited serially, so stdio spawns
+///    and OAuth keyring lookups stacked per server);
+/// 2. **short lock** — insert the entries (`Pending`/`Disabled`) so the
+///    /mcp view can list them immediately, and snapshot connect inputs;
+/// 3. **no lock** — run every `connect_one` concurrently (same job shape
+///    as `connect_all`);
+/// 4. **short lock** — merge the outcomes via `apply_connect_outcome`,
+///    which skips servers the user removed/disabled meanwhile.
+pub async fn startup_initialize(mcp: &tokio::sync::Mutex<MCPManager>) {
+    let configs = load_mcp_config();
+    let own_enabled = load_own_enabled_map();
+    let foreign_overrides = load_overrides();
+
+    // Phase 1: build all clients concurrently, off the lock.
+    let jobs: Vec<_> = configs
+        .into_iter()
+        .map(|(name, config)| {
+            let (enabled, source) =
+                resolve_enabled_and_source(&name, &own_enabled, &foreign_overrides);
+            async move {
+                let client = if enabled {
+                    match build_client(&name, &config).await {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            tracing::warn!("Failed to create MCP client for '{name}': {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                (name, config, enabled, source, client)
+            }
+        })
+        .collect();
+    let built = futures::future::join_all(jobs).await;
+
+    // Phase 2: insert entries and collect connect inputs in one short,
+    // await-free lock hold.
+    let (inputs, cache_ttl) = {
+        let mut manager = mcp.lock().await;
+        let mut inputs = Vec::new();
+        for (name, config, enabled, source, client) in built {
+            if !enabled {
+                // Mirrors `add_server`'s disabled arm.
+                manager.servers.insert(
+                    name.clone(),
+                    MCPServerEntry {
+                        client: Arc::new(MCPClient::dummy(&name)),
+                        config,
+                        status: MCPServerStatus::Disabled,
+                        tools: Vec::new(),
+                        resources: Vec::new(),
+                        enabled: false,
+                        source,
+                    },
+                );
+                continue;
+            }
+            // Mirrors `add_server`'s build-failure arm: silently skipped
+            // (already logged in phase 1).
+            let Some(client) = client else { continue };
+            let client = Arc::new(client);
+            manager.servers.insert(
+                name.clone(),
+                MCPServerEntry {
+                    client: Arc::clone(&client),
+                    config,
+                    status: MCPServerStatus::Pending,
+                    tools: Vec::new(),
+                    resources: Vec::new(),
+                    enabled: true,
+                    source,
+                },
+            );
+            let cached = manager.cache_snapshot(&name);
+            inputs.push((name, client, cached));
+        }
+        (inputs, manager.cache_ttl)
+    };
+
+    // Phase 3: connect everything concurrently, no lock held.
+    let jobs = inputs
+        .into_iter()
+        .map(|(name, client, cached)| connect_one(name, client, cached, cache_ttl));
+    let outcomes = futures::future::join_all(jobs).await;
+
+    // Phase 4: merge.
+    let mut manager = mcp.lock().await;
+    for outcome in outcomes {
+        manager.apply_connect_outcome(outcome);
     }
 }
 

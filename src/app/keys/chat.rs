@@ -178,11 +178,14 @@ impl App {
         self.state.input.selection_anchor = None;
         self.state.autocomplete = AutocompleteState::default();
         self.state.input.history_index = None;
-        crate::session::append_history(&input);
-        // Keep the in-memory recall list in sync with disk —
-        // otherwise up-arrow only ever shows what was loaded
-        // at startup, never anything typed this session.
-        self.state.input.history = crate::session::load_history();
+        // Update the in-memory recall list synchronously (up-arrow must
+        // see the new entry immediately), then queue the file write on the
+        // persist worker — this used to be a blocking read-modify-write of
+        // history.json right here on the event loop.
+        crate::session::push_history_entry(&mut self.state.input.history, &input);
+        self.persister.enqueue(crate::app::persist::PersistJob::WriteHistory(
+            self.state.input.history.clone(),
+        ));
 
         // --- GOAL mode: intercept non-command input ---
         if self.state.goal.mode && !input.starts_with('/') {

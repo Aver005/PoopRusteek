@@ -429,30 +429,19 @@ impl App {
             provider_parent_message_id: identity.and_then(|(_, pm)| pm),
         };
 
-        let now = session::timestamp_now();
-        let result = session::save_session(
-            &conv.session_id,
-            &now,
-            &conv.messages,
-            &self.config,
-            &self.state.workspace_path,
-            &meta,
-        );
-
+        // Snapshot everything now and hand the write (plus the follow-up
+        // semantic indexing on success) to the persist worker — the full
+        // pretty-JSON rewrite grows with conversation length and used to
+        // block the event loop at the end of every turn. FIFO ordering on
+        // the worker guarantees a later turn's save lands after this one.
+        self.persister.enqueue(super::persist::PersistJob::SaveSession {
+            session_id: conv.session_id.clone(),
+            created_at: session::timestamp_now(),
+            messages: conv.messages.clone(),
+            config: Box::new(self.config.clone()),
+            workspace_path: self.state.workspace_path.clone(),
+            meta,
+        });
         self.state.focused_mut().broken = broken;
-        match result {
-            Err(e) => tracing::warn!("Failed to auto-save session: {e}"),
-            Ok(()) => {
-                // Session persisted — feed its new messages to the history
-                // index (no-op while semantic matching is off/initializing;
-                // the startup backfill catches up from the file later).
-                let conv = self.state.focused();
-                self.semantic.index_session(
-                    conv.session_id.clone(),
-                    session::derive_title(&conv.messages),
-                    conv.messages.clone(),
-                );
-            }
-        }
     }
 }

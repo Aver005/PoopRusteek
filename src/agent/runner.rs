@@ -7,7 +7,7 @@ use crate::semantic::SemanticService;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
 use crate::agent::stream::{collect_stream, StreamEnd};
-use crate::agent::tool_parser::{parse_tool_calls, stream_visible_text, strip_tool_calls};
+use crate::agent::tool_parser::{parse_tool_calls, strip_tool_calls, StreamTextTracker};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -94,11 +94,14 @@ pub async fn run_agent_loop(
 
         // Visible-delta emission rides the collector's progress callback:
         // strip tool-call syntax from the accumulated text and stream only
-        // the newly-appended visible suffix.
+        // the newly-appended visible suffix. The tracker is per-step: the
+        // accumulated text is append-only within one completion, which is
+        // exactly what its incremental freezing relies on.
         let mut streamed_visible = String::new();
+        let mut visible_tracker = StreamTextTracker::default();
         let progress_tx = event_tx.clone();
         let outcome = collect_stream(&provider, request, |full_response| {
-            let next_visible = stream_visible_text(full_response);
+            let next_visible = visible_tracker.visible(full_response);
             if next_visible.starts_with(&streamed_visible) {
                 let delta = &next_visible[streamed_visible.len()..];
                 if !delta.is_empty() {

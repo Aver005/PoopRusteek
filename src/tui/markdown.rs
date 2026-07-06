@@ -2,10 +2,29 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Modifier, Style};
 use crate::tui::theme::Theme;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{ThemeSet, Style as SynStyle};
 use syntect::parsing::SyntaxSet;
+
+/// Memoized syntect output per code block.
+///
+/// While a message is streaming, its whole text is re-rendered every frame
+/// (the message-level cache in `widgets::chat` can only serve finished
+/// messages), which used to re-highlight every *completed* code block from
+/// scratch each time — syntect dominates `render_markdown` cost. Keyed by
+/// code + language + the theme's warning color (the syntect theme itself
+/// is fixed; `theme.warning` only styles the fallback paths). Bounded two
+/// ways: wiped wholesale past `HIGHLIGHT_CACHE_CAP` entries, and blocks
+/// over `HIGHLIGHT_CACHE_MAX_BYTES` are never cached — the live working
+/// set is just the streaming message's blocks, since finished messages are
+/// served whole from the message cache.
+#[expect(clippy::type_complexity, reason = "internal cache map, not an API surface")]
+static HIGHLIGHT_CACHE: LazyLock<Mutex<HashMap<(String, String, Color), Vec<Line<'static>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const HIGHLIGHT_CACHE_CAP: usize = 128;
+const HIGHLIGHT_CACHE_MAX_BYTES: usize = 64 * 1024;
 
 fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
@@ -205,6 +224,12 @@ fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
         }).collect();
     }
 
+    let cache_key = (code.to_string(), lang.to_string(), theme.warning);
+    if let Ok(cache) = HIGHLIGHT_CACHE.lock()
+        && let Some(lines) = cache.get(&cache_key) {
+            return lines.clone();
+        }
+
     let ss = syntax_set();
     let ts = theme_set();
 
@@ -251,6 +276,14 @@ fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
 
         result.push(Line::from(spans));
     }
+
+    if code.len() <= HIGHLIGHT_CACHE_MAX_BYTES
+        && let Ok(mut cache) = HIGHLIGHT_CACHE.lock() {
+            if cache.len() >= HIGHLIGHT_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(cache_key, result.clone());
+        }
 
     result
 }

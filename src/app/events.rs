@@ -159,6 +159,13 @@ pub enum AppEvent {
     /// A detached MCP admin operation (reload / toggle / reconnect) finished.
     McpOperationDone { message: String },
 
+    /// The background MCP startup (spawned in `App::new`) finished
+    /// connecting every discovered server — refresh the cached counts and
+    /// server list now instead of waiting for the next 2s stats poll.
+    /// Deliberately quiet (no chat/status message): startup never announced
+    /// itself before it was backgrounded either.
+    McpInitialized,
+
     /// An OAuth authorization flow started from `/mcp auth` finished. On
     /// `Ok`, the token is already persisted and the handler kicks off a
     /// `reconnect_server` for `server` itself — that reconnect's own
