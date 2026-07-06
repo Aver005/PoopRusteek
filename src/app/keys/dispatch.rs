@@ -298,7 +298,14 @@ impl App {
     }
 
     fn rag_status_text(&self) -> String {
-        let status = self.semantic.status();
+        // `status()` declines instead of waiting when an indexing pass
+        // holds the index lock — this runs on the event loop, and waiting
+        // out a corpus rebuild here used to freeze the whole UI.
+        let Some(status) = self.semantic.status() else {
+            return "RAG — indexing in progress (embedding skills / MCP tools / session history); \
+                    detailed status is briefly unavailable. Run /rag again in a few seconds."
+                .to_string();
+        };
         let state = match (status.enabled, status.ready, status.init_running) {
             (false, ..) => "disabled",
             (true, true, _) => "enabled, ready",

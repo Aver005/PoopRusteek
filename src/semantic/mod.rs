@@ -32,8 +32,15 @@ use crate::mcp::manager::FullMCPTool;
 use crate::skills::SkillDefinition;
 use matcher::{McpCorpus, McpToolMatch, SkillCorpus, SkillMatch};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// How long a per-turn hint may wait for the index lock before the turn
+/// proceeds without one. Long enough to ride out another turn's query
+/// embedding (a few ms), far too short to wait out an indexing hold
+/// (corpus rebuild / history backfill run for seconds to minutes).
+const HINT_LOCK_BUDGET: Duration = Duration::from_millis(150);
 
 /// Readiness is implicit: `inner.embedder.is_some()` means embeddings are
 /// live. Before that (still initializing, init failed, or disabled by
@@ -230,9 +237,32 @@ impl SemanticService {
         true
     }
 
-    pub fn status(&self) -> RagStatus {
-        let inner = self.inner.lock().unwrap();
-        RagStatus {
+    /// Acquire the inner lock without unbounded waiting. `budget == ZERO`
+    /// means exactly one `try_lock` (safe from the event loop); a positive
+    /// budget retries with short sleeps (blocking threads only). Returns
+    /// `None` on timeout or a poisoned lock — every caller treats that as
+    /// "index busy, degrade" per the semantic-layer contract.
+    fn lock_inner_bounded(&self, budget: Duration) -> Option<MutexGuard<'_, Inner>> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.inner.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(_)) => return None,
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Point-in-time state for `/rag`. Returns `None` while an indexing
+    /// pass holds the index lock — the caller runs on the event loop and
+    /// must not wait out a multi-second (post-thread-cap: longer) hold.
+    pub fn status(&self) -> Option<RagStatus> {
+        let inner = self.lock_inner_bounded(Duration::ZERO)?;
+        Some(RagStatus {
             enabled: self.is_enabled(),
             ready: inner.embedder.is_some(),
             init_running: self.init_running.load(Ordering::SeqCst),
@@ -243,7 +273,7 @@ impl SemanticService {
             deferred: self.mcp_deferred.load(Ordering::Relaxed),
             history_chunks: inner.history.as_ref().map_or(0, history::HistoryStore::record_count),
             history_sessions: inner.history.as_ref().map_or(0, history::HistoryStore::session_count),
-        }
+        })
     }
 
     /// An always-off service for contexts with no config/event channel.
@@ -382,8 +412,10 @@ impl SemanticService {
     }
 
     /// (Re)embed the MCP corpus from `raw_mcp`. Blocking; holds the inner
-    /// lock for the duration (~100 ms for dozens of tools) — concurrent
-    /// `match_prompt` calls on other blocking threads just wait.
+    /// lock for the duration (seconds for dozens of tools, and the
+    /// intra-thread cap trades speed for UI headroom) — a concurrent
+    /// `match_prompt` gives up after its bounded wait and the turn simply
+    /// goes out without a hint.
     fn rebuild_mcp_corpus(&self) {
         let mut inner = self.inner.lock().unwrap();
         let Inner { embedder, mcp, raw_mcp, .. } = &mut *inner;
@@ -402,14 +434,20 @@ impl SemanticService {
     }
 
     /// Match `prompt` against both corpora with one query embedding.
-    /// Returns nothing until background init completes or while `/rag off`
-    /// is in effect. Blocking (ONNX inference under the state lock, no
-    /// awaits) — call from `spawn_blocking`.
+    /// Returns nothing until background init completes, while `/rag off`
+    /// is in effect, or when an indexing pass holds the index lock past
+    /// [`HINT_LOCK_BUDGET`] — the hint is advisory and must never delay a
+    /// turn's first token by the length of a corpus rebuild or history
+    /// backfill. Blocking (ONNX inference under the state lock, plus the
+    /// bounded lock wait) — call from `spawn_blocking`.
     pub fn match_prompt(&self, prompt: &str) -> PromptMatches {
         if !self.is_enabled() {
             return PromptMatches::default();
         }
-        let mut inner = self.inner.lock().unwrap();
+        let Some(mut inner) = self.lock_inner_bounded(HINT_LOCK_BUDGET) else {
+            tracing::debug!("semantic: hint skipped — index lock busy (indexing in progress)");
+            return PromptMatches::default();
+        };
         let Inner { embedder, skills, mcp, .. } = &mut *inner;
         let Some(emb) = embedder else {
             return PromptMatches::default();
@@ -528,3 +566,43 @@ impl SemanticService {
     }
 }
 
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    fn enabled_service_without_init() -> Arc<SemanticService> {
+        Arc::new(SemanticService {
+            inner: Mutex::new(Inner::default()),
+            config: SemanticConfig::default(),
+            enabled: AtomicBool::new(true),
+            init_running: AtomicBool::new(false),
+            mcp_deferred: AtomicBool::new(false),
+        })
+    }
+
+    /// A held index lock (corpus rebuild, history backfill) must degrade,
+    /// never block: `status()` declines immediately (it runs on the event
+    /// loop) and `match_prompt` gives up within its bounded budget instead
+    /// of delaying the turn's first token.
+    #[test]
+    fn busy_index_lock_degrades_instead_of_blocking() {
+        let service = enabled_service_without_init();
+        let guard = service.inner.lock().unwrap();
+
+        assert!(service.status().is_none(), "status must decline while the lock is held");
+
+        let start = Instant::now();
+        let matches = service.match_prompt("anything");
+        assert!(matches.is_empty(), "no hint while the lock is held");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "match_prompt must give up within its bounded budget, waited {:?}",
+            start.elapsed()
+        );
+
+        drop(guard);
+        let status = service.status().expect("status once the lock is free");
+        assert!(!status.ready, "no embedder was ever initialized in this test");
+    }
+}
