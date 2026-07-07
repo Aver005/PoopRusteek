@@ -1,6 +1,6 @@
 # REFERENCE: DeepSeek Provider
 > The LLM backend. Reverse-engineered DeepSeek **web** API (chat.deepseek.com), not the public API key product.
-> Source: `src/provider/`. Last updated: 2026-07-04 (constructor gained `rate_limit_per_minute`; trait gained `session_identity`/`session_is_alive`/`adopt_session` for cross-restart session resume — see `reference/CONFIG.md`'s "Remote session resume" section for the full flow)
+> Source: `src/provider/`. Last updated: 2026-07-07 (corrected from code: PoW WASM is now **embedded** via `include_bytes!`, a file on disk only overrides it; `build_body` always sends the literal `model: "deepseek-chat"`; fixed the `### LOCAL MEMORY` vs newest-turn label description). Before: 2026-07-04 (constructor gained `rate_limit_per_minute`; trait gained `session_identity`/`session_is_alive`/`adopt_session` for cross-restart session resume — see `reference/CONFIG.md`'s "Remote session resume" section for the full flow)
 
 > Line numbers below (`deepseek.rs:NNN`) predate the module split into
 > `src/provider/deepseek/{mod,http,session,stream,endpoints}.rs` — treat them as
@@ -59,9 +59,9 @@ Every PoW-gated call needs a solved challenge in the `x-ds-pow-response` header 
 1. `POST chat/create_pow_challenge` with `{ "target_path": "/api/v0/chat/completion" }`.
 2. Response → `PowChallengeData` (:33): `algorithm, challenge, difficulty(str), salt, signature, target_path, expire_at`.
 3. `solve_pow()` (:71): only `"DeepSeekHashV1"` supported. Builds prefix `"{salt}_{expire_at}_"`, runs the WASM solver.
-4. WASM blob `assets/sha3_wasm_bg.7b9ca65ddd.wasm` (SHA-3) run via **`wasmtime`**. Exports used: `memory`, `__wbindgen_add_to_stack_pointer`, `__wbindgen_export_0` (alloc), `wasm_solve`. Result region: `[status:i32 | pad | value:f64]`; `status==0` → no answer; else answer = `value.floor() as u64`.
+4. SHA-3 WASM solver run via **`wasmtime`** (`WasmPowRuntime::load`, `pow.rs`). The blob is **embedded in the binary** — `const EMBEDDED_WASM = include_bytes!("../../assets/sha3_wasm_bg.7b9ca65ddd.wasm")` (`pow.rs:14`), so a release binary is self-contained. A wasm file found on disk **overrides** the embedded copy (dev checkout / manual drop-in of a newer upstream solver, no rebuild needed). Exports used: `memory`, `__wbindgen_add_to_stack_pointer`, `__wbindgen_export_0` (alloc), `wasm_solve`. Result region: `[status:i32 | pad | value:f64]`; `status==0` → no answer; else answer = `value.floor() as u64`.
 5. `encode_solution()` (:194): JSON → base64 → header value.
-6. Asset path resolution (:233): `CARGO_MANIFEST_DIR/assets/…` → CWD → exe-dir. Runtime cached in a `OnceLock`.
+6. On-disk override lookup (`resolve_wasm_path`, `pow.rs:255`): first existing of `CARGO_MANIFEST_DIR/assets/…` → CWD/`assets/…` → exe-dir/`assets/…`; if none exists, falls back to `EMBEDDED_WASM`. Runtime cached in a `OnceLock`.
 
 **Fragility**: no check that the challenge hasn't expired before submit; slow solves can send a stale challenge with no retry.
 
@@ -72,14 +72,15 @@ Every PoW-gated call needs a solved challenge in the `x-ds-pow-response` header 
 - `extract_text_from_event()` (:656): tries `p` contains `/content`, then `v.response`, then ~9 OpenAI-style fallback paths (`choices[0].delta.content`, etc.).
 - On `[DONE]`: emit final chunk with `finish_reason="stop"`, then `mark_session_after_success()` updates `parent_message_id` + `system_sent_for_session`.
 
-## PROMPT ASSEMBLY (`build_prompt`, `deepseek.rs:460–531`)
+## PROMPT ASSEMBLY (`build_prompt`, `src/provider/prompt.rs`)
 
 DeepSeek web API takes a single `prompt` string, so history is flattened:
-- First message of a session: `system prompt` + `### LOCAL MEMORY` + history, tool results as `### TOOL RESULT: {name}`, user as `### USER INPUT`.
-- Subsequent: only the new turn (batched tool results, or user input).
+- **First turn of a session** (`system_sent_for_session == false`): `system prompt` + `### LOCAL MEMORY` + flattened prior history + the newest turn. Inside `### LOCAL MEMORY`, each prior message is labelled by role via `format_history_message` → `[ASSISTANT]` / `[USER]` / `[SYSTEM]` / `[TOOL]`. The newest turn is then appended with a `### USER INPUT` or `### TOOL RESULT: {name}` marker.
+- **Subsequent turns**: only the newest turn is sent (DeepSeek retains the rest server-side) — `### USER INPUT`, or a batch of `### TOOL RESULT: {name}` blocks when the last messages are tool results.
+- So `### USER INPUT` / `### TOOL RESULT` mark **only the newest turn**; the `[ROLE]` labels are what appear inside the `### LOCAL MEMORY` history block. Don't conflate the two.
 - **`### LOCAL MEMORY` is just a history-section label — it does NOT load `.memories/` files.** (Verified: nothing in `src/` reads `.memories/`.)
-- Code blocks > 300 chars are stripped to `[...]` via regex (:79) to save tokens.
-- `model_type`: "expert" (thinking) if model name contains "reasoner"/"expert", else "default"/null.
+- Code blocks > 300 chars are stripped to `[...]` via regex (`strip_long_code_blocks`) to save tokens.
+- **Request body** (`build_body`, `deepseek/stream.rs`) always sends the literal `"model": "deepseek-chat"`; the TUI's model string only drives `model_type` via `resolve_model_type(model, parent_message_id)` (`prompt.rs`): name contains `reasoner`/`expert` → `"expert"` (+ `thinking_enabled: true`); a chat model on the first turn (`parent_message_id == None`) → `"default"`; a chat model on later turns → `null`.
 
 ## RESILIENCE
 

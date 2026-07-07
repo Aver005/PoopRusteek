@@ -1,6 +1,6 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-07-06 session 3 (added /refetch-providers + /cache-providers — provider model-list freshness; earlier today: /serve + /server — API-server control). Before: 2026-07-05 (added /themes — theme gallery with live preview + custom-theme wizard; earlier: /rag — semantic-matching status/on/off/reload); 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
+> Last updated: 2026-07-07 (added the 4 rows this file had been missing — /providers, /models, /delete, /delete-local — verified against `src/commands/defs/`; count corrected to 44 distinct). Before: 2026-07-06 session 3 (added /refetch-providers + /cache-providers — provider model-list freshness; earlier today: /serve + /server — API-server control). Before: 2026-07-05 (added /themes — theme gallery with live preview + custom-theme wizard; earlier: /rag — semantic-matching status/on/off/reload); 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
 
 ## HOW COMMANDS WORK
 
@@ -13,7 +13,7 @@
 ### `CommandResult` variants (`src/commands/mod.rs:26`)
 `Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)` · `OpenConfirm(ConfirmAction)`
 
-## FULL COMMAND LIST (42 commands, +2 `/cwd` aliases)
+## FULL COMMAND LIST (44 distinct commands, +2 `/cwd` aliases = 46 registered names)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -58,6 +58,10 @@
 | `/cache-providers` | — | `<ms\|off>` | How long persisted model lists (`data_dir/provider_models.json`) stay valid across restarts → `config.provider_models.cache_ms` (default 180000; off = every startup re-fetches). Bare = same status as `/refetch-providers` | `defs/provider_models.rs` |
 | `/update` | — | — | Self-update: fetches `SHA256SUMS` from the GitHub release tagged `latest`, compares against the running binary's SHA-256, on mismatch downloads the raw platform binary, verifies its hash, **stages it at `<exe>.new`, then swaps** (Unix atomic rename; Windows move-to-`.old`+rename; applies on next launch). In a **debug/`cargo run`** build (`cfg!(debug_assertions)`) it opens a confirm modal first (`ConfirmAction::Update`) — a dev binary always mismatches the released hash. All work off-loop (`app::spawn_update_task` → `AppEvent::UpdateStatus`); an `update_in_flight` AtomicBool blocks concurrent passes. **Contract points** (asset names ↔ CI, `latest` tag ↔ URL) in `reference/AUTO-UPDATE.md` | `defs/update.rs` (`UpdateCommand`), `src/update.rs` |
 | `/autoupdate` | — | `[on\|off]` | Startup auto-update switch → `config.update.auto` (default off). When on, every TUI launch runs the same check/install in the background — quiet if already current (status line only), chat message on install/failure. Bare = status + explanation. Intents: `CommandResult::Update(UpdateAction)` → `apply_update_action` (keys/dispatch.rs) | `defs/update.rs` (`AutoUpdateCommand`) |
+| `/providers` | — | `[add [<name> [openai\|anthropic] <base_url> [model] [api_key]]]` | Manage LLM providers: built-in DeepSeek + extra OpenAI-compatible / Anthropic / Gemini endpoints. Bare opens the providers view/picker; `add` runs a wizard (no args) or a one-liner. Persists provider entries to config | `defs/providers.rs` |
+| `/models` | — | `[<model_id>]` | List the active provider's available models (picker), or switch directly to `<model_id>` | `defs/models.rs` |
+| `/delete` | — | `[session_id]` | Delete sessions both remotely (DeepSeek account) **and** their local copies; opens a picker when no id given | `defs/delete.rs` |
+| `/delete-local` | — | `[session_id]` | Delete only the local session file(s); the DeepSeek account copy is left intact | `defs/delete.rs` |
 | `/themes` | — | `[new\|<name>]` | Theme gallery (full-screen `View::Themes`): 10 built-in presets + `[[ui.custom_themes]]` entries; moving the cursor redraws the *whole frame* in the highlighted theme (live preview — `ThemesViewState::preview_theme` resolved in `render()`), Enter applies + saves `ui.theme`. `n`/`e`/`d` = new/edit/delete custom themes. `new`/`add`/`create` arg jumps straight into the step-by-step wizard (name → base preset → one step per `theme::ROLES` color role, hex prefilled from the base so Enter-through is fast, Ctrl+S = finish early → confirm saves + applies). `<name>` switches directly (validated against presets+customs). Intents: `OpenThemes`/`OpenThemeWizard`/`SetTheme` | `defs/themes.rs`, `app/themes.rs`, `keys/themes.rs`, `tui/render/themes.rs`, `tui/theme.rs` |
 
 ## NOTES & GOTCHAS
