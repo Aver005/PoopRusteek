@@ -120,12 +120,20 @@ impl App {
                     && !self.state.focused_mut().generation.active =>
             {
                 self.state.input.history_prev();
+                // Browsing history is recall, not composition: a recalled
+                // `/command` must not pop the menu (nor leave a stale one to
+                // hijack the next Ctrl+Up). It reopens only once the user edits,
+                // so skip the trailing refresh below.
+                self.state.autocomplete = AutocompleteState::default();
+                return Ok(false);
             }
             KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !self.state.focused_mut().generation.active =>
             {
                 self.state.input.history_next();
+                self.state.autocomplete = AutocompleteState::default();
+                return Ok(false);
             }
             KeyCode::Up => {
                 self.state.scroll_offset = self.state.scroll_offset.saturating_add(1);

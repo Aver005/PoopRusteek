@@ -9,12 +9,22 @@ impl App {
     /// open (and no modal owns the keyboard). Returns whether the key was
     /// consumed by the dropdown.
     pub(super) fn autocomplete_intercepts(&mut self, key: crossterm::event::KeyEvent) -> bool {
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
 
         let ac_visible = self.state.autocomplete.visible
             && !self.state.autocomplete.items.is_empty()
             && self.state.modal.is_none();
         if !ac_visible {
+            return false;
+        }
+        // The dropdown only owns *bare* Tab/Up/Down/Enter. Any Ctrl/Alt-modified
+        // key (notably Ctrl+Up/Down history recall) must fall through — otherwise
+        // a menu opened by a recalled `/command` would trap the very keys used to
+        // keep browsing history.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
             return false;
         }
         match key.code {
