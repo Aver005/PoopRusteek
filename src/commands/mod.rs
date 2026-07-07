@@ -59,6 +59,19 @@ pub enum ServeAction {
     SetApi(crate::config::ServerApi),
 }
 
+/// `/update` + `/autoupdate` intents — interpreted in
+/// `apply_update_action` (app::keys::dispatch), which owns the in-flight
+/// guard, the event channel, and the mutable config these effects need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateAction {
+    /// `/update` — check the `latest` release, install on hash mismatch.
+    Run,
+    /// `/autoupdate` — show whether the startup check is enabled.
+    AutoStatus,
+    /// `/autoupdate on` / `/autoupdate off` — persist the flag.
+    SetAuto(bool),
+}
+
 /// `/refetch-providers` + `/cache-providers` intents — interpreted in
 /// `app/providers.rs::apply_provider_models_action`, which owns the model
 /// cache handle and mutable config.
@@ -141,6 +154,8 @@ pub enum CommandResult {
     /// `/refetch-providers` + `/cache-providers` — provider model-list
     /// freshness knobs.
     ProviderModels(ProviderModelsAction),
+    /// `/update` + `/autoupdate` — self-update control.
+    Update(UpdateAction),
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +266,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::serve::ServerCommand));
         self.register(Box::new(defs::provider_models::RefetchProvidersCommand));
         self.register(Box::new(defs::provider_models::CacheProvidersCommand));
+        self.register(Box::new(defs::update::UpdateCommand));
+        self.register(Box::new(defs::update::AutoUpdateCommand));
 
         // Registered last so its own entry is included in the generated list.
         let help = Box::new(defs::help::HelpCommand::new(self.help_entries()));

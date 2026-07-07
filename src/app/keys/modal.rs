@@ -200,6 +200,7 @@ impl App {
                     Some(true) => match cs.action {
                         events::ConfirmAction::Logout => self.execute_logout().await,
                         events::ConfirmAction::Wipe => self.execute_wipe().await,
+                        events::ConfirmAction::Update => self.start_manual_update(),
                     },
                     Some(false) => {}
                     None => {

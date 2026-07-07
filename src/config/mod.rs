@@ -31,6 +31,20 @@ pub struct Config {
     /// `crate::provider::model_cache`.
     #[serde(default)]
     pub provider_models: ProviderModelsConfig,
+    /// Self-update from the rolling `latest` release — see `crate::update`.
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// `[update]` — the self-updater (`/update`, `/autoupdate`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// `/autoupdate on|off` — when true, every TUI startup checks the
+    /// `latest` release in the background and installs it on hash mismatch
+    /// (takes effect on the next launch). Off by default: replacing the
+    /// binary behind the user's back must be an explicit opt-in.
+    #[serde(default)]
+    pub auto: bool,
 }
 
 /// `[provider_models]` — how the per-provider model catalogs (fetched via
@@ -512,6 +526,7 @@ impl Default for Config {
             active_provider: None,
             server: ServerConfig::default(),
             provider_models: ProviderModelsConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -744,6 +759,28 @@ mod tests {
         assert!(parsed.active_provider.is_none());
         assert!(parsed.active_provider_entry().is_none());
         assert_eq!(parsed.active_model(), "deepseek-chat");
+    }
+
+    #[test]
+    fn config_without_update_section_still_loads() {
+        // Pre-updater config files carry no [update] table — it must
+        // default (auto off) instead of failing the parse.
+        let old = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .lines()
+            .take_while(|line| !line.contains("[update]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed: Config = toml::from_str(&old).unwrap();
+        assert!(!parsed.update.auto);
+
+        // And the flag round-trips once set.
+        let mut config = Config::default();
+        config.update.auto = true;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let reparsed: Config = toml::from_str(&text).unwrap();
+        assert!(reparsed.update.auto);
     }
 
     #[test]

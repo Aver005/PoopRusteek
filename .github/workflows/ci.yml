@@ -5,7 +5,10 @@ name: CI
 # scripts/dev-release.template.md) only start once both pass, and only for
 # a push to `develop` — so a broken commit never gets released, and CI
 # doesn't waste minutes building release binaries for code that's already
-# failing.
+# failing. After the versioned dev release publishes, the `latest`
+# tag/release is re-pointed at the same assets — that is the auto-update
+# channel the app's `/update` + `/autoupdate` check against (src/update.rs
+# compares the local binary's SHA-256 with the SHA256SUMS asset).
 
 on:
   push:
@@ -139,6 +142,25 @@ jobs:
           find artifacts -type f -exec cp {} release-assets/ \;
           ls -la release-assets
 
+      # The self-updater (src/update.rs) downloads raw binaries and verifies
+      # them against SHA256SUMS — hashes are over the *uncompressed*
+      # binaries so they compare directly with the installed file. Asset
+      # names must stay in step with `update::platform_asset`.
+      - name: Extract raw binaries + SHA256SUMS (auto-update assets)
+        shell: bash
+        run: |
+          cd release-assets
+          mkdir unpacked
+          unzip -o pooprusteek-windows-x86_64.zip -d unpacked
+          mv unpacked/pooprusteek.exe pooprusteek-windows-x86_64.exe
+          tar -xzf pooprusteek-linux-x86_64.tar.gz -C unpacked
+          mv unpacked/pooprusteek pooprusteek-linux-x86_64
+          tar -xzf pooprusteek-macos-arm64.tar.gz -C unpacked
+          mv unpacked/pooprusteek pooprusteek-macos-arm64
+          rmdir unpacked
+          sha256sum pooprusteek-windows-x86_64.exe pooprusteek-linux-x86_64 pooprusteek-macos-arm64 > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Compute rolling tag from Cargo.toml version
         id: ver
         shell: bash
@@ -256,6 +278,31 @@ jobs:
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: "Dev build ${{ steps.ver.outputs.tag }}"
+          prerelease: true
+          body_path: release-body.md
+          files: release-assets/*
+
+      # The `latest` tag/release is the auto-update channel: a stable
+      # download URL (releases/download/latest/…) re-pointed at every
+      # successful dev release. Ordered after the versioned release above so
+      # a failed publish never moves `latest`.
+      - name: Move `latest` tag to current commit
+        shell: bash
+        run: |
+          git tag -f latest
+          git push origin latest --force
+
+      - name: Delete previous `latest` release (if any)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete latest --yes || true
+
+      - name: Publish `latest` release (auto-update channel)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest dev build (${{ steps.ver.outputs.tag }})"
           prerelease: true
           body_path: release-body.md
           files: release-assets/*

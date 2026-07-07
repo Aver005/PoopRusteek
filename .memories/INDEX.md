@@ -30,6 +30,7 @@
 | `reference/TOOLS.md` | Tool system, agent loop, background PTY |
 | `reference/MCP.md` | MCP clients, transports, 8 config sources |
 | `reference/CONFIG.md` | Config schema, storage paths, sessions |
+| `reference/AUTO-UPDATE.md` | Self-updater (`/update`, `/autoupdate`) + the `latest` CI release channel — swap mechanics, **contract points that must not desync**, failure modes |
 | `reference/PROMPTS.md` | Prompt library + skills discovery |
 | `reference/AUDIT-2026-07-02.md` | Full-codebase audit (2026-07-02): severity-ranked defects, `[FIXED]`/`[OPEN]`/`[ACCEPTED]` status |
 | `reference/AUDIT-2026-07-04-CLEANUP.md` | Cleanup audit (2026-07-04): duplication / dead code / inefficiency / coupling, with verified-vs-reported status and execution order |

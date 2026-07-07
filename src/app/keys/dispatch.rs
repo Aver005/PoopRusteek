@@ -243,6 +243,9 @@ impl App {
             CommandResult::ProviderModels(action) => {
                 self.apply_provider_models_action(action);
             }
+            CommandResult::Update(action) => {
+                self.apply_update_action(action);
+            }
             CommandResult::SearchHistory(query) => {
                 self.state.view = View::Search;
                 self.state.search = crate::app::search::SearchViewState::fresh(&query);
@@ -341,6 +344,62 @@ impl App {
                 ));
             }
         }
+    }
+
+    /// `/update` + `/autoupdate` effects: the network check and binary swap
+    /// run in a spawned task (`app::spawn_update_task`) — these arms only
+    /// flip the persisted flag and report.
+    fn apply_update_action(&mut self, action: crate::commands::UpdateAction) {
+        use crate::commands::UpdateAction;
+        match action {
+            UpdateAction::Run => {
+                // A debug/`cargo run` binary always mismatches the released
+                // hash, so an unconfirmed /update would silently swap the dev
+                // build for the release. Make that an explicit choice; a
+                // release build updates straight away.
+                if cfg!(debug_assertions) {
+                    self.open_confirm(crate::app::events::ConfirmAction::Update);
+                } else {
+                    self.start_manual_update();
+                }
+            }
+            UpdateAction::AutoStatus => {
+                let state = if self.config.update.auto { "on" } else { "off" };
+                self.state.push_system(&format!(
+                    "Auto-update on startup: {state}.\n\
+                     When on, every launch compares the binary's SHA-256 with the `latest` \
+                     release in the background and installs on mismatch (applied on the next start).\n\
+                     \u{2022} /autoupdate on|off — toggle\n\
+                     \u{2022} /update — check and install right now"
+                ));
+            }
+            UpdateAction::SetAuto(on) => {
+                self.config.update.auto = on;
+                if let Err(e) = crate::config::save(&self.config) {
+                    self.state
+                        .push_system(&format!("Failed to save config: {e}"));
+                    return;
+                }
+                self.state.push_system(if on {
+                    "Auto-update enabled — every startup checks the `latest` release in the background."
+                } else {
+                    "Auto-update disabled. /update still works manually."
+                });
+            }
+        }
+    }
+
+    /// Kick off a manual (`/update`) check + install off the event loop.
+    /// Shared by the release-build direct path and the dev-build confirm arm
+    /// (`ConfirmAction::Update`).
+    pub(super) fn start_manual_update(&mut self) {
+        self.state
+            .push_system("Checking for updates against the `latest` release\u{2026}");
+        crate::app::spawn_update_task(
+            self.event_tx.clone(),
+            Arc::clone(&self.update_in_flight),
+            false,
+        );
     }
 
     /// `/rag-limit` status: the configured mode, the batch it resolves to,

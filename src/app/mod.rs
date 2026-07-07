@@ -114,6 +114,45 @@ pub struct App {
     provider_models: std::sync::Arc<crate::provider::model_cache::ProviderModelCache>,
     /// When the periodic model refetch last ran (`[provider_models] refetch_ms`).
     last_models_refetch: std::time::Instant,
+    /// True while a self-update pass runs (startup auto-check or `/update`) —
+    /// two concurrent passes would race on the binary swap.
+    update_in_flight: Arc<AtomicBool>,
+}
+
+/// Run one self-update pass off the event loop and report through
+/// `AppEvent::UpdateStatus`. Shared by `/update` (dispatch) and the startup
+/// auto-check (`App::new`); `quiet_when_current` keeps the routine startup
+/// "already up to date" out of the chat (status line only).
+pub(crate) fn spawn_update_task(
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+    in_flight: Arc<AtomicBool>,
+    quiet_when_current: bool,
+) {
+    if in_flight.swap(true, Ordering::SeqCst) {
+        let _ = event_tx.send(AppEvent::UpdateStatus {
+            message: "An update is already in progress.".to_string(),
+            notable: true,
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let (message, notable) = match crate::update::run().await {
+            Ok(crate::update::UpdateOutcome::UpToDate) => (
+                "Already up to date — the binary matches the `latest` release.".to_string(),
+                !quiet_when_current,
+            ),
+            Ok(crate::update::UpdateOutcome::Updated { new_hash }) => (
+                format!(
+                    "⬇ Updated to the latest dev build (sha256 {}…) — restart to apply.",
+                    crate::util::truncate_at_char_boundary(&new_hash, 12)
+                ),
+                true,
+            ),
+            Err(e) => (format!("Update failed: {e}"), true),
+        };
+        in_flight.store(false, Ordering::SeqCst);
+        let _ = event_tx.send(AppEvent::UpdateStatus { message, notable });
+    });
 }
 
 pub struct AppState {
@@ -318,6 +357,16 @@ impl App {
             );
         }
 
+        // Self-updater: clear the `.old` backup a previous update may have
+        // left (Windows can't delete it while that binary's process runs),
+        // then — only when opted in via /autoupdate — check the `latest`
+        // release in the background. Quiet when already current.
+        crate::update::cleanup_stale_backup();
+        let update_in_flight = Arc::new(AtomicBool::new(false));
+        if config.update.auto {
+            spawn_update_task(event_tx.clone(), Arc::clone(&update_in_flight), true);
+        }
+
         Ok(Self {
             config,
             state,
@@ -335,6 +384,7 @@ impl App {
             server_generation: 0,
             provider_models,
             last_models_refetch: std::time::Instant::now(),
+            update_in_flight,
         })
     }
 
@@ -781,6 +831,15 @@ impl App {
             AppEvent::SemanticStatus(message) => {
                 self.state.status_message = message;
             }
+            AppEvent::UpdateStatus { message, notable } => {
+                self.state.status_message = message.clone();
+                if notable {
+                    self.state
+                        .focused_mut()
+                        .messages
+                        .push(ChatMessage::ui_system(&message));
+                }
+            }
             AppEvent::ErrorLogged { message } => {
                 self.state.error_count += 1;
                 self.state.last_error = Some(message);
@@ -1050,6 +1109,7 @@ impl App {
         let cs = match action {
             ConfirmAction::Logout => ConfirmState::logout(),
             ConfirmAction::Wipe => ConfirmState::wipe(),
+            ConfirmAction::Update => ConfirmState::update_dev(),
         };
         self.state.modal = Some(Modal::Confirm(cs));
     }

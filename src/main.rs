@@ -16,6 +16,7 @@ mod session;
 mod skills;
 mod tools;
 mod tui;
+mod update;
 mod util;
 mod whitelist;
 

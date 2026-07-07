@@ -13,7 +13,7 @@
 ### `CommandResult` variants (`src/commands/mod.rs:26`)
 `Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)` · `OpenConfirm(ConfirmAction)`
 
-## FULL COMMAND LIST (40 commands, +2 `/cwd` aliases)
+## FULL COMMAND LIST (42 commands, +2 `/cwd` aliases)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -56,6 +56,8 @@
 | `/server` | — | `<port>` | Set the API server port → `config.server.port` (saved for all future runs); a running server is restarted onto the new port (bind-retry absorbs the listener-close race). Bare `/server` = same status as `/serve`. Port 0 rejected | `defs/serve.rs` (`ServerCommand`) |
 | `/refetch-providers` | — | `<ms\|off>` | Background period for re-fetching every `/providers` entry's model list (`GET /models`) → `config.provider_models.refetch_ms` (default 180000; off = only startup + provider add). Bare = show both knobs + per-provider fetch state (count, age). Runs off `AppEvent::Tick`; effects in `apply_provider_models_action` | `defs/provider_models.rs` |
 | `/cache-providers` | — | `<ms\|off>` | How long persisted model lists (`data_dir/provider_models.json`) stay valid across restarts → `config.provider_models.cache_ms` (default 180000; off = every startup re-fetches). Bare = same status as `/refetch-providers` | `defs/provider_models.rs` |
+| `/update` | — | — | Self-update: fetches `SHA256SUMS` from the GitHub release tagged `latest`, compares against the running binary's SHA-256, on mismatch downloads the raw platform binary, verifies its hash, **stages it at `<exe>.new`, then swaps** (Unix atomic rename; Windows move-to-`.old`+rename; applies on next launch). In a **debug/`cargo run`** build (`cfg!(debug_assertions)`) it opens a confirm modal first (`ConfirmAction::Update`) — a dev binary always mismatches the released hash. All work off-loop (`app::spawn_update_task` → `AppEvent::UpdateStatus`); an `update_in_flight` AtomicBool blocks concurrent passes. **Contract points** (asset names ↔ CI, `latest` tag ↔ URL) in `reference/AUTO-UPDATE.md` | `defs/update.rs` (`UpdateCommand`), `src/update.rs` |
+| `/autoupdate` | — | `[on\|off]` | Startup auto-update switch → `config.update.auto` (default off). When on, every TUI launch runs the same check/install in the background — quiet if already current (status line only), chat message on install/failure. Bare = status + explanation. Intents: `CommandResult::Update(UpdateAction)` → `apply_update_action` (keys/dispatch.rs) | `defs/update.rs` (`AutoUpdateCommand`) |
 | `/themes` | — | `[new\|<name>]` | Theme gallery (full-screen `View::Themes`): 10 built-in presets + `[[ui.custom_themes]]` entries; moving the cursor redraws the *whole frame* in the highlighted theme (live preview — `ThemesViewState::preview_theme` resolved in `render()`), Enter applies + saves `ui.theme`. `n`/`e`/`d` = new/edit/delete custom themes. `new`/`add`/`create` arg jumps straight into the step-by-step wizard (name → base preset → one step per `theme::ROLES` color role, hex prefilled from the base so Enter-through is fast, Ctrl+S = finish early → confirm saves + applies). `<name>` switches directly (validated against presets+customs). Intents: `OpenThemes`/`OpenThemeWizard`/`SetTheme` | `defs/themes.rs`, `app/themes.rs`, `keys/themes.rs`, `tui/render/themes.rs`, `tui/theme.rs` |
 
 ## NOTES & GOTCHAS

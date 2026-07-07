@@ -258,6 +258,15 @@ pub enum AppEvent {
         summary: String,
         failed: usize,
     },
+
+    /// A self-update pass (manual `/update` or the startup auto-check)
+    /// finished — see `crate::update`. With `notable: false` (startup check
+    /// found nothing to do) only the status line changes; otherwise the
+    /// message also lands in the focused chat.
+    UpdateStatus {
+        message: String,
+        notable: bool,
+    },
 }
 
 // Populated at the `AgentDone` send site but every current receiver
@@ -724,6 +733,9 @@ pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCod
 pub enum ConfirmAction {
     Logout,
     Wipe,
+    /// `/update` invoked from a debug/`cargo run` build — confirm before
+    /// replacing the running dev binary with the released one.
+    Update,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -783,6 +795,25 @@ impl ConfirmState {
                 ConfirmLine::dim("Local sessions, history and settings stay on disk."),
             ],
             action: ConfirmAction::Logout,
+        }
+    }
+
+    pub fn update_dev() -> Self {
+        Self {
+            title: "Update from a dev build?".to_string(),
+            lines: vec![
+                ConfirmLine::normal(
+                    "You're running a development build (debug, e.g. `cargo run`).",
+                ),
+                ConfirmLine::soft(
+                    "Updating replaces the running binary with the released build from the `latest` GitHub release.",
+                ),
+                ConfirmLine::dim(
+                    "Under `cargo run` that file lives in target/debug — cargo may keep running the downloaded release until the next source change or `cargo clean`.",
+                ),
+                ConfirmLine::danger("Are you sure you want to update?"),
+            ],
+            action: ConfirmAction::Update,
         }
     }
 

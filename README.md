@@ -168,6 +168,7 @@ On first launch, an onboarding flow helps you set your DeepSeek token and model.
 |---------|-------------|
 | `/rate <ms>\|<N>/min\|off` | Rate limit: ms between requests and/or max requests per minute |
 | `/retry <N\|on\|off\|-1>` | Max retries on API failure (-1 = infinite) |
+| `/update` · `/autoupdate [on\|off]` | Self-update from the `latest` release now · toggle the startup auto-check |
 | `/debug [on\|off]` | Toggle debug logging to `.dev/debug.log` (no args = switch) |
 | `/help` · `/version` · `/quit` | Help · version · exit |
 
@@ -206,6 +207,33 @@ top_k = 3               # max suggestions per corpus per turn
 min_dense_score = 0.80  # cosine floor for hint candidates without keyword overlap
 mcp_schemas = "auto"    # "auto" (defer above 12 tools) | "full" | "deferred"
 ```
+
+## ⬆️ Self-update
+
+**`/update`** compares the SHA-256 of the running binary against the
+`SHA256SUMS` asset of the GitHub Release tagged **`latest`**; on a mismatch it
+downloads the raw platform binary, verifies its hash, stages it next to the
+current one, and swaps it in (the new binary applies on the next launch — a
+running executable is renamed aside, never overwritten live). **`/autoupdate
+on`** runs that check in the background on every startup (off by default —
+`[update] auto`). In a `cargo run` dev build `/update` asks for confirmation
+first, since a debug binary always differs from the release.
+
+CI publishes that channel: the `publish` job (`.github/workflows/ci.yml`)
+extracts the raw per-platform binaries, writes `SHA256SUMS` over them, and
+force-re-points the `latest` tag/release at every successful `develop`
+release — ordered after the versioned release so a failed publish never moves
+`latest`.
+
+> [!IMPORTANT]
+> Two things must stay in lock-step: the raw asset names in
+> `update::platform_asset()` and the CI extraction step, and the `latest` tag
+> in `update::RELEASE_DOWNLOAD_BASE` and the CI tag/release steps. The full
+> list of load-bearing contract points lives in
+> [`.memories/reference/AUTO-UPDATE.md`](.memories/reference/AUTO-UPDATE.md).
+> Note the check is identity ("am I exactly `latest`"), not version ordering —
+> there's no downgrade protection, and integrity (not authenticity) is
+> guaranteed: trust rests on TLS + GitHub, there's no binary signing yet.
 
 ## 🏗️ Architecture
 
