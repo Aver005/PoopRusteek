@@ -103,6 +103,10 @@ pub enum AppEvent {
     // Mouse wheel scrolls the focused window (chat transcript, MCP details,
     // approval modal, search results). Clicks are ignored for now.
     Mouse(crossterm::event::MouseEvent),
+    // A bracketed paste (whole clipboard as one chunk). Routed to whatever
+    // text field currently has focus so multi-line pastes never fire an early
+    // submit. See `keys::paste`.
+    Paste(String),
     // The new size only triggers a redraw (ratatui re-queries the terminal
     // size when rendering); the dimensions themselves aren't read anywhere.
     #[expect(

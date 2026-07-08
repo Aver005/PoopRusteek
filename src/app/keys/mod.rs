@@ -23,6 +23,7 @@ mod mcp;
 mod modal;
 mod mouse;
 mod onboarding;
+mod paste;
 mod providers;
 mod search;
 mod themes;

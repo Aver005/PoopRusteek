@@ -8,6 +8,17 @@
 //! bug-prone parts (byte/char offset juggling, word boundaries, selection
 //! deletion) are testable in isolation.
 
+/// A multi-line paste collapsed to a compact placeholder chip in the buffer.
+/// The chip keeps the prompt readable; the real text is restored by
+/// [`InputState::expanded`] at submit time.
+#[derive(Debug, Clone)]
+pub struct PasteChunk {
+    /// The exact token shown in the buffer, e.g. `[Pasted #1, 42 lines]`.
+    pub placeholder: String,
+    /// The real pasted text this chip stands in for.
+    pub content: String,
+}
+
 /// Editable state of the prompt input line.
 #[derive(Debug, Default, Clone)]
 pub struct InputState {
@@ -23,6 +34,10 @@ pub struct InputState {
     pub history_index: Option<usize>,
     /// Buffer stashed when the user starts browsing history, restored on exit.
     pub unsent: String,
+    /// Multi-line pastes collapsed to chips in `buffer`, restored on submit.
+    pub pastes: Vec<PasteChunk>,
+    /// Monotonic id for the next paste chip (never reused within a draft).
+    pub next_paste_id: usize,
 }
 
 impl InputState {
@@ -63,6 +78,61 @@ impl InputState {
         self.buffer.insert(byte_pos, c);
         self.cursor += 1;
         self.selection_anchor = None;
+    }
+
+    /// Insert a whole string at the cursor, replacing any selection first.
+    /// Used for bracketed paste: the entire clipboard lands as one edit
+    /// instead of a stream of key events, so embedded newlines never fire an
+    /// early submit. Callers sanitize (strip `\r`, drop `\n` for single-line
+    /// fields) before calling.
+    pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.delete_selection();
+        let byte_pos = char_to_byte_pos(&self.buffer, self.cursor);
+        self.buffer.insert_str(byte_pos, s);
+        self.cursor += s.chars().count();
+        self.selection_anchor = None;
+    }
+
+    /// Collapse a multi-line paste to a compact placeholder chip at the cursor
+    /// and remember the real content for expansion at submit time. Keeps the
+    /// prompt readable and — since the newlines live in the stored content, not
+    /// the buffer — stops a pasted block from firing an early submit.
+    pub fn insert_paste(&mut self, content: String) {
+        self.next_paste_id += 1;
+        let id = self.next_paste_id;
+        let lines = content.lines().count().max(1);
+        let placeholder = format!("[Pasted #{id}, {lines} lines]");
+        self.insert_str(&placeholder);
+        self.pastes.push(PasteChunk {
+            placeholder,
+            content,
+        });
+    }
+
+    /// The buffer with every still-present paste chip expanded back to its real
+    /// content. Used at submit time. A chip the user edited away no longer
+    /// matches and is left as-is; unreferenced chunks are simply ignored.
+    pub fn expanded(&self) -> String {
+        let mut out = self.buffer.clone();
+        for chunk in &self.pastes {
+            if out.contains(&chunk.placeholder) {
+                out = out.replace(&chunk.placeholder, &chunk.content);
+            }
+        }
+        out
+    }
+
+    /// Reset the editable buffer (text, cursor, selection, paste chips) without
+    /// touching recall history. Called after a submit and on history recall,
+    /// where a fresh buffer replaces the draft.
+    pub fn clear_buffer(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.selection_anchor = None;
+        self.pastes.clear();
     }
 
     /// Insert a newline at the cursor, replacing any selection first.
@@ -164,6 +234,7 @@ impl InputState {
             self.buffer = self.history[i].clone();
             self.cursor = self.char_count();
             self.selection_anchor = None;
+            self.pastes.clear();
             self.history_index = Some(i);
         }
     }
@@ -185,6 +256,7 @@ impl InputState {
             }
         }
         self.selection_anchor = None;
+        self.pastes.clear();
     }
 }
 
@@ -277,6 +349,84 @@ mod tests {
         s.insert_char('a');
         assert_eq!(s.buffer, "😀ab");
         assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn insert_str_mid_buffer_advances_by_char_count() {
+        let mut s = at("ac", 1);
+        s.insert_str("XYZ");
+        assert_eq!(s.buffer, "aXYZc");
+        assert_eq!(s.cursor, 4);
+    }
+
+    #[test]
+    fn insert_str_replaces_selection() {
+        let mut s = at("hello", 5);
+        s.selection_anchor = Some(0);
+        s.insert_str("hi");
+        assert_eq!(s.buffer, "hi");
+        assert_eq!(s.cursor, 2);
+        assert_eq!(s.selection_anchor, None);
+    }
+
+    #[test]
+    fn insert_str_multibyte_and_newlines() {
+        // Cursor is a char index; a paste with emoji + newline must count chars,
+        // not bytes, and keep the newline in the buffer.
+        let mut s = at("😀b", 1);
+        s.insert_str("a\nx");
+        assert_eq!(s.buffer, "😀a\nxb");
+        assert_eq!(s.cursor, 4); // 'a', '\n', 'x' are 3 chars past the emoji
+    }
+
+    #[test]
+    fn insert_str_empty_is_noop() {
+        let mut s = at("ab", 1);
+        s.insert_str("");
+        assert_eq!(s.buffer, "ab");
+        assert_eq!(s.cursor, 1);
+    }
+
+    #[test]
+    fn insert_paste_collapses_to_chip_and_expands() {
+        let mut s = at("hi ", 3);
+        s.insert_paste("line one\nline two\nline three".to_string());
+        assert_eq!(s.buffer, "hi [Pasted #1, 3 lines]");
+        // Cursor sits after the chip; the newlines never entered the buffer.
+        assert!(!s.buffer.contains('\n'));
+        assert_eq!(s.expanded(), "hi line one\nline two\nline three");
+    }
+
+    #[test]
+    fn insert_paste_ids_increment_and_both_expand() {
+        let mut s = at("", 0);
+        s.insert_paste("a\nb".to_string());
+        s.insert_str(" and ");
+        s.insert_paste("c\nd".to_string());
+        assert_eq!(s.buffer, "[Pasted #1, 2 lines] and [Pasted #2, 2 lines]");
+        assert_eq!(s.expanded(), "a\nb and c\nd");
+    }
+
+    #[test]
+    fn expanded_leaves_edited_away_chip_literal() {
+        let mut s = at("", 0);
+        s.insert_paste("x\ny".to_string());
+        // User deletes the chip entirely; expansion has nothing to substitute.
+        s.clear_buffer();
+        s.insert_str("plain text");
+        assert_eq!(s.expanded(), "plain text");
+        assert!(s.pastes.is_empty());
+    }
+
+    #[test]
+    fn history_recall_drops_paste_chips() {
+        let mut s = at("draft ", 6);
+        s.history = vec!["old".to_string()];
+        s.insert_paste("a\nb".to_string());
+        assert!(!s.pastes.is_empty());
+        s.history_prev();
+        assert_eq!(s.buffer, "old");
+        assert!(s.pastes.is_empty());
     }
 
     #[test]

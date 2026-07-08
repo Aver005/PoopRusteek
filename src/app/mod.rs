@@ -473,6 +473,10 @@ impl App {
                             dirty = true;
                             self.handle_event(AppEvent::Mouse(mouse)).await?;
                         }
+                        crossterm::event::Event::Paste(text) => {
+                            dirty = true;
+                            self.handle_event(AppEvent::Paste(text)).await?;
+                        }
                         crossterm::event::Event::Resize(w, h) => {
                             dirty = true;
                             self.handle_event(AppEvent::Resize(w, h)).await?;
@@ -576,6 +580,7 @@ impl App {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
+            AppEvent::Paste(text) => self.handle_paste(text),
             AppEvent::AgentStarted(_) => {
                 self.state
                     .focused_mut()

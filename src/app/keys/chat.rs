@@ -169,7 +169,9 @@ impl App {
             return Ok(SubmitOutcome::Continue);
         }
 
-        let input = self.state.input.buffer.trim().to_string();
+        // Expand any `[Pasted #N, L lines]` chips back to their real content so
+        // the model (and the saved message) get the full pasted text.
+        let input = self.state.input.expanded().trim().to_string();
         // Empty submission while defining a goal: nudge instead of silently ignoring it.
         if input.is_empty()
             && self.state.goal.mode
@@ -186,8 +188,7 @@ impl App {
             self.state.push_system(&format!(
                 "Your {what} is empty — type something before pressing Enter."
             ));
-            self.state.input.buffer.clear();
-            self.state.input.cursor = 0;
+            self.state.input.clear_buffer();
         }
         if input.is_empty() {
             return Ok(SubmitOutcome::Continue);
@@ -198,9 +199,7 @@ impl App {
         self.state.error_count = 0;
         self.state.last_error = None;
 
-        self.state.input.buffer.clear();
-        self.state.input.cursor = 0;
-        self.state.input.selection_anchor = None;
+        self.state.input.clear_buffer();
         self.state.autocomplete = AutocompleteState::default();
         self.state.input.history_index = None;
         // Update the in-memory recall list synchronously (up-arrow must
