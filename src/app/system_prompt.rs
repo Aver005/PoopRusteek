@@ -5,15 +5,17 @@
 //! workspace path — taken as explicit narrow parameters rather than reaching
 //! into all of `App`.
 
-use crate::config::McpSchemaMode;
+use crate::config::{McpSchemaMode, SkillInjectionMode};
 use crate::mcp::MCPManager;
 use crate::prompts::PromptFiles;
 use crate::skills::SkillDefinition;
 use crate::tools::registry::ToolRegistry;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build(
     prompts: &PromptFiles,
     skills: &[SkillDefinition],
+    skills_injection: SkillInjectionMode,
     tools: &ToolRegistry,
     mcp: &tokio::sync::Mutex<MCPManager>,
     mcp_schema_mode: McpSchemaMode,
@@ -40,9 +42,10 @@ pub async fn build(
     let mcp_guard = mcp.lock().await;
     let all_mcp_tools = mcp_guard.get_all_tools();
     let all_mcp_resources = mcp_guard.get_all_resources();
+    let mcp_deferred = mcp_schema_mode.deferred_for(all_mcp_tools.len());
     let mcp_tool_section = if all_mcp_tools.is_empty() {
         "- none".to_string()
-    } else if mcp_schema_mode.deferred_for(all_mcp_tools.len()) {
+    } else if mcp_deferred {
         // Deferred mode: a server-level summary ONLY — individual tools are
         // not listed at all. Semantic hints attach full definitions of the
         // tools relevant to each request, and `tool_search` covers explicit
@@ -82,6 +85,14 @@ pub async fn build(
     };
     let mcp_resource_section = if all_mcp_resources.is_empty() {
         String::new()
+    } else if mcp_deferred {
+        // Same rationale as deferred tool schemas: an itemized resource
+        // catalog is up-front context spend with no read path in the agent
+        // loop today — a count is enough.
+        format!(
+            "\n\n{} MCP resource(s) from the connected servers exist but are not listed here.",
+            all_mcp_resources.len()
+        )
     } else {
         let mut lines = vec!["\n\n### Available MCP resources:".to_string()];
         for r in &all_mcp_resources {
@@ -104,12 +115,28 @@ pub async fn build(
         .replace("{{builtin_tools}}", &builtin_section)
         .replace("{{mcp_tools}}", &mcp_section);
 
-    let skills_section = crate::skills::discovery::load_enabled_skills_content(skills);
+    let skills_section =
+        crate::skills::discovery::load_enabled_skills_content(skills, skills_injection);
 
-    format!(
+    let assembled = format!(
         "{}\n\n{}{}",
         base_prompt.trim(),
         tools_prompt.trim(),
         skills_section
-    )
+    );
+    // Prompt-size telemetry: every DeepSeek session pays this up front as
+    // flat text, so section growth is worth noticing before users do.
+    crate::debug_log::log(
+        "system_prompt.assembled",
+        format!(
+            "bytes: base={} tools={} builtin_defs={} mcp={} skills={} total={}",
+            base_prompt.len(),
+            tools_prompt.len(),
+            builtin_section.len(),
+            mcp_section.len(),
+            skills_section.len(),
+            assembled.len()
+        ),
+    );
+    assembled
 }

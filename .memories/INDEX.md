@@ -1,5 +1,5 @@
 # .memories INDEX
-> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-06 (BLAZE perf pass: background MCP startup, incremental stream stripping, render row-cache + viewport culling, off-loop persistence worker — clippy 0, tests 364, MSRV 1.91)
+> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-13 (prompt diet + hint-delivery CRITICAL fix: tail-batch wire format, skills injection modes, byte-budget tests — clippy 0, tests 434, MSRV 1.91)
 
 > ⚠️ `CLAUDE.md` at the repo root is now the auto-loaded bridge into this folder — **Claude Code**
 > reads it automatically and it points here. The **app itself** still does **NOT** auto-load

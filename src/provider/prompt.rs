@@ -54,83 +54,117 @@ fn format_history_message(message: &ChatMessage) -> String {
     format!("[{role}]\n{}", message.content)
 }
 
+/// Trailing one-line format anchor appended to every non-empty send. The
+/// system prompt is delivered once per session and then only lives far back
+/// in DeepSeek's server-side context; a weak model holds the tool-call
+/// format by recency far better than by primacy, and this costs ~60 tokens
+/// per turn.
+const FORMAT_REMINDER: &str = "[Напоминание формата: инструменты вызывай только блоком <tool_use><name>…</name><arguments>{JSON}</arguments></tool_use>, после </tool_use> — стоп. Имена инструментов не изобретай, результаты не выдумывай — жди TOOL RESULT.]";
+
+/// Index where the "new input" tail begins: everything after the last
+/// assistant message. That tail is what a continuing session actually needs
+/// to send — typically one user message, a batch of tool results, or an
+/// advisory system note (semantic hint) followed by the user message.
+fn tail_start(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .map(|i| i + 1)
+        .unwrap_or(0)
+}
+
+/// Render one tail message as a labeled section. `None` for empty user/system
+/// content (nothing to say) and for assistant messages (excluded from the
+/// tail by construction). Tool results keep an explicit section even when
+/// empty so the model sees the call completed.
+fn format_tail_message(message: &ChatMessage) -> Option<String> {
+    match message.role {
+        Role::Tool => Some(format!(
+            "### TOOL RESULT: {}\n{}",
+            message.name.as_deref().unwrap_or("unknown"),
+            message.content
+        )),
+        Role::User if !message.content.is_empty() => {
+            Some(format!("### USER INPUT\n{}", message.content))
+        }
+        Role::System if !message.content.is_empty() => {
+            Some(format!("### NOTE\n{}", message.content))
+        }
+        _ => None,
+    }
+}
+
+fn render_tail(tail: &[ChatMessage]) -> String {
+    tail.iter()
+        .filter_map(format_tail_message)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// True when the local transcript holds exactly one real conversational
+/// message (the newest user input) — i.e. this is the first send of a brand
+/// new conversation on a possibly-reused provider session. Advisory system
+/// notes (semantic hints) are not conversational and don't count.
+pub(crate) fn is_first_conversational_send(non_system_messages: &[ChatMessage]) -> bool {
+    non_system_messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .count()
+        == 1
+}
+
 /// Build the flat prompt string sent to DeepSeek.
 ///
-/// On the first turn of a session (`system_sent_for_session == false`) the
-/// system prompt and prior turns are embedded as local memory. On later turns
-/// only the newest user input or tool-result batch is sent, since DeepSeek
-/// retains the rest server-side.
+/// On the first send of a session (`system_sent_for_session == false`) the
+/// system prompt and prior turns are embedded as local memory. On later sends
+/// only the tail after the last assistant message goes out (the newest user
+/// input, tool-result batch, and any system note), since DeepSeek retains the
+/// rest server-side. A user message in the tail always renders as its own
+/// `### USER INPUT` section — system notes must never displace it.
 pub(crate) fn build_prompt(
     messages: &[ChatMessage],
     system_prompt: &str,
     system_sent_for_session: bool,
 ) -> String {
-    let Some(last_message) = messages.last() else {
+    if messages.is_empty() {
         return system_prompt.trim().to_string();
-    };
-
-    if !system_sent_for_session {
-        let mut parts = Vec::new();
-
-        if !system_prompt.trim().is_empty() {
-            parts.push(system_prompt.trim().to_string());
-        }
-
-        if messages.len() > 1 {
-            let history = messages[..messages.len() - 1]
-                .iter()
-                .map(format_history_message)
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            parts.push(String::new());
-            parts.push("### LOCAL MEMORY".to_string());
-            parts.push(history);
-        }
-
-        if last_message.role == Role::Tool {
-            parts.push(String::new());
-            parts.push(format!(
-                "### TOOL RESULT: {}",
-                last_message.name.as_deref().unwrap_or("unknown")
-            ));
-            parts.push(last_message.content.clone());
-        } else if !last_message.content.is_empty() {
-            parts.push(String::new());
-            parts.push("### USER INPUT".to_string());
-            parts.push(last_message.content.clone());
-        }
-
-        return parts.join("\n");
     }
 
-    if last_message.role == Role::Tool {
-        let mut tool_batch = Vec::new();
-        for message in messages.iter().rev() {
-            if message.role != Role::Tool {
-                break;
-            }
-            tool_batch.push(message);
-        }
-        tool_batch.reverse();
+    let tail_from = tail_start(messages);
+    let tail = render_tail(&messages[tail_from..]);
 
-        return tool_batch
-            .into_iter()
-            .map(|message| {
-                format!(
-                    "### TOOL RESULT: {}\n{}",
-                    message.name.as_deref().unwrap_or("unknown"),
-                    message.content
-                )
-            })
+    if system_sent_for_session {
+        if tail.is_empty() {
+            return tail;
+        }
+        return format!("{tail}\n\n{FORMAT_REMINDER}");
+    }
+
+    let mut parts = Vec::new();
+
+    if !system_prompt.trim().is_empty() {
+        parts.push(system_prompt.trim().to_string());
+    }
+
+    if tail_from > 0 {
+        let history = messages[..tail_from]
+            .iter()
+            .map(format_history_message)
             .collect::<Vec<_>>()
             .join("\n\n");
+        parts.push(String::new());
+        parts.push("### LOCAL MEMORY".to_string());
+        parts.push(history);
     }
 
-    if last_message.content.is_empty() {
-        return last_message.content.clone();
+    if !tail.is_empty() {
+        parts.push(String::new());
+        parts.push(tail);
+        parts.push(String::new());
+        parts.push(FORMAT_REMINDER.to_string());
     }
 
-    format!("### USER INPUT\n{}", last_message.content)
+    parts.join("\n")
 }
 
 /// Map a model name + session position to DeepSeek's `model_type` field.
@@ -198,21 +232,99 @@ mod tests {
             ChatMessage::user("new"),
         ];
         let prompt = build_prompt(&messages, "SYS", true);
-        assert_eq!(prompt, "### USER INPUT\nnew");
+        assert_eq!(prompt, format!("### USER INPUT\nnew\n\n{FORMAT_REMINDER}"));
+        assert!(!prompt.contains("old")); // server already has earlier turns
     }
 
     #[test]
     fn later_turn_batches_trailing_tool_results() {
         let messages = vec![
             ChatMessage::user("q"),
+            ChatMessage::assistant("<tool_use>…</tool_use>"),
             ChatMessage::tool_with_display("id1", "bash", "out-a", "out-a", false),
             ChatMessage::tool_with_display("id2", "grep", "out-b", "out-b", false),
         ];
         let prompt = build_prompt(&messages, "SYS", true);
         assert_eq!(
             prompt,
-            "### TOOL RESULT: bash\nout-a\n\n### TOOL RESULT: grep\nout-b"
+            format!(
+                "### TOOL RESULT: bash\nout-a\n\n### TOOL RESULT: grep\nout-b\n\n{FORMAT_REMINDER}"
+            )
         );
+    }
+
+    /// Regression: the semantic hint is inserted *before* the newest user
+    /// message; the user text must go out as its own `### USER INPUT`
+    /// section, after the hint's `### NOTE`.
+    #[test]
+    fn hint_before_user_keeps_user_input_last() {
+        let messages = vec![
+            ChatMessage::user("old"),
+            ChatMessage::assistant("a"),
+            ChatMessage::system("[Hint] maybe use skill X"),
+            ChatMessage::user("real question"),
+        ];
+        let prompt = build_prompt(&messages, "SYS", true);
+        assert_eq!(
+            prompt,
+            format!(
+                "### NOTE\n[Hint] maybe use skill X\n\n### USER INPUT\nreal question\n\n{FORMAT_REMINDER}"
+            )
+        );
+    }
+
+    /// Regression for the original bug: a trailing system note after the
+    /// user message used to be sent as the sole `### USER INPUT`, silently
+    /// dropping the user's actual message.
+    #[test]
+    fn trailing_system_note_never_displaces_user_input() {
+        let messages = vec![
+            ChatMessage::user("old"),
+            ChatMessage::assistant("a"),
+            ChatMessage::user("real question"),
+            ChatMessage::system("[Hint] maybe use skill X"),
+        ];
+        let prompt = build_prompt(&messages, "SYS", true);
+        assert!(prompt.contains("### USER INPUT\nreal question"));
+        assert!(prompt.contains("### NOTE\n[Hint] maybe use skill X"));
+    }
+
+    #[test]
+    fn first_send_renders_hint_as_note_not_memory() {
+        let messages = vec![
+            ChatMessage::system("[Hint] maybe use skill X"),
+            ChatMessage::user("hello"),
+        ];
+        let prompt = build_prompt(&messages, "SYSTEM PROMPT", false);
+        assert!(prompt.starts_with("SYSTEM PROMPT"));
+        assert!(prompt.contains("### NOTE\n[Hint] maybe use skill X"));
+        assert!(prompt.contains("### USER INPUT\nhello"));
+        assert!(!prompt.contains("### LOCAL MEMORY"));
+    }
+
+    #[test]
+    fn empty_user_content_on_later_turn_sends_nothing() {
+        let messages = vec![
+            ChatMessage::user("old"),
+            ChatMessage::assistant("a"),
+            ChatMessage::user(""),
+        ];
+        assert_eq!(build_prompt(&messages, "SYS", true), "");
+    }
+
+    #[test]
+    fn first_conversational_send_ignores_system_notes() {
+        assert!(is_first_conversational_send(&[ChatMessage::user("hi")]));
+        assert!(is_first_conversational_send(&[
+            ChatMessage::system("[Hint] x"),
+            ChatMessage::user("hi"),
+        ]));
+        assert!(!is_first_conversational_send(&[
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("a"),
+            ChatMessage::user("more"),
+        ]));
+        assert!(!is_first_conversational_send(&[]));
     }
 
     #[test]

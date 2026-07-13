@@ -65,6 +65,7 @@ impl App {
         let system_prompt = super::system_prompt::build(
             &self.prompts,
             &self.skills,
+            self.config.skills.injection,
             &self.tools,
             &self.mcp,
             self.effective_mcp_schema_mode(),

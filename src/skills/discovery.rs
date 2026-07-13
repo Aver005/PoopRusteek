@@ -293,21 +293,44 @@ fn prompt_skill_from_content(
     })
 }
 
-pub fn load_enabled_skills_content(skills: &[SkillDefinition]) -> String {
+pub fn load_enabled_skills_content(
+    skills: &[SkillDefinition],
+    injection: crate::config::SkillInjectionMode,
+) -> String {
     let enabled: Vec<_> = skills.iter().filter(|s| s.enabled).collect();
     if enabled.is_empty() {
         return String::new();
     }
 
+    let total_content_bytes: usize = enabled.iter().map(|s| s.content.len()).sum();
     let mut sections = Vec::new();
     sections.push("\n\n---\n\n# Active Skills".to_string());
 
-    for skill in &enabled {
+    if injection.summary_for(total_content_bytes) {
+        // Compact list: full content stays out of the prompt; the model
+        // pulls a skill in with `skill {"action":"load"}` when the task
+        // calls for it (the per-turn semantic hint points at the match).
         sections.push(format!(
-            "\n## Skill: {}\n{}\n",
-            skill.name,
-            skill.content.trim()
+            "\nАктивных скиллов: {}. Их полный текст в промпт не включён — перед задачей, которую скилл покрывает, загрузи его: `skill` c {{\"action\":\"load\",\"name\":\"<slug>\"}}.\n",
+            enabled.len()
         ));
+        for skill in &enabled {
+            let description = if skill.description.trim().is_empty() {
+                skill.name.as_str()
+            } else {
+                skill.description.trim()
+            };
+            sections.push(format!("- `{}` — {}", skill.slug, description));
+        }
+        sections.push(String::new());
+    } else {
+        for skill in &enabled {
+            sections.push(format!(
+                "\n## Skill: {}\n{}\n",
+                skill.name,
+                skill.content.trim()
+            ));
+        }
     }
 
     sections.push("\n---\n".to_string());
@@ -364,5 +387,56 @@ mod tests {
         assert_eq!(skill.slug, "role-creator");
         assert_eq!(skill.name, "Role Creator");
         assert_eq!(skill.content, "body");
+    }
+
+    fn enabled_skill(slug: &str, content: &str) -> SkillDefinition {
+        SkillDefinition {
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            description: format!("{slug} description"),
+            source: SkillSource::BuiltIn,
+            content: content.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn small_enabled_skills_inject_full_content_in_auto_mode() {
+        use crate::config::SkillInjectionMode;
+        let skills = vec![enabled_skill("tiny", "full body here")];
+        let section = load_enabled_skills_content(&skills, SkillInjectionMode::Auto);
+        assert!(section.contains("full body here"));
+        assert!(section.contains("## Skill: tiny"));
+    }
+
+    #[test]
+    fn oversized_enabled_skills_fall_back_to_summary_in_auto_mode() {
+        use crate::config::SkillInjectionMode;
+        let big = "x".repeat(SkillInjectionMode::AUTO_FULL_BUDGET_BYTES + 1);
+        let skills = vec![enabled_skill("huge", &big)];
+        let section = load_enabled_skills_content(&skills, SkillInjectionMode::Auto);
+        assert!(!section.contains(&big), "full content must stay out");
+        assert!(section.contains("`huge` — huge description"));
+        assert!(section.contains("skill"), "must point at the skill tool");
+    }
+
+    #[test]
+    fn summary_mode_lists_instead_of_inlining_regardless_of_size() {
+        use crate::config::SkillInjectionMode;
+        let skills = vec![enabled_skill("tiny", "full body here")];
+        let section = load_enabled_skills_content(&skills, SkillInjectionMode::Summary);
+        assert!(!section.contains("full body here"));
+        assert!(section.contains("`tiny` — tiny description"));
+    }
+
+    #[test]
+    fn disabled_skills_produce_no_section() {
+        use crate::config::SkillInjectionMode;
+        let mut skill = enabled_skill("off", "body");
+        skill.enabled = false;
+        assert_eq!(
+            load_enabled_skills_content(&[skill], SkillInjectionMode::Auto),
+            ""
+        );
     }
 }

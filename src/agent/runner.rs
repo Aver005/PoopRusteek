@@ -52,12 +52,16 @@ pub async fn run_agent_loop(
     // message copy — it is never persisted to the conversation. ONNX
     // inference is CPU-bound, so it runs on a blocking thread, not this
     // task; a not-yet-initialized matcher returns nothing instantly.
-    if let Some(user_text) = messages
+    //
+    // The hint is inserted *before* the user message it annotates, never
+    // after: providers that send only the newest tail (DeepSeek's flat
+    // prompt) must always deliver the user's text as the final USER INPUT —
+    // a trailing system note used to displace it entirely.
+    if let Some(user_idx) = messages
         .iter()
-        .rev()
-        .find(|m| matches!(m.role, Role::User) && !m.content.trim().is_empty())
-        .map(|m| m.content.clone())
+        .rposition(|m| matches!(m.role, Role::User) && !m.content.trim().is_empty())
     {
+        let user_text = messages[user_idx].content.clone();
         let service = Arc::clone(&semantic);
         let matches = tokio::task::spawn_blocking(move || service.match_prompt(&user_text))
             .await
@@ -79,7 +83,7 @@ pub async fn run_agent_loop(
                     described.join(", ")
                 ),
             );
-            messages.push(ChatMessage::system(&hint));
+            messages.insert(user_idx, ChatMessage::system(&hint));
         }
     }
 

@@ -1,6 +1,6 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-07-07 (fixed frozen-agent-on-malformed-tool_use + orphaned detached powershell; see RESOLVED)
+> Last updated: 2026-07-13 (fixed semantic-hint displacing the user's message on the DeepSeek wire; see RESOLVED)
 > Full audit digest: `reference/AUDIT-2026-07-02.md` (2026-07-02)
 
 ## CRITICAL
@@ -35,6 +35,8 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **Semantic hint silently displaced the user's message on the DeepSeek wire** (2026-07-13). `run_agent_loop` pushed the RAG hint as a `Role::System` message **after** the newest user message; `split_system_prompt` only extracts the *first* system message, and `build_prompt` on a continuing session sent **only `messages.last()`** — so whenever the hint fired, the request became `### USER INPUT\n[Hint…]` and the user's actual text never reached the server (on the first send it was mislabeled into `### LOCAL MEMORY` while the hint posed as USER INPUT). Symptom: model "hallucinating"/answering off-target exactly when semantic matching worked. **Fix:** (1) hint now inserted *before* the user message (`runner.rs` `rposition`+`insert`); (2) `build_prompt` rewritten around a **tail batch** — everything after the last assistant message goes out, each piece as its own section (`### NOTE` for system notes, `### USER INPUT`, `### TOOL RESULT: …`), so a user message can never be displaced regardless of ordering; (3) `should_reset` in `stream.rs` now uses role-aware `is_first_conversational_send` (a hint no longer masks a fresh conversation); (4) every non-empty send gets a trailing one-line `FORMAT_REMINDER` (recency anchor for the tool-call format). Regression tests: `hint_before_user_keeps_user_input_last`, `trailing_system_note_never_displaces_user_input`, `first_send_renders_hint_as_note_not_memory`. `→ src/provider/prompt.rs`, `src/provider/deepseek/stream.rs`, `src/agent/runner.rs`. Write-up: `JOURNAL/2026-07-13.md`.
 
 - ✅ **Frozen agent on malformed `<tool_use>` + orphaned detached powershell** (2026-07-07). DeepSeek emitted a `<tool_use>` with swapped `</tool_use>`/`</arguments>` closing tags **and** invalid JSON (unescaped quotes around a Windows path). `parse_tool_calls` silently dropped it (log-only warn), `strip_tool_calls` erased it → empty turn → `AgentDone` with nothing shown/run; every later turn repeated → "frozen". The same unbalanced quote hung `powershell -Command` (unterminated string, `stdin=null`, `DETACHED_PROCESS`), and detached jobs are only reaped on graceful exit → a force-close orphaned 6 of them. **Fix:** (1) `parse_tool_calls_with_errors` + tolerant `extract_arguments` (swapped tags, dropped `<arguments>`, `{"name","arguments"}` shape) — broken JSON becomes a diagnostic, never a guessed call; (2) runner feeds the parse error back and retries (`MAX_MALFORMED_TOOL_RETRIES=2`) instead of ending silently; (3) Windows Job Object with `KILL_ON_JOB_CLOSE` binds every background/PTY child so a force-close kills the tree. `→ src/agent/tool_parser.rs`, `src/agent/runner.rs`, `src/tools/background/types.rs` (`win_job`) + `spawn.rs`. Write-up: `JOURNAL/2026-07-07.md` (pt.2).
 

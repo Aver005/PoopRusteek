@@ -56,6 +56,30 @@ pub fn resolve_existing_asset_path(relative_path: &str) -> AppResult<PathBuf> {
     )))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Prompt-bloat budget. The two core templates are fixed per-session
+    /// overhead every DeepSeek session pays up front as flat text (the web
+    /// API has no system role), and an oversized instruction block measurably
+    /// degrades a weak model's adherence. Deliberate growth is fine — trim
+    /// something else or bump the budget consciously in the same commit.
+    #[test]
+    fn core_prompt_templates_stay_within_byte_budget() {
+        assert!(
+            EMBEDDED_BASE_PROMPT.len() < 5_000,
+            "base.prompt.md grew to {} bytes (budget 5000)",
+            EMBEDDED_BASE_PROMPT.len()
+        );
+        assert!(
+            EMBEDDED_TOOLS_PROMPT.len() < 4_500,
+            "tools.prompt.md grew to {} bytes (budget 4500)",
+            EMBEDDED_TOOLS_PROMPT.len()
+        );
+    }
+}
+
 fn collect_asset_candidates(relative_path: &str) -> Vec<PathBuf> {
     let sanitized = relative_path.trim_start_matches(['.', '/', '\\']);
     let mut candidates = Vec::new();

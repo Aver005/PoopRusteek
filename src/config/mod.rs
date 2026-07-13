@@ -318,6 +318,42 @@ impl Default for McpConfig {
 pub struct SkillsConfig {
     pub enabled: Vec<String>,
     pub paths: Vec<String>,
+    /// How enabled skills reach the system prompt — see [`SkillInjectionMode`].
+    #[serde(default)]
+    pub injection: SkillInjectionMode,
+}
+
+/// Whether enabled skills are injected into the system prompt as full
+/// content or as a compact `slug — description` list the model loads on
+/// demand via the `skill` tool (the per-turn semantic hint suggests the
+/// relevant one automatically). Full content is fine for a couple of small
+/// skills and pure prompt bloat beyond that.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillInjectionMode {
+    /// Full content while the combined size stays under
+    /// [`Self::AUTO_FULL_BUDGET_BYTES`]; compact list beyond it.
+    #[default]
+    Auto,
+    /// Always inline full content (pre-summary behavior).
+    Full,
+    /// Always inject the compact list.
+    Summary,
+}
+
+impl SkillInjectionMode {
+    /// `Auto` switches to the compact list once the enabled skills' combined
+    /// content outgrows this many bytes.
+    pub const AUTO_FULL_BUDGET_BYTES: usize = 8 * 1024;
+
+    /// Resolve the mode against the combined content size of enabled skills.
+    pub fn summary_for(self, total_content_bytes: usize) -> bool {
+        match self {
+            SkillInjectionMode::Full => false,
+            SkillInjectionMode::Summary => true,
+            SkillInjectionMode::Auto => total_content_bytes > Self::AUTO_FULL_BUDGET_BYTES,
+        }
+    }
 }
 
 /// Semantic matching (`[semantic]`) over skills and MCP tools. Enabled by

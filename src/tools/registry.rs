@@ -105,4 +105,26 @@ mod tests {
         let registry = ToolRegistry::new();
         assert_eq!(registry.get("powershell").is_some(), cfg!(windows));
     }
+
+    /// Prompt-bloat budget for the formatted builtin definitions — they are
+    /// injected verbatim into every system prompt. Measured on the worst
+    /// case (Windows: both shells + the skill tool; the semantic pair adds
+    /// ~1.5 KB more at runtime). Bump only deliberately.
+    #[test]
+    fn builtin_tool_definitions_stay_within_byte_budget() {
+        let registry = ToolRegistry::new();
+        registry.update_skills(Vec::new());
+        let total: usize = registry
+            .definitions()
+            .iter()
+            .map(|tool| {
+                crate::util::format_tool_definition(&tool.name, &tool.description, &tool.parameters)
+                    .len()
+            })
+            .sum();
+        assert!(
+            total < 10_000,
+            "formatted builtin tool definitions grew to {total} bytes (budget 10000)"
+        );
+    }
 }

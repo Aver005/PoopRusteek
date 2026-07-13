@@ -88,7 +88,10 @@ Key subsystems added on top of that core:
   index to the model on demand. **Deferred MCP schemas**: above 12 tools
   (`[semantic] mcp_schemas = auto`), the system prompt carries only a
   server-level summary (`<server> (N tools)`) — individual tools are not
-  enumerated; full definitions come from hints or `tool_search`.
+  enumerated; full definitions come from hints or `tool_search`. Enabled
+  skills follow the same idea (`[skills] injection = auto`): above 8 KB of
+  combined content the prompt carries a `slug — description` list and the
+  model `skill load`s on demand.
   The history index (`data_dir/semantic/history.json`) is a rebuildable cache
   over session files (per-session watermarks, model-stamp wipe); `/search`
   (View::Search) and `/rag` are the user-facing surfaces.

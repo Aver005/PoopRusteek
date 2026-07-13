@@ -49,6 +49,9 @@ cache_ttl = 300            # MCP tools/list cache TTL secs; set via /mcp ttl
 [skills]
 enabled = []               # list of enabled skill names
 paths = []                 # extra skill search dirs
+injection = "auto"         # auto | full | summary — how enabled skills reach the system prompt (SkillInjectionMode, added 2026-07-13).
+                           # full = inline content (old behavior); summary = compact `slug — description` list, model loads on demand via the
+                           # `skill` tool (per-turn semantic hint suggests the match); auto = full while combined content ≤ 8 KB (AUTO_FULL_BUDGET_BYTES), summary beyond
 
 [server]                   # API gateway (src/server/) — /serve, /server <port>, --serve, --proxy
 host = "127.0.0.1"         # loopback by default; widen deliberately

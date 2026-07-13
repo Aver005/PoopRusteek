@@ -114,7 +114,8 @@ impl DeepseekProvider {
                 .session_state
                 .lock()
                 .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
-            state.system_sent_for_session && non_system_messages.len() == 1
+            state.system_sent_for_session
+                && prompt::is_first_conversational_send(&non_system_messages)
         };
 
         let session = self.ensure_session(should_reset).await?;

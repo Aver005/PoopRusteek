@@ -74,10 +74,13 @@ Every PoW-gated call needs a solved challenge in the `x-ds-pow-response` header 
 
 ## PROMPT ASSEMBLY (`build_prompt`, `src/provider/prompt.rs`)
 
-DeepSeek web API takes a single `prompt` string, so history is flattened:
-- **First turn of a session** (`system_sent_for_session == false`): `system prompt` + `### LOCAL MEMORY` + flattened prior history + the newest turn. Inside `### LOCAL MEMORY`, each prior message is labelled by role via `format_history_message` → `[ASSISTANT]` / `[USER]` / `[SYSTEM]` / `[TOOL]`. The newest turn is then appended with a `### USER INPUT` or `### TOOL RESULT: {name}` marker.
-- **Subsequent turns**: only the newest turn is sent (DeepSeek retains the rest server-side) — `### USER INPUT`, or a batch of `### TOOL RESULT: {name}` blocks when the last messages are tool results.
-- So `### USER INPUT` / `### TOOL RESULT` mark **only the newest turn**; the `[ROLE]` labels are what appear inside the `### LOCAL MEMORY` history block. Don't conflate the two.
+DeepSeek web API takes a single `prompt` string, so history is flattened. Reworked 2026-07-13 around a **tail batch**: the "newest turn" is *everything after the last assistant message* (not just `messages.last()`), each piece rendered as its own section via `format_tail_message` — `### NOTE` (system notes, e.g. the semantic hint), `### USER INPUT`, `### TOOL RESULT: {name}`.
+- **First send of a session** (`system_sent_for_session == false`): `system prompt` + `### LOCAL MEMORY` + flattened history *before the tail* + the tail sections. Inside `### LOCAL MEMORY`, each prior message is labelled by role via `format_history_message` → `[ASSISTANT]` / `[USER]` / `[SYSTEM]` / `[TOOL]`.
+- **Subsequent sends**: only the tail is sent (DeepSeek retains the rest server-side).
+- **Every non-empty send ends with `FORMAT_REMINDER`** — a one-line RU recency anchor restating the `<tool_use>` format (~60 tokens/turn; a weak model holds format by recency far better than by primacy).
+- The tail design is the fix for the 2026-07-13 CRITICAL: a trailing system hint used to be sent as the sole `### USER INPUT`, silently dropping the user's message (see `BUGS.md` RESOLVED).
+- `is_first_conversational_send` (role-aware: system notes don't count) feeds `should_reset` in `stream.rs` — a hint accompanying the first user message must not mask a fresh conversation.
+- So `### USER INPUT` / `### TOOL RESULT` / `### NOTE` mark **only the newest tail**; the `[ROLE]` labels are what appear inside the `### LOCAL MEMORY` history block. Don't conflate the two.
 - **`### LOCAL MEMORY` is just a history-section label — it does NOT load `.memories/` files.** (Verified: nothing in `src/` reads `.memories/`.)
 - Code blocks > 300 chars are stripped to `[...]` via regex (`strip_long_code_blocks`) to save tokens.
 - **Request body** (`build_body`, `deepseek/stream.rs`) always sends the literal `"model": "deepseek-chat"`; the TUI's model string only drives `model_type` via `resolve_model_type(model, parent_message_id)` (`prompt.rs`): name contains `reasoner`/`expert` → `"expert"` (+ `thinking_enabled: true`); a chat model on the first turn (`parent_message_id == None`) → `"default"`; a chat model on later turns → `null`.
