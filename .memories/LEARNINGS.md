@@ -82,3 +82,13 @@
 
 ## BUILD
 - `lto="fat"`, `codegen-units=1`, `strip=true` (release). `wasmtime` for PoW, `portable-pty` for shells, `syntect`+`pulldown-cmark` for rendering.
+
+- **CI lints on a moving stable — keep the local toolchain current.**
+  `dtolnay/rust-toolchain@stable` in `ci.yml` resolves to the *latest*
+  stable on every run, so each ~6-week Rust release can promote new clippy
+  lints that a stale local toolchain never shows: local gates green, CI
+  `lint` red (first hit 2026-07-15: 1.97's `unneeded_wildcard_pattern` on
+  `{ result: _, .. }` while local was 1.96). After a Rust release day, run
+  `rustup update stable` before trusting a local `clippy -D warnings` run;
+  the `.githooks/pre-commit` hook uses the local toolchain too, so it
+  inherits the same blind spot until updated.
