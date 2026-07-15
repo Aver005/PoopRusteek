@@ -93,17 +93,8 @@ pub async fn run_agent_loop(
             ),
         );
         let _ = event_tx.send(AppEvent::BeginAssistantMessage(conversation));
-        let mut request_messages = Vec::with_capacity(messages.len() + 1);
-        request_messages.push(ChatMessage::system(&system_prompt));
-        request_messages.extend(messages.clone());
-
-        let request = CompletionRequest {
-            messages: request_messages,
-            model: model.clone(),
-            temperature,
-            max_tokens,
-            stream: true,
-        };
+        let request =
+            build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
 
         // Visible-delta emission rides the collector's progress callback:
         // strip tool-call syntax from the accumulated text and stream only
@@ -367,10 +358,7 @@ pub async fn run_agent_loop(
             // model must learn they were skipped, not reason from phantom
             // results it assumes came back.
             if call_index >= max_tools_per_step {
-                let skipped = format!(
-                    "Skipped: per-step tool-call limit of {max_tools_per_step} reached \
-                    ({total_calls} calls requested). Re-issue this call next step if still needed."
-                );
+                let skipped = tool_skip_message(max_tools_per_step, total_calls);
                 let tool_message = ChatMessage::tool_with_display(
                     &tool_id,
                     &tool_call.name,
@@ -510,34 +498,13 @@ pub async fn run_agent_loop(
                         conversation,
                         name: tool_call.name.clone(),
                     });
-                    if tool_call.name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
-                        // Resolve the client under a short-lived lock, then
-                        // call on the owned handle. Holding the manager mutex
-                        // across the network await froze the whole UI — the
-                        // event loop polls the same mutex for status counts.
-                        let client = { mcp.lock().await.client_for(&tool_call.name) };
-                        match client {
-                            Some((client, bare_name)) => match client
-                                .call_tool(&bare_name, tool_call.arguments.clone())
-                                .await
-                            {
-                                Ok(result) => (result.content, result.is_error),
-                                Err(error) => (error.to_string(), true),
-                            },
-                            None => (
-                                format!(
-                                    "MCP tool '{}' is not available (server not connected)",
-                                    tool_call.name
-                                ),
-                                true,
-                            ),
-                        }
-                    } else {
-                        let result = tools
-                            .execute(&tool_call.name, tool_call.arguments.clone())
-                            .await;
-                        (result.content, result.is_error)
-                    }
+                    dispatch_generic_tool(
+                        &tools,
+                        &mcp,
+                        &tool_call.name,
+                        tool_call.arguments.clone(),
+                    )
+                    .await
                 } else {
                     ("Execution denied by user.".to_string(), true)
                 }
@@ -609,6 +576,68 @@ pub async fn run_agent_loop(
         conversation,
         "Reached max agent steps before producing a final answer".to_string(),
     ));
+}
+
+/// Build one step's completion request: system prompt first, then the
+/// running history. Shared by the main and sub-agent loops (the two copies
+/// had already been flagged as drift-prone).
+pub(crate) fn build_step_request(
+    system_prompt: &str,
+    messages: &[ChatMessage],
+    model: &str,
+    temperature: f32,
+    max_tokens: u32,
+) -> CompletionRequest {
+    let mut request_messages = Vec::with_capacity(messages.len() + 1);
+    request_messages.push(ChatMessage::system(system_prompt));
+    request_messages.extend(messages.iter().cloned());
+    CompletionRequest {
+        messages: request_messages,
+        model: model.to_string(),
+        temperature,
+        max_tokens,
+        stream: true,
+    }
+}
+
+/// The explicit tool_result for a call dropped by the per-step limit — the
+/// model must learn it was skipped, not reason from phantom results it
+/// assumes came back. Was byte-identical in both loops before extraction.
+pub(crate) fn tool_skip_message(max_tools_per_step: usize, total_calls: usize) -> String {
+    format!(
+        "Skipped: per-step tool-call limit of {max_tools_per_step} reached \
+        ({total_calls} calls requested). Re-issue this call next step if still needed."
+    )
+}
+
+/// Execute a plain (non-meta) tool call. MCP tools resolve their client
+/// under a short-lived manager lock and call on the owned handle — holding
+/// the mutex across the network await froze the whole UI once (the event
+/// loop polls the same mutex for status counts); everything else goes to
+/// the builtin registry. Returns `(content, is_error)`; the sub-agent loop
+/// drops the flag and reports errors as plain result text.
+pub(crate) async fn dispatch_generic_tool(
+    tools: &ToolRegistry,
+    mcp: &tokio::sync::Mutex<MCPManager>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> (String, bool) {
+    if name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
+        let client = { mcp.lock().await.client_for(name) };
+        match client {
+            Some((client, bare_name)) => match client.call_tool(&bare_name, arguments).await {
+                Ok(result) => (result.content, result.is_error),
+                Err(error) => (error.to_string(), true),
+            },
+            None => (
+                format!("MCP tool '{name}' is not available (server not connected)"),
+                true,
+            ),
+        }
+    } else {
+        let result = tools.execute(name, arguments).await;
+        (result.content, result.is_error)
+    }
 }
 
 /// How many times, within one turn, a malformed `<tool_use>` block may be

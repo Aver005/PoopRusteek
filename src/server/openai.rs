@@ -12,7 +12,7 @@ use crate::config::ProviderProtocol;
 use crate::provider::openai_compat::{
     self, ChatCompletionRequest, CompletionMeta, ErrorResponse, ReasoningStreamSplitter,
 };
-use crate::provider::{ChatMessage, CompletionRequest, LLMProvider};
+use crate::provider::{ChatMessage, CompletionRequest, CompletionResponse, LLMProvider};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode, header};
@@ -201,22 +201,35 @@ async fn blocking_completion(
         .iter()
         .map(|message| message.content.clone())
         .collect();
+    let response = match run_blocking_completion(&provider, is_deepseek, request).await {
+        Ok(response) => response,
+        Err(error_response) => return error_response,
+    };
+    let prompt_refs: Vec<&str> = prompt_texts.iter().map(String::as_str).collect();
+    let fallback = openai_compat::estimated_usage(&prompt_refs, &response.content);
+    json_response(
+        StatusCode::OK,
+        &openai_compat::response_to_openai(&response, fallback, &meta),
+    )
+}
+
+/// Run a blocking completion and discard the per-request DeepSeek session;
+/// errors come back as a ready-to-return 500. Success-payload shaping is
+/// each dialect's own business — this is the half `blocking_completion`
+/// and `legacy_blocking` used to duplicate.
+async fn run_blocking_completion(
+    provider: &Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    request: CompletionRequest,
+) -> Result<CompletionResponse, Response<ApiBody>> {
     let result = provider.complete(request).await;
-    discard_deepseek_session(is_deepseek, &provider).await;
-    match result {
-        Ok(response) => {
-            let prompt_refs: Vec<&str> = prompt_texts.iter().map(String::as_str).collect();
-            let fallback = openai_compat::estimated_usage(&prompt_refs, &response.content);
-            json_response(
-                StatusCode::OK,
-                &openai_compat::response_to_openai(&response, fallback, &meta),
-            )
-        }
-        Err(error) => json_response(
+    discard_deepseek_session(is_deepseek, provider).await;
+    result.map_err(|error| {
+        json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &ErrorResponse::server_error(error.to_string()),
-        ),
-    }
+        )
+    })
 }
 
 /// Streaming path: respond immediately with an SSE body fed by a bridge
@@ -229,9 +242,18 @@ fn stream_completion(
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    let (body_tx, mut body_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-    tokio::spawn(bridge_stream(provider, is_deepseek, request, meta, body_tx));
+    sse_stream_response(move |body_tx| bridge_stream(provider, is_deepseek, request, meta, body_tx))
+}
 
+/// Respond immediately with an SSE body fed by a detached bridge task —
+/// the channel/poll_fn/header scaffolding both dialects used to duplicate.
+fn sse_stream_response<F, Fut>(bridge: F) -> Response<ApiBody>
+where
+    F: FnOnce(tokio::sync::mpsc::UnboundedSender<Bytes>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (body_tx, mut body_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    tokio::spawn(bridge(body_tx));
     let stream = futures::stream::poll_fn(move |task_context| {
         body_rx
             .poll_recv(task_context)
@@ -245,9 +267,10 @@ fn stream_completion(
         .expect("static response parts are valid")
 }
 
-/// Pump provider chunks into SSE frames. Runs detached from the HTTP
-/// response; a dropped `body_tx` receiver (client hung up) aborts the
-/// upstream call instead of streaming into the void.
+/// Chat-dialect frame shaping over [`drive_sse_bridge`]. Routes `<think>`
+/// reasoning into `reasoning_content` deltas live, so a reasoning model's
+/// chain-of-thought reaches clients in the right field instead of
+/// polluting the answer (see openai_compat::split_reasoning).
 async fn bridge_stream(
     provider: Arc<dyn LLMProvider>,
     is_deepseek: bool,
@@ -255,20 +278,84 @@ async fn bridge_stream(
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) {
+    drive_sse_bridge(
+        provider,
+        is_deepseek,
+        request,
+        body_tx,
+        |reasoning, content, is_first| {
+            if reasoning.is_empty() && content.is_empty() {
+                return None; // held back a partial tag — nothing to emit yet
+            }
+            Some(sse_data(&openai_compat::split_delta_chunk(
+                reasoning, content, is_first, &meta,
+            )))
+        },
+        // Flush any tail the splitter held (e.g. an unterminated `<think>`)
+        // as one more delta — even an errored stream delivers held-back text.
+        |reasoning, content, is_first| {
+            (!reasoning.is_empty() || !content.is_empty()).then(|| {
+                sse_data(&openai_compat::split_delta_chunk(
+                    reasoning, content, is_first, &meta,
+                ))
+            })
+        },
+        |_content, reason| sse_data(&openai_compat::final_chunk(reason, &meta)),
+    )
+    .await;
+}
+
+/// Idle backstop for the SSE bridges: provider-side read timeouts are a
+/// convention (every current provider configures 120s), not a guarantee —
+/// a silently stalled upstream must not pin a bridge task (and its client
+/// connection) forever. Mirrors the agent loop's idle guard in
+/// `agent/stream.rs`.
+const UPSTREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Everything both SSE bridges share: spawn the upstream completion into a
+/// chunk channel, pump chunks through the reasoning splitter, and handle
+/// client hang-up, the idle backstop, the upstream post-mortem, and the
+/// trailing `data: [DONE]`; the per-request DeepSeek session is discarded
+/// on every exit path. The dialects contribute only frame shaping:
+/// `delta_frame` renders one split delta (`None` = nothing to emit yet),
+/// `tail_frame` renders the splitter's flushed remainder (chat emits it as
+/// a delta, legacy returns `None` and folds it into its final frame), and
+/// `final_frame` renders the success terminator. `is_first` stays true
+/// until a delta has been sent — the chat dialect's first frame announces
+/// the assistant role.
+async fn drive_sse_bridge(
+    provider: Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    request: CompletionRequest,
+    body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    mut delta_frame: impl FnMut(&str, &str, bool) -> Option<Bytes> + Send,
+    tail_frame: impl FnOnce(&str, &str, bool) -> Option<Bytes> + Send,
+    final_frame: impl FnOnce(&str, &str) -> Bytes + Send,
+) {
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
     let upstream = {
         let provider = Arc::clone(&provider);
         tokio::spawn(async move { provider.complete_stream(request, chunk_tx).await })
     };
 
-    // Route `<think>` reasoning into `reasoning_content` deltas live, so a
-    // reasoning model's chain-of-thought reaches clients in the right field
-    // instead of polluting the answer (see openai_compat::split_reasoning).
     let mut splitter = ReasoningStreamSplitter::new();
-    let mut first = true;
     let mut finish_reason: Option<String> = None;
-    let mut client_gone = false;
-    while let Some(chunk) = chunk_rx.recv().await {
+    let mut sent_any = false;
+    let mut aborted = false;
+    loop {
+        let chunk = match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, chunk_rx.recv()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break, // upstream closed its sender — post-mortem below
+            Err(_elapsed) => {
+                upstream.abort();
+                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(format!(
+                    "upstream produced no data for {}s; stream aborted",
+                    UPSTREAM_IDLE_TIMEOUT.as_secs()
+                ))));
+                aborted = true;
+                break;
+            }
+        };
         if chunk.finish_reason.is_some() {
             finish_reason = chunk.finish_reason.clone();
         }
@@ -276,32 +363,27 @@ async fn bridge_stream(
             continue;
         }
         let (reasoning, content) = splitter.push(&chunk.content);
-        if reasoning.is_empty() && content.is_empty() {
-            continue; // held back a partial tag — nothing to emit yet
-        }
-        let frame = sse_data(&openai_compat::split_delta_chunk(
-            &reasoning, &content, first, &meta,
-        ));
-        first = false;
+        let Some(frame) = delta_frame(&reasoning, &content, !sent_any) else {
+            continue;
+        };
+        sent_any = true;
         if body_tx.send(frame).is_err() {
-            client_gone = true;
+            // Client hung up — stop paying for tokens nobody reads.
             upstream.abort();
+            aborted = true;
             break;
         }
     }
 
-    if !client_gone {
-        // Flush any tail the splitter held (e.g. an unterminated `<think>`).
+    if !aborted {
         let (reasoning, content) = splitter.finish();
-        if !reasoning.is_empty() || !content.is_empty() {
-            let _ = body_tx.send(sse_data(&openai_compat::split_delta_chunk(
-                &reasoning, &content, first, &meta,
-            )));
+        if let Some(frame) = tail_frame(&reasoning, &content, !sent_any) {
+            let _ = body_tx.send(frame);
         }
         match upstream.await {
             Ok(Ok(())) => {
                 let reason = finish_reason.as_deref().unwrap_or("stop");
-                let _ = body_tx.send(sse_data(&openai_compat::final_chunk(reason, &meta)));
+                let _ = body_tx.send(final_frame(&content, reason));
                 let _ = body_tx.send(Bytes::from_static(b"data: [DONE]\n\n"));
             }
             Ok(Err(error)) => {
@@ -438,35 +520,29 @@ async fn legacy_blocking(
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    let result = provider.complete(request).await;
-    discard_deepseek_session(is_deepseek, &provider).await;
-    match result {
-        Ok(response) => {
-            let (_reasoning, text) = openai_compat::split_reasoning(&response.content);
-            let usage = response
-                .usage
-                .unwrap_or_else(|| openai_compat::estimated_usage(&[prompt], &text));
-            let finish = response
-                .finish_reason
-                .clone()
-                .unwrap_or_else(|| "stop".to_string());
-            json_response(
-                StatusCode::OK,
-                &serde_json::json!({
-                    "id": meta.id,
-                    "object": "text_completion",
-                    "created": meta.created,
-                    "model": meta.model,
-                    "choices": [legacy_choice(&text, Some(&finish))],
-                    "usage": usage,
-                }),
-            )
-        }
-        Err(error) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorResponse::server_error(error.to_string()),
-        ),
-    }
+    let response = match run_blocking_completion(&provider, is_deepseek, request).await {
+        Ok(response) => response,
+        Err(error_response) => return error_response,
+    };
+    let (_reasoning, text) = openai_compat::split_reasoning(&response.content);
+    let usage = response
+        .usage
+        .unwrap_or_else(|| openai_compat::estimated_usage(&[prompt], &text));
+    let finish = response
+        .finish_reason
+        .clone()
+        .unwrap_or_else(|| "stop".to_string());
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "id": meta.id,
+            "object": "text_completion",
+            "created": meta.created,
+            "model": meta.model,
+            "choices": [legacy_choice(&text, Some(&finish))],
+            "usage": usage,
+        }),
+    )
 }
 
 fn legacy_stream(
@@ -475,29 +551,15 @@ fn legacy_stream(
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    let (body_tx, mut body_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-    tokio::spawn(bridge_legacy_stream(
-        provider,
-        is_deepseek,
-        request,
-        meta,
-        body_tx,
-    ));
-    let stream = futures::stream::poll_fn(move |task_context| {
-        body_rx
-            .poll_recv(task_context)
-            .map(|next| next.map(|bytes| Ok(Frame::data(bytes))))
-    });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(StreamBody::new(stream).boxed())
-        .expect("static response parts are valid")
+    sse_stream_response(move |body_tx| {
+        bridge_legacy_stream(provider, is_deepseek, request, meta, body_tx)
+    })
 }
 
-/// Legacy streaming: `text_completion` chunks. Reasoning is dropped (no
-/// field), so only the post-`<think>` content is streamed as `text`.
+/// Legacy `text_completion` frame shaping over [`drive_sse_bridge`].
+/// Reasoning is dropped (the legacy shape has no field for it), so only
+/// the post-`<think>` content is streamed as `text`; the splitter's tail
+/// rides in the final frame together with the finish reason.
 async fn bridge_legacy_stream(
     provider: Arc<dyn LLMProvider>,
     is_deepseek: bool,
@@ -505,12 +567,6 @@ async fn bridge_legacy_stream(
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) {
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
-    let upstream = {
-        let provider = Arc::clone(&provider);
-        tokio::spawn(async move { provider.complete_stream(request, chunk_tx).await })
-    };
-
     let text_chunk = |text: &str, finish: Option<&str>| {
         sse_data(&serde_json::json!({
             "id": meta.id,
@@ -520,49 +576,21 @@ async fn bridge_legacy_stream(
             "choices": [legacy_choice(text, finish)],
         }))
     };
-
-    let mut splitter = ReasoningStreamSplitter::new();
-    let mut finish_reason: Option<String> = None;
-    let mut client_gone = false;
-    while let Some(chunk) = chunk_rx.recv().await {
-        if chunk.finish_reason.is_some() {
-            finish_reason = chunk.finish_reason.clone();
-        }
-        if chunk.content.is_empty() {
-            continue;
-        }
-        // Only the content half becomes `text`; reasoning is discarded.
-        let (_reasoning, content) = splitter.push(&chunk.content);
-        if content.is_empty() {
-            continue;
-        }
-        if body_tx.send(text_chunk(&content, None)).is_err() {
-            client_gone = true;
-            upstream.abort();
-            break;
-        }
-    }
-
-    if !client_gone {
-        let (_reasoning, content) = splitter.finish();
-        match upstream.await {
-            Ok(Ok(())) => {
-                let reason = finish_reason.as_deref().unwrap_or("stop");
-                let _ = body_tx.send(text_chunk(&content, Some(reason)));
-                let _ = body_tx.send(Bytes::from_static(b"data: [DONE]\n\n"));
+    drive_sse_bridge(
+        provider,
+        is_deepseek,
+        request,
+        body_tx,
+        |_reasoning, content, _is_first| {
+            if content.is_empty() {
+                return None;
             }
-            Ok(Err(error)) => {
-                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(error.to_string())));
-            }
-            Err(join_error) => {
-                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(format!(
-                    "completion task failed: {join_error}"
-                ))));
-            }
-        }
-    }
-
-    discard_deepseek_session(is_deepseek, &provider).await;
+            Some(text_chunk(content, None))
+        },
+        |_reasoning, _content, _is_first| None,
+        |content, reason| text_chunk(content, Some(reason)),
+    )
+    .await;
 }
 
 // ── Passthrough (`/v1/embeddings`, `/v1/rerank`) ───────────────────────

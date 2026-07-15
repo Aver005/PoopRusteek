@@ -6,11 +6,14 @@
 //! (no user is watching), and `task`/`question` are refused so a sub-agent
 //! can't spawn sub-agents or block on a prompt (depth limit of 1).
 
-use crate::agent::runner::{MAX_MALFORMED_TOOL_RETRIES, malformed_tool_feedback};
+use crate::agent::runner::{
+    MAX_MALFORMED_TOOL_RETRIES, build_step_request, dispatch_generic_tool, malformed_tool_feedback,
+    tool_skip_message,
+};
 use crate::agent::stream::{StreamEnd, collect_stream};
 use crate::agent::tool_parser::{parse_tool_calls_with_errors, strip_tool_calls};
 use crate::mcp::MCPManager;
-use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
+use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
 use std::sync::Arc;
@@ -32,17 +35,8 @@ pub async fn run_sub_agent(
     let mut malformed_retries: u32 = 0;
 
     for _step in 0..max_steps {
-        let mut request_messages = Vec::with_capacity(messages.len() + 1);
-        request_messages.push(ChatMessage::system(&system_prompt));
-        request_messages.extend(messages.clone());
-
-        let request = CompletionRequest {
-            messages: request_messages,
-            model: model.clone(),
-            temperature,
-            max_tokens,
-            stream: true,
-        };
+        let request =
+            build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
 
         // Headless: no progress callback — nothing streams to a UI.
         let outcome = collect_stream(&provider, request, |_| {}).await;
@@ -92,40 +86,20 @@ pub async fn run_sub_agent(
             if call_index >= max_tools_per_step {
                 messages.push(ChatMessage::tool(
                     &tool_id,
-                    &format!(
-                        "Skipped: per-step tool-call limit of {max_tools_per_step} reached \
-                        ({total_calls} calls requested). Re-issue this call next step if still needed."
-                    ),
+                    &tool_skip_message(max_tools_per_step, total_calls),
                 ));
                 continue;
             }
             let result = if tool_call.name == TASK_TOOL_NAME || tool_call.name == QUESTION_TOOL_NAME
             {
                 format!("'{}' is not available inside a sub-agent.", tool_call.name)
-            } else if tool_call.name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
-                // Same lock discipline as the main loop: never hold the
-                // manager mutex across the network await.
-                let client = { mcp.lock().await.client_for(&tool_call.name) };
-                match client {
-                    Some((client, bare_name)) => {
-                        match client
-                            .call_tool(&bare_name, tool_call.arguments.clone())
-                            .await
-                        {
-                            Ok(r) => r.content,
-                            Err(e) => e.to_string(),
-                        }
-                    }
-                    None => format!(
-                        "MCP tool '{}' is not available (server not connected)",
-                        tool_call.name
-                    ),
-                }
             } else {
-                tools
-                    .execute(&tool_call.name, tool_call.arguments.clone())
+                // Shared with the main loop (same short-lock MCP discipline).
+                // A sub-agent reports errors as plain result text, so the
+                // error flag is dropped.
+                dispatch_generic_tool(&tools, &mcp, &tool_call.name, tool_call.arguments.clone())
                     .await
-                    .content
+                    .0
             };
             messages.push(ChatMessage::tool(&tool_id, &result));
         }

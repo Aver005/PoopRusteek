@@ -111,7 +111,7 @@
 - `[REPORTED]` **`Conversations::remove` latent panic**: removing the focused,
   last conversation leaves `self.focused` dangling → next `focused()`
   `.expect` panics. Guarded only by today's two call sites (multichat).
-- `[REPORTED]` **Server SSE bridges have no idle-timeout backstop**
+- `[FIXED 2026-07-15]` **Server SSE bridges have no idle-timeout backstop**
   (`bridge_stream`/`bridge_legacy_stream`) — they rely on every provider
   having configured `read_timeout(120s)`, an unenforced convention;
   `collect_stream`'s explicit idle-timeout pattern is right there to reuse.
@@ -136,7 +136,7 @@
   trait default's behavior (delete it).
 
 ### Agent runner pair (residual after 2026-07-04's `collect_stream`)
-- `[VERIFIED]` The MCP-dispatch block ("resolve client under short lock, call,
+- `[DONE 2026-07-15]` The MCP-dispatch block ("resolve client under short lock, call,
   fallback to registry") is copy-pasted `runner.rs` ↔ `sub_agent.rs`
   (sub_agent's comment admits "Same lock discipline as the main loop"); the
   per-step skip message is byte-identical in both; the step-request build
@@ -148,7 +148,7 @@
   hook" fix as the runner pair got.
 
 ### Server gateway
-- `[REPORTED]` `server/openai.rs`: SSE bridge scaffolding (channel + spawn +
+- `[DONE 2026-07-15]` `server/openai.rs`: SSE bridge scaffolding (channel + spawn +
   `poll_fn` StreamBody + identical Response builder + identical 3-arm
   post-mortem match) duplicated between `stream_completion` and
   `legacy_stream` (~90 lines); blocking skeleton (complete → discard session →
@@ -372,7 +372,7 @@ vs status-text display builders are unrelated under a misleading name.
 2. `[DONE 2026-07-15]` **Dedup batch A (provider)**: client-trio `CompatTransport` extraction +
    satellites (error parser, `data:` strip, merge_alternating_turns);
    deepseek complete/complete_stream shared core.
-3. **Dedup batch B (agent/server)**: `dispatch_generic_tool` +
+3. `[DONE 2026-07-15]` **Dedup batch B (agent/server)**: `dispatch_generic_tool` +
    `build_step_request` + `tool_skip_message`; server SSE-bridge +
    blocking-skeleton helpers (+ idle-timeout backstop while there).
 4. **Structure batch**: `run_agent_loop` phase extraction + `TurnSpec`
