@@ -499,58 +499,70 @@ impl App {
                 }
             }
 
-            // Drain whatever queued up while we were handling, then render
-            // ONCE. Without this a streaming burst (one event per token) costs
-            // one full render per token, and once render time exceeds chunk
-            // arrival time the unbounded queue only ever grows.
-            let mut drained = 0usize;
-            while drained < 256 {
-                match self.event_rx.try_recv() {
-                    Ok(event) => {
-                        drained += 1;
-                        dirty = true;
-                        if self.handle_event(event).await? {
-                            return Ok(());
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            if self.state.view == View::Mcp {
-                dirty |= self.state.mcp_status.refresh_view(&self.mcp).await;
-            }
-            dirty |= self.state.mcp_status.update_stats(&self.mcp).await;
-            dirty |= self.state.background.refresh().await;
-
-            if consume_terminal_restore_request() {
-                self.state.needs_terminal_restore = true;
-            }
-
-            if self.state.needs_terminal_restore {
-                self.state.needs_terminal_restore = false;
-                let _ = crossterm::terminal::disable_raw_mode();
-                let _ = crossterm::execute!(
-                    terminal.backend_mut(),
-                    crossterm::terminal::LeaveAlternateScreen,
-                );
-                let _ = crossterm::terminal::enable_raw_mode();
-                let _ = crossterm::execute!(
-                    terminal.backend_mut(),
-                    crossterm::terminal::EnterAlternateScreen,
-                    crossterm::cursor::DisableBlinking,
-                    crossterm::cursor::Show,
-                );
-                terminal.clear()?;
-                dirty = true;
-            }
-
-            // Idle ticks with nothing animating skip the draw entirely — this
-            // is what turns the former ~8 renders/sec at rest into zero.
-            if dirty {
-                self.render(terminal)?;
+            if self.settle_frame(terminal, dirty).await? {
+                return Ok(());
             }
         }
+    }
+
+    /// Post-`select!` settle phase: drain whatever queued up while handling
+    /// (a streaming burst is one event per token — rendering per token would
+    /// let the unbounded queue outgrow render time), refresh MCP/background
+    /// stats, honor terminal-restore requests, then render ONCE behind the
+    /// dirty flag. Idle ticks with nothing animating skip the draw entirely —
+    /// this is what turns the former ~8 renders/sec at rest into zero.
+    /// Returns `true` when a drained event asked the app to quit.
+    async fn settle_frame(
+        &mut self,
+        terminal: &mut crate::tui::TuiTerminal,
+        mut dirty: bool,
+    ) -> AppResult<bool> {
+        let mut drained = 0usize;
+        while drained < 256 {
+            match self.event_rx.try_recv() {
+                Ok(event) => {
+                    drained += 1;
+                    dirty = true;
+                    if self.handle_event(event).await? {
+                        return Ok(true);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if self.state.view == View::Mcp {
+            dirty |= self.state.mcp_status.refresh_view(&self.mcp).await;
+        }
+        dirty |= self.state.mcp_status.update_stats(&self.mcp).await;
+        dirty |= self.state.background.refresh().await;
+
+        if consume_terminal_restore_request() {
+            self.state.needs_terminal_restore = true;
+        }
+
+        if self.state.needs_terminal_restore {
+            self.state.needs_terminal_restore = false;
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::LeaveAlternateScreen,
+            );
+            let _ = crossterm::terminal::enable_raw_mode();
+            let _ = crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::cursor::DisableBlinking,
+                crossterm::cursor::Show,
+            );
+            terminal.clear()?;
+            dirty = true;
+        }
+
+        if dirty {
+            self.render(terminal)?;
+        }
+        Ok(false)
     }
 
     /// Does a tick actually change pixels? The spinner and elapsed-time stats
@@ -642,7 +654,7 @@ impl App {
             AppEvent::ToolStarted { name, .. } => {
                 self.state.status_message = format!("Running {name}...");
             }
-            AppEvent::ToolDone { result: _, .. } => {
+            AppEvent::ToolDone { .. } => {
                 self.state.status_message = "Tool finished".to_string();
             }
             AppEvent::ToolError { error, .. } => {
@@ -1167,24 +1179,5 @@ mod wipe_tests {
             "wipe_roots must return deduped paths"
         );
         assert!(!roots.is_empty());
-    }
-}
-
-pub fn format_size(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-pub fn format_duration_secs(seconds: u64) -> String {
-    match seconds {
-        0..=59 => format!("{seconds}s"),
-        60..=3599 => format!("{}m", seconds / 60),
-        3600..=86_399 => format!("{}h", seconds / 3600),
-        _ => format!("{}d", seconds / 86_400),
     }
 }

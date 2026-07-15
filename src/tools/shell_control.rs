@@ -138,19 +138,19 @@ impl Tool for ShellListTool {
                 "background"
             };
             let persist = if proc.persistent { " persistent" } else { "" };
-            let age = crate::app::format_duration_secs(
+            let age = crate::util::format_duration_secs(
                 now.signed_duration_since(proc.started_at)
                     .num_seconds()
                     .max(0) as u64,
             );
-            let idle = crate::app::format_duration_secs(
+            let idle = crate::util::format_duration_secs(
                 now.signed_duration_since(proc.last_activity_at)
                     .num_seconds()
                     .max(0) as u64,
             );
             let ttl = match proc.ttl_secs {
                 Some(0) => " ttl=off".to_string(),
-                Some(ttl) => format!(" ttl={}", crate::app::format_duration_secs(ttl)),
+                Some(ttl) => format!(" ttl={}", crate::util::format_duration_secs(ttl)),
                 None => String::new(),
             };
             msg.push_str(&format!(

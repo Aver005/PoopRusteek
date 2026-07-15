@@ -36,7 +36,10 @@ impl App {
             } else {
                 // Mirror the key handler's clamp so the wheel can't scroll past
                 // the end of the argument block.
-                let max_scroll = arguments.lines().count().saturating_sub(12);
+                let max_scroll = arguments
+                    .lines()
+                    .count()
+                    .saturating_sub(super::modal::TOOL_APPROVAL_VISIBLE_LINES);
                 *scroll_offset = (*scroll_offset + WHEEL_STEP).min(max_scroll);
             }
             return;

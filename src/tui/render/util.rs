@@ -5,16 +5,31 @@
 use crate::config::Config;
 use crate::tui::theme::Theme;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+/// Truncate `s` to at most `max` display columns, appending `…` when cut.
+/// Measures display cells like [`fit_col`] — a char count under-measures
+/// wide glyphs (CJK, emoji) and misaligns the fixed-width layouts these
+/// strings land in next to dates, badges, and checkboxes.
 pub(super) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    } else {
-        s.to_string()
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
     }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthStr::width(ch.to_string().as_str()).max(1);
+        if used + cw > budget {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
 }
 
 /// Fit `s` into exactly `width` display columns for fixed-column table layout:
@@ -94,7 +109,9 @@ pub(super) fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         } else if t == "null" {
             Style::default().fg(theme.text_dim)
         } else if t.parse::<f64>().is_ok() {
-            Style::default().fg(Color::Rgb(255, 203, 107))
+            // Theme role, not a literal — the one hardcoded RGB in render/
+            // violated the "colors come from Theme" rule.
+            Style::default().fg(theme.warning)
         } else {
             Style::default().fg(theme.fg)
         }

@@ -11,6 +11,22 @@
 
 use std::collections::HashSet;
 
+/// Scroll-follows-cursor clamp shared by every list modal: keep
+/// `scroll_offset` positioned so `cursor` stays inside a `visible`-row
+/// window. Was reimplemented three times (picker, delete-sessions,
+/// question) with two different hardcoded window sizes; the window size
+/// stays per-caller (it mirrors each modal's rendered height), the
+/// algorithm lives here.
+pub(crate) fn clamp_scroll(cursor: usize, scroll_offset: usize, visible: usize) -> usize {
+    if cursor < scroll_offset {
+        cursor
+    } else if cursor >= scroll_offset + visible {
+        cursor + 1 - visible
+    } else {
+        scroll_offset
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QuestionState {
     pub question: String,
@@ -375,17 +391,13 @@ pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCod
         },
         crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
             picker.cursor = picker.cursor.saturating_sub(1);
-            if picker.cursor < picker.scroll_offset {
-                picker.scroll_offset = picker.cursor;
-            }
+            picker.scroll_offset = clamp_scroll(picker.cursor, picker.scroll_offset, VISIBLE);
             PickerAction::None
         }
         crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
             let max = picker.items.len().saturating_sub(1);
             picker.cursor = (picker.cursor + 1).min(max);
-            if picker.cursor >= picker.scroll_offset + VISIBLE {
-                picker.scroll_offset = picker.cursor + 1 - VISIBLE;
-            }
+            picker.scroll_offset = clamp_scroll(picker.cursor, picker.scroll_offset, VISIBLE);
             PickerAction::None
         }
         crossterm::event::KeyCode::Home => {
@@ -720,9 +732,7 @@ pub fn handle_delete_sessions_key(
             KeyCode::Esc | KeyCode::Char('q') => DeleteAction::Close,
             KeyCode::Up | KeyCode::Char('k') => {
                 state.cursor = state.cursor.saturating_sub(1);
-                if state.cursor < state.scroll_offset {
-                    state.scroll_offset = state.cursor;
-                }
+                state.scroll_offset = clamp_scroll(state.cursor, state.scroll_offset, VISIBLE);
                 DeleteAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -730,9 +740,7 @@ pub fn handle_delete_sessions_key(
                 if len > 0 && state.cursor + 1 < len {
                     state.cursor += 1;
                 }
-                if state.cursor >= state.scroll_offset + VISIBLE {
-                    state.scroll_offset = state.cursor + 1 - VISIBLE;
-                }
+                state.scroll_offset = clamp_scroll(state.cursor, state.scroll_offset, VISIBLE);
                 DeleteAction::None
             }
             KeyCode::Char(' ') => {
@@ -913,12 +921,9 @@ pub fn handle_question_key(
 
 impl QuestionState {
     fn update_scroll(&mut self) {
+        // 10, not the pickers' 12 — the question modal draws a smaller body.
         const VISIBLE: usize = 10;
-        if self.selected < self.scroll_offset {
-            self.scroll_offset = self.selected;
-        } else if self.selected >= self.scroll_offset + VISIBLE {
-            self.scroll_offset = self.selected + 1 - VISIBLE;
-        }
+        self.scroll_offset = clamp_scroll(self.selected, self.scroll_offset, VISIBLE);
     }
 }
 

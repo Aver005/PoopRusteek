@@ -239,7 +239,7 @@ pub(super) fn render_attach_bar(frame: &mut Frame, area: Rect, state: &AppState,
     let mut remaining = max_w;
     for (i, f) in files.iter().enumerate() {
         let icon = if f.is_image { "\u{1F5BC}" } else { "\u{1F4C4}" };
-        let size_str = crate::app::format_size(f.size);
+        let size_str = crate::util::format_size(f.size);
         let label = format!(" {} {} {} ", icon, f.display_name, size_str);
         let sep = if i > 0 { " " } else { "" };
         let entry = format!("{}{}", sep, label);

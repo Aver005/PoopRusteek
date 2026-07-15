@@ -234,7 +234,7 @@ impl App {
                     let header = format!(
                         "File: {} ({}):",
                         f.display_name,
-                        crate::app::format_size(f.size)
+                        crate::util::format_size(f.size)
                     );
                     attached_names.push(f.display_name.clone());
                     Some(format!("```\n{}\n{}\n```", header, content))

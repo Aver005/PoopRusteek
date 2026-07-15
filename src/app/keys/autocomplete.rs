@@ -1,8 +1,9 @@
 //! Autocomplete: dropdown navigation interception, suggestion refresh (both
 //! `/command` and `@file` modes), and acceptance of the selected entry.
 
-use crate::app::{AUTOCOMPLETE_VISIBLE, App, AutocompleteState, format_size};
+use crate::app::{AUTOCOMPLETE_VISIBLE, App, AutocompleteState};
 use crate::commands::CommandSuggestion;
+use crate::util::format_size;
 
 impl App {
     /// Intercept dropdown-navigation keys while the autocomplete popup is

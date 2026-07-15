@@ -24,7 +24,6 @@ None currently known.
 - `[BUG]` `RagLimit` deserializer contract split: `visit_u64(0)` silently floors to `Fixed(1)` while `visit_i64(0)` hard-errors — behavior depends on which visitor the TOML backend invokes. Found 2026-07-15. `→ src/config/mod.rs`
 - `[BUG]` `Conversations::remove` leaves `self.focused` dangling if the removed conversation is both focused and last → next `focused()` panics via `.expect`; guarded only by today's two call sites. Found 2026-07-15. `→ src/app/conversation.rs`
 - `[BUG]` ACP mode: `PromptRequest.images` is parsed then silently dropped; stdout write failures are `.ok()`-swallowed so a half-closed pipe leaves the loop running completions and discarding responses forever. (ACP also has no tools and a hardcoded system prompt — owner decision pending, see AUDIT-2026-07-15.) Found 2026-07-15. `→ src/acp/server.rs`
-- `[BUG]` `write_history` swallows serialize+write errors with no log — a failed prompt-history write leaves zero diagnostic trail (siblings log). Found 2026-07-15. `→ src/session.rs`
 - `[BUG]` MCP image content is dropped to `[Image: {mime}]` text; non-text/image/resource content types ignored. `→ src/mcp/client.rs`
 - `[BUG]` `mcp__` uses `__` as separator → name collision possible if a server/tool name contains `__`. `→ src/mcp/manager.rs`
 - `[BUG]` History deduplication only catches **consecutive** duplicates. `→ src/session.rs`
@@ -38,6 +37,8 @@ None currently known.
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **2026-07-15 sweepables pass** — `write_history` now logs serialize/write failures; the skills toggle no longer reloads config from disk (a fresh-copy save used to silently clobber unsaved in-memory config changes); `/import`'s id-truncate is char-boundary-defensive; dead `cursor_pos` and the three never-read UiConfig fields deleted. `→ src/session.rs`, `src/app/pickers.rs`, `src/app/keys/modal.rs`, `src/commands/defs/import.rs`, `src/tui/widgets/input.rs`, `src/config/mod.rs`
 
 - ✅ **2026-07-15 defect batch** — same-day fixes for the quality audit's defect findings (tests 434→436, clippy 0, fmt clean):
   - **MCP stdio children now bound to the Windows kill-on-close Job Object** (`win_job` re-exported from `tools/background`, assigned in `StdioTransport::new`) — a force-close can no longer orphan `npx …server-*` children. `→ src/mcp/transport.rs`, `src/tools/background/mod.rs`

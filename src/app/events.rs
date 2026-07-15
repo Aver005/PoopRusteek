@@ -111,7 +111,7 @@ pub enum AppEvent {
     },
     ToolDone {
         conversation: ConversationId,
-        // Every receiver currently discards this with `result: _` — the
+        // Every receiver currently ignores this (matched out with `..`) — the
         // status line shows a generic "Tool finished" rather than a preview.
         #[expect(
             dead_code,

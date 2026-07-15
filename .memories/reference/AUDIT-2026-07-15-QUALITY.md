@@ -64,7 +64,7 @@
    debounce, no spawn_blocking); `app/sessions.rs` `handle_load_session`/
    `finalize_broken_session` do sync `load_local`/`save_local` while
    `auto_save_session` in the same file routes through the persist worker.
-6. `[VERIFIED]` **#6 (tools→app upward reaches), full extent mapped**: the
+6. `[PARTLY FIXED 2026-07-15 — the pure formatters moved to util.rs; the PID slot and terminal-restore flag remain]` **#6 (tools→app upward reaches), full extent mapped**: the
    known `FOREGROUND_CHILD_PID` slot (shell.rs), plus `request_terminal_restore()`
    (shell.rs, same category — cross-layer atomic signal), plus
    `shell_control.rs` calling `crate::app::format_duration_secs` — a **pure
@@ -115,7 +115,7 @@
   (`bridge_stream`/`bridge_legacy_stream`) — they rely on every provider
   having configured `read_timeout(120s)`, an unenforced convention;
   `collect_stream`'s explicit idle-timeout pattern is right there to reuse.
-- `[REPORTED]` `session.rs::write_history` swallows serialize+write errors
+- `[FIXED 2026-07-15]` `session.rs::write_history` swallows serialize+write errors
   with no log (siblings `whitelist`/`semantic history` both log).
 
 ## DUPLICATION (ranked by payoff)
@@ -165,7 +165,7 @@
   format!(\"Failed to save config: {e}\")") ×10 across app/providers.rs,
   keys/themes.rs, keys/providers.rs, keys/dispatch.rs — the 2026-07-04
   `save_config_then` helper covered only `commands/defs/`.
-- `[REPORTED]` `toggle_skill` (pickers.rs) and the Picker Skills arm
+- `[FIXED 2026-07-15 — both sites mutate and save `self.config`]` `toggle_skill` (pickers.rs) and the Picker Skills arm
   (keys/modal.rs) both re-`config::load()` from disk, mutate `.skills.enabled`
   on the fresh copy and save — an extra read plus a latent lost-update of any
   in-memory config change. Mutate `self.config` like every other site.
@@ -183,14 +183,14 @@
   widgets/input.rs).
 
 ### TUI
-- `[VERIFIED]` `render_question` custom-input mode hand-rolls single-line
+- `[FIXED 2026-07-15 — reuses `popup::push_text_box_lines`]` `render_question` custom-input mode hand-rolls single-line
   cursor rendering (and doesn't split `'\n'` — a paste renders glued) while
   `popup::push_text_box_lines` is already imported and used in the same file.
 - `[REPORTED]` "selectable option list" loop ×4 (modals ×2, themes, providers)
   → `popup::push_option_list`; `GoalStage`→label match ×3 (status.rs ×2,
   landing.rs) → one helper next to the enum; selected-row background drawn
   from 3 different theme roles across 7 list renderers (drift, not tiers).
-- `[VERIFIED]` `render/util.rs::truncate` measures `.chars().count()` while
+- `[FIXED 2026-07-15 — truncate now measures display cells; the wider 4-helper consolidation remains open]` `render/util.rs::truncate` measures `.chars().count()` while
   its neighbor `fit_col` correctly measures display columns — emoji/CJK
   under-truncate and misalign fixed-width tables (Cyrillic is width-1, safe).
   Repo-wide there are now **4 truncate/fit helpers with 3 measurement units**
@@ -287,7 +287,7 @@ vs status-text display builders are unrelated under a misleading name.
 
 ## DEAD CODE
 
-- `[VERIFIED]` `UiConfig::show_status_bar` / `show_line_numbers` /
+- `[FIXED 2026-07-15 — deleted; no deny_unknown_fields, old configs still parse]` `UiConfig::show_status_bar` / `show_line_numbers` /
   `max_message_length`: defined, defaulted, serialized, round-trip-tested —
   **zero consumers**. Wire or delete.
 - `[REPORTED]` `ServerCapabilities` deserialized from every `initialize` then
@@ -299,7 +299,7 @@ vs status-text display builders are unrelated under a misleading name.
   upstream reasoning model's `reasoning_content` is silently dropped when
   pooprusteek is the client (not covered by the file's "deliberately not
   translated" note, which only names tool-calling).
-- `[VERIFIED]` `widgets/input.rs::cursor_pos` — `#[allow(dead_code)]`, zero
+- `[FIXED 2026-07-15 — deleted]` `widgets/input.rs::cursor_pos` — `#[allow(dead_code)]`, zero
   callers, its private twin is the live one. Delete.
 - `[REPORTED]` ACP `PromptRequest.images` parsed, never read (see RELIABILITY).
 - Known/stable (owner decisions, unchanged): `provider/types.rs` parity
@@ -378,7 +378,7 @@ vs status-text display builders are unrelated under a misleading name.
 4. `[DONE 2026-07-15]` **Structure batch**: `run_agent_loop` phase extraction + `TurnSpec`
    signature; events.rs contract/state split; handle_event arm delegation;
    keys extractions (GOAL block out of submit_input first).
-5. **Sweepables (mechanical, anytime)**: announce() helper, save-or-rollback
+5. `[MOSTLY DONE 2026-07-15 — remaining: save-or-rollback helper, nav_step idiom, option-list/panel/onboarding extractions, dispatch/modal arms, shell run_foreground]` **Sweepables (mechanical, anytime)**: announce() helper, save-or-rollback
    helper, nav/scroll helpers + visible-rows const, `format_duration_secs` →
    util.rs, option-list/text-box popup helpers, truncate consolidation,
    UiConfig ghost fields, `cursor_pos` deletion, magic-number consts.

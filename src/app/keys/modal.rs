@@ -11,6 +11,12 @@ use crate::error::AppResult;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::collections::HashSet;
 
+/// How many argument lines the tool-approval modal shows at once. The
+/// keyboard scroll clamp here and the mouse-wheel clamp in `keys::mouse`
+/// must agree, or one input method can scroll past the other's limit —
+/// they used to be two independent magic `12`s.
+pub(crate) const TOOL_APPROVAL_VISIBLE_LINES: usize = 12;
+
 /// What a keystroke means to the tool-approval modal.
 #[derive(Debug, PartialEq, Eq)]
 enum ApprovalKey {
@@ -98,9 +104,10 @@ impl App {
                         });
                     }
                     Some(ApprovalKey::ScrollDown) => {
-                        let arg_lines = arguments.lines().count();
-                        let max_visible = 12usize;
-                        let max_scroll = arg_lines.saturating_sub(max_visible);
+                        let max_scroll = arguments
+                            .lines()
+                            .count()
+                            .saturating_sub(TOOL_APPROVAL_VISIBLE_LINES);
                         self.state.modal = Some(Modal::ToolApproval {
                             tool_name,
                             arguments,
@@ -234,19 +241,18 @@ impl App {
                 self.state.approved_tools = selected_names;
             }
             events::PickerKind::Skills => {
-                let Ok(mut config) = crate::config::load() else {
-                    return Ok(());
-                };
                 let enabled: Vec<String> = indices
                     .iter()
                     .filter_map(|&i| picker.items.get(i))
                     .map(|item| item.value.clone())
                     .collect();
-                config.skills.enabled = enabled.clone();
-                if let Err(e) = crate::config::save(&config) {
+                // Save the in-memory config — reloading a fresh copy from
+                // disk here used to silently clobber any other unsaved
+                // config change made earlier in the session.
+                self.config.skills.enabled = enabled.clone();
+                if let Err(e) = crate::config::save(&self.config) {
                     tracing::warn!("Failed to save skills config: {e}");
                 }
-                self.config.skills.enabled = enabled.clone();
                 for skill in &mut self.skills {
                     skill.enabled = enabled.contains(&skill.slug) || enabled.contains(&skill.name);
                 }

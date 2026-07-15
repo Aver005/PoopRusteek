@@ -76,7 +76,7 @@ impl Command for ImportCommand {
 
             state.status_message = format!(
                 "Imported session {} ({} messages, tagged Imported)",
-                &session_id[..session_id.len().min(17)],
+                crate::util::truncate_at_char_boundary(&session_id, 17),
                 state.focused_mut().messages.len(),
             );
 

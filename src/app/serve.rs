@@ -117,7 +117,7 @@ impl App {
             Some(handle) => match handle.bound_addr {
                 Some(addr) => format!(
                     "running on http://{addr}/v1 (up {}, {} requests, {} errors)",
-                    crate::app::format_duration_secs(handle.started_at.elapsed().as_secs()),
+                    crate::util::format_duration_secs(handle.started_at.elapsed().as_secs()),
                     handle.stats.requests.load(Ordering::Relaxed),
                     handle.stats.errors.load(Ordering::Relaxed),
                 ),

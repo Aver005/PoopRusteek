@@ -213,3 +213,27 @@ pub fn format_tool_definition(name: &str, description: &str, schema: &serde_json
 
     result
 }
+
+/// Human-readable byte size (B / KB / MB). Lived in `app/mod.rs` until the
+/// 2026-07-15 sweep — `tools/shell_control` reaching up into `app` for a
+/// pure formatter was one of the three tools→app dependencies.
+pub fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Coarse human-readable duration (s / m / h / d). Same move as
+/// [`format_size`].
+pub fn format_duration_secs(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        3600..=86_399 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}

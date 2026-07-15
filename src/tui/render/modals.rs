@@ -3,7 +3,9 @@
 //! autocomplete dropdown. All of them share the popup skeleton from
 //! [`super::popup`].
 
-use super::popup::{center_popup, fill_panel_space, modal_block, separator_line};
+use super::popup::{
+    center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
+};
 use super::util::{highlight_json, truncate};
 use crate::app::AppState;
 use crate::app::events::{ConfirmState, Modal, PickerMode, PickerState, QuestionState};
@@ -601,49 +603,10 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         ]));
         lines.push(Line::from(""));
 
-        let cursor_visible = qs.custom_cursor < qs.custom_input.chars().count();
-        let before_cursor: String = qs.custom_input.chars().take(qs.custom_cursor).collect();
-
-        if cursor_visible {
-            let after_cursor: String = qs.custom_input.chars().skip(qs.custom_cursor).collect();
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::default().fg(theme.fg)),
-                Span::styled(
-                    before_cursor,
-                    Style::default().fg(theme.fg).bg(theme.input_bg),
-                ),
-                Span::styled(
-                    qs.custom_input
-                        .chars()
-                        .nth(qs.custom_cursor)
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::REVERSED),
-                ),
-                Span::styled(
-                    after_cursor,
-                    Style::default().fg(theme.fg).bg(theme.input_bg),
-                ),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::default().fg(theme.fg)),
-                Span::styled(
-                    before_cursor,
-                    Style::default().fg(theme.fg).bg(theme.input_bg),
-                ),
-                Span::styled(
-                    " ",
-                    Style::default()
-                        .fg(theme.fg)
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::REVERSED),
-                ),
-            ]));
-        }
+        // Shared text-box renderer (cursor highlight, `\n`-aware): the
+        // hand-rolled single-line variant this replaces glued embedded
+        // newlines (possible via paste) into one line.
+        push_text_box_lines(&mut lines, &qs.custom_input, qs.custom_cursor, theme, 1);
 
         fill_panel_space(&mut lines, inner.height.saturating_sub(3) as usize);
         lines.push(separator_line(inner_w, theme));

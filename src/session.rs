@@ -239,17 +239,26 @@ pub fn push_history_entry(history: &mut Vec<String>, input: &str) {
     if history.last().map(|s| s.as_str()) != Some(input) {
         history.push(input.to_string());
     }
-    if history.len() > 500 {
-        let excess = history.len() - 500;
+    if history.len() > MAX_HISTORY_ENTRIES {
+        let excess = history.len() - MAX_HISTORY_ENTRIES;
         history.drain(0..excess);
     }
 }
 
+/// Cap on the prompt-recall list (up-arrow history) — was the last inline
+/// tunable in this file.
+pub const MAX_HISTORY_ENTRIES: usize = 500;
+
 /// Serialize and atomically write the full history list. Blocking — call
 /// from the persist worker, not the event loop.
 pub fn write_history(history: &[String]) {
-    if let Ok(json) = serde_json::to_string(history) {
-        let _ = crate::util::atomic_write(&history_path(), json.as_bytes());
+    match serde_json::to_string(history) {
+        Ok(json) => {
+            if let Err(error) = crate::util::atomic_write(&history_path(), json.as_bytes()) {
+                tracing::warn!("prompt-history write failed: {error}");
+            }
+        }
+        Err(error) => tracing::warn!("prompt-history serialize failed: {error}"),
     }
 }
 

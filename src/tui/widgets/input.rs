@@ -306,13 +306,6 @@ fn cursor_pos_inner(
     Some((x, cursor_y))
 }
 
-#[allow(dead_code)]
-pub fn cursor_pos(state: &AppState, area: Rect) -> Option<(u16, u16)> {
-    let input = &state.input.buffer;
-    let cursor = state.input.cursor.min(input.chars().count());
-    cursor_pos_inner(input, cursor, area, state)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

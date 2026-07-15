@@ -250,9 +250,6 @@ pub struct UiConfig {
     /// name of a `custom_themes` entry. Unknown names fall back to the
     /// default theme — see `Theme::resolve`.
     pub theme: String,
-    pub show_status_bar: bool,
-    pub show_line_numbers: bool,
-    pub max_message_length: usize,
     /// User-made themes from the `/themes` wizard.
     #[serde(default)]
     pub custom_themes: Vec<CustomTheme>,
@@ -541,9 +538,6 @@ impl Default for Config {
             },
             ui: UiConfig {
                 theme: "default".to_string(),
-                show_status_bar: true,
-                show_line_numbers: false,
-                max_message_length: 4096,
                 custom_themes: Vec::new(),
             },
             agent: AgentConfig {

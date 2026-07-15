@@ -3,7 +3,8 @@
 //! background jobs). Pure presentation over the tool/skill/job registries —
 //! no agent or session state is mutated here beyond opening a picker modal.
 
-use super::{App, format_duration_secs};
+use super::App;
+use crate::util::format_duration_secs;
 use std::collections::HashSet;
 
 impl App {
@@ -128,13 +129,10 @@ impl App {
                 .filter(|s| s.enabled)
                 .map(|s| s.slug.clone())
                 .collect();
-            self.config.skills.enabled = enabled.clone();
-            let mut config = match crate::config::load() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            config.skills.enabled = enabled;
-            if let Err(e) = crate::config::save(&config) {
+            self.config.skills.enabled = enabled;
+            // Save the in-memory config — reloading a fresh copy from disk
+            // here used to silently clobber any other unsaved config change.
+            if let Err(e) = crate::config::save(&self.config) {
                 tracing::warn!("Failed to save skills config: {e}");
             }
             self.tools.update_skills(self.skills.clone());
