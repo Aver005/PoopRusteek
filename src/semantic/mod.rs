@@ -167,7 +167,7 @@ impl SemanticService {
                 // be the slowest part (first run embeds every saved
                 // session) and everything else is already usable.
                 {
-                    let mut inner = this_blocking.inner.lock().unwrap();
+                    let mut inner = this_blocking.lock_inner();
                     inner.embedder = Some(Box::new(emb));
                     inner.skills = Some(skill_corpus);
                     inner.history = Some(history_store);
@@ -176,9 +176,7 @@ impl SemanticService {
                 this_blocking.backfill_history();
                 Ok::<usize, String>(
                     this_blocking
-                        .inner
-                        .lock()
-                        .unwrap()
+                        .lock_inner()
                         .skills
                         .as_ref()
                         .map_or(0, SkillCorpus::len),
@@ -216,7 +214,7 @@ impl SemanticService {
     /// (on enable) calling `spawn_init` if `is_ready()` is still false.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
-        let tool_count = self.inner.lock().unwrap().raw_mcp.len();
+        let tool_count = self.lock_inner().raw_mcp.len();
         self.mcp_deferred.store(
             on && self.config.mcp_schemas.deferred_for(tool_count),
             Ordering::Relaxed,
@@ -241,14 +239,14 @@ impl SemanticService {
         let resolved = limit.resolve(crate::util::total_ram_bytes());
         self.embed_batch
             .store(resolved.unwrap_or(0), Ordering::Relaxed);
-        if let Some(emb) = self.inner.lock().unwrap().embedder.as_mut() {
+        if let Some(emb) = self.lock_inner().embedder.as_mut() {
             emb.set_batch_limit(resolved);
         }
         resolved
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner.lock().unwrap().embedder.is_some()
+        self.lock_inner().embedder.is_some()
     }
 
     /// `/rag reload` — drop the loaded model and every embedded corpus,
@@ -265,7 +263,7 @@ impl SemanticService {
             return false;
         }
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.lock_inner();
             inner.embedder = None;
             inner.skills = None;
             inner.mcp = None;
@@ -296,6 +294,20 @@ impl SemanticService {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Poison-tolerant unbounded lock for blocking-thread paths. A panic on
+    /// an embedding thread must not take the whole semantic layer down with
+    /// it (the layer's contract: degrade, never crash) — recover the inner
+    /// state and continue. Safe because every write path replaces fields or
+    /// rebuilds a corpus wholesale, so post-poison state is at worst stale,
+    /// never half-applied in a way the next rebuild wouldn't overwrite.
+    /// Event-loop paths use `lock_inner_bounded`, which instead treats
+    /// poison as "busy, degrade".
+    fn lock_inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Point-in-time state for `/rag`. Returns `None` while an indexing
@@ -346,7 +358,7 @@ impl SemanticService {
             Ordering::Relaxed,
         );
         let embedder_ready = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.lock_inner();
             inner.raw_mcp = tools;
             inner.embedder.is_some()
         };
@@ -384,7 +396,7 @@ impl SemanticService {
         let mut indexed_chunks = 0usize;
         for summary in &summaries {
             {
-                let inner = self.inner.lock().unwrap();
+                let inner = self.lock_inner();
                 let Some(store) = inner.history.as_ref() else {
                     return;
                 };
@@ -397,7 +409,7 @@ impl SemanticService {
             let Ok(session) = crate::session::load_local(&summary.id, &Config::default()) else {
                 continue;
             };
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.lock_inner();
             let Inner {
                 embedder, history, ..
             } = &mut *inner;
@@ -435,7 +447,7 @@ impl SemanticService {
         }
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            let mut inner = this.inner.lock().unwrap();
+            let mut inner = this.lock_inner();
             let Inner {
                 embedder, history, ..
             } = &mut *inner;
@@ -455,7 +467,7 @@ impl SemanticService {
         if !self.is_enabled() {
             return Vec::new();
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let Inner {
             embedder, history, ..
         } = &mut *inner;
@@ -477,7 +489,7 @@ impl SemanticService {
     /// `match_prompt` gives up after its bounded wait and the turn simply
     /// goes out without a hint.
     fn rebuild_mcp_corpus(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let Inner {
             embedder,
             mcp,
@@ -550,7 +562,7 @@ impl SemanticService {
     /// tool list instead of returning nothing. Blocking — call from
     /// `spawn_blocking`.
     pub fn search_tools(&self, query: &str, limit: usize) -> Vec<McpToolMatch> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let Inner {
             embedder,
             mcp,
@@ -686,6 +698,26 @@ mod lock_tests {
         assert!(
             !status.ready,
             "no embedder was ever initialized in this test"
+        );
+    }
+
+    /// A panic on an embedding thread poisons `inner`; blocking-path locks
+    /// must recover instead of propagating the panic (degrade, never crash),
+    /// while bounded event-loop paths keep treating poison as "busy".
+    #[test]
+    fn poisoned_lock_recovers_instead_of_panicking() {
+        let service = enabled_service_without_init();
+        let s2 = Arc::clone(&service);
+        let _ = std::thread::spawn(move || {
+            let _guard = s2.inner.lock().unwrap();
+            panic!("simulated embedder panic");
+        })
+        .join();
+
+        assert!(!service.is_ready(), "is_ready must answer, not panic");
+        assert!(
+            service.status().is_none(),
+            "bounded event-loop path still declines on poison"
         );
     }
 }

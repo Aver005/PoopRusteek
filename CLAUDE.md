@@ -22,8 +22,9 @@ to. **Read `.memories/INDEX.md` first** — it gives the full read order
 (`QUICKSTART.md` → `STATE.md` → `MAP.md` → `ARCHITECTURE.md` → `GLOSSARY.md` →
 `BUGS.md` → `PLANS.md` → `LEARNINGS.md` → `CONVENTIONS.md` → `JOURNAL/`), plus a
 `reference/` folder looked up on demand (commands, provider, tools, MCP, config,
-prompts). `.memories/reference/AUDIT-2026-07-02.md` holds the latest full-codebase
-audit — check it before assuming a subsystem is clean.
+prompts). `.memories/reference/AUDIT-2026-07-15-QUALITY.md` holds the latest
+full-codebase audit (quality/structure; defects: `AUDIT-2026-07-02.md`, cleanup:
+`AUDIT-2026-07-04-CLEANUP.md`) — check it before assuming a subsystem is clean.
 
 Note: Claude Code auto-loads this file, but **the app itself does not auto-load
 `.memories/`** — an agent only benefits from that folder if told to read it.

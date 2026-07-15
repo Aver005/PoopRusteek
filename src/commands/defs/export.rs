@@ -69,7 +69,7 @@ impl Command for ExportCommand {
             md.push_str("\n\n---\n\n");
         }
 
-        match std::fs::write(&path, md) {
+        match crate::util::atomic_write(&path, md.as_bytes()) {
             Ok(_) => {
                 let display = path.display().to_string();
                 let count = state.focused().messages.len();

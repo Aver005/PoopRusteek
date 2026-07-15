@@ -29,11 +29,11 @@ pub struct ParsedToolCall {
     pub arguments: Value,
 }
 
-/// Parse every tool call in `text`. Convenience wrapper over
-/// [`parse_tool_calls_with_errors`] that discards the diagnostics — callers
-/// that need to know a `<tool_use>` block was present but *malformed* (so they
-/// can ask the model to retry instead of silently ending the turn) use the
-/// `_with_errors` variant.
+/// Test-only convenience wrapper over [`parse_tool_calls_with_errors`] that
+/// discards the diagnostics. Every production caller (main and sub-agent
+/// loops) uses the `_with_errors` variant, so a malformed `<tool_use>` block
+/// is handed back for a retry instead of silently ending the turn.
+#[cfg(test)]
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     parse_tool_calls_with_errors(text).0
 }

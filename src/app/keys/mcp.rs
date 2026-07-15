@@ -124,19 +124,19 @@ impl App {
                     .cloned()
                 {
                     let name = info.name.clone();
-                    let mut mcp = self.mcp.lock().await;
-                    if let Err(e) = mcp.remove_server(&name).await {
-                        self.state.mcp_status.view.status_message = format!("Remove failed: {e}");
-                    } else {
-                        self.state.mcp_status.view.status_message = format!("{name} removed");
-                    }
-                    self.state.mcp_status.view.servers = mcp.get_servers_info();
-                    self.state.mcp_status.view.selected = self
-                        .state
-                        .mcp_status
-                        .view
-                        .selected
-                        .min(self.state.mcp_status.view.servers.len().saturating_sub(1));
+                    self.state.mcp_status.view.status_message = format!("Removing {name}...");
+                    // Removing closes the child process and rewrites mcp.json —
+                    // off the loop, like toggle/reconnect above. The view
+                    // refreshes via `McpOperationDone`.
+                    let mcp = Arc::clone(&self.mcp);
+                    let event_tx = self.event_tx.clone();
+                    tokio::spawn(async move {
+                        let message = match mcp.lock().await.remove_server(&name).await {
+                            Err(e) => format!("Remove failed: {e}"),
+                            Ok(_) => format!("{name} removed"),
+                        };
+                        let _ = event_tx.send(events::AppEvent::McpOperationDone { message });
+                    });
                 }
             }
             KeyCode::Up | KeyCode::Char('k') if details_open => {

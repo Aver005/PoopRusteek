@@ -102,6 +102,14 @@ impl StdioTransport {
         cwd: Option<&str>,
     ) -> AppResult<Self> {
         let mut child = spawn_command(command, args, env, cwd)?;
+        // Bind the child to the kill-on-close Job Object: `kill_on_drop`
+        // only covers a graceful teardown — a force-close of pooprusteek
+        // (Task Manager "End Task", crash, taskkill) would orphan the MCP
+        // server child, the exact gap `win_job` closes for background jobs.
+        #[cfg(windows)]
+        if let Some(handle) = child.raw_handle() {
+            crate::tools::background::win_job::assign_child_handle(handle);
+        }
         let stdin = child.stdin.take().ok_or_else(|| {
             crate::error::AppError::Mcp("Failed to open stdin for MCP subprocess".to_string())
         })?;

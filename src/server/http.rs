@@ -247,6 +247,11 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
         );
     }
 
+    // Count the request before the auth gate — `handle_request` increments
+    // `errors` for any 4xx, so a 401 without a matching `requests` increment
+    // skews the error rate (errors > requests under a misconfigured client).
+    context.stats.requests.fetch_add(1, Ordering::Relaxed);
+
     if let Some(expected) = &context.api_key {
         let authorized = request
             .headers()
@@ -263,8 +268,6 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
             );
         }
     }
-
-    context.stats.requests.fetch_add(1, Ordering::Relaxed);
 
     let handled = match context.api {
         ServerApi::Openai => openai::route(request, context).await,

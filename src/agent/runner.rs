@@ -40,10 +40,6 @@ pub async fn run_agent_loop(
 ) {
     let mut collected_tool_calls = Vec::new();
     let mut messages = messages;
-    // How many times, within one turn, a malformed `<tool_use>` block may be
-    // handed back to the model for correction before the turn gives up. Bounds
-    // a weaker model that can't recover its own XML/JSON so it can't spin.
-    const MAX_MALFORMED_TOOL_RETRIES: u32 = 2;
     let mut malformed_retries: u32 = 0;
 
     // Semantic hint: match the newest user message against the skill and
@@ -615,10 +611,17 @@ pub async fn run_agent_loop(
     ));
 }
 
+/// How many times, within one turn, a malformed `<tool_use>` block may be
+/// handed back to the model for correction before the turn gives up. Bounds
+/// a weaker model that can't recover its own XML/JSON so it can't spin.
+/// Shared with the sub-agent loop, which applies the same recovery.
+pub(crate) const MAX_MALFORMED_TOOL_RETRIES: u32 = 2;
+
 /// Correction message handed back to the model after it emitted a `<tool_use>`
 /// block that couldn't be parsed. Names each concrete problem and restates the
-/// exact required shape so the model can re-issue the call.
-fn malformed_tool_feedback(errors: &[String]) -> String {
+/// exact required shape so the model can re-issue the call. Shared by the
+/// main and sub-agent loops.
+pub(crate) fn malformed_tool_feedback(errors: &[String]) -> String {
     format!(
         "Your previous message contained a tool call that could NOT be parsed, \
          so it was NOT executed:\n- {}\n\nRe-issue it using exactly this shape, \

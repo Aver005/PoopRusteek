@@ -1,5 +1,5 @@
 # .memories INDEX
-> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-13 (prompt diet + hint-delivery CRITICAL fix: tail-batch wire format, skills injection modes, byte-budget tests — clippy 0, tests 434, MSRV 1.91)
+> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-15 (quality/structure audit → `reference/AUDIT-2026-07-15-QUALITY.md`; BUGS.md refreshed (+8 entries, 2 stale corrected) — clippy 0, tests 434, MSRV 1.91)
 
 > ⚠️ `CLAUDE.md` at the repo root is now the auto-loaded bridge into this folder — **Claude Code**
 > reads it automatically and it points here. The **app itself** still does **NOT** auto-load
@@ -34,6 +34,7 @@
 | `reference/PROMPTS.md` | Prompt library + skills discovery |
 | `reference/AUDIT-2026-07-02.md` | Full-codebase audit (2026-07-02): severity-ranked defects, `[FIXED]`/`[OPEN]`/`[ACCEPTED]` status |
 | `reference/AUDIT-2026-07-04-CLEANUP.md` | Cleanup audit (2026-07-04): duplication / dead code / inefficiency / coupling, with verified-vs-reported status and execution order |
+| `reference/AUDIT-2026-07-15-QUALITY.md` | Quality/structure audit (2026-07-15): duplication, dead code, branching, overloaded modules — verified/reported status, execution order, plus verdicts on what NOT to split |
 
 ## 2. KEY SIGNALS
 
@@ -50,9 +51,9 @@
 ## 3. EXTERNAL CONTEXT
 
 - Original repo (TS): https://github.com/aver005/poopseek
-- This project: Rust rewrite (edition 2024, MSRV 1.91), ~15k LOC, License MIT.
+- This project: Rust rewrite (edition 2024, MSRV 1.91), ~42k LOC incl. inline tests (166 files), License MIT.
 - LLM backend: DeepSeek **web** API (reverse-engineered, v0) — cookie/token auth, requires PoW.
-- Primary verification: `cargo build` + `cargo test --bin pooprusteek` (209 passing) + `cargo clippy` (0 warnings). CI (`.github/workflows/ci.yml`) runs build+test on Windows/Linux; clippy advisory.
+- Primary verification: `cargo build` + `cargo test --bin pooprusteek` (434 passing) + `cargo clippy` (0 warnings). CI (`.github/workflows/ci.yml`): `test` (build+test, win+linux) and `lint` (fmt --check + clippy -D warnings) are both blocking and gate the dev-build release.
 
 ## 4. MAINTENANCE RULE
 

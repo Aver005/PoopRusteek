@@ -1,27 +1,30 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-07-13 (fixed semantic-hint displacing the user's message on the DeepSeek wire; see RESOLVED)
-> Full audit digest: `reference/AUDIT-2026-07-02.md` (2026-07-02)
+> Last updated: 2026-07-15 (quality audit +8 entries, then the same-day defect batch fixed 7 of them — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
+> Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure)
 
 ## CRITICAL
 None currently known.
 
 ## HIGH
-None currently known. (The infinite-retry-hang entry that used to live here was fixed this session — see RESOLVED.)
+None currently known.
 
 ## MEDIUM
 
 - `[BUG]` MCP tool arguments are passed to `tools/call` with **no schema validation**. `→ src/mcp/client.rs`
 - `[BUG]` `stream_visible_text` truncates at the first bare `<` → legitimate text containing `<` (C++ templates, `a < b`, HTML) is hidden mid-stream. `→ src/agent/tool_parser.rs`
-- `[BUG]` PoW challenge is solved once before the retry loop (not re-solved per attempt) and the solve runs on the async task instead of `spawn_blocking`, competing with the executor. `→ src/provider/pow.rs` + `src/provider/deepseek.rs`
+- `[BUG]` PoW challenge is solved once before the retry loop, not re-solved per attempt — deliberately left (changing it changes the request pattern); a stale challenge on a slow retry can be rejected. (~~solve ran on the async task~~ — fixed 2026-07-04, now `spawn_blocking`.) `→ src/provider/pow.rs` + `src/provider/deepseek/stream.rs`
 - `[BUG]` Legacy `[TOOL:name] {json}` regex uses a non-nesting brace pattern and can't parse nested JSON objects. `→ src/agent/tool_parser.rs`
 - `[BUG]` Fenced code-block examples containing tool-call syntax can be parsed and executed as real tool calls during auto-approve (background) turns. `→ src/agent/tool_parser.rs`
 
 ## LOW
 
 - `[BUG]` `/import` overwrites the session tag with `"Imported"`, losing any original tag/metadata. `→ src/commands/defs/import.rs`
-- `[BUG]` Autocomplete file paths resolve against `current_dir()`, which can drift from `workspace_path` after a subprocess `cd`. `→ src/app/keys.rs` (autocomplete)
-- `[BUG]` Theme is hardcoded Catppuccin Mocha; `ui.theme` config is ignored. `→ src/tui/theme.rs`
+- `[BUG]` Autocomplete file paths resolve against `current_dir()`, which can drift from `workspace_path` after a subprocess `cd`. `→ src/app/keys/autocomplete.rs`
+- `[BUG]` `RagLimit` deserializer contract split: `visit_u64(0)` silently floors to `Fixed(1)` while `visit_i64(0)` hard-errors — behavior depends on which visitor the TOML backend invokes. Found 2026-07-15. `→ src/config/mod.rs`
+- `[BUG]` `Conversations::remove` leaves `self.focused` dangling if the removed conversation is both focused and last → next `focused()` panics via `.expect`; guarded only by today's two call sites. Found 2026-07-15. `→ src/app/conversation.rs`
+- `[BUG]` ACP mode: `PromptRequest.images` is parsed then silently dropped; stdout write failures are `.ok()`-swallowed so a half-closed pipe leaves the loop running completions and discarding responses forever. (ACP also has no tools and a hardcoded system prompt — owner decision pending, see AUDIT-2026-07-15.) Found 2026-07-15. `→ src/acp/server.rs`
+- `[BUG]` `write_history` swallows serialize+write errors with no log — a failed prompt-history write leaves zero diagnostic trail (siblings log). Found 2026-07-15. `→ src/session.rs`
 - `[BUG]` MCP image content is dropped to `[Image: {mime}]` text; non-text/image/resource content types ignored. `→ src/mcp/client.rs`
 - `[BUG]` `mcp__` uses `__` as separator → name collision possible if a server/tool name contains `__`. `→ src/mcp/manager.rs`
 - `[BUG]` History deduplication only catches **consecutive** duplicates. `→ src/session.rs`
@@ -35,6 +38,17 @@ None currently known. (The infinite-retry-hang entry that used to live here was 
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **2026-07-15 defect batch** — same-day fixes for the quality audit's defect findings (tests 434→436, clippy 0, fmt clean):
+  - **MCP stdio children now bound to the Windows kill-on-close Job Object** (`win_job` re-exported from `tools/background`, assigned in `StdioTransport::new`) — a force-close can no longer orphan `npx …server-*` children. `→ src/mcp/transport.rs`, `src/tools/background/mod.rs`
+  - **MCP view `'d'` (remove server) spawned off the event loop** and reports via `McpOperationDone`, matching toggle/reconnect — the manager lock is no longer held across process-close + config-write on the loop. `→ src/app/keys/mcp.rs`
+  - **`tick_is_visual` unified**: checks the *focused* conversation only, and the `Tick` arm reuses the same predicate — a background sidechat no longer forces a full redraw every ~120 ms. `→ src/app/mod.rs`
+  - **Sub-agents got the malformed-tool-call recovery**: `parse_tool_calls_with_errors` + the main loop's bounded retry (shared `MAX_MALFORMED_TOOL_RETRIES`/`malformed_tool_feedback`, now `pub(crate)` in runner.rs); exhausted retries return an explicit `Err` instead of a silent empty answer; `parse_tool_calls` demoted to a `#[cfg(test)]` helper. Regression test: `malformed_tool_call_is_retried_not_swallowed`. `→ src/agent/sub_agent.rs`, `src/agent/runner.rs`, `src/agent/tool_parser.rs`
+  - **Semantic layer poison-tolerant**: new `lock_inner()` (`PoisonError::into_inner`) replaces every bare `.lock().unwrap()` on blocking paths; bounded event-loop paths keep treating poison as "busy, degrade". (Embedding still runs under the lock — hold-time only, degrade paths cover it.) Test: `poisoned_lock_recovers_instead_of_panicking`. `→ src/semantic/mod.rs`
+  - **Server stats**: requests counted before the auth gate, so 401s can't push `errors > requests`. `→ src/server/http.rs`
+  - **`/export` writes through `util::atomic_write`**. `→ src/commands/defs/export.rs`
+
+- ✅ `~~Theme is hardcoded Catppuccin Mocha; `ui.theme` config is ignored~~` — fixed 2026-07-05 with the multi-theme system (`Theme::resolve(&config.ui)`, 10 presets, `/themes`, custom themes). Entry was stale in LOW until 2026-07-15.
 
 - ✅ **Semantic hint silently displaced the user's message on the DeepSeek wire** (2026-07-13). `run_agent_loop` pushed the RAG hint as a `Role::System` message **after** the newest user message; `split_system_prompt` only extracts the *first* system message, and `build_prompt` on a continuing session sent **only `messages.last()`** — so whenever the hint fired, the request became `### USER INPUT\n[Hint…]` and the user's actual text never reached the server (on the first send it was mislabeled into `### LOCAL MEMORY` while the hint posed as USER INPUT). Symptom: model "hallucinating"/answering off-target exactly when semantic matching worked. **Fix:** (1) hint now inserted *before* the user message (`runner.rs` `rposition`+`insert`); (2) `build_prompt` rewritten around a **tail batch** — everything after the last assistant message goes out, each piece as its own section (`### NOTE` for system notes, `### USER INPUT`, `### TOOL RESULT: …`), so a user message can never be displaced regardless of ordering; (3) `should_reset` in `stream.rs` now uses role-aware `is_first_conversational_send` (a hint no longer masks a fresh conversation); (4) every non-empty send gets a trailing one-line `FORMAT_REMINDER` (recency anchor for the tool-call format). Regression tests: `hint_before_user_keeps_user_input_last`, `trailing_system_note_never_displaces_user_input`, `first_send_renders_hint_as_note_not_memory`. `→ src/provider/prompt.rs`, `src/provider/deepseek/stream.rs`, `src/agent/runner.rs`. Write-up: `JOURNAL/2026-07-13.md`.
 

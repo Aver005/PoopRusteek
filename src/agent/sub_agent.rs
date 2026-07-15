@@ -6,8 +6,9 @@
 //! (no user is watching), and `task`/`question` are refused so a sub-agent
 //! can't spawn sub-agents or block on a prompt (depth limit of 1).
 
+use crate::agent::runner::{MAX_MALFORMED_TOOL_RETRIES, malformed_tool_feedback};
 use crate::agent::stream::{StreamEnd, collect_stream};
-use crate::agent::tool_parser::{parse_tool_calls, strip_tool_calls};
+use crate::agent::tool_parser::{parse_tool_calls_with_errors, strip_tool_calls};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::tools::registry::ToolRegistry;
@@ -28,6 +29,7 @@ pub async fn run_sub_agent(
     max_tools_per_step: usize,
 ) -> Result<String, String> {
     let mut messages = vec![ChatMessage::user(&user_prompt)];
+    let mut malformed_retries: u32 = 0;
 
     for _step in 0..max_steps {
         let mut request_messages = Vec::with_capacity(messages.len() + 1);
@@ -58,10 +60,26 @@ pub async fn run_sub_agent(
         }
         let full = outcome.text;
 
-        let tool_calls = parse_tool_calls(&full);
+        let (tool_calls, parse_errors) = parse_tool_calls_with_errors(&full);
         let visible = strip_tool_calls(&full);
 
         if tool_calls.is_empty() {
+            // Same recovery as the main loop: zero parsed calls plus parse
+            // errors means a malformed `<tool_use>`, not a final answer —
+            // returning `visible` here silently swallowed the failure (the
+            // text before a broken block is usually empty).
+            if !parse_errors.is_empty() && malformed_retries < MAX_MALFORMED_TOOL_RETRIES {
+                malformed_retries += 1;
+                messages.push(ChatMessage::assistant(&full));
+                messages.push(ChatMessage::user(&malformed_tool_feedback(&parse_errors)));
+                continue;
+            }
+            if !parse_errors.is_empty() {
+                return Err(format!(
+                    "sub-agent kept emitting malformed tool calls: {}",
+                    parse_errors.join(" | ")
+                ));
+            }
             return Ok(visible);
         }
 
@@ -150,5 +168,34 @@ mod tests {
         .await;
 
         assert_eq!(out.unwrap(), "Done: 42");
+    }
+
+    /// A malformed `<tool_use>` must be handed back for correction — the same
+    /// contract as the main loop — not silently returned as an empty answer.
+    #[tokio::test]
+    async fn malformed_tool_call_is_retried_not_swallowed() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_responses(vec![
+            "<tool_use>\n<name>shell</name>\n<arguments>\n{ not json }\n</arguments>\n</tool_use>"
+                .to_string(),
+            "Recovered".to_string(),
+        ]));
+        let tools = Arc::new(ToolRegistry::new());
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+
+        let out = run_sub_agent(
+            provider,
+            tools,
+            mcp,
+            "system".to_string(),
+            "do the thing".to_string(),
+            "fake".to_string(),
+            0.0,
+            128,
+            4,
+            4,
+        )
+        .await;
+
+        assert_eq!(out.unwrap(), "Recovered");
     }
 }
