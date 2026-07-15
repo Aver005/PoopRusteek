@@ -308,12 +308,7 @@ impl App {
                 }
                 // Also refresh the raw MCP tool list so the rebuilt index
                 // can't resurrect tools from servers that have gone away.
-                let mcp = Arc::clone(&self.mcp);
-                let semantic = Arc::clone(&self.semantic);
-                tokio::spawn(async move {
-                    let tools = mcp.lock().await.get_all_tools();
-                    semantic.update_mcp_tools(tools);
-                });
+                self.spawn_mcp_semantic_refresh();
                 self.state.push_system(
                     "RAG reloading: verifying the model (missing files are re-downloaded) and re-embedding skills + MCP tools in the background.",
                 );

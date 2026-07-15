@@ -57,19 +57,10 @@ impl AgentRuntime {
     /// Launch a turn on its own task; the returned handle drives cancellation.
     pub fn spawn(&self, spec: TurnSpec) -> JoinHandle<()> {
         tokio::spawn(crate::agent::runner::run_agent_loop(
-            spec.conversation,
-            spec.provider,
+            spec,
             Arc::clone(&self.tools),
             Arc::clone(&self.mcp),
             Arc::clone(&self.semantic),
-            spec.messages,
-            spec.system_prompt,
-            spec.model,
-            spec.temperature,
-            spec.max_tokens,
-            spec.max_steps,
-            spec.max_tools_per_step,
-            spec.auto_approve,
             self.event_tx.clone(),
         ))
     }

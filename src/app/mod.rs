@@ -11,12 +11,13 @@ mod multichat;
 mod persist;
 mod pickers;
 pub mod providers;
-mod runtime;
+pub(crate) mod runtime;
 pub mod search;
 mod serve;
 mod sessions;
 mod system_prompt;
 pub mod themes;
+pub mod view_state;
 
 use crate::commands::CommandRegistry;
 use crate::commands::CommandSuggestion;
@@ -29,8 +30,8 @@ use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::skills::{SkillDefinition, discovery::discover_all_skills};
 use crate::tools::registry::ToolRegistry;
 use events::{
-    AppEvent, ConfirmAction, GoalStage, Modal, OnboardingState, PendingInteraction,
-    QuestionRequest, QuestionState, ToolApprovalRequest, View,
+    AppEvent, ConfirmAction, Modal, OnboardingState, PendingInteraction, QuestionRequest,
+    QuestionState, ToolApprovalRequest, View,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -566,6 +567,18 @@ impl App {
             || (self.state.focused().messages.is_empty() && self.state.modal.is_none())
     }
 
+    /// Set the status line and mirror the same text into the focused chat as
+    /// a UI-only system line — the standard shape for reporting a background
+    /// operation's outcome (was copy-pasted across seven event arms).
+    pub(crate) fn announce(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::ui_system(&message));
+        self.state.status_message = message;
+    }
+
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
         // Agent events for a background conversation are applied to its parked
         // record, not the focused chat. Sidechats/sub-agents route by KIND even
@@ -607,40 +620,7 @@ impl App {
                 self.state.status_message = "Ready".to_string();
                 self.record_gen_stats();
                 self.auto_save_session();
-
-                // --- GOAL cycle check ---
-                if self.state.goal.mode && self.state.goal.stage == GoalStage::RunAgent1 {
-                    // Agent 1 finished — get last assistant content for evaluation
-                    let agent_result = self
-                        .state
-                        .focused_mut()
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == Role::Assistant)
-                        .map(|m| m.content.clone())
-                        .unwrap_or_default();
-
-                    if !agent_result.is_empty() {
-                        self.state.status_message = "Evaluating goal...".to_string();
-                        self.state.goal.stage = GoalStage::RunEvaluator;
-                        self.state
-                            .focused_mut()
-                            .messages
-                            .push(ChatMessage::ui_system(
-                                "🔍 Evaluating result against goal...",
-                            ));
-                        self.spawn_goal_evaluation(agent_result);
-                    } else {
-                        self.state
-                            .focused_mut()
-                            .messages
-                            .push(ChatMessage::ui_system(
-                                "⚠ Agent produced no output. Retrying...",
-                            ));
-                        self.retry_agent1().await;
-                    }
-                }
+                self.maybe_advance_goal_cycle().await;
             }
             AppEvent::AgentError(_, err) => {
                 self.state.status_message = err.clone();
@@ -761,79 +741,16 @@ impl App {
                 self.handle_models_listed(result, switch_to);
             }
             AppEvent::SessionsDeleted { deleted, failed } => {
-                let mut message = format!(
-                    "🗑 Deleted {deleted} session cop{}",
-                    if deleted == 1 { "y" } else { "ies" }
-                );
-                if !failed.is_empty() {
-                    message.push_str(&format!(
-                        "; {} failed:\n  {}",
-                        failed.len(),
-                        failed.join("\n  ")
-                    ));
-                }
-                self.state.status_message = if failed.is_empty() {
-                    "Sessions deleted".to_string()
-                } else {
-                    "Some session deletions failed".to_string()
-                };
-                self.state
-                    .focused_mut()
-                    .messages
-                    .push(ChatMessage::ui_system(&message));
+                self.on_sessions_deleted(deleted, failed);
             }
             AppEvent::McpOperationDone { message } => {
-                self.state.mcp_status.view.status_message = message.clone();
-                self.state.status_message = message.clone();
-                self.state
-                    .focused_mut()
-                    .messages
-                    .push(ChatMessage::ui_system(&message));
-                // Force the next loop iteration to re-pull fresh server info.
-                self.state.mcp_status.view.servers.clear();
-                self.state.mcp_status.last_stats_update = None;
-                // The tool set likely changed (add/reload/toggle/reconnect
-                // all funnel through this event) — re-embed the MCP corpus.
-                // Fetch under a short-lived lock off the event loop.
-                let mcp = Arc::clone(&self.mcp);
-                let semantic = Arc::clone(&self.semantic);
-                tokio::spawn(async move {
-                    let tools = mcp.lock().await.get_all_tools();
-                    semantic.update_mcp_tools(tools);
-                });
+                self.on_mcp_operation_done(message);
             }
             AppEvent::McpInitialized => {
-                // Startup connects finished — force the next loop iteration
-                // to re-pull fresh server counts instead of waiting out the
-                // stats-poll throttle. The semantic MCP corpus was already
-                // updated by the startup task itself.
-                self.state.mcp_status.view.servers.clear();
-                self.state.mcp_status.last_stats_update = None;
+                self.on_mcp_initialized();
             }
             AppEvent::McpOAuthResult { server, result } => {
-                match result {
-                    Ok(()) => {
-                        self.state.mcp_status.view.status_message =
-                            format!("{server} authorized, reconnecting...");
-                        // The token is already persisted (oauth_store::save) —
-                        // reconnect picks it up via `build_client`'s
-                        // `with_bearer_header` call and reports its own
-                        // outcome through the existing `McpOperationDone`.
-                        let mcp = Arc::clone(&self.mcp);
-                        let event_tx = self.event_tx.clone();
-                        tokio::spawn(async move {
-                            let message = match mcp.lock().await.reconnect_server(&server).await {
-                                Err(e) => format!("Reconnect after authorization failed: {e}"),
-                                Ok(_) => format!("{server} authorized and reconnected"),
-                            };
-                            let _ = event_tx.send(AppEvent::McpOperationDone { message });
-                        });
-                    }
-                    Err(e) => {
-                        self.state.mcp_status.view.status_message =
-                            format!("Authorization failed: {e}");
-                    }
-                }
+                self.on_mcp_oauth_result(server, result);
             }
             AppEvent::SemanticStatus(message) => {
                 self.state.status_message = message;
@@ -852,51 +769,13 @@ impl App {
                 self.state.last_error = Some(message);
             }
             AppEvent::ServerStarted { generation, addr } => {
-                if let Some(handle) = &mut self.server
-                    && handle.generation == generation
-                {
-                    handle.bound_addr = Some(addr);
-                    let message = format!(
-                        "API server listening on http://{addr}/v1 ({} dialect).",
-                        handle.api.label()
-                    );
-                    self.state.status_message = message.clone();
-                    self.state
-                        .focused_mut()
-                        .messages
-                        .push(ChatMessage::ui_system(&message));
-                }
+                self.on_server_started(generation, addr);
             }
             AppEvent::ServerFailed { generation, error } => {
-                if self
-                    .server
-                    .as_ref()
-                    .is_some_and(|handle| handle.generation == generation)
-                {
-                    self.server = None;
-                }
-                let message = format!("API server failed to start: {error}");
-                self.state.status_message = message.clone();
-                self.state
-                    .focused_mut()
-                    .messages
-                    .push(ChatMessage::ui_system(&message));
+                self.on_server_failed(generation, error);
             }
             AppEvent::ServerStopped { generation } => {
-                // Only the *current* server's stop clears the handle; a
-                // replaced server (port change restart) reports late.
-                if self
-                    .server
-                    .as_ref()
-                    .is_some_and(|handle| handle.generation == generation)
-                {
-                    self.server = None;
-                    self.state.status_message = "API server stopped".to_string();
-                    self.state
-                        .focused_mut()
-                        .messages
-                        .push(ChatMessage::ui_system("API server stopped."));
-                }
+                self.on_server_stopped(generation);
             }
             AppEvent::ServerRequestLog { .. } => {
                 // Proxy-mode-only event (request_log is off for TUI-owned

@@ -71,3 +71,63 @@ impl McpStatus {
         !self.view.servers.is_empty()
     }
 }
+
+impl crate::app::App {
+    /// `AppEvent::McpOperationDone` — announce the outcome, force the next
+    /// loop iteration to re-pull fresh server info, and re-embed the MCP
+    /// corpus (add/reload/toggle/reconnect/remove all funnel through this).
+    pub(crate) fn on_mcp_operation_done(&mut self, message: String) {
+        self.state.mcp_status.view.status_message = message.clone();
+        self.announce(message);
+        self.state.mcp_status.view.servers.clear();
+        self.state.mcp_status.last_stats_update = None;
+        self.spawn_mcp_semantic_refresh();
+    }
+
+    /// `AppEvent::McpInitialized` — startup connects finished; clear the
+    /// cached view and skip the stats-poll throttle so fresh counts appear
+    /// immediately. (The startup task already updated the semantic corpus.)
+    pub(crate) fn on_mcp_initialized(&mut self) {
+        self.state.mcp_status.view.servers.clear();
+        self.state.mcp_status.last_stats_update = None;
+    }
+
+    /// `AppEvent::McpOAuthResult` — on success, reconnect the server off the
+    /// event loop; the token is already persisted (oauth_store::save), so
+    /// `build_client` picks it up, and the reconnect reports its own outcome
+    /// through the existing `McpOperationDone` funnel.
+    pub(crate) fn on_mcp_oauth_result(&mut self, server: String, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.state.mcp_status.view.status_message =
+                    format!("{server} authorized, reconnecting...");
+                let mcp = std::sync::Arc::clone(&self.mcp);
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let message = match mcp.lock().await.reconnect_server(&server).await {
+                        Err(e) => format!("Reconnect after authorization failed: {e}"),
+                        Ok(_) => format!("{server} authorized and reconnected"),
+                    };
+                    let _ =
+                        event_tx.send(crate::app::events::AppEvent::McpOperationDone { message });
+                });
+            }
+            Err(e) => {
+                self.state.mcp_status.view.status_message = format!("Authorization failed: {e}");
+            }
+        }
+    }
+
+    /// Fetch the current MCP tool list under a short-lived lock off the
+    /// event loop and hand it to the semantic layer for re-embedding — one
+    /// definition for the sites that used to copy this block (the startup
+    /// wiring keeps its own inline copy: it also signals `McpInitialized`).
+    pub(crate) fn spawn_mcp_semantic_refresh(&self) {
+        let mcp = std::sync::Arc::clone(&self.mcp);
+        let semantic = std::sync::Arc::clone(&self.semantic);
+        tokio::spawn(async move {
+            let tools = mcp.lock().await.get_all_tools();
+            semantic.update_mcp_tools(tools);
+        });
+    }
+}

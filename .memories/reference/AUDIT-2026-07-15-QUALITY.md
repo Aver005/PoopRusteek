@@ -157,9 +157,9 @@
   `&ResolvedModel`.
 
 ### App layer
-- `[VERIFIED]` "status_message + identical ui_system chat push" announce shape
+- `[DONE 2026-07-15]` "status_message + identical ui_system chat push" announce shape
   ×7 in `handle_event` → one `announce()` helper.
-- `[VERIFIED]` mcp+semantic corpus-refresh spawn block ×3 (app/mod.rs ×2,
+- `[DONE 2026-07-15 — shared `spawn_mcp_semantic_refresh`; the startup copy stays, it also signals `McpInitialized`]` mcp+semantic corpus-refresh spawn block ×3 (app/mod.rs ×2,
   keys/dispatch.rs RAG reload).
 - `[REPORTED]` config save-or-rollback ("mutate → save → on Err roll back +
   format!(\"Failed to save config: {e}\")") ×10 across app/providers.rs,
@@ -221,7 +221,7 @@
 ## OVERLOADED MODULES / EXCESSIVE BRANCHING
 
 ### The big four
-1. `[VERIFIED]` **`agent/runner.rs::run_agent_loop` — 513 lines, CC 42, and a
+1. `[DONE 2026-07-15]` **`agent/runner.rs::run_agent_loop` — 513 lines, CC 42, and a
    14-positional-arg signature** under `#[allow(clippy::too_many_arguments)]`
    even though `TurnSpec` exists precisely for this: `AgentRuntime::spawn`
    unpacks the spec back into positional order (runtime.rs doc comment
@@ -231,14 +231,14 @@
    &ToolExecContext)` for the ~152-line 5-deep tool dispatch (which also
    becomes the shared home for sub_agent's copy). Signature fix: pass
    `TurnSpec` + the runtime deps directly.
-2. `[VERIFIED]` **`app/events.rs` (1440) is two files**: the `AppEvent`
+2. `[DONE 2026-07-15 — `app/view_state.rs`, glob-re-exported]` **`app/events.rs` (1440) is two files**: the `AppEvent`
    contract (~200 lines, imported by server/semantic/agent/logging as the
    cross-layer vocabulary) buried under ~900 lines of UI state machines
    (View, Onboarding, Picker*, Confirm*, Modal, DeleteSessions*, Question*).
    Split: events.rs keeps the event vocabulary; per-modal state moves to
    `app/view_state/` (or per-feature modules). Everything imports this file —
    the split shrinks incremental-build blast radius too.
-3. `[VERIFIED]` **`app/mod.rs` regrew 990 → 1309**: the regrowth is precisely
+3. `[DONE 2026-07-15 — arm delegation + announce(); 1309→1190, CC ok]` **`app/mod.rs` regrew 990 → 1309**: the regrowth is precisely
    the new features bolted onto the dispatcher — server/update/model-cache
    wiring in `new()` + Server*/UpdateStatus/ProviderModelsRefreshed/
    SessionsDeleted arms in `handle_event` (338 lines, CC 30). Fix is
@@ -247,7 +247,7 @@
    `AgentDone` belongs next to `apply_verdict`), leaving handle_event as pure
    dispatch. `run_loop`'s post-select "settle the frame" phase (drain, MCP
    refresh, terminal-restore, conditional render) is its own extraction.
-4. `[REPORTED]` **keys layer**: `submit_input` (147) inlines a 4-stage GOAL
+4. `[PARTLY DONE 2026-07-15 — the GOAL machine moved to goal.rs; dispatch/modal arm extraction remains]` **keys layer**: `submit_input` (147) inlines a 4-stage GOAL
    state machine + paste-chip expansion + history + attachments — extract the
    GOAL block to goal.rs; `apply_command_result` (235) and `handle_modal_key`
    (163) both already contain the fix pattern (two arms delegate to
@@ -375,7 +375,7 @@ vs status-text display builders are unrelated under a misleading name.
 3. `[DONE 2026-07-15]` **Dedup batch B (agent/server)**: `dispatch_generic_tool` +
    `build_step_request` + `tool_skip_message`; server SSE-bridge +
    blocking-skeleton helpers (+ idle-timeout backstop while there).
-4. **Structure batch**: `run_agent_loop` phase extraction + `TurnSpec`
+4. `[DONE 2026-07-15]` **Structure batch**: `run_agent_loop` phase extraction + `TurnSpec`
    signature; events.rs contract/state split; handle_event arm delegation;
    keys extractions (GOAL block out of submit_input first).
 5. **Sweepables (mechanical, anytime)**: announce() helper, save-or-rollback

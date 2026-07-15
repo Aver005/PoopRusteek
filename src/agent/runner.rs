@@ -1,11 +1,12 @@
-use crate::agent::stream::{StreamEnd, collect_stream};
+use crate::agent::stream::{StreamEnd, StreamOutcome, collect_stream};
 use crate::agent::tool_parser::{
-    StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
+    ParsedToolCall, StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
 };
 use crate::app::conversation::ConversationId;
 use crate::app::events::{
     AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo,
 };
+use crate::app::runtime::TurnSpec;
 use crate::debug_log;
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
@@ -16,72 +17,50 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Drive one agent turn for `conversation`. Every event it emits is tagged with
-/// that id so the app routes it to the right conversation (focused or
-/// background). When `auto_approve` is set (background sidechats / sub-agents,
-/// where no user is watching) tool calls run without an approval prompt and
-/// `question` calls are declined instead of blocking.
-#[allow(clippy::too_many_arguments)]
+/// Drive one agent turn described by `spec`. Every event it emits is tagged
+/// with the spec's conversation id so the app routes it to the right
+/// conversation (focused or background). When `spec.auto_approve` is set
+/// (background sidechats / sub-agents, where no user is watching) tool calls
+/// run without an approval prompt and `question` calls are declined instead
+/// of blocking.
 pub async fn run_agent_loop(
-    conversation: ConversationId,
-    provider: Arc<dyn LLMProvider>,
+    spec: TurnSpec,
     tools: Arc<ToolRegistry>,
     mcp: Arc<tokio::sync::Mutex<MCPManager>>,
     semantic: Arc<SemanticService>,
-    messages: Vec<ChatMessage>,
-    system_prompt: String,
-    model: String,
-    temperature: f32,
-    max_tokens: u32,
-    max_steps: usize,
-    max_tools_per_step: usize,
-    auto_approve: bool,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let TurnSpec {
+        conversation,
+        provider,
+        mut messages,
+        system_prompt,
+        model,
+        temperature,
+        max_tokens,
+        max_steps,
+        max_tools_per_step,
+        auto_approve,
+    } = spec;
     let mut collected_tool_calls = Vec::new();
-    let mut messages = messages;
     let mut malformed_retries: u32 = 0;
 
-    // Semantic hint: match the newest user message against the skill and
-    // MCP-tool corpora and attach an advisory note the model can act on
-    // (`skill` tool / listed MCP tools). Lives only in this turn's local
-    // message copy — it is never persisted to the conversation. ONNX
-    // inference is CPU-bound, so it runs on a blocking thread, not this
-    // task; a not-yet-initialized matcher returns nothing instantly.
-    //
-    // The hint is inserted *before* the user message it annotates, never
-    // after: providers that send only the newest tail (DeepSeek's flat
-    // prompt) must always deliver the user's text as the final USER INPUT —
-    // a trailing system note used to displace it entirely.
-    if let Some(user_idx) = messages
-        .iter()
-        .rposition(|m| matches!(m.role, Role::User) && !m.content.trim().is_empty())
-    {
-        let user_text = messages[user_idx].content.clone();
-        let service = Arc::clone(&semantic);
-        let matches = tokio::task::spawn_blocking(move || service.match_prompt(&user_text))
-            .await
-            .unwrap_or_default();
-        if let Some(hint) = semantic.render_hint(&matches) {
-            let described: Vec<String> =
-                matches
-                    .skills
-                    .iter()
-                    .map(|m| format!("skill:{}(d={:.3},s={:.3})", m.slug, m.dense, m.sparse))
-                    .chain(matches.mcp_tools.iter().map(|m| {
-                        format!("mcp:{}(d={:.3},s={:.3})", m.full_name, m.dense, m.sparse)
-                    }))
-                    .collect();
-            debug_log::log(
-                "agent.semantic_hint",
-                format!(
-                    "conversation={conversation} matches={}",
-                    described.join(", ")
-                ),
-            );
-            messages.insert(user_idx, ChatMessage::system(&hint));
-        }
-    }
+    inject_semantic_hint(conversation, &semantic, &mut messages).await;
+
+    let ctx = ToolExecContext {
+        conversation,
+        provider: &provider,
+        tools: &tools,
+        mcp: &mcp,
+        system_prompt: &system_prompt,
+        model: &model,
+        temperature,
+        max_tokens,
+        max_steps,
+        max_tools_per_step,
+        auto_approve,
+        event_tx: &event_tx,
+    };
 
     for step in 0..max_steps {
         let step_number = step + 1;
@@ -96,30 +75,7 @@ pub async fn run_agent_loop(
         let request =
             build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
 
-        // Visible-delta emission rides the collector's progress callback:
-        // strip tool-call syntax from the accumulated text and stream only
-        // the newly-appended visible suffix. The tracker is per-step: the
-        // accumulated text is append-only within one completion, which is
-        // exactly what its incremental freezing relies on.
-        let mut streamed_visible = String::new();
-        let mut visible_tracker = StreamTextTracker::default();
-        let progress_tx = event_tx.clone();
-        let outcome = collect_stream(&provider, request, |full_response| {
-            let next_visible = visible_tracker.visible(full_response);
-            if next_visible.starts_with(&streamed_visible) {
-                let delta = &next_visible[streamed_visible.len()..];
-                if !delta.is_empty() {
-                    let _ = progress_tx.send(AppEvent::AgentChunk(conversation, delta.to_string()));
-                }
-            } else if !next_visible.is_empty() {
-                let _ = progress_tx.send(AppEvent::AddMessage(
-                    conversation,
-                    ChatMessage::system("⚠ Streaming sync issue — agent will continue"),
-                ));
-            }
-            streamed_visible = next_visible;
-        })
-        .await;
+        let outcome = stream_step(conversation, &provider, request, &event_tx).await;
 
         let full_response = outcome.text;
         let got_stop = outcome.got_stop;
@@ -378,137 +334,7 @@ pub async fn run_agent_loop(
                 continue;
             }
 
-            let (tool_result, is_error) = if tool_call.name == QUESTION_TOOL_NAME {
-                // Background turns (auto_approve) have no user to answer.
-                if auto_approve {
-                    (
-                        "Cannot ask the user from a background agent.".to_string(),
-                        true,
-                    )
-                } else {
-                    let question_text = tool_call.arguments["question"]
-                        .as_str()
-                        .unwrap_or("(no question)");
-                    let options: Vec<String> = tool_call.arguments["options"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let allow_custom = tool_call.arguments["allow_custom"]
-                        .as_bool()
-                        .unwrap_or(false);
-
-                    let qs = QuestionState::new(question_text.to_string(), options, allow_custom);
-                    let request = QuestionRequest::new();
-                    let _ = event_tx.send(AppEvent::RequestQuestion(request.clone(), qs));
-
-                    let _ = event_tx.send(AppEvent::ToolStarted {
-                        conversation,
-                        name: tool_call.name.clone(),
-                    });
-
-                    match request.wait().await {
-                        Some(answer) if !answer.is_empty() => {
-                            (format!("User answered: {answer}"), false)
-                        }
-                        _ => ("User cancelled the question".to_string(), true),
-                    }
-                }
-            } else if tool_call.name == TASK_TOOL_NAME {
-                // Only the foreground (interactive) loop may spawn sub-agents;
-                // sidechats / sub-agents (auto_approve) cannot — depth limit 1.
-                if auto_approve {
-                    ("Nested sub-agents are not allowed.".to_string(), true)
-                } else {
-                    let prompt = tool_call.arguments["prompt"]
-                        .as_str()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let label = tool_call.arguments["description"]
-                        .as_str()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or("sub-agent task")
-                        .to_string();
-                    let background = tool_call.arguments["background"].as_bool().unwrap_or(false);
-                    if prompt.is_empty() {
-                        (
-                            "The 'task' tool requires a non-empty 'prompt'.".to_string(),
-                            true,
-                        )
-                    } else if background {
-                        let _ = event_tx.send(AppEvent::SpawnSubAgent {
-                            parent: conversation,
-                            label: label.clone(),
-                            prompt,
-                        });
-                        (format!("Started background sub-agent: {label}"), false)
-                    } else {
-                        let _ = event_tx.send(AppEvent::ToolStarted {
-                            conversation,
-                            name: TASK_TOOL_NAME.to_string(),
-                        });
-                        let sub_provider = provider.fork();
-                        let session_cleanup = Arc::clone(&sub_provider);
-                        let outcome = match crate::agent::sub_agent::run_sub_agent(
-                            sub_provider,
-                            Arc::clone(&tools),
-                            Arc::clone(&mcp),
-                            system_prompt.clone(),
-                            prompt,
-                            model.clone(),
-                            temperature,
-                            max_tokens,
-                            max_steps.min(8),
-                            max_tools_per_step,
-                        )
-                        .await
-                        {
-                            Ok(text) => (text, false),
-                            Err(e) => (format!("Sub-agent failed: {e}"), true),
-                        };
-                        // The fork is one-shot — delete its server-side
-                        // session so it doesn't linger on the account.
-                        tokio::spawn(async move {
-                            let _ = session_cleanup.discard_remote_session().await;
-                        });
-                        outcome
-                    }
-                }
-            } else {
-                let approved = if auto_approve {
-                    true
-                } else {
-                    let arguments_preview = serde_json::to_string_pretty(&tool_call.arguments)
-                        .unwrap_or_else(|_| tool_call.arguments.to_string());
-                    let approval = ToolApprovalRequest::new(
-                        conversation,
-                        tool_call.name.clone(),
-                        arguments_preview,
-                    );
-                    let _ = event_tx.send(AppEvent::RequestToolApproval(approval.clone()));
-                    approval.wait().await
-                };
-
-                if approved {
-                    let _ = event_tx.send(AppEvent::ToolStarted {
-                        conversation,
-                        name: tool_call.name.clone(),
-                    });
-                    dispatch_generic_tool(
-                        &tools,
-                        &mcp,
-                        &tool_call.name,
-                        tool_call.arguments.clone(),
-                    )
-                    .await
-                } else {
-                    ("Execution denied by user.".to_string(), true)
-                }
-            };
+            let (tool_result, is_error) = execute_tool_call(&tool_call, &ctx).await;
 
             let preview = summarize_tool_result(&tool_result);
             let display = preview.clone();
@@ -576,6 +402,231 @@ pub async fn run_agent_loop(
         conversation,
         "Reached max agent steps before producing a final answer".to_string(),
     ));
+}
+
+/// Semantic hint: match the newest user message against the skill and
+/// MCP-tool corpora and insert an advisory note the model can act on
+/// (`skill` tool / listed MCP tools). Mutates only this turn's local message
+/// copy — it is never persisted to the conversation. ONNX inference is
+/// CPU-bound, so it runs on a blocking thread, not this task; a
+/// not-yet-initialized matcher returns nothing instantly.
+///
+/// The hint is inserted *before* the user message it annotates, never
+/// after: providers that send only the newest tail (DeepSeek's flat prompt)
+/// must always deliver the user's text as the final USER INPUT — a trailing
+/// system note used to displace it entirely.
+async fn inject_semantic_hint(
+    conversation: ConversationId,
+    semantic: &Arc<SemanticService>,
+    messages: &mut Vec<ChatMessage>,
+) {
+    let Some(user_idx) = messages
+        .iter()
+        .rposition(|m| matches!(m.role, Role::User) && !m.content.trim().is_empty())
+    else {
+        return;
+    };
+    let user_text = messages[user_idx].content.clone();
+    let service = Arc::clone(semantic);
+    let matches = tokio::task::spawn_blocking(move || service.match_prompt(&user_text))
+        .await
+        .unwrap_or_default();
+    if let Some(hint) = semantic.render_hint(&matches) {
+        let described: Vec<String> = matches
+            .skills
+            .iter()
+            .map(|m| format!("skill:{}(d={:.3},s={:.3})", m.slug, m.dense, m.sparse))
+            .chain(
+                matches
+                    .mcp_tools
+                    .iter()
+                    .map(|m| format!("mcp:{}(d={:.3},s={:.3})", m.full_name, m.dense, m.sparse)),
+            )
+            .collect();
+        debug_log::log(
+            "agent.semantic_hint",
+            format!(
+                "conversation={conversation} matches={}",
+                described.join(", ")
+            ),
+        );
+        messages.insert(user_idx, ChatMessage::system(&hint));
+    }
+}
+
+/// Stream one step's completion, emitting visible-text deltas as they
+/// arrive: tool-call syntax is stripped from the accumulated text and only
+/// the newly-appended visible suffix is streamed. The tracker is per-step —
+/// the accumulated text is append-only within one completion, which is
+/// exactly what its incremental freezing relies on.
+async fn stream_step(
+    conversation: ConversationId,
+    provider: &Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> StreamOutcome {
+    let mut streamed_visible = String::new();
+    let mut visible_tracker = StreamTextTracker::default();
+    let progress_tx = event_tx.clone();
+    collect_stream(provider, request, |full_response| {
+        let next_visible = visible_tracker.visible(full_response);
+        if next_visible.starts_with(&streamed_visible) {
+            let delta = &next_visible[streamed_visible.len()..];
+            if !delta.is_empty() {
+                let _ = progress_tx.send(AppEvent::AgentChunk(conversation, delta.to_string()));
+            }
+        } else if !next_visible.is_empty() {
+            let _ = progress_tx.send(AppEvent::AddMessage(
+                conversation,
+                ChatMessage::system("⚠ Streaming sync issue — agent will continue"),
+            ));
+        }
+        streamed_visible = next_visible;
+    })
+    .await
+}
+
+/// Everything one tool call's execution needs from the turn — bundled so
+/// [`execute_tool_call`] doesn't take a dozen positional arguments (the
+/// same disease `TurnSpec` cures one level up).
+struct ToolExecContext<'turn> {
+    conversation: ConversationId,
+    provider: &'turn Arc<dyn LLMProvider>,
+    tools: &'turn Arc<ToolRegistry>,
+    mcp: &'turn Arc<tokio::sync::Mutex<MCPManager>>,
+    system_prompt: &'turn str,
+    model: &'turn str,
+    temperature: f32,
+    max_tokens: u32,
+    max_steps: usize,
+    max_tools_per_step: usize,
+    auto_approve: bool,
+    event_tx: &'turn mpsc::UnboundedSender<AppEvent>,
+}
+
+/// Execute one parsed tool call: `question` (interactive prompt — declined
+/// on background turns), `task` (sub-agent spawn — foreground only, depth
+/// limit 1), or a generic builtin/MCP tool behind the approval gate.
+/// Returns `(result, is_error)`.
+async fn execute_tool_call(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> (String, bool) {
+    if call.name == QUESTION_TOOL_NAME {
+        // Background turns (auto_approve) have no user to answer.
+        if ctx.auto_approve {
+            return (
+                "Cannot ask the user from a background agent.".to_string(),
+                true,
+            );
+        }
+        let question_text = call.arguments["question"]
+            .as_str()
+            .unwrap_or("(no question)");
+        let options: Vec<String> = call.arguments["options"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let allow_custom = call.arguments["allow_custom"].as_bool().unwrap_or(false);
+
+        let qs = QuestionState::new(question_text.to_string(), options, allow_custom);
+        let request = QuestionRequest::new();
+        let _ = ctx
+            .event_tx
+            .send(AppEvent::RequestQuestion(request.clone(), qs));
+        let _ = ctx.event_tx.send(AppEvent::ToolStarted {
+            conversation: ctx.conversation,
+            name: call.name.clone(),
+        });
+        return match request.wait().await {
+            Some(answer) if !answer.is_empty() => (format!("User answered: {answer}"), false),
+            _ => ("User cancelled the question".to_string(), true),
+        };
+    }
+
+    if call.name == TASK_TOOL_NAME {
+        // Only the foreground (interactive) loop may spawn sub-agents;
+        // sidechats / sub-agents (auto_approve) cannot — depth limit 1.
+        if ctx.auto_approve {
+            return ("Nested sub-agents are not allowed.".to_string(), true);
+        }
+        let prompt = call.arguments["prompt"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let label = call.arguments["description"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("sub-agent task")
+            .to_string();
+        let background = call.arguments["background"].as_bool().unwrap_or(false);
+        if prompt.is_empty() {
+            return (
+                "The 'task' tool requires a non-empty 'prompt'.".to_string(),
+                true,
+            );
+        }
+        if background {
+            let _ = ctx.event_tx.send(AppEvent::SpawnSubAgent {
+                parent: ctx.conversation,
+                label: label.clone(),
+                prompt,
+            });
+            return (format!("Started background sub-agent: {label}"), false);
+        }
+        let _ = ctx.event_tx.send(AppEvent::ToolStarted {
+            conversation: ctx.conversation,
+            name: TASK_TOOL_NAME.to_string(),
+        });
+        let sub_provider = ctx.provider.fork();
+        let session_cleanup = Arc::clone(&sub_provider);
+        let outcome = match crate::agent::sub_agent::run_sub_agent(
+            sub_provider,
+            Arc::clone(ctx.tools),
+            Arc::clone(ctx.mcp),
+            ctx.system_prompt.to_string(),
+            prompt,
+            ctx.model.to_string(),
+            ctx.temperature,
+            ctx.max_tokens,
+            ctx.max_steps.min(8),
+            ctx.max_tools_per_step,
+        )
+        .await
+        {
+            Ok(text) => (text, false),
+            Err(e) => (format!("Sub-agent failed: {e}"), true),
+        };
+        // The fork is one-shot — delete its server-side session so it
+        // doesn't linger on the account.
+        tokio::spawn(async move {
+            let _ = session_cleanup.discard_remote_session().await;
+        });
+        return outcome;
+    }
+
+    let approved = if ctx.auto_approve {
+        true
+    } else {
+        let arguments_preview = serde_json::to_string_pretty(&call.arguments)
+            .unwrap_or_else(|_| call.arguments.to_string());
+        let approval =
+            ToolApprovalRequest::new(ctx.conversation, call.name.clone(), arguments_preview);
+        let _ = ctx
+            .event_tx
+            .send(AppEvent::RequestToolApproval(approval.clone()));
+        approval.wait().await
+    };
+    if !approved {
+        return ("Execution denied by user.".to_string(), true);
+    }
+    let _ = ctx.event_tx.send(AppEvent::ToolStarted {
+        conversation: ctx.conversation,
+        name: call.name.clone(),
+    });
+    dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments.clone()).await
 }
 
 /// Build one step's completion request: system prompt first, then the
@@ -692,19 +743,21 @@ mod tests {
         let cid = ConversationId::next();
 
         run_agent_loop(
-            cid,
-            provider,
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("hi")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: false,
+            },
             tools,
             mcp,
             SemanticService::disabled(),
-            vec![ChatMessage::user("hi")],
-            "system".to_string(),
-            "fake".to_string(),
-            0.0,
-            128,
-            4,
-            4,
-            false,
             event_tx,
         )
         .await;
@@ -752,19 +805,21 @@ mod tests {
         let cid = ConversationId::next();
 
         run_agent_loop(
-            cid,
-            provider,
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("hi")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: false,
+            },
             tools,
             mcp,
             SemanticService::disabled(),
-            vec![ChatMessage::user("hi")],
-            "system".to_string(),
-            "fake".to_string(),
-            0.0,
-            128,
-            4,
-            4,
-            false,
             event_tx,
         )
         .await;
@@ -795,19 +850,21 @@ mod tests {
         let cid = ConversationId::next();
 
         run_agent_loop(
-            cid,
-            provider,
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("hi")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+            },
             tools,
             mcp,
             SemanticService::disabled(),
-            vec![ChatMessage::user("hi")],
-            "system".to_string(),
-            "fake".to_string(),
-            0.0,
-            128,
-            4,
-            4,
-            true,
             event_tx,
         )
         .await;

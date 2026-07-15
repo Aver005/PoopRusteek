@@ -454,3 +454,30 @@ impl App {
         self.state.focused_mut().broken = broken;
     }
 }
+
+impl App {
+    /// `AppEvent::SessionsDeleted` — summarize the `/delete` outcome:
+    /// failures are enumerated in the chat line, the status line stays short.
+    pub(crate) fn on_sessions_deleted(&mut self, deleted: usize, failed: Vec<String>) {
+        let mut message = format!(
+            "🗑 Deleted {deleted} session cop{}",
+            if deleted == 1 { "y" } else { "ies" }
+        );
+        if !failed.is_empty() {
+            message.push_str(&format!(
+                "; {} failed:\n  {}",
+                failed.len(),
+                failed.join("\n  ")
+            ));
+        }
+        self.state.status_message = if failed.is_empty() {
+            "Sessions deleted".to_string()
+        } else {
+            "Some session deletions failed".to_string()
+        };
+        self.state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::ui_system(&message));
+    }
+}

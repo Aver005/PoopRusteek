@@ -167,3 +167,46 @@ impl App {
         )
     }
 }
+
+impl App {
+    /// `AppEvent::ServerStarted` — record the bound address and announce.
+    /// Stale generations are ignored: a replaced server may report late.
+    pub(crate) fn on_server_started(&mut self, generation: u64, addr: std::net::SocketAddr) {
+        if let Some(handle) = &mut self.server
+            && handle.generation == generation
+        {
+            handle.bound_addr = Some(addr);
+            let message = format!(
+                "API server listening on http://{addr}/v1 ({} dialect).",
+                handle.api.label()
+            );
+            self.announce(message);
+        }
+    }
+
+    /// `AppEvent::ServerFailed` — drop the handle (if it is still this
+    /// generation's) and announce the failure.
+    pub(crate) fn on_server_failed(&mut self, generation: u64, error: String) {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|handle| handle.generation == generation)
+        {
+            self.server = None;
+        }
+        self.announce(format!("API server failed to start: {error}"));
+    }
+
+    /// `AppEvent::ServerStopped` — only the *current* server's stop clears
+    /// the handle; a replaced server (port-change restart) reports late.
+    pub(crate) fn on_server_stopped(&mut self, generation: u64) {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|handle| handle.generation == generation)
+        {
+            self.server = None;
+            self.announce("API server stopped.");
+        }
+    }
+}

@@ -4,7 +4,6 @@
 //! slash-command dispatch via `dispatch::apply_command_result`, or a plain
 //! message turn).
 
-use crate::app::events::GoalStage;
 use crate::app::{App, AutocompleteState};
 use crate::error::AppResult;
 use crate::provider::ChatMessage;
@@ -172,25 +171,9 @@ impl App {
         // Expand any `[Pasted #N, L lines]` chips back to their real content so
         // the model (and the saved message) get the full pasted text.
         let input = self.state.input.expanded().trim().to_string();
-        // Empty submission while defining a goal: nudge instead of silently ignoring it.
-        if input.is_empty()
-            && self.state.goal.mode
-            && matches!(
-                self.state.goal.stage,
-                GoalStage::Inactive | GoalStage::WaitForGoal
-            )
-        {
-            let what = if matches!(self.state.goal.stage, GoalStage::Inactive) {
-                "prompt"
-            } else {
-                "goal"
-            };
-            self.state.push_system(&format!(
-                "Your {what} is empty — type something before pressing Enter."
-            ));
-            self.state.input.clear_buffer();
-        }
         if input.is_empty() {
+            // Empty while defining a goal gets a nudge instead of silence.
+            self.maybe_nudge_empty_goal();
             return Ok(SubmitOutcome::Continue);
         }
 
@@ -212,70 +195,12 @@ impl App {
                 self.state.input.history.clone(),
             ));
 
-        // --- GOAL mode: intercept non-command input ---
-        if self.state.goal.mode && !input.starts_with('/') {
-            match self.state.goal.stage {
-                GoalStage::Inactive => {
-                    // First input in goal mode = the prompt.
-                    // Echoes are ui_only: the model gets the
-                    // combined agent-1 prompt once, below.
-                    self.state.goal.prompt = input.clone();
-                    self.state.goal.stage = GoalStage::WaitForGoal;
-                    let mut echo = ChatMessage::user(&input);
-                    echo.ui_only = true;
-                    self.state.focused_mut().messages.push(echo);
-                    self.state
-                        .focused_mut()
-                        .messages
-                        .push(ChatMessage::ui_system(
-                            "🎯 Goal mode: now define your GOAL (what must be achieved)",
-                        ));
-                    return Ok(SubmitOutcome::Consumed);
-                }
-                GoalStage::WaitForGoal => {
-                    // Second input = the goal
-                    self.state.goal.text = input.clone();
-                    let mut echo = ChatMessage::user(&format!("GOAL: {}", input));
-                    echo.ui_only = true;
-                    self.state.focused_mut().messages.push(echo);
-
-                    // Without a provider the worker can't run; advancing
-                    // the stage would wedge the cycle, so bail cleanly.
-                    if self.state.focused().provider.is_none() {
-                        self.cancel_goal_cycle(
-                            "No provider configured — cannot run the goal. Set your DeepSeek token, then /goal to retry.",
-                        );
-                        return Ok(SubmitOutcome::Consumed);
-                    }
-
-                    self.state.goal.stage = GoalStage::RunAgent1;
-                    self.state.goal.iteration = 1;
-
-                    // Build the agent 1 prompt: user's prompt + goal
-                    let agent1_prompt = format!(
-                        "{}\n\nIMPORTANT - GOAL to achieve: {}",
-                        self.state.goal.prompt, self.state.goal.text
-                    );
-                    let message = ChatMessage::user_with_display(
-                        &agent1_prompt,
-                        "[Goal cycle started — attempt 1]",
-                    );
-                    self.send_focused_turn(Some(message)).await?;
-                    return Ok(SubmitOutcome::Consumed);
-                }
-                GoalStage::RunAgent1 | GoalStage::RunEvaluator => {
-                    // Block input while goal cycle is active
-                    self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                        "Goal cycle in progress. Wait for it to finish or type /goal to cancel.",
-                    ));
-                    return Ok(SubmitOutcome::Consumed);
-                }
-                GoalStage::Done => {
-                    // After goal is done, regular input resumes
-                    self.state.goal.mode = false;
-                    self.state.goal.stage = GoalStage::Inactive;
-                }
-            }
+        // GOAL mode intercepts non-command input — the whole state machine
+        // lives in goal.rs; `false` means goal mode just ended and the
+        // input proceeds as a normal turn.
+        if self.state.goal.mode && !input.starts_with('/') && self.handle_goal_input(&input).await?
+        {
+            return Ok(SubmitOutcome::Consumed);
         }
 
         if input.starts_with('/') {

@@ -603,3 +603,144 @@ impl App {
             });
     }
 }
+
+impl App {
+    /// GOAL-cycle transition run after every `AgentDone`: when agent 1 just
+    /// finished, hand its output to the evaluator — or retry an empty turn.
+    /// Lives here so the whole goal state machine reads in one file; the
+    /// `AgentDone` arm in `handle_event` only calls this.
+    pub(crate) async fn maybe_advance_goal_cycle(&mut self) {
+        if !(self.state.goal.mode && self.state.goal.stage == GoalStage::RunAgent1) {
+            return;
+        }
+        // Agent 1 finished — take the last assistant content for evaluation.
+        let agent_result = self
+            .state
+            .focused_mut()
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::provider::Role::Assistant)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        if !agent_result.is_empty() {
+            self.state.status_message = "Evaluating goal...".to_string();
+            self.state.goal.stage = GoalStage::RunEvaluator;
+            self.state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::ui_system(
+                    "🔍 Evaluating result against goal...",
+                ));
+            self.spawn_goal_evaluation(agent_result);
+        } else {
+            self.state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::ui_system(
+                    "⚠ Agent produced no output. Retrying...",
+                ));
+            self.retry_agent1().await;
+        }
+    }
+}
+
+impl App {
+    /// Empty submission while defining a goal: nudge instead of silently
+    /// ignoring it (part of `submit_input`'s goal interception — kept here
+    /// with the rest of the goal state machine).
+    pub(crate) fn maybe_nudge_empty_goal(&mut self) {
+        if !(self.state.goal.mode
+            && matches!(
+                self.state.goal.stage,
+                GoalStage::Inactive | GoalStage::WaitForGoal
+            ))
+        {
+            return;
+        }
+        let what = if matches!(self.state.goal.stage, GoalStage::Inactive) {
+            "prompt"
+        } else {
+            "goal"
+        };
+        self.state.push_system(&format!(
+            "Your {what} is empty — type something before pressing Enter."
+        ));
+        self.state.input.clear_buffer();
+    }
+
+    /// Goal-mode interception of a non-command submission: the first input
+    /// becomes the prompt, the second the goal (which launches agent 1), and
+    /// input during a running cycle is blocked. Returns `true` when the
+    /// input was consumed by the state machine; `false` (the `Done` stage)
+    /// means goal mode just ended and the caller should treat the input as a
+    /// normal turn.
+    pub(crate) async fn handle_goal_input(&mut self, input: &str) -> crate::error::AppResult<bool> {
+        match self.state.goal.stage {
+            GoalStage::Inactive => {
+                // First input in goal mode = the prompt. Echoes are ui_only:
+                // the model gets the combined agent-1 prompt once, later.
+                self.state.goal.prompt = input.to_string();
+                self.state.goal.stage = GoalStage::WaitForGoal;
+                let mut echo = ChatMessage::user(input);
+                echo.ui_only = true;
+                self.state.focused_mut().messages.push(echo);
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::ui_system(
+                        "🎯 Goal mode: now define your GOAL (what must be achieved)",
+                    ));
+                Ok(true)
+            }
+            GoalStage::WaitForGoal => {
+                // Second input = the goal.
+                self.state.goal.text = input.to_string();
+                let mut echo = ChatMessage::user(&format!("GOAL: {}", input));
+                echo.ui_only = true;
+                self.state.focused_mut().messages.push(echo);
+
+                // Without a provider the worker can't run; advancing the
+                // stage would wedge the cycle, so bail cleanly.
+                if self.state.focused().provider.is_none() {
+                    self.cancel_goal_cycle(
+                        "No provider configured — cannot run the goal. Set your DeepSeek token, then /goal to retry.",
+                    );
+                    return Ok(true);
+                }
+
+                self.state.goal.stage = GoalStage::RunAgent1;
+                self.state.goal.iteration = 1;
+
+                // Build the agent 1 prompt: user's prompt + goal.
+                let agent1_prompt = format!(
+                    "{}\n\nIMPORTANT - GOAL to achieve: {}",
+                    self.state.goal.prompt, self.state.goal.text
+                );
+                let message = ChatMessage::user_with_display(
+                    &agent1_prompt,
+                    "[Goal cycle started — attempt 1]",
+                );
+                self.send_focused_turn(Some(message)).await?;
+                Ok(true)
+            }
+            GoalStage::RunAgent1 | GoalStage::RunEvaluator => {
+                // Block input while the goal cycle is active.
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::ui_system(
+                        "Goal cycle in progress. Wait for it to finish or type /goal to cancel.",
+                    ));
+                Ok(true)
+            }
+            GoalStage::Done => {
+                // After the goal is done, regular input resumes.
+                self.state.goal.mode = false;
+                self.state.goal.stage = GoalStage::Inactive;
+                Ok(false)
+            }
+        }
+    }
+}
