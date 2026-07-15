@@ -50,8 +50,7 @@ struct Args {
     uiless: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     color_eyre::install()?;
 
     let args = Args::parse();
@@ -75,6 +74,29 @@ async fn main() -> Result<()> {
         }
     };
 
+    // A manual runtime instead of `#[tokio::main]` for one reason: bounded
+    // shutdown. `spawn_blocking` work cannot be aborted, and the semantic
+    // layer legitimately runs ONNX embedding there for seconds to minutes
+    // (model init, MCP-corpus re-embed, history backfill). A plain runtime
+    // drop waits for ALL blocking tasks, so quitting during that background
+    // load left the process alive, holding the user's shell hostage.
+    // `shutdown_timeout` abandons the blocking threads after a grace period
+    // — safe here: every durable write goes through `util::atomic_write`,
+    // the persist worker is flushed (bounded) before `run()` returns, and
+    // the semantic index is a rebuildable cache that re-fills on the next
+    // launch. Async tasks (MCP startup connects etc.) are cancelled by the
+    // shutdown as they always were.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_async(args, config));
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+async fn run_async(args: Args, config: Config) -> Result<()> {
+    // ACP dispatch stays inside the runtime: the server uses
+    // `block_in_place` internally, which needs a live multi-thread runtime.
     if args.acp {
         return run_acp_server(&config);
     }

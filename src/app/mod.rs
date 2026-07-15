@@ -436,8 +436,16 @@ impl App {
         // and the tokio runtime can shut down cleanly.
         let _ = crate::tools::background::shutdown_all().await;
         // Terminate MCP server children — dropping them without close() used
-        // to orphan one subprocess per stdio server on every exit.
-        self.mcp.lock().await.shutdown_all().await;
+        // to orphan one subprocess per stdio server on every exit. Bounded
+        // like every other cleanup step: the manager lock can be busy (a
+        // startup merge, an admin operation) and a wedged child can stall
+        // `close()` — exit must not wait either out. On timeout the children
+        // still die with the process on Windows (the kill-on-close Job
+        // Object) and via `kill_on_drop` wherever the transport is dropped.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            self.mcp.lock().await.shutdown_all().await;
+        })
+        .await;
         result
     }
 

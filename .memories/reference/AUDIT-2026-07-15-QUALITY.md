@@ -39,7 +39,7 @@
    mcp sweep): `MCPManager`'s mutating methods are `&mut self` async fns with
    I/O inside — the caller decides whether the antipattern happens. Fix the
    'd' arm now; longer-term give mutations a snapshot→unlock→I/O→relock shape.
-2. `[VERIFIED]` **#2 by the letter (not on the event loop)**:
+2. `[PARTLY FIXED 2026-07-15 — the exit-path shutdown is bounded (3s) now; the reconnect-under-lock in the spawned task remains]` **#2 by the letter (not on the event loop)**:
    `app/mod.rs` `McpOAuthResult` arm — `mcp.lock().await.reconnect_server(...)
    .await` inside a spawned task holds the manager lock for the whole
    reconnect handshake (other lockers queue); `run()` exit path
