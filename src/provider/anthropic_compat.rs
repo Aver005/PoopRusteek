@@ -18,7 +18,8 @@
 //! Pure data mapping — no I/O. Transport lives in
 //! [`super::anthropic_client`].
 
-use crate::provider::{CompletionRequest, CompletionResponse, Role, Usage};
+use super::compat_client::merge_alternating_turns;
+use crate::provider::{CompletionRequest, CompletionResponse, Usage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -26,38 +27,9 @@ use serde_json::{Value, json};
 /// for the same reason `provider/prompt.rs` filters them: UI chrome must
 /// never reach a model.
 pub fn request_to_anthropic(request: &CompletionRequest) -> Value {
-    let mut system_parts: Vec<&str> = Vec::new();
-    // (role, accumulated text) with consecutive same-role runs merged.
-    let mut turns: Vec<(&'static str, String)> = Vec::new();
-
-    for message in request.messages.iter().filter(|message| !message.ui_only) {
-        let (role, text) = match message.role {
-            Role::System => {
-                system_parts.push(&message.content);
-                continue;
-            }
-            Role::User => ("user", message.content.clone()),
-            Role::Assistant => ("assistant", message.content.clone()),
-            // Prompt-encoded tool protocol: results go back as user text,
-            // labeled so the model can tell them from the human.
-            Role::Tool => ("user", format!("[tool result]\n{}", message.content)),
-        };
-        if text.is_empty() {
-            continue;
-        }
-        match turns.last_mut() {
-            Some((last_role, buffer)) if *last_role == role => {
-                buffer.push_str("\n\n");
-                buffer.push_str(&text);
-            }
-            _ => turns.push((role, text)),
-        }
-    }
-
-    // The API rejects an assistant-first (or empty) conversation.
-    if matches!(turns.first(), Some(("assistant", _)) | None) {
-        turns.insert(0, ("user", "(continue)".to_string()));
-    }
+    // Shared with gemini_compat — same merge/opener algorithm, different
+    // assistant-role literal.
+    let (system_parts, turns) = merge_alternating_turns(request, "assistant");
 
     let messages: Vec<Value> = turns
         .into_iter()

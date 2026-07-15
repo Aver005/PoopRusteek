@@ -6,6 +6,15 @@
 //! primitive — decoding the JSON inside each `data:` line stays the caller's
 //! job, since the event shapes are provider-specific.
 
+/// Strip the `data:` field name from an SSE line, returning the trimmed
+/// payload — `None` for anything that isn't a data line (comments, `event:`
+/// fields, blank separators). One shared definition so the prefix handling
+/// can't drift between the SSE consumers (it had already been hand-rolled
+/// four slightly different ways).
+pub fn sse_data_payload(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("data:").map(str::trim)
+}
+
 /// Accumulates raw bytes and yields complete lines as they become available.
 ///
 /// Bytes are buffered raw and decoded per *line*, not per chunk: a multibyte
@@ -54,6 +63,16 @@ impl SseLineBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_payload_strips_prefix_and_whitespace() {
+        assert_eq!(sse_data_payload("data: {\"a\":1}"), Some("{\"a\":1}"));
+        assert_eq!(sse_data_payload("data:[DONE] "), Some("[DONE]"));
+        assert_eq!(sse_data_payload("  data: x"), Some("x"));
+        assert_eq!(sse_data_payload("event: ping"), None);
+        assert_eq!(sse_data_payload(": comment"), None);
+        assert_eq!(sse_data_payload(""), None);
+    }
 
     #[test]
     fn splits_complete_lines_in_one_chunk() {

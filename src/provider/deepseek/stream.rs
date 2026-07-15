@@ -501,7 +501,7 @@ fn event_signals_finished(event: &Value) -> bool {
 }
 
 pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
-    let payload = line.trim().strip_prefix("data:")?.trim();
+    let payload = crate::provider::sse::sse_data_payload(line)?;
     if payload.is_empty() {
         return None;
     }

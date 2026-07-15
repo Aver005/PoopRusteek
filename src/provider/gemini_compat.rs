@@ -17,46 +17,17 @@
 //!
 //! Pure data mapping — no I/O. Transport lives in [`super::gemini_client`].
 
-use crate::provider::{CompletionRequest, CompletionResponse, Role, Usage};
+use super::compat_client::merge_alternating_turns;
+use crate::provider::{CompletionRequest, CompletionResponse, Usage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// Build the `generateContent` request body. `ui_only` messages are
 /// filtered for the same reason every other compat layer filters them.
 pub fn request_to_gemini(request: &CompletionRequest) -> Value {
-    let mut system_parts: Vec<&str> = Vec::new();
-    // (role, accumulated text) with consecutive same-role runs merged —
-    // the API rejects non-alternating multi-turn requests.
-    let mut turns: Vec<(&'static str, String)> = Vec::new();
-
-    for message in request.messages.iter().filter(|message| !message.ui_only) {
-        let (role, text) = match message.role {
-            Role::System => {
-                system_parts.push(&message.content);
-                continue;
-            }
-            Role::User => ("user", message.content.clone()),
-            Role::Assistant => ("model", message.content.clone()),
-            // Prompt-encoded tool protocol, same stance as the other
-            // compat layers: results go back as labeled user text.
-            Role::Tool => ("user", format!("[tool result]\n{}", message.content)),
-        };
-        if text.is_empty() {
-            continue;
-        }
-        match turns.last_mut() {
-            Some((last_role, buffer)) if *last_role == role => {
-                buffer.push_str("\n\n");
-                buffer.push_str(&text);
-            }
-            _ => turns.push((role, text)),
-        }
-    }
-
-    // A multi-turn request must start with a user turn.
-    if matches!(turns.first(), Some(("model", _)) | None) {
-        turns.insert(0, ("user", "(continue)".to_string()));
-    }
+    // Shared with anthropic_compat — same merge/opener algorithm, Gemini
+    // just calls the model side "model".
+    let (system_parts, turns) = merge_alternating_turns(request, "model");
 
     let contents: Vec<Value> = turns
         .into_iter()

@@ -107,6 +107,101 @@ impl DeepseekProvider {
             request_history: Mutex::new(VecDeque::new()),
         }
     }
+
+    /// Drive one completion request's SSE stream to the end, handing every
+    /// text fragment to `on_text`. Owns everything `complete` and
+    /// `complete_stream` used to duplicate verbatim: read-error session
+    /// persistence, parent-id capture (persisted immediately so a cut
+    /// stream keeps the thread id), the explicit finish signal, and
+    /// DeepSeek's clean-EOF-means-stop convention. `log_tag` keeps the two
+    /// callers' historical debug-event names apart
+    /// (`completion.collect.*` / `completion.stream.*`).
+    async fn drive_completion(
+        &self,
+        request: &CompletionRequest,
+        log_tag: &str,
+        mut on_text: impl FnMut(String) + Send,
+    ) -> AppResult<()> {
+        let (response, session_id) = self.send_request(request).await?;
+        let mut stream = response.bytes_stream();
+        let mut sse = super::sse::SseLineBuffer::new();
+        let mut parent_message_id = None;
+        let mut text_bytes = 0usize;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    // The server already advanced this session's message
+                    // tree; persist the id we have so the next message
+                    // threads onto it instead of forking onto an invisible
+                    // branch.
+                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    debug_log::log(
+                        &format!("completion.{log_tag}.error"),
+                        format!(
+                            "stream_read_error={error} parent_message_id={parent_message_id:?}"
+                        ),
+                    );
+                    return Err(error.into());
+                }
+            };
+
+            for line in sse.push_bytes(&chunk) {
+                let Some(event) = stream::process_stream_line(&line) else {
+                    // Unrecognized lines are logged so protocol changes stay
+                    // visible instead of silently dropping server events.
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        debug_log::log(&format!("completion.{log_tag}.skipped"), trimmed);
+                    }
+                    continue;
+                };
+
+                debug_log::log(&format!("completion.{log_tag}.line"), line.trim());
+                if event.parent_message_id.is_some() {
+                    parent_message_id = event.parent_message_id;
+                    debug_log::log(
+                        &format!("completion.{log_tag}.parent"),
+                        format!("parent_message_id={:?}", parent_message_id),
+                    );
+                    // Persist immediately — if the stream is cut after this,
+                    // the thread id is already saved.
+                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                }
+                if let Some(text) = event.text {
+                    debug_log::log(
+                        &format!("completion.{log_tag}.chunk"),
+                        format!("text_chunk={}", text),
+                    );
+                    text_bytes += text.len();
+                    on_text(text);
+                }
+                if event.finished {
+                    debug_log::log(
+                        &format!("completion.{log_tag}.done"),
+                        "received explicit finish signal",
+                    );
+                    self.mark_session_after_success(&session_id, parent_message_id)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        self.mark_session_after_success(&session_id, parent_message_id)?;
+        // DeepSeek's web endpoint routinely finishes a response by just
+        // closing the connection — no `data: [DONE]`, no status event. A
+        // cleanly terminated chunked body is a deliberate server-side close,
+        // so treat it as a normal stop; a severed connection surfaces as a
+        // read error in the loop above, never as clean EOF.
+        debug_log::log(
+            &format!("completion.{log_tag}.eof"),
+            format!(
+                "clean EOF treated as stop. session_id={session_id} parent_message_id={parent_message_id:?} text_bytes={text_bytes}"
+            ),
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -122,79 +217,11 @@ impl LLMProvider for DeepseekProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
-        let (response, session_id) = self.send_request(&request).await?;
-        let mut stream = response.bytes_stream();
-        let mut sse = super::sse::SseLineBuffer::new();
         let mut content = String::new();
-        let mut parent_message_id = None;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    // Persist the thread id before bailing so an interrupted
-                    // collection doesn't fork the conversation on the next turn.
-                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
-                    debug_log::log(
-                        "completion.collect.error",
-                        format!(
-                            "stream_read_error={error} parent_message_id={parent_message_id:?}"
-                        ),
-                    );
-                    return Err(error.into());
-                }
-            };
-
-            for line in sse.push_bytes(&chunk) {
-                let Some(event) = stream::process_stream_line(&line) else {
-                    // Unrecognized lines are logged so protocol changes stay
-                    // visible instead of silently dropping server events.
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        debug_log::log("completion.collect.skipped", trimmed);
-                    }
-                    continue;
-                };
-
-                debug_log::log("completion.collect.line", line.trim());
-                if event.parent_message_id.is_some() {
-                    parent_message_id = event.parent_message_id;
-                    debug_log::log(
-                        "completion.collect.parent",
-                        format!("parent_message_id={:?}", parent_message_id),
-                    );
-                    // Persist immediately so a cut stream keeps the thread id.
-                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
-                }
-                if let Some(text) = event.text {
-                    debug_log::log("completion.collect.chunk", format!("text_chunk={}", text));
-                    content.push_str(&text);
-                }
-                if event.finished {
-                    debug_log::log("completion.collect.done", "received explicit finish signal");
-                    self.mark_session_after_success(&session_id, parent_message_id)?;
-                    return Ok(CompletionResponse {
-                        content,
-                        finish_reason: Some("stop".to_string()),
-                        usage: None,
-                    });
-                }
-            }
-        }
-
-        self.mark_session_after_success(&session_id, parent_message_id)?;
-        // DeepSeek's web endpoint routinely finishes a response by just
-        // closing the connection — no `data: [DONE]`, no status event. A
-        // cleanly terminated chunked body is a deliberate server-side close,
-        // so treat it as a normal stop; a severed connection surfaces as a
-        // read error in the loop above, never as clean EOF.
-        debug_log::log(
-            "completion.collect.eof",
-            format!(
-                "clean EOF treated as stop. session_id={session_id} parent_message_id={parent_message_id:?} content_len={}",
-                content.len()
-            ),
-        );
+        self.drive_completion(&request, "collect", |text| content.push_str(&text))
+            .await?;
+        // Explicit finish and clean EOF both mean "stop" (see
+        // `drive_completion`); errors have already propagated.
         Ok(CompletionResponse {
             content,
             finish_reason: Some("stop".to_string()),
@@ -207,86 +234,16 @@ impl LLMProvider for DeepseekProvider {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
     ) -> AppResult<()> {
-        let (response, session_id) = self.send_request(&request).await?;
-        let mut stream = response.bytes_stream();
-        let mut sse = super::sse::SseLineBuffer::new();
-        let mut parent_message_id = None;
-        let mut streamed_bytes = 0usize;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    // The server already advanced this session's message tree;
-                    // persist the id we have so the next message threads onto it
-                    // instead of forking onto an invisible branch.
-                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
-                    debug_log::log(
-                        "completion.stream.error",
-                        format!(
-                            "stream_read_error={error} parent_message_id={parent_message_id:?}"
-                        ),
-                    );
-                    return Err(error.into());
-                }
-            };
-
-            for line in sse.push_bytes(&chunk) {
-                let Some(event) = stream::process_stream_line(&line) else {
-                    // Unrecognized lines are logged so protocol changes stay
-                    // visible instead of silently dropping server events.
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        debug_log::log("completion.stream.skipped", trimmed);
-                    }
-                    continue;
-                };
-
-                debug_log::log("completion.stream.line", line.trim());
-                if event.parent_message_id.is_some() {
-                    parent_message_id = event.parent_message_id;
-                    debug_log::log(
-                        "completion.stream.parent",
-                        format!("parent_message_id={:?}", parent_message_id),
-                    );
-                    // Persist immediately — if the stream is cut after this,
-                    // the thread id is already saved.
-                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
-                }
-
-                if let Some(text) = event.text {
-                    debug_log::log("completion.stream.chunk", format!("text_chunk={}", text));
-                    streamed_bytes += text.len();
-                    let _ = tx.send(CompletionChunk {
-                        content: text,
-                        finish_reason: None,
-                    });
-                }
-
-                if event.finished {
-                    debug_log::log("completion.stream.done", "received explicit finish signal");
-                    self.mark_session_after_success(&session_id, parent_message_id)?;
-                    let _ = tx.send(CompletionChunk {
-                        content: String::new(),
-                        finish_reason: Some("stop".to_string()),
-                    });
-                    return Ok(());
-                }
-            }
-        }
-
-        self.mark_session_after_success(&session_id, parent_message_id)?;
-        // DeepSeek's web endpoint routinely finishes a response by just
-        // closing the connection — no `data: [DONE]`, no status event. A
-        // cleanly terminated chunked body is a deliberate server-side close,
-        // so treat it as a normal stop; a severed connection surfaces as a
-        // read error in the loop above, never as clean EOF.
-        debug_log::log(
-            "completion.stream.eof",
-            format!(
-                "clean EOF treated as stop. session_id={session_id} parent_message_id={parent_message_id:?} streamed_bytes={streamed_bytes}"
-            ),
-        );
+        self.drive_completion(&request, "stream", |text| {
+            let _ = tx.send(CompletionChunk {
+                content: text,
+                finish_reason: None,
+            });
+        })
+        .await?;
+        // Explicit finish and clean EOF both mean "stop"; a read error has
+        // already propagated above without a stop chunk, which the runner
+        // treats as a failed turn — same contract as before the extraction.
         let _ = tx.send(CompletionChunk {
             content: String::new(),
             finish_reason: Some("stop".to_string()),

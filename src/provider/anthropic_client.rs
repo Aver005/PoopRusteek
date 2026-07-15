@@ -1,179 +1,89 @@
-//! `LLMProvider` over any Anthropic-compatible endpoint (the Anthropic API
-//! itself, Claude-compatible proxies/gateways). Transport twin of
-//! [`super::openai_client`]: the wire format lives in
-//! [`super::anthropic_compat`], this file only does HTTP + SSE.
+//! Anthropic-compatible protocol plug-in (the Anthropic API itself,
+//! Claude-compatible proxies/gateways) for the shared [`CompatClient`]
+//! transport. The wire format lives in [`super::anthropic_compat`]; this
+//! file contributes only the protocol details.
 //!
 //! Auth follows the Anthropic convention: the key goes in `x-api-key`
 //! (not a bearer header) alongside a pinned `anthropic-version`.
-//! Stateless, like every compat provider: full history per request,
-//! `fork()` is a config copy.
 
 use super::anthropic_compat::{self, StreamEvent};
-use super::sse::SseLineBuffer;
-use super::{CompletionChunk, CompletionRequest, CompletionResponse, LLMProvider};
-use crate::config::ProviderEntry;
-use crate::debug_log;
-use crate::error::{AppError, AppResult};
-use async_trait::async_trait;
-use futures::StreamExt;
-use std::sync::Arc;
+use super::compat_client::{CompatClient, CompatProtocol, SseFlow, envelope_error_message};
+use super::{CompletionChunk, CompletionRequest, CompletionResponse};
+use crate::error::AppResult;
 
 /// The Messages API requires this header; compat servers accept it.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-pub struct AnthropicCompatProvider {
-    client: reqwest::Client,
-    /// Base URL without a trailing slash (usually `…/v1`).
-    base_url: String,
-    api_key: Option<String>,
-    model: String,
-}
+/// `LLMProvider` over any Anthropic-compatible endpoint.
+pub type AnthropicCompatProvider = CompatClient<AnthropicProtocol>;
 
-impl AnthropicCompatProvider {
-    pub fn new(entry: &ProviderEntry) -> AppResult<Self> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(AppError::Http)?;
-        Ok(Self {
-            client,
-            base_url: entry.base_url.trim_end_matches('/').to_string(),
-            api_key: entry.api_key.clone(),
-            model: entry.model.clone(),
-        })
+pub struct AnthropicProtocol;
+
+impl CompatProtocol for AnthropicProtocol {
+    const LOG_TAG: &'static str = "anthropic_compat";
+
+    fn completions_url(base_url: &str, _model: &str, _stream: bool) -> String {
+        format!("{base_url}/messages")
     }
 
-    fn with_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn apply_headers(
+        request: reqwest::RequestBuilder,
+        api_key: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let request = request.header("anthropic-version", ANTHROPIC_VERSION);
-        match &self.api_key {
+        match api_key {
             Some(key) => request.header("x-api-key", key),
             None => request,
         }
     }
 
-    async fn send(
-        &self,
-        request: &CompletionRequest,
-        stream: bool,
-    ) -> AppResult<reqwest::Response> {
+    fn request_body(request: &CompletionRequest, model: &str, stream: bool) -> serde_json::Value {
         let mut body = anthropic_compat::request_to_anthropic(request);
         body["stream"] = serde_json::json!(stream);
-        body["model"] = serde_json::json!(self.model);
+        body["model"] = serde_json::json!(model);
         // Modern Claude models (Opus 4.7+, Sonnet 5, Fable/Mythos 5) return
         // 400 on any sampling parameter — drop it for those families only.
-        if anthropic_compat::model_rejects_sampling(&self.model)
+        if anthropic_compat::model_rejects_sampling(model)
             && let Some(object) = body.as_object_mut()
         {
             object.remove("temperature");
         }
-
-        let url = format!("{}/messages", self.base_url);
-        debug_log::log(
-            "anthropic_compat.request",
-            format!("url={url} stream={stream} model={}", self.model),
-        );
-        let response = self
-            .with_headers(self.client.post(&url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(AppError::Http)?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            // Anthropic's error envelope is {"type":"error","error":{...}}.
-            let message = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or_else(|| crate::util::truncate_at_char_boundary(&text, 300).to_string());
-            debug_log::log(
-                "anthropic_compat.error",
-                format!("status={status} message={message}"),
-            );
-            return Err(AppError::Provider(format!("{status}: {message}")));
-        }
-        Ok(response)
+        body
     }
-}
 
-#[async_trait]
-impl LLMProvider for AnthropicCompatProvider {
-    async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
-        let response = self.send(&request, false).await?;
-        let parsed: anthropic_compat::MessagesResponse =
-            response.json().await.map_err(AppError::Http)?;
+    fn error_message(body: &str) -> Option<String> {
+        // Anthropic's error envelope is {"type":"error","error":{...}}.
+        envelope_error_message(body)
+    }
+
+    fn parse_response(body: &[u8]) -> AppResult<CompletionResponse> {
+        let parsed: anthropic_compat::MessagesResponse = serde_json::from_slice(body)?;
         Ok(anthropic_compat::response_from_anthropic(parsed))
     }
 
-    async fn complete_stream(
-        &self,
-        request: CompletionRequest,
-        tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
-    ) -> AppResult<()> {
-        let response = self.send(&request, true).await?;
-        let mut stream = response.bytes_stream();
-        let mut buffer = SseLineBuffer::new();
-
-        while let Some(piece) = stream.next().await {
-            let piece = piece.map_err(AppError::Http)?;
-            for line in buffer.push_bytes(&piece) {
-                // `event: <type>` lines are redundant — the type is
-                // repeated inside each data payload.
-                let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
-                    continue;
-                };
-                match anthropic_compat::parse_stream_event(payload) {
-                    StreamEvent::Text(text) => {
-                        let _ = tx.send(CompletionChunk {
-                            content: text,
-                            finish_reason: None,
-                        });
-                    }
-                    StreamEvent::Done => {
-                        let _ = tx.send(CompletionChunk {
-                            content: String::new(),
-                            finish_reason: Some("stop".to_string()),
-                        });
-                        return Ok(());
-                    }
-                    StreamEvent::Error(message) => {
-                        return Err(AppError::Provider(message));
-                    }
-                    StreamEvent::Ignore => {}
-                }
+    fn handle_sse_payload(payload: &str, emit: &mut dyn FnMut(CompletionChunk)) -> SseFlow {
+        match anthropic_compat::parse_stream_event(payload) {
+            StreamEvent::Text(text) => {
+                emit(CompletionChunk {
+                    content: text,
+                    finish_reason: None,
+                });
+                SseFlow::Continue
             }
+            StreamEvent::Done => {
+                emit(CompletionChunk {
+                    content: String::new(),
+                    finish_reason: Some("stop".to_string()),
+                });
+                SseFlow::Done
+            }
+            StreamEvent::Error(message) => SseFlow::Fail(message),
+            StreamEvent::Ignore => SseFlow::Continue,
         }
-        // Ended without message_stop — the runner's no-stop error path
-        // handles it.
-        Ok(())
     }
 
-    async fn list_models(&self) -> AppResult<Vec<String>> {
-        let response = self
-            .with_headers(self.client.get(format!("{}/models", self.base_url)))
-            .send()
-            .await
-            .map_err(AppError::Http)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(AppError::Provider(format!("GET /models failed: {status}")));
-        }
-        let page: anthropic_compat::ModelsPage = response.json().await.map_err(AppError::Http)?;
+    fn parse_models(body: &[u8]) -> AppResult<Vec<String>> {
+        let page: anthropic_compat::ModelsPage = serde_json::from_slice(body)?;
         Ok(page.data.into_iter().map(|model| model.id).collect())
-    }
-
-    fn model(&self) -> &str {
-        &self.model
-    }
-
-    fn fork(&self) -> Arc<dyn LLMProvider> {
-        Arc::new(Self {
-            client: self.client.clone(),
-            base_url: self.base_url.clone(),
-            api_key: self.api_key.clone(),
-            model: self.model.clone(),
-        })
     }
 }

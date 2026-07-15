@@ -1,5 +1,6 @@
 pub mod anthropic_client;
 pub mod anthropic_compat;
+pub(crate) mod compat_client;
 pub mod deepseek;
 #[cfg(test)]
 pub mod fake;

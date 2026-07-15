@@ -121,14 +121,14 @@
 ## DUPLICATION (ranked by payoff)
 
 ### Provider client trio — the largest single dedup (~150–200 lines)
-- `[VERIFIED]` `openai_client.rs` / `anthropic_client.rs` / `gemini_client.rs`
+- `[DONE 2026-07-15]` `openai_client.rs` / `anthropic_client.rs` / `gemini_client.rs`
   are near-identical end to end: same 4-field struct, byte-identical `new()`
   (same 10s/120s timeouts ×3), structurally identical
   `send`/`complete`/`complete_stream` (SSE pump)/`list_models`/`fork`. Only
   URL shape, auth header, body model-field, error JSON path, and per-event SSE
   dispatch differ. Extract a `CompatTransport<P: CompatProtocol>` with ~5
   protocol hooks; each protocol becomes ~40–60 lines.
-- `[REPORTED]` Satellites of the same cleanup: error-envelope parser
+- `[DONE 2026-07-15]` Satellites of the same cleanup: error-envelope parser
   byte-identical in anthropic/gemini clients; `data:`-prefix strip repeated
   4×; `merge_alternating_turns` copy-pasted between `anthropic_compat` and
   `gemini_compat` (only the assistant-role literal differs);
@@ -142,7 +142,7 @@
   per-step skip message is byte-identical in both; the step-request build
   (system prompt + `messages.clone()`) is duplicated. Extract
   `dispatch_generic_tool` + `tool_skip_message` + `build_step_request`.
-- `[REPORTED]` `deepseek/mod.rs` `complete` vs `complete_stream` repeat the
+- `[DONE 2026-07-15]` `deepseek/mod.rs` `complete` vs `complete_stream` repeat the
   same ~85-line SSE-consume loop (session persistence, parent-id capture,
   finished handling) — only text delivery differs. Same "shared core + chunk
   hook" fix as the runner pair got.
@@ -369,7 +369,7 @@ vs status-text display builders are unrelated under a misleading name.
    spawn the `'d'` remove_server arm; unify `tick_is_visual`; sub_agent →
    `parse_tool_calls_with_errors`; export.rs → atomic_write; 401 stats fix;
    semantic poison-tolerant lock helper (+ embed-outside-lock ×3).
-2. **Dedup batch A (provider)**: client-trio `CompatTransport` extraction +
+2. `[DONE 2026-07-15]` **Dedup batch A (provider)**: client-trio `CompatTransport` extraction +
    satellites (error parser, `data:` strip, merge_alternating_turns);
    deepseek complete/complete_stream shared core.
 3. **Dedup batch B (agent/server)**: `dispatch_generic_tool` +
