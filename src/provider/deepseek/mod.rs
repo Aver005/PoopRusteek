@@ -116,11 +116,62 @@ impl DeepseekProvider {
     /// DeepSeek's clean-EOF-means-stop convention. `log_tag` keeps the two
     /// callers' historical debug-event names apart
     /// (`completion.collect.*` / `completion.stream.*`).
+    /// Send one completion and retry it when the provider answers 200 OK and
+    /// then reports a rate limit inside the stream.
+    ///
+    /// The HTTP retry loop in `http.rs` cannot cover this: it only sees the
+    /// status line, which is a perfectly good 200. Retrying is only safe while
+    /// nothing has been emitted yet — past that point a retry would duplicate
+    /// text the caller already streamed — so [`drive_completion_once`] only
+    /// reports [`AppError::RateLimited`] when it produced no output.
     async fn drive_completion(
         &self,
         request: &CompletionRequest,
         log_tag: &str,
         mut on_text: impl FnMut(String) + Send,
+    ) -> AppResult<()> {
+        let max_attempts = match self.max_retries {
+            -1 => usize::MAX,
+            // Even with retries disabled, one wait-and-retry is worth it: a
+            // rate limit is transient by definition, and the alternative is
+            // failing a turn the user asked for.
+            0 => 2,
+            n => (n as usize) + 1,
+        };
+        let mut attempt = 0usize;
+        loop {
+            match self
+                .drive_completion_once(request, log_tag, &mut on_text)
+                .await
+            {
+                Err(AppError::RateLimited(message)) if attempt + 1 < max_attempts => {
+                    attempt += 1;
+                    let wait = Self::retry_backoff(attempt);
+                    debug_log::log(
+                        &format!("completion.{log_tag}.rate_limit_retry"),
+                        format!(
+                            "attempt={attempt}/{max_attempts} wait_ms={} reason={message}",
+                            wait.as_millis()
+                        ),
+                    );
+                    tracing::warn!("rate limited, retry {attempt}/{max_attempts} in {wait:?}");
+                    tokio::time::sleep(wait).await;
+                }
+                // Out of attempts: report it as a provider error so the agent
+                // loop treats it as a real failure rather than a retryable one.
+                Err(AppError::RateLimited(message)) => {
+                    return Err(AppError::Provider(message));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn drive_completion_once(
+        &self,
+        request: &CompletionRequest,
+        log_tag: &str,
+        on_text: &mut (impl FnMut(String) + Send),
     ) -> AppResult<()> {
         let (response, session_id) = self.send_request(request).await?;
         let mut stream = response.bytes_stream();
@@ -159,6 +210,30 @@ impl DeepseekProvider {
                 };
 
                 debug_log::log(&format!("completion.{log_tag}.line"), line.trim());
+
+                // An in-stream error must not be mistaken for a normal end of
+                // response. The server answers 200 OK, sends this frame, then
+                // closes cleanly; treating that EOF as a stop turned an
+                // explicit "rate limit reached" into an empty, silent success.
+                if let Some(stream_error) = &event.error {
+                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    debug_log::log(
+                        &format!("completion.{log_tag}.provider_error"),
+                        format!(
+                            "finish_reason={:?} rate_limit={} text_bytes={text_bytes} content={:?}",
+                            stream_error.finish_reason,
+                            stream_error.is_rate_limit(),
+                            stream_error.content
+                        ),
+                    );
+                    // Retryable only before any text reached the caller;
+                    // otherwise a retry would duplicate what was streamed.
+                    if stream_error.is_rate_limit() && text_bytes == 0 {
+                        return Err(AppError::RateLimited(stream_error.message()));
+                    }
+                    return Err(AppError::Provider(stream_error.message()));
+                }
+
                 if event.parent_message_id.is_some() {
                     parent_message_id = event.parent_message_id;
                     debug_log::log(

@@ -17,6 +17,12 @@ pub enum AppError {
     #[error("Provider error: {0}")]
     Provider(String),
 
+    /// The provider said "too many requests" — worth waiting and retrying,
+    /// unlike [`AppError::Provider`]. Separate variant so the retry decision
+    /// is made on the error's meaning rather than by matching on its text.
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
+
     #[error("MCP error: {0}")]
     Mcp(String),
 

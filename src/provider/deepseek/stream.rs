@@ -457,6 +457,74 @@ pub(super) struct StreamEvent {
     /// The server explicitly marked the response complete: `[DONE]` or a
     /// FINISHED status patch.
     pub finished: bool,
+    /// The server reported a failure *inside* the stream rather than over
+    /// HTTP status. Found by the harness: a rate-limited request answers 200
+    /// OK and then sends
+    /// `{"type":"error","content":"...","finish_reason":"rate_limit_reached"}`
+    /// followed by a clean EOF. This frame used to match nothing, so it was
+    /// logged as "skipped" and the turn ended as an empty *success* — an agent
+    /// that silently did nothing while the provider had said exactly why.
+    pub error: Option<StreamError>,
+}
+
+/// An in-stream error frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StreamError {
+    /// The provider's own reason code, e.g. `rate_limit_reached`.
+    pub finish_reason: Option<String>,
+    /// Human-readable text, often localized (the rate-limit message is
+    /// Chinese), so it is passed through rather than matched on.
+    pub content: Option<String>,
+}
+
+impl StreamError {
+    /// Message shown to the user and recorded in the trace. The provider's
+    /// own text is kept verbatim (it is the ground truth, and localized), with
+    /// an actionable line appended for the reason we can act on.
+    pub fn message(&self) -> String {
+        let detail = match (&self.finish_reason, &self.content) {
+            (Some(reason), Some(content)) => format!("provider error ({reason}): {content}"),
+            (Some(reason), None) => format!("provider error: {reason}"),
+            (None, Some(content)) => format!("provider error: {content}"),
+            (None, None) => "provider error (no detail given)".to_string(),
+        };
+        if self.is_rate_limit() {
+            format!(
+                "{detail} — too many requests; wait a moment, or raise `/rate` to throttle sends"
+            )
+        } else {
+            detail
+        }
+    }
+
+    /// Whether backing off is the right response. Retrying a rate limit
+    /// immediately makes it worse.
+    pub fn is_rate_limit(&self) -> bool {
+        self.finish_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("rate_limit"))
+    }
+}
+
+/// Recognize an in-stream error frame, whatever else the payload carries.
+fn extract_stream_error(event: &Value) -> Option<StreamError> {
+    let object = event.as_object()?;
+    let is_error = object.get("type").and_then(Value::as_str) == Some("error")
+        || object.get("finish_reason").and_then(Value::as_str) == Some("rate_limit_reached");
+    if !is_error {
+        return None;
+    }
+    Some(StreamError {
+        finish_reason: object
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        content: object
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// True when a single patch object sets the response status to FINISHED,
@@ -510,6 +578,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
             text: None,
             parent_message_id: None,
             finished: true,
+            error: None,
         });
     }
 
@@ -532,7 +601,11 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
         }
     }
 
-    if text_chunk.is_empty() && parent_message_id.is_none() && !finished {
+    // Checked before the "nothing recognized" bail-out below: an error frame
+    // carries no text and no ids, so it would otherwise be dropped.
+    let error = extract_stream_error(&normalized).or_else(|| extract_stream_error(&parsed));
+
+    if text_chunk.is_empty() && parent_message_id.is_none() && !finished && error.is_none() {
         return None;
     }
 
@@ -544,11 +617,45 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
         },
         parent_message_id,
         finished,
+        error,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    /// The frame that made the harness's "agent silently did nothing" run
+    /// explicable: HTTP 200, an error inside the stream, then a clean EOF.
+    #[test]
+    fn recognizes_the_rate_limit_error_frame() {
+        let line = r#"data: {"type":"error","content":"消息发送过于频繁，请稍后重试","clear_response":true,"finish_reason":"rate_limit_reached"}"#;
+        let event = process_stream_line(line).expect("error frame must be recognized, not skipped");
+        let error = event.error.expect("frame carries an error");
+        assert!(error.is_rate_limit());
+        assert_eq!(error.finish_reason.as_deref(), Some("rate_limit_reached"));
+        let message = error.message();
+        assert!(message.contains("rate_limit_reached"), "{message}");
+        assert!(message.contains("too many requests"), "{message}");
+        // No text, so nothing must leak into the assistant's reply.
+        assert!(event.text.is_none());
+    }
+
+    #[test]
+    fn a_type_error_frame_without_a_reason_is_still_an_error() {
+        let line = r#"data: {"type":"error","content":"something broke"}"#;
+        let event = process_stream_line(line).expect("recognized");
+        let error = event.error.expect("carries an error");
+        assert!(!error.is_rate_limit());
+        assert_eq!(error.message(), "provider error: something broke");
+    }
+
+    #[test]
+    fn ordinary_content_frames_carry_no_error() {
+        let line = r#"data: {"p":"response/content","o":"APPEND","v":"hello"}"#;
+        let event = process_stream_line(line).expect("recognized");
+        assert!(event.error.is_none());
+        assert_eq!(event.text.as_deref(), Some("hello"));
+    }
+
     use super::*;
 
     #[test]
