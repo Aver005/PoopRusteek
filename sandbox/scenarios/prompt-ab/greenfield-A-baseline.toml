@@ -1,0 +1,32 @@
+# Prompt A/B: greenfield under variant A-baseline.
+# Variant: the prompt as shipped, so every other row has something to be measured against.
+# Task: the task the baseline fails by announcing the work and stopping.
+#
+# Every scenario in this directory differs from its siblings in exactly one
+# field: `system_prompt_append`. That is the whole point.
+name = "greenfield-A-baseline"
+description = "greenfield / A-baseline"
+prompt = """
+Create a small static todo page in the current directory. Three files: index.html, style.css, script.js. Typing a task and pressing the button must add it to a visible list. No frameworks, no build step, no CDN links - plain HTML, CSS and JS. index.html must link both other files.
+"""
+workspace_template = "../../fixtures/empty"
+timeout = 300
+max_steps = 14
+repeat = 3
+
+[expect]
+status = "completed"
+files_exist = ["index.html", "style.css", "script.js"]
+min_pass_rate = 1.0
+
+[[expect.file_matches]]
+path = "index.html"
+pattern = 'style\.css'
+
+[[expect.file_matches]]
+path = "index.html"
+pattern = 'script\.js'
+
+[[expect.file_matches]]
+path = "script.js"
+pattern = '(?i)addEventListener|onclick'

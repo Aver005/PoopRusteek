@@ -133,6 +133,10 @@ pub struct ExecOptions {
     /// Persist the turn as a session file, so the run joins the corpus
     /// `harness mine` and the history index read from.
     pub save_session: bool,
+    /// Extra instructions appended to the assembled system prompt. Prompt
+    /// wording is the cheapest variable to change and one of the most
+    /// influential, so it is a first-class knob here.
+    pub system_append: Option<PathBuf>,
 }
 
 /// How a run ended.
@@ -352,7 +356,7 @@ async fn assemble(
         &serde_json::json!({ "ready": semantic_ready, "enabled": semantic.is_enabled() }),
     );
 
-    let system_prompt = crate::app::system_prompt::build(
+    let mut system_prompt = crate::app::system_prompt::build(
         &crate::prompts::load_prompt_files(),
         &skills,
         config.skills.injection,
@@ -362,6 +366,28 @@ async fn assemble(
         workspace,
     )
     .await;
+
+    // A prompt variant is appended rather than substituted: the comparison
+    // worth making is "does this instruction change behaviour", and replacing
+    // the whole prompt would change the tool contract along with it.
+    if let Some(path) = &options.system_append {
+        let extra = std::fs::read_to_string(path)
+            .map_err(|e| AppError::Custom(format!("{}: {e}", path.display())))?;
+        debug_log::log_json(
+            "system_prompt.appended",
+            &serde_json::json!({
+                "file": path.display().to_string(),
+                "bytes": extra.len(),
+                "text": extra,
+            }),
+        );
+        system_prompt.push_str(
+            "
+
+",
+        );
+        system_prompt.push_str(extra.trim());
+    }
 
     Ok(Harness {
         runtime: AgentRuntime::new(tools, mcp, semantic, event_tx),
@@ -689,6 +715,7 @@ mod tests {
             provider: None,
             model: None,
             save_session: false,
+            system_append: None,
         }
     }
 }

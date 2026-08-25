@@ -44,6 +44,10 @@ pub struct Scenario {
     /// under the report directory so the agent's actual output can be
     /// inspected after the fact. Resolved relative to the scenario file.
     pub workspace_template: Option<PathBuf>,
+    /// File appended to the system prompt for this scenario, resolved
+    /// relative to the scenario file. This is how one task is run under
+    /// several prompt variants and the results compared.
+    pub system_prompt_append: Option<PathBuf>,
     #[serde(default = "default_approve")]
     pub approve: String,
     pub answer: Option<String>,
@@ -296,6 +300,9 @@ impl Scenario {
         if let Some(template) = scenario.workspace_template.take() {
             scenario.workspace_template = Some(resolve(template));
         }
+        if let Some(append) = scenario.system_prompt_append.take() {
+            scenario.system_prompt_append = Some(resolve(append));
+        }
         if scenario.workspace.is_some() && scenario.workspace_template.is_some() {
             return Err(AppError::Custom(format!(
                 "{}: set either `workspace` or `workspace_template`, not both",
@@ -386,12 +393,15 @@ fn collect_scenarios(dir: &Path) -> AppResult<Vec<PathBuf>> {
 /// Run `repeat` children and assemble the scenario report.
 async fn execute(
     scenario: &Scenario,
-    repeat_override: usize,
+    repeat_override: Option<usize>,
     out: &Path,
     concurrency: usize,
     config_path: Option<&Path>,
 ) -> AppResult<ScenarioReport> {
-    let repeats = scenario.repeat.unwrap_or(repeat_override).max(1);
+    let repeats = repeat_override
+        .or(scenario.repeat)
+        .unwrap_or(crate::harness::DEFAULT_REPEATS)
+        .max(1);
     let stamp = run_stamp();
     let dir = out.join(sanitize(&scenario.name)).join(&stamp);
     std::fs::create_dir_all(&dir)
@@ -483,6 +493,9 @@ async fn spawn_run(
 
     if let Some(workspace) = &scenario.workspace {
         command.arg("--workspace").arg(workspace);
+    }
+    if let Some(append) = &scenario.system_prompt_append {
+        command.arg("--system-append").arg(append);
     }
     if let Some(answer) = &scenario.answer {
         command.arg("--answer").arg(answer);

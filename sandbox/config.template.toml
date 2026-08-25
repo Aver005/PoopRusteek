@@ -32,8 +32,12 @@ auto_compact = true
 # three-repeat suite tripped DeepSeek's own limiter, which answers HTTP 200
 # and then sends `{"type":"error",...,"finish_reason":"rate_limit_reached"}`
 # inside the stream. Roughly one run in three came back having done nothing.
-# 1200ms was enough to stop it while keeping a suite quick.
-rate_limit_ms = 1200
+# 3000ms is what a prompt A/B run needed: rate-limit failures are noise that
+# would swamp the effect being measured. Repeats already run one at a time
+# (`--concurrency 1`), and each is its own process, so the in-process limiter
+# cannot coordinate across them — the spacing has to be generous enough that
+# it does not need to.
+rate_limit_ms = 3000
 rate_limit_per_minute = 0
 max_retries = 2
 

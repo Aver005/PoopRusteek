@@ -93,6 +93,8 @@ COPY --chown=agent:agent sandbox/entrypoint.sh /opt/sandbox/entrypoint.sh
 COPY --chown=agent:agent sandbox/scenarios /opt/sandbox/scenarios
 COPY --chown=agent:agent sandbox/mock-scripts /opt/sandbox/mock-scripts
 COPY --chown=agent:agent sandbox/fixtures /opt/sandbox/fixtures
+# Prompt variants for A/B runs: a scenario points at one of these files.
+COPY --chown=agent:agent sandbox/prompts /opt/sandbox/prompts
 # Skills come from the repo so RAG scenarios have something real to retrieve.
 COPY --chown=agent:agent skills /opt/sandbox/skills
 RUN chmod +x /opt/sandbox/entrypoint.sh \

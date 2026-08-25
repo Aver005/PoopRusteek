@@ -115,8 +115,9 @@ case "$command" in
       live) dir=/opt/sandbox/scenarios/live ;;
       mock) dir=/opt/sandbox/scenarios/mock ;;
       dev)  dir=/opt/sandbox/scenarios/dev ;;
+      prompt-ab) dir=/opt/sandbox/scenarios/prompt-ab ;;
       all)  dir=/opt/sandbox/scenarios ;;
-      *) echo "suite takes live | mock | dev | all, got '$which'" >&2; exit 2 ;;
+      *) echo "suite takes live | mock | dev | prompt-ab | all, got '$which'" >&2; exit 2 ;;
     esac
     [[ "$which" != "live" ]] && \
       echo "Note: mock scenarios need the mock service — ./sandbox.sh mock <script>" >&2

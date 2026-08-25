@@ -144,8 +144,9 @@ switch ($Command) {
             'live' { '/opt/sandbox/scenarios/live' }
             'mock' { '/opt/sandbox/scenarios/mock' }
             'dev' { '/opt/sandbox/scenarios/dev' }
+            'prompt-ab' { '/opt/sandbox/scenarios/prompt-ab' }
             'all' { '/opt/sandbox/scenarios' }
-            default { throw "suite takes live | mock | dev | all, got '$which'" }
+            default { throw "suite takes live | mock | dev | prompt-ab | all, got '$which'" }
         }
         if ($which -ne 'live') {
             Write-Host 'Note: mock scenarios need the mock service — ./sandbox.ps1 mock <script>' -ForegroundColor Yellow

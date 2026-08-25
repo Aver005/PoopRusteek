@@ -1,0 +1,29 @@
+# Prompt A/B: fixtest under variant B-finish.
+# Variant: an explicit rule against ending a turn on an announcement.
+# Task: multi-step work, where "verify before claiming" should pay off if it pays off anywhere.
+#
+# Every scenario in this directory differs from its siblings in exactly one
+# field: `system_prompt_append`. That is the whole point.
+name = "fixtest-B-finish"
+description = "fixtest / B-finish"
+prompt = """
+This project has a failing test. Run `python3 -m unittest discover`, find the cause, fix the source so all tests pass, then run the tests again to confirm. Do not change the tests.
+"""
+workspace_template = "../../fixtures/broken-calc"
+system_prompt_append = "../../prompts/B-finish-the-work.md"
+timeout = 420
+max_steps = 20
+repeat = 3
+
+[expect]
+status = "completed"
+files_exist = ["calculator.py", "test_calculator.py"]
+min_pass_rate = 1.0
+
+[[expect.file_matches]]
+path = "test_calculator.py"
+pattern = 'average\(\[\]\), 0'
+
+[[expect.file_matches]]
+path = "calculator.py"
+pattern = '(?s)def average.*(if not|len\(values\) == 0|== 0|or 0|else 0)'

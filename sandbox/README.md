@@ -36,9 +36,22 @@ shell.
 - **Do not run a host `cargo build` at the same time as the image build.** They
   compete for the same Windows pagefile; the host build dies with `os error
   1455` and takes the daemon with it.
+- **Check `~/.docker/daemon.json` before your first build.** Docker Desktop
+  ships `builder.gc.defaultKeepStorage`, and on this machine it was `20GB` —
+  which is a licence for the build cache to consume an entire drive, and it
+  did, twice, taking the daemon's filesystem read-only with it each time. Every
+  code change here means a full image rebuild, so the cache refills fast. Set
+  it to something the drive can actually afford (`4GB` is plenty for this
+  image) and the problem stops recurring:
+
+  ```json
+  { "builder": { "gc": { "enabled": true, "defaultKeepStorage": "4GB" } } }
+  ```
+
 - `docker builder prune -f` is always safe to reclaim space (build cache is
   regenerable by definition). Note that Docker's data disk does not shrink on
-  its own even after pruning.
+  its own even after pruning, so a disk that has already ballooned has to be
+  reset, not pruned.
 
 ## Quick start
 

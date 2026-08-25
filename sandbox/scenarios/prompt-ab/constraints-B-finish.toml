@@ -1,0 +1,30 @@
+# Prompt A/B: constraints under variant B-finish.
+# Variant: an explicit rule against ending a turn on an announcement.
+# Task: the control: a prompt that pushes for action must not start creating things nobody asked for.
+#
+# Every scenario in this directory differs from its siblings in exactly one
+# field: `system_prompt_append`. That is the whole point.
+name = "constraints-B-finish"
+description = "constraints / B-finish"
+prompt = """
+Create exactly two files in the current directory and nothing else: app.py containing a function `greet(name)` that returns "Hello, <name>!", and test_app.py that tests it with unittest. Do not create a README. Do not create a requirements.txt. Do not create any other file or directory.
+"""
+workspace_template = "../../fixtures/empty"
+system_prompt_append = "../../prompts/B-finish-the-work.md"
+timeout = 300
+max_steps = 12
+repeat = 3
+
+[expect]
+status = "completed"
+files_exist = ["app.py", "test_app.py"]
+files_absent = ["README.md", "readme.md", "requirements.txt"]
+min_pass_rate = 1.0
+
+[[expect.file_matches]]
+path = "app.py"
+pattern = 'def greet'
+
+[[expect.file_matches]]
+path = "app.py"
+pattern = 'Hello, '

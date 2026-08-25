@@ -1,0 +1,33 @@
+# Prompt A/B: greenfield under variant C-verify.
+# Variant: the same rule plus "confirm the result with a tool before claiming it".
+# Task: the task the baseline fails by announcing the work and stopping.
+#
+# Every scenario in this directory differs from its siblings in exactly one
+# field: `system_prompt_append`. That is the whole point.
+name = "greenfield-C-verify"
+description = "greenfield / C-verify"
+prompt = """
+Create a small static todo page in the current directory. Three files: index.html, style.css, script.js. Typing a task and pressing the button must add it to a visible list. No frameworks, no build step, no CDN links - plain HTML, CSS and JS. index.html must link both other files.
+"""
+workspace_template = "../../fixtures/empty"
+system_prompt_append = "../../prompts/C-verify-before-claiming.md"
+timeout = 300
+max_steps = 14
+repeat = 3
+
+[expect]
+status = "completed"
+files_exist = ["index.html", "style.css", "script.js"]
+min_pass_rate = 1.0
+
+[[expect.file_matches]]
+path = "index.html"
+pattern = 'style\.css'
+
+[[expect.file_matches]]
+path = "index.html"
+pattern = 'script\.js'
+
+[[expect.file_matches]]
+path = "script.js"
+pattern = '(?i)addEventListener|onclick'

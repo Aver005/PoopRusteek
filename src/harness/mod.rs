@@ -35,6 +35,9 @@ use std::time::Duration;
 
 /// Where traces and reports land by default. Under `.dev/`, which is
 /// git-ignored, so runs never dirty the tree.
+/// Repeats when neither the command line nor the scenario file says.
+pub const DEFAULT_REPEATS: usize = 3;
+
 const DEFAULT_OUT_DIR: &str = ".dev/harness";
 
 #[derive(Subcommand)]
@@ -84,6 +87,13 @@ pub struct ExecArgs {
     #[arg(long, default_value = "off")]
     pub semantic: String,
 
+    /// File whose contents are appended to the assembled system prompt.
+    /// The point of the harness is comparing behaviour, and prompt wording is
+    /// the cheapest thing to change, so a variant is a file on disk rather
+    /// than a string on a command line: it stays readable and diffable.
+    #[arg(long)]
+    pub system_append: Option<PathBuf>,
+
     /// Connect configured MCP servers first (slow, and depends on hosts
     /// outside the sandbox).
     #[arg(long)]
@@ -112,8 +122,10 @@ pub struct ScenarioArgs {
 
     /// How many times to run it. A single sample of a nondeterministic
     /// model is not evidence.
-    #[arg(long, default_value_t = 3)]
-    pub repeat: usize,
+    /// Repeats per scenario. Overrides a scenario file's own `repeat`;
+    /// absent means the file decides, and [`DEFAULT_REPEATS`] if it does not.
+    #[arg(long)]
+    pub repeat: Option<usize>,
 
     /// Directory for traces and the report.
     #[arg(long, default_value = DEFAULT_OUT_DIR)]
@@ -133,8 +145,10 @@ pub struct SuiteArgs {
     /// Directory of scenario TOML files (searched recursively).
     pub dir: PathBuf,
 
-    #[arg(long, default_value_t = 3)]
-    pub repeat: usize,
+    /// Repeats per scenario. Overrides a scenario file's own `repeat`;
+    /// absent means the file decides, and [`DEFAULT_REPEATS`] if it does not.
+    #[arg(long)]
+    pub repeat: Option<usize>,
 
     #[arg(long, default_value = DEFAULT_OUT_DIR)]
     pub out: PathBuf,
@@ -207,6 +221,7 @@ async fn exec(args: ExecArgs, config: Config) -> AppResult<i32> {
         provider: args.provider,
         model: args.model,
         save_session: args.save_session,
+        system_append: args.system_append.clone(),
     };
 
     let outcome = driver::exec(config, options).await?;
