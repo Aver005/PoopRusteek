@@ -68,7 +68,7 @@ impl App {
             self.config.skills.injection,
             &self.tools,
             &self.mcp,
-            self.effective_mcp_schema_mode(),
+            self.config.effective_mcp_schema_mode(),
             &self.state.workspace_path,
         )
         .await;

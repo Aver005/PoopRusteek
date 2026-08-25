@@ -596,6 +596,19 @@ impl Config {
         .to_string()
     }
 
+    /// MCP schema mode as the system prompt should see it. Without
+    /// semantic matching there is no `tool_search` worth relying on, so
+    /// deferring schemas would leave the model with no good path to them —
+    /// force full inlining in that case. Shared by the TUI turn paths and
+    /// the headless harness so the two build identical prompts.
+    pub fn effective_mcp_schema_mode(&self) -> McpSchemaMode {
+        if self.semantic.enabled {
+            self.semantic.mcp_schemas
+        } else {
+            McpSchemaMode::Full
+        }
+    }
+
     pub fn path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -612,6 +625,23 @@ impl Config {
     pub fn sessions_dir() -> PathBuf {
         Self::data_dir().join("sessions")
     }
+}
+
+/// `--config <file>` when given, the user's real config otherwise.
+pub fn load_from_optional(explicit: Option<&std::path::Path>) -> AppResult<Config> {
+    match explicit {
+        Some(path) => load_from(path),
+        None => load(),
+    }
+}
+
+/// Load from an explicit file instead of the user's real config. Used by
+/// `--config`, so a harness run can point at a throwaway token and data set
+/// without touching the config the TUI uses.
+pub fn load_from(path: &std::path::Path) -> AppResult<Config> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| AppError::Config(format!("{}: {e}", path.display())))?;
+    toml::from_str(&content).map_err(|e| AppError::Config(format!("{}: {e}", path.display())))
 }
 
 pub fn load() -> AppResult<Config> {

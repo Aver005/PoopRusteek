@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod debug_log;
 mod error;
+mod harness;
 mod logging;
 mod mcp;
 mod prompts;
@@ -20,7 +21,7 @@ mod update;
 mod util;
 mod whitelist;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use config::Config;
 use std::sync::Arc;
@@ -48,6 +49,24 @@ struct Args {
     /// With --serve/--server/--api: drop the TUI (headless proxy mode).
     #[arg(long, requires = "serve")]
     uiless: bool,
+
+    /// Read config from this file instead of the user's real one. Mainly
+    /// for harness runs against a throwaway token.
+    #[arg(long, value_name = "FILE")]
+    config: Option<std::path::PathBuf>,
+
+    /// Headless test-harness subcommands (`exec`, `scenario`, `suite`,
+    /// `mine`, `mock-provider`). Absent means the TUI, as before.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Top-level subcommands. Only the harness has any today; the TUI stays the
+/// bare-invocation default so no existing usage changes.
+#[derive(Subcommand)]
+enum Command {
+    #[command(flatten)]
+    Harness(harness::Command),
 }
 
 fn main() -> Result<()> {
@@ -62,12 +81,24 @@ fn main() -> Result<()> {
     // redirects the raw stderr fd there so dependency output that bypasses
     // tracing (ONNX Runtime) can't corrupt a frame. Args are parsed first so
     // the redirect decision is made before anything that loads ONNX.
-    let headless = args.acp || args.proxy || (args.serve && args.uiless);
+    // Harness subcommands own stdout the same way --acp and --proxy do, so
+    // they must not get the TUI's stderr redirect either.
+    let headless = args.acp || args.proxy || (args.serve && args.uiless) || args.command.is_some();
     logging::setup(!headless);
 
     debug_log::init(args.debug_log)?;
-    let config: Config = match config::load() {
+    let config: Config = match config::load_from_optional(args.config.as_deref()) {
         Ok(c) => c,
+        // A config that cannot be read is fatal for anything non-interactive:
+        // falling back to defaults would run against the wrong provider, or
+        // against none at all. That cost real debugging time once — a CRLF
+        // config template made the harness report "no provider configured"
+        // while the actual cause was a TOML parse error two lines up. The TUI
+        // keeps the lenient path so it can start and let the user fix it.
+        Err(e) if args.config.is_some() || args.command.is_some() => {
+            eprintln!("Error: {e}");
+            std::process::exit(3);
+        }
         Err(e) => {
             eprintln!("Warning: failed to load config, using defaults: {e}");
             Config::default()
@@ -91,20 +122,36 @@ fn main() -> Result<()> {
         .build()?;
     let result = runtime.block_on(run_async(args, config));
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
-    result
+    match result {
+        // A harness subcommand's exit code is its verdict (failed run,
+        // unmet expectations), not an error to print a backtrace for.
+        Ok(Some(code)) if code != 0 => std::process::exit(code),
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
-async fn run_async(args: Args, config: Config) -> Result<()> {
+/// `Ok(Some(code))` carries a harness subcommand's exit code; `Ok(None)`
+/// means a normal exit.
+async fn run_async(args: Args, config: Config) -> Result<Option<i32>> {
+    // Harness subcommands are checked first: they never build an App and
+    // must not be reordered behind the TUI's terminal setup.
+    if let Some(Command::Harness(command)) = args.command {
+        return Ok(Some(harness::run(command, config, args.config).await?));
+    }
+
     // ACP dispatch stays inside the runtime: the server uses
     // `block_in_place` internally, which needs a live multi-thread runtime.
     if args.acp {
-        return run_acp_server(&config);
+        run_acp_server(&config)?;
+        return Ok(None);
     }
 
     // Headless proxy: the API server is the whole program — no TUI, stdout
     // is the event log (tracing still goes to the data-dir file).
     if args.proxy || (args.serve && args.uiless) {
-        return Ok(server::proxy::run(config).await?);
+        server::proxy::run(config).await?;
+        return Ok(None);
     }
 
     // TUI-only (never in --acp mode, where stdout is the JSON-RPC channel):
@@ -121,7 +168,7 @@ async fn run_async(args: Args, config: Config) -> Result<()> {
     }
     app.run().await?;
 
-    Ok(())
+    Ok(None)
 }
 
 fn run_acp_server(config: &Config) -> Result<()> {

@@ -15,7 +15,7 @@ pub(crate) mod runtime;
 pub mod search;
 mod serve;
 mod sessions;
-mod system_prompt;
+pub mod system_prompt;
 pub mod themes;
 pub mod view_state;
 
@@ -973,7 +973,7 @@ impl App {
             self.config.skills.injection,
             &self.tools,
             &self.mcp,
-            self.effective_mcp_schema_mode(),
+            self.config.effective_mcp_schema_mode(),
             &self.state.workspace_path,
         )
         .await;
@@ -996,18 +996,6 @@ impl App {
         self.state.focused_mut().agent_task = Some(handle);
 
         Ok(())
-    }
-
-    /// MCP schema mode as the system prompt should see it. Without
-    /// semantic matching there is no `tool_search` worth relying on, so
-    /// deferring schemas would leave the model with no good path to them —
-    /// force full inlining in that case.
-    fn effective_mcp_schema_mode(&self) -> crate::config::McpSchemaMode {
-        if self.config.semantic.enabled {
-            self.config.semantic.mcp_schemas
-        } else {
-            crate::config::McpSchemaMode::Full
-        }
     }
 
     /// Open the generic confirm modal for `/logout` or `/wipe`.
