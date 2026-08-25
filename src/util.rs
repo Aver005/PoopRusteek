@@ -8,6 +8,101 @@ pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..s.floor_char_boundary(max_bytes)]
 }
 
+/// Decode child-process output that is *usually* UTF-8 but not always.
+///
+/// Use for every byte stream read off a pipe or PTY instead of a bare
+/// `from_utf8_lossy`. On Windows some tools write UTF-16: `wsl.exe` emits its
+/// own diagnostics that way (so a WSL failure behind the `bash` tool reached
+/// the model as `\x1d\x045\x04 \x00C\x04…`, unreadable to model and human
+/// alike), as do parts of .NET and WMI. `POWERSHELL_UTF8_PREFIX` in
+/// `tools::shell` solves the sibling problem — PowerShell writing the OEM
+/// codepage — but nothing can make a foreign executable stop writing UTF-16.
+///
+/// Detection is by BOM first, then by where the *implausible* bytes sit. A
+/// byte below 0x20 (other than tab/CR/LF) does not occur in real text output,
+/// but in UTF-16 it is the high half of every character below U+2000 — `0x00`
+/// for ASCII, `0x04` for Cyrillic. When those land consistently on one side of
+/// each byte pair the stream is UTF-16, and that side gives the endianness.
+/// Counting NULs alone is not enough: `Н` (U+041D) encodes as `1D 04`, so a
+/// Russian message contains no NULs at all.
+pub fn decode_process_output(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    match utf16_encoding(bytes) {
+        Some(encoding) => std::borrow::Cow::Owned(decode_utf16(bytes, encoding)),
+        None => {
+            // A UTF-8 BOM would otherwise survive into the text as U+FEFF and
+            // show up as a stray glyph at the start of the output.
+            let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+            String::from_utf8_lossy(body)
+        }
+    }
+}
+
+/// Which UTF-16 flavour `bytes` is, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Utf16 {
+    Little,
+    Big,
+}
+
+/// A byte that text output does not contain, but a UTF-16 high half does.
+fn implausible_in_text(byte: u8) -> bool {
+    (byte < 0x20 && byte != b'\t' && byte != b'\n' && byte != b'\r') || byte == 0x7F
+}
+
+fn utf16_encoding(bytes: &[u8]) -> Option<Utf16> {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return Some(Utf16::Little);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return Some(Utf16::Big);
+    }
+    // No BOM: infer from byte-pair structure. Only the first chunk is
+    // examined — enough to classify, and bounded for very large outputs.
+    let sample = &bytes[..bytes.len().min(512)];
+    if sample.len() < 4 {
+        return None;
+    }
+    let pairs = sample.len() / 2;
+    // UTF-16LE puts the high half second in each pair, UTF-16BE first.
+    let (mut second, mut first) = (0usize, 0usize);
+    for pair in sample[..pairs * 2].chunks_exact(2) {
+        if implausible_in_text(pair[1]) {
+            second += 1;
+        }
+        if implausible_in_text(pair[0]) {
+            first += 1;
+        }
+    }
+    // Real UTF-16 text hits the dominant side on nearly every pair; UTF-8
+    // hits neither, and binary hits both at random parity. Requiring both a
+    // clear majority and a wide margin keeps those two out.
+    let decisive = |dominant: usize, other: usize| dominant * 5 > pairs * 2 && other * 4 < dominant;
+    if decisive(second, first) {
+        Some(Utf16::Little)
+    } else if decisive(first, second) {
+        Some(Utf16::Big)
+    } else {
+        None
+    }
+}
+
+fn decode_utf16(bytes: &[u8], encoding: Utf16) -> String {
+    let body = match encoding {
+        Utf16::Little => bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes),
+        Utf16::Big => bytes.strip_prefix(&[0xFE, 0xFF]).unwrap_or(bytes),
+    };
+    // A trailing odd byte is a truncated code unit (a capped or still-streaming
+    // read) — drop it rather than losing the whole decode to it.
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|pair| match encoding {
+            Utf16::Little => u16::from_le_bytes([pair[0], pair[1]]),
+            Utf16::Big => u16::from_be_bytes([pair[0], pair[1]]),
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
 /// Truncate to `max_bytes` with an ellipsis suffix, char-boundary safe.
 pub fn truncate_with_ellipsis(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -123,6 +218,81 @@ pub fn total_ram_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode as UTF-16LE the way a Windows console tool does.
+    fn utf16le(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    fn utf16be(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+    }
+
+    #[test]
+    fn plain_utf8_passes_through_untouched() {
+        assert_eq!(decode_process_output(b"hello, world"), "hello, world");
+        let cyrillic = "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}, world";
+        assert_eq!(decode_process_output(cyrillic.as_bytes()), cyrillic);
+    }
+
+    #[test]
+    fn utf8_bom_is_stripped_not_rendered() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"ok");
+        assert_eq!(decode_process_output(&bytes), "ok");
+    }
+
+    #[test]
+    fn bomless_utf16le_is_recovered() {
+        // The real shape of the bug: wsl.exe writing a Russian error message.
+        let message = "\u{41d}\u{435} \u{443}\u{434}\u{430}\u{43b}\u{43e}\u{441}\u{44c} \
+                       \u{43f}\u{43e}\u{434}\u{43a}\u{43b}\u{44e}\u{447}\u{438}\u{442}\u{44c} \
+                       \u{434}\u{438}\u{441}\u{43a}: WSL2";
+        assert_eq!(decode_process_output(&utf16le(message)), message);
+    }
+
+    #[test]
+    fn utf16_boms_are_honoured_in_both_endiannesses() {
+        let mut le = vec![0xFF, 0xFE];
+        le.extend(utf16le("left"));
+        assert_eq!(decode_process_output(&le), "left");
+
+        let mut be = vec![0xFE, 0xFF];
+        be.extend(utf16be("right"));
+        assert_eq!(decode_process_output(&be), "right");
+    }
+
+    #[test]
+    fn bomless_utf16be_is_recovered() {
+        assert_eq!(
+            decode_process_output(&utf16be("big endian text")),
+            "big endian text"
+        );
+    }
+
+    #[test]
+    fn a_truncated_utf16_code_unit_does_not_lose_the_rest() {
+        // A capped or still-streaming read can end mid-unit.
+        let mut bytes = utf16le("abcdefgh");
+        bytes.pop();
+        assert_eq!(decode_process_output(&bytes), "abcdefg");
+    }
+
+    #[test]
+    fn short_and_empty_inputs_are_not_mistaken_for_utf16() {
+        assert_eq!(decode_process_output(b""), "");
+        assert_eq!(decode_process_output(b"ok"), "ok");
+        // A lone NUL is too little evidence to switch decoders.
+        assert_eq!(decode_process_output(b"a\0b").len(), 3);
+    }
+
+    #[test]
+    fn binary_output_still_decodes_lossily_rather_than_panicking() {
+        // Half NULs but no consistent position: not UTF-16, so lossy UTF-8.
+        let bytes = [0x00, 0x01, 0x02, 0x00, 0xFF, 0x00, 0x00, 0x9F];
+        let text = decode_process_output(&bytes);
+        assert!(!text.is_empty());
+    }
 
     #[test]
     fn atomic_write_creates_and_replaces() {

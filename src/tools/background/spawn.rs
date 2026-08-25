@@ -41,10 +41,13 @@ async fn pipe_reader_loop<R: AsyncRead + Unpin + Send + 'static>(
         match reader.read_until(b'\n', &mut raw_line).await {
             Ok(0) => break,
             Ok(_) => {
-                let text = String::from_utf8_lossy(&raw_line);
+                // Raw bytes: decoding per line would break whole-stream
+                // encoding detection (a UTF-16 child's newline is `0A 00`, so
+                // chunks arrive half-aligned). `sanitize_terminal_output`
+                // decodes the finished buffer once.
                 let mut b = buffer.lock().unwrap();
-                if b.len() + text.len() <= MAX_BUFFER_BYTES {
-                    b.extend_from_slice(text.as_bytes());
+                if b.len() + raw_line.len() <= MAX_BUFFER_BYTES {
+                    b.extend_from_slice(&raw_line);
                 } else {
                     overflow.store(true, Ordering::Relaxed);
                 }

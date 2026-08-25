@@ -94,7 +94,7 @@ impl BackgroundHandle {
 }
 
 pub(crate) fn sanitize_terminal_output(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
+    let text = crate::util::decode_process_output(bytes);
     let without_ansi = ANSI_ESCAPE_RE.replace_all(&text, "");
     without_ansi
         .replace("\r\n", "\n")

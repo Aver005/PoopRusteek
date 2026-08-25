@@ -56,19 +56,28 @@ async fn capped_pipe_reader<R: tokio::io::AsyncRead + Unpin>(
         match reader.read_until(b'\n', &mut chunk).await {
             Ok(0) => break,
             Ok(_) => {
-                let text = String::from_utf8_lossy(&chunk);
+                // Raw bytes all the way through, as the doc above says. An
+                // earlier version decoded each chunk lossily and re-encoded
+                // it, which defeated whole-stream encoding detection: a
+                // UTF-16 child (wsl.exe writes its diagnostics that way) has
+                // its newline as `0A 00`, so `read_until` hands back
+                // half-aligned chunks that cannot be decoded in isolation.
+                // One decode of the finished buffer handles it — see
+                // `util::decode_process_output` at the collection site.
                 let remaining =
                     FOREGROUND_OUTPUT_CAP_BYTES.saturating_sub(budget.load(Ordering::Relaxed));
                 if remaining == 0 {
                     truncated.store(true, Ordering::Relaxed);
                 } else {
-                    let take = remaining.min(text.len());
-                    if take < text.len() {
+                    let take = remaining.min(chunk.len());
+                    if take < chunk.len() {
                         truncated.store(true, Ordering::Relaxed);
                     }
-                    let boundary = crate::util::truncate_at_char_boundary(&text, take);
-                    dest.lock().unwrap().extend_from_slice(boundary.as_bytes());
-                    budget.fetch_add(boundary.len(), Ordering::Relaxed);
+                    // Cutting mid-character is fine here: it only happens at
+                    // the 1 MiB cap, which already appends a marker, and the
+                    // final decode is lossy by design.
+                    dest.lock().unwrap().extend_from_slice(&chunk[..take]);
+                    budget.fetch_add(take, Ordering::Relaxed);
                 }
             }
             // read_until on raw bytes only errors on genuine I/O failure,
@@ -382,8 +391,11 @@ impl Tool for ShellTool {
 
         crate::app::FOREGROUND_CHILD_PID.store(0, Ordering::SeqCst);
 
-        let mut stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
+        // One decode per stream, on the complete buffer: this is the only
+        // place that can tell UTF-16 child output from UTF-8.
+        let mut stdout =
+            crate::util::decode_process_output(&stdout_buf.lock().unwrap()).into_owned();
+        let stderr = crate::util::decode_process_output(&stderr_buf.lock().unwrap()).into_owned();
         if truncated.load(Ordering::Relaxed) {
             // Appended to `stdout` specifically (not `stderr`) because the
             // success path below returns stdout only — a marker attached to
