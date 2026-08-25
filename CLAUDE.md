@@ -22,7 +22,9 @@ to. **Read `.memories/INDEX.md` first** — it gives the full read order
 (`QUICKSTART.md` → `STATE.md` → `MAP.md` → `ARCHITECTURE.md` → `GLOSSARY.md` →
 `BUGS.md` → `PLANS.md` → `LEARNINGS.md` → `CONVENTIONS.md` → `JOURNAL/`), plus a
 `reference/` folder looked up on demand (commands, provider, tools, MCP, config,
-prompts). `.memories/reference/AUDIT-2026-07-15-QUALITY.md` holds the latest
+prompts). `.memories/reference/HARNESS.md` documents the headless test harness and the
+Docker sandbox — read it before testing agent *behaviour* rather than code.
+`.memories/reference/AUDIT-2026-07-15-QUALITY.md` holds the latest
 full-codebase audit (quality/structure; defects: `AUDIT-2026-07-02.md`, cleanup:
 `AUDIT-2026-07-04-CLEANUP.md`) — check it before assuming a subsystem is clean.
 
@@ -60,6 +62,27 @@ cargo test --bin pooprusteek semantic::eval -- --ignored --nocapture
 Run it whenever you touch `src/semantic/` ranking (thresholds, RRF, corpus
 text composition) and record the numbers in the journal. Current baselines:
 skills MRR 0.927, MCP tools MRR 0.836.
+
+Agent **behaviour** has its own gate, separate from both: the headless
+harness (`src/harness/`, full reference `.memories/reference/HARNESS.md`).
+Unit tests cover code; the harness covers what the agent actually does.
+
+```
+# one real turn, no terminal, JSONL trace
+pooprusteek --config <throwaway.toml> exec "<prompt>" --trace .dev/t.jsonl
+# a prompt repeated N times, expectations checked, metrics aggregated
+pooprusteek --config <throwaway.toml> scenario sandbox/scenarios/live/<x>.toml --repeat 5
+# rank failure patterns across every trace (and the saved-session corpus)
+pooprusteek mine .dev/harness --sessions
+```
+
+Run it whenever you touch the agent loop, the tool prompt/parser, or the
+semantic hint path, and record the pass rates in the journal. Always use
+`--config` with a throwaway token: a run drives real tools under a policy.
+Inside Docker: `sandbox/README.md` (`./sandbox.ps1 suite live -Repeat 5`).
+`sandbox/scenarios/mock/` runs against `mock-provider` for deterministic
+regressions — the only reliable way to reach failure paths the live model
+produces by accident.
 
 Build flake to know about: parallel rustc + ort linking can exhaust the
 Windows pagefile (`STATUS_STACK_BUFFER_OVERRUN` / os error 1455, "paging file
@@ -104,19 +127,32 @@ Key subsystems added on top of that core:
   (JSON / wizard / one-liner), RFC 9728/8414/7591 + PKCE authorization with
   OS-keyring token storage.
 
+- **`src/harness/` — headless behaviour testing.** A peer of `app/`, above it:
+  `pooprusteek exec` assembles the same deps `App::new` does and drives one
+  real `TurnSpec` with the human replaced by a policy. Two properties are
+  load-bearing. (1) The trace is **the existing `debug_log`** in a new JSONL
+  format, not a second telemetry stream — so it can never drift from the
+  runner's instrumentation. (2) `auto_approve` stays **false**: the runner
+  refuses sub-agents when it is on, so the driver answers
+  `RequestToolApproval` from an `ApprovePolicy` instead of bypassing it.
+  `scenario`/`suite` repeat a prompt as child processes and report a pass
+  *rate*; `mine` ranks normalised failure shapes; `mock-provider` serves
+  scripted replies.
+
 ## Invariants for contributors (human or AI)
 
 1. **Never block or `.await` network/LLM/file I/O inside `handle_event`** — it runs on the main `select!` loop; spawn a task and send an `AppEvent` back instead.
 2. **Never hold the `MCPManager` lock (or any shared `Mutex`) across an I/O `.await`** — a slow call under the lock freezes every other consumer of that lock, including the UI.
 3. **All user-data persistence goes through `util::atomic_write`, never `std::fs::write`** — direct writes truncate-in-place and corrupt on crash mid-write.
-4. **Never byte-slice text** — use `util::truncate_at_char_boundary`; raw byte indices can split a multi-byte UTF-8 char or emoji.
+4. **Never byte-slice text, and never decode child-process output with a bare `from_utf8_lossy`** — use `util::truncate_at_char_boundary` and `util::decode_process_output`. Raw byte indices split a multi-byte UTF-8 char or emoji; and some Windows tools write UTF-16 (`wsl.exe` does, for its own diagnostics), which lossy UTF-8 turns into mojibake the model cannot read. Decode once on a complete buffer — per-line decoding cannot work when the newline is `0A 00`.
 5. **A slash command is one file in `src/commands/defs/` + registration in `commands/mod.rs`** — `name()` must be returned **without** a leading slash (dispatch strips the `/` before lookup; a registry test enforces this).
 6. **The tools layer must never reach into the app layer** — `tools/` and `app/` communicate exclusively through `AppEvent`s, never direct calls or shared state upward.
 7. **A new tool = implement the `Tool` trait + one registration line** in `tools/registry.rs`.
 8. **Update `.memories` (`STATE.md`, `BUGS.md`, `JOURNAL/`) as part of "done"** for any non-trivial change. Anchor documentation to function/struct names, not line numbers — line numbers drift on the next edit.
 9. **CPU-heavy work (ONNX embedding, PoW solving) runs on `tokio::task::spawn_blocking` only** — never on the event loop, never bare on an async worker. The `SemanticService` inner mutex is held across synchronous work only, never across an `.await`.
 10. **Never print to stdout/stderr while the app runs** — the TUI owns the terminal and `--acp` owns stdout for JSON-RPC. `tracing` goes to the data-dir log file (set up in `main.rs`); ad-hoc debugging goes through `debug_log`. This includes dependencies: fastembed's download progress bar is explicitly disabled for this reason.
-11. **The semantic layer must degrade, never block features** — every entry point returns empty/falls back to lexical when the embedder is disabled, still initializing, or failed. Deferred MCP schemas are only allowed when semantic matching is enabled (`App::effective_mcp_schema_mode` forces `Full` otherwise); session files remain the source of truth for the history index (it is a wipeable cache).
+11. **The harness must never add instrumentation to the agent loop, and never set `auto_approve: true`** — telemetry goes through the existing `debug_log` call sites (a parallel stream drifts), and bypassing approval silently disables the `task` tool, making sub-agents untestable.
+12. **The semantic layer must degrade, never block features** — every entry point returns empty/falls back to lexical when the embedder is disabled, still initializing, or failed. Deferred MCP schemas are only allowed when semantic matching is enabled (`App::effective_mcp_schema_mode` forces `Full` otherwise); session files remain the source of truth for the history index (it is a wipeable cache).
 
 ## Conventions
 

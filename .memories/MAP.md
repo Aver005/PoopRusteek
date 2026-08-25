@@ -1,6 +1,6 @@
 # MAP
 > Codebase map — file → purpose. Navigation aid. (~15k LOC)
-> Last updated: 2026-07-02 (in-TUI onboarding, /logout, /wipe — sizes approximate, anchor to names not lines)
+> Last updated: 2026-08-25 (+ `src/harness/` and `sandbox/` — sizes approximate, anchor to names not lines)
 
 ## ENTRY / ROOT
 | File | Purpose | Lines |
@@ -109,6 +109,30 @@
 | `src/server/proxy.rs` | `--proxy` / `--api --uiless` headless mode: same `spawn()` server, no TUI — timestamped stdout log (lifecycle, per-request lines, refresh summaries), own startup-fetch + interval refetch loop, Ctrl+C graceful (2× = hard exit) | ~110 |
 | `src/provider/model_cache.rs` | `ProviderModelCache` — persistent per-entry model lists (`data_dir/provider_models.json`, atomic_write, rebuildable): `snapshot()`, `age_ms`, `refresh(entries, cache_ttl, force)` (concurrent `list_models`, 20s cap each, failures keep stale data, prunes deleted entries), `RefreshOutcome::summary()` | ~280 |
 | `src/app/serve.rs` | `/serve`+`/server` effects on `App`: `apply_serve_action`, `start_server` (pub — `--serve` calls it), restart-on-port/dialect-change, `server_status_text` (live fetched-model list, capped at 24 shown) | ~170 |
+
+## HARNESS (headless behaviour testing — added 2026-08-25, see `reference/HARNESS.md`)
+| File | Purpose | Lines |
+|------|---------|-------|
+| `src/harness/mod.rs` | clap subcommands (`exec`/`scenario`/`suite`/`mine`/`mock-provider`) + `run()` dispatch returning a process exit code; `parse_semantic` (`off`/`background`/`ready[:s]`), `run_stamp`, `DEFAULT_OUT_DIR` (`.dev/harness`) | ~300 |
+| `src/harness/driver.rs` | One real turn without a terminal: `assemble` (same deps as `App::new`) → `AgentRuntime::spawn(TurnSpec)` → `drive` (services `AppEvent`s under a wall-clock deadline). `ApprovePolicy` answers approvals (**`auto_approve` stays false** — `run_agent_loop` refuses sub-agents when it is on), `SemanticMode` gates RAG readiness, `SpawnSubAgent` honoured for real, `absolutize` keeps the trace out of the workspace under test. `RunOutcome`/`RunStatus` (exit 0/1/2/3) | ~640 |
+| `src/harness/trace.rs` | Reading side of the JSONL trace: `TraceRecord {seq, ts, action, message\|data}`, `Trace::{read,parse,by_action}` (seq-ordered, counts unparsable lines), `action::*` constants for the `harness.*` records | ~150 |
+| `src/harness/metrics.rs` | `RunMetrics::from_trace` — steps, tool calls/errors/skips, per-tool counts, malformed count + exhausted flag, salvaged streams, stream timeouts, empty steps, semantic hint, `TurnEnd {Done, MaxSteps, Errored, Unknown}`. `message_field` parses the runner's `key=value` message lines (values run to the next ` <ident>=`, not the first space) | ~210 |
+| `src/harness/scenario.rs` | `Scenario` + `Expect` TOML (`deny_unknown_fields` on both — a mistyped expectation must not silently pass), `Expect::check` → failure reasons, `execute` fans repeats out as **child processes** (`exec --json`, `kill_on_drop` + timeout+60s backstop, `--config` forwarded), `collect_scenarios`, `EXIT_EXPECTATIONS_FAILED = 4` | ~530 |
+| `src/harness/report.rs` | `RunReport`/`ScenarioReport`/`SuiteReport`, `Aggregate` + `Stat` (min/mean/**median**/max — one timeout otherwise swamps the mean), failure buckets, `render_run`/`render_scenario`/`render_suite`. Reports are written as JSON so runs are diffable across code changes | ~420 |
+| `src/harness/mine.rs` | Pattern mining: `normalize` (quoted spans→`<str>`, path-like tokens→`<path>`, digit runs→`<n>` — in that order) → `Counter` → ranked `Bucket`s (`malformed-tool-calls`, `tool-errors`, `stream-problems`, `hints-without-tool-use`, `repeated-answers`), over traces and the saved-session corpus (`--sessions`) | ~430 |
+| `src/harness/mock.rs` | Scripted OpenAI-compatible endpoint (hyper): `GET /v1/models`, `POST /v1/chat/completions` blocking + SSE. `Reply {when, content, delay_ms, status}`, positional order with the last reply repeating. JSON hand-rolled on purpose — a double sharing wire code with the thing under test cannot catch a wire bug | ~370 |
+
+## SANDBOX (Docker — see `sandbox/README.md`)
+| File | Purpose |
+|------|---------|
+| `sandbox/Dockerfile` | 2-stage: `rust:1.91-trixie` builder (**trixie, not bookworm** — the prebuilt static ONNX Runtime needs glibc >= 2.38 for `__isoc23_strtoll`; BuildKit cache mounts, `BUILD_PROFILE` dev/release, `CARGO_BUILD_JOBS=4` so the ort/wasmtime link doesn't OOM the WSL2 VM) → `debian:trixie-slim` runtime (bash/git/curl/jq/tini, non-root `agent`, explicit XDG paths, `libonnxruntime*.so` copied out) |
+| `sandbox/docker-compose.yml` | `sandbox` (one-shot `run --rm`, data volume + `./out` bind, `cap_drop: ALL`, `no-new-privileges`, pids/mem caps) + `mock` (long-running scripted provider, reachable as `http://mock:811/v1`) |
+| `sandbox/entrypoint.sh` | Renders `config.template.toml` with `POOPRUSTEEK_TOKEN` at run time (never in an image layer), points skills at `/opt/sandbox/skills`, lets bare harness subcommands omit the binary name |
+| `sandbox/sandbox.ps1` / `.sh` | Control CLI: `build`/`doctor`/`shell`/`exec`/`scenario`/`suite`/`mine`/`mock`/`stop`/`report`/`reset` |
+| `sandbox/scenarios/live/*.toml` | 5 live scenarios: no-tool answer, shell reads workspace, denied-approval reporting, sub-agent spawn, RAG hint fires |
+| `sandbox/scenarios/mock/*.toml` | 2 deterministic scenarios: malformed-tool-call recovery, clean failure on 429 |
+| `sandbox/mock-scripts/*.toml` | Scripted replies: `plain-answer`, `malformed-then-recovers`, `rate-limited` |
+| `sandbox/fixtures/tiny-repo/` | Read-only workspace scenarios run against (declares version `0.4.2`, which expectations assert on) |
 
 ## OTHER
 | File | Purpose |

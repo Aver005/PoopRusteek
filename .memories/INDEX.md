@@ -1,5 +1,5 @@
 # .memories INDEX
-> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-07-15 (quality/structure audit → `reference/AUDIT-2026-07-15-QUALITY.md`; BUGS.md refreshed (+8 entries, 2 stale corrected) — clippy 0, tests 434, MSRV 1.91)
+> Agent entry point. If you were handed this project cold, START HERE. Last updated: 2026-08-25 (headless harness + Docker sandbox → `reference/HARNESS.md`, `JOURNAL/2026-08-25.md`; tests 474). Before: 2026-07-15 (quality/structure audit → `reference/AUDIT-2026-07-15-QUALITY.md`; BUGS.md refreshed (+8 entries, 2 stale corrected) — clippy 0, tests 434, MSRV 1.91)
 
 > ⚠️ `CLAUDE.md` at the repo root is now the auto-loaded bridge into this folder — **Claude Code**
 > reads it automatically and it points here. The **app itself** still does **NOT** auto-load
@@ -32,6 +32,7 @@
 | `reference/CONFIG.md` | Config schema, storage paths, sessions |
 | `reference/AUTO-UPDATE.md` | Self-updater (`/update`, `/autoupdate`) + the `latest` CI release channel — swap mechanics, **contract points that must not desync**, failure modes |
 | `reference/PROMPTS.md` | Prompt library + skills discovery |
+| `reference/HARNESS.md` | **Headless behaviour testing** — `pooprusteek exec`, JSONL traces, scenarios/expectations, pattern mining, mock provider, the Docker sandbox, and why `auto_approve` must stay false |
 | `reference/AUDIT-2026-07-02.md` | Full-codebase audit (2026-07-02): severity-ranked defects, `[FIXED]`/`[OPEN]`/`[ACCEPTED]` status |
 | `reference/AUDIT-2026-07-04-CLEANUP.md` | Cleanup audit (2026-07-04): duplication / dead code / inefficiency / coupling, with verified-vs-reported status and execution order |
 | `reference/AUDIT-2026-07-15-QUALITY.md` | Quality/structure audit (2026-07-15): duplication, dead code, branching, overloaded modules — verified/reported status, execution order, plus verdicts on what NOT to split |

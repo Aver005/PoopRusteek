@@ -1,13 +1,30 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-07-15 (quality audit +8 entries, then the same-day defect batch fixed 7 of them — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
+> Last updated: 2026-08-26 (the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
 > Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure)
 
 ## CRITICAL
 None currently known.
 
 ## HIGH
-None currently known.
+
+### Announcing work ends the turn as if it were done
+
+A turn whose final reply is plain text and no tool call is treated as a
+finished answer. The model frequently uses that shape to *announce* the next
+step instead of answering: given an empty directory and "create three files",
+a live run did `ls -la`, replied "Директория пуста, только .gitkeep. Создам три
+файла." and stopped. The harness scored it `completed` with an empty workspace;
+a user would see a confident message and no files.
+
+Reproduce: `sandbox/scenarios/dev/greenfield-todo-page.toml`, which fails on
+the file expectations rather than on the answer text.
+
+Not obviously a code bug — the loop cannot read intent — so the first thing to
+measure is whether the system prompt can remove the behaviour ("never end a
+turn by announcing work you have not done"). A loop-side nudge on
+announcement-shaped endings is the fallback, and needs the harness to show it
+does not cost anything elsewhere.
 
 ## MEDIUM
 
@@ -37,6 +54,11 @@ None currently known.
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **Tool output in UTF-16 was decoded as UTF-8, handing the model mojibake instead of the error** (found 2026-08-25 by `harness mine` on its first trace corpus; fixed same day). On Windows `bash` commonly resolves to WSL, and `wsl.exe` writes *its own* diagnostics in UTF-16LE — a failed ext4.vhdx mount arrived as `1d 04 35 04 20 00 43 04 34 04`, unreadable to model and human alike. New shared `util::decode_process_output`: BOM first, then endianness inferred from which side of each byte pair carries a byte that cannot occur in text (< 0x20 excluding tab/CR/LF, or 0x7F). Counting NULs is not enough — `Н` (U+041D) is `1D 04`, so a Russian message has none; the first attempt at this heuristic failed its own test for exactly that reason. Both streaming readers now keep **raw bytes** (as their doc comments always claimed) instead of decoding per line and re-encoding — a UTF-16 newline is `0A 00`, so `read_until(b'
+')` yields half-aligned chunks that cannot be decoded in isolation; one decode of the finished buffer replaces four scattered `from_utf8_lossy` calls. `→ src/util.rs` (`decode_process_output`), `src/tools/shell.rs` (`capped_pipe_reader` + collection site), `src/tools/background/spawn.rs`, `src/tools/background/types.rs` (`sanitize_terminal_output`)
+
+- ✅ **Harness contaminated the workspace it was measuring** (found 2026-08-25 on the first tool-using run). `driver::exec` changed the process working directory into the scenario's workspace *before* resolving a relative `--trace` path, so the trace and its parent directories were created **inside the directory under test** — the agent then listed the harness's own scratch folder as part of the workspace. Trace paths are now absolutised before the `chdir`. `→ src/harness/driver.rs` (`absolutize`)
 
 - ✅ **Quitting during the background MCP/semantic load left the process alive, holding the shell** (user-reported 2026-07-15, evening). Two compounding waits on exit: (1) `run()`'s `self.mcp.lock().await.shutdown_all().await` was the only unbounded cleanup step — now under the same 3s timeout as its neighbors (on timeout, children die with the process via the Windows kill-on-close Job Object / `kill_on_drop`); (2) the real killer — `#[tokio::main]`'s implicit runtime drop **waits for all `spawn_blocking` tasks**, and the semantic layer legitimately runs ONNX embedding there for seconds-to-minutes (model init/download, MCP-corpus re-embed, history backfill) — blocking work can't be aborted. `main` now builds the runtime manually and calls `shutdown_timeout(2s)` after `run_async` returns: abandoning the blocking threads is safe (persister already flushed bounded, every durable write is `atomic_write`, the semantic index is a rebuildable cache). Side effect worth knowing: a hung old instance used to keep its half-started `npx` MCP children alive, which could then collide with a relaunched instance's copies of the same servers (npm cache/port contention) — the "MCP acting up after a bad exit" symptom. `→ src/main.rs`, `src/app/mod.rs` (`run`)
 
