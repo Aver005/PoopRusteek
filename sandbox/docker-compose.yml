@@ -34,6 +34,11 @@ services:
       - ./scenarios:/opt/sandbox/scenarios:ro
       - ./mock-scripts:/opt/sandbox/mock-scripts:ro
       - ./fixtures:/opt/sandbox/fixtures:ro
+      # System-prompt variants, for the same reason: comparing prompt wording
+      # is an editing loop, and it must not cost an image rebuild.
+      - ./prompts:/opt/sandbox/prompts:ro
+      # Mounted too, so changing a throttle or a limit is an edit, not a build.
+      - ./config.template.toml:/opt/sandbox/config.template.toml:ro
     working_dir: /work
     # The agent runs arbitrary shell commands; drop what it has no business
     # having. `no-new-privileges` blocks setuid escalation from inside.
