@@ -1,0 +1,16 @@
+# Needs `sandbox mock malformed-then-recovers` running, and a `mock` provider
+# entry in the config (the sandbox image writes one).
+name = "recovers-from-malformed-call"
+description = "A malformed tool call is retried and the turn still finishes"
+prompt = "Show me the package version."
+workspace = "../../fixtures/tiny-repo"
+provider = "mock"
+timeout = 60
+max_steps = 6
+
+[expect]
+status = "completed"
+tools_used = ["bash"]
+final_matches = ['0\.4\.2']
+# The point of the scenario: exactly the scripted mistake, then recovery.
+min_pass_rate = 1.0

@@ -1,0 +1,15 @@
+# The floor: can the agent answer a trivial question in one step without
+# reaching for a tool? A regression here means the tool prompt is pushing the
+# model to act when it should just talk.
+name = "answers-without-tools"
+description = "Trivial question, one step, no tools"
+prompt = "What is 2 + 2? Answer with just the number, and do not use any tools."
+timeout = 120
+
+[expect]
+status = "completed"
+max_steps = 2
+tools_forbidden = ["bash", "powershell", "task"]
+final_matches = ["4"]
+no_malformed = true
+min_pass_rate = 1.0

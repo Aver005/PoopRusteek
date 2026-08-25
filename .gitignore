@@ -65,3 +65,8 @@ cache/
 .dev/
 *.dev.*
 .playwright-mcp
+# Sandbox run artifacts (traces, reports) — regenerated on every run.
+sandbox/out/
+# Fixture runs leave bytecode behind; the fixtures themselves are sources.
+__pycache__/
+*.pyc

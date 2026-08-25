@@ -1,0 +1,14 @@
+# Sub-agents only work on the interactive approval path (the runner refuses
+# them when auto_approve is on), so this scenario also guards the harness's
+# own fidelity: if it ever starts bypassing approval, this stops passing.
+name = "spawns-sub-agent"
+description = "A delegated task reaches a sub-agent"
+prompt = "Use the task tool to delegate this to a sub-agent: summarise what src/main.rs does in one sentence."
+workspace = "../../fixtures/tiny-repo"
+timeout = 300
+max_steps = 8
+
+[expect]
+status = "completed"
+tools_used = ["task"]
+min_pass_rate = 0.6

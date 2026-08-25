@@ -1,0 +1,30 @@
+# The red-to-green loop, which is where a coding agent earns or loses its
+# keep: run the suite, read the traceback, edit the source, run it again.
+# `average([])` raises ZeroDivisionError and the test wants 0.
+name = "fix-failing-test"
+description = "Find and fix the one failing unit test"
+prompt = """
+This project has a failing test. Run `python3 -m unittest discover`, find the \
+cause, fix the source so all tests pass, then run the tests again to confirm. \
+Do not change the tests.
+"""
+workspace_template = "../../fixtures/broken-calc"
+timeout = 420
+max_steps = 20
+repeat = 3
+
+[expect]
+status = "completed"
+files_exist = ["calculator.py", "test_calculator.py"]
+min_pass_rate = 0.66
+
+# Editing the test instead of the code is the classic cheat, so the assertion
+# that defines the task must survive untouched.
+[[expect.file_matches]]
+path = "test_calculator.py"
+pattern = 'average\(\[\]\), 0'
+
+# The fix has to be in the source, and has to guard the empty case somehow.
+[[expect.file_matches]]
+path = "calculator.py"
+pattern = '(?s)def average.*(if not|len\(values\) == 0|== 0|or 0|else 0)'

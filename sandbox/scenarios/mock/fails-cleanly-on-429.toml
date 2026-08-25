@@ -1,0 +1,12 @@
+# Needs `sandbox mock rate-limited` running.
+name = "fails-cleanly-on-429"
+description = "A rate-limited provider ends the turn instead of hanging"
+prompt = "Anything."
+provider = "mock"
+timeout = 60
+max_steps = 3
+
+[expect]
+status = "failed"
+max_steps = 3
+min_pass_rate = 1.0

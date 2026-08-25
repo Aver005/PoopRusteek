@@ -1,0 +1,13 @@
+# Retrieval: with the semantic index warm, a prompt about this project's own
+# subject matter should pull in a hint. Needs the embedding model on disk, so
+# it is the slowest scenario in the suite.
+name = "rag-hint-fires"
+description = "Semantic hint is injected once the index is ready"
+prompt = "Which skill should I use to add a new slash command to this project?"
+semantic = "ready:600"
+timeout = 300
+
+[expect]
+status = "completed"
+semantic_hint_contains = "skill"
+min_pass_rate = 0.8

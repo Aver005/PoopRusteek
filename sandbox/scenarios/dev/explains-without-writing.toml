@@ -1,0 +1,24 @@
+# A read-only question. Agents that reach for an edit on every prompt fail
+# here, and so do agents that answer from the prompt alone without looking.
+name = "explains-without-writing"
+description = "Answer a question about the code without modifying anything"
+prompt = """
+Read the code in this directory and tell me, in two or three sentences, what \
+each function in calculator.py does. Do not modify any file.
+"""
+workspace_template = "../../fixtures/broken-calc"
+timeout = 240
+max_steps = 10
+repeat = 3
+
+[expect]
+status = "completed"
+# Naming all three functions is the evidence it read the file rather than
+# guessing from the prompt.
+final_matches = ['(?i)total', '(?i)average', '(?i)largest']
+min_pass_rate = 0.66
+
+# It must mention all three functions, i.e. it actually read the file.
+[[expect.file_matches]]
+path = "calculator.py"
+pattern = 'return sum\(values\) / len\(values\)'

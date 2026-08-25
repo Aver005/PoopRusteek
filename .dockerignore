@@ -1,0 +1,14 @@
+# The build context is the repo root; without these the context is gigabytes
+# and every build re-uploads them.
+target/
+.dev/
+.git/
+.github/
+.gitlab-ci.yml
+.playwright-mcp/
+.trae/
+.docs/
+.memories/
+sandbox/out/
+**/*.jsonl
+**/*.log

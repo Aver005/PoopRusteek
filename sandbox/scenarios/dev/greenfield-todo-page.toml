@@ -1,0 +1,39 @@
+# The canonical "just build me a small thing" request. Everything is checked
+# against the filesystem, not the answer text: a confident summary over an
+# empty directory is the most common way this fails.
+#
+# TOML note: every `[expect]` scalar must come before the
+# `[[expect.file_matches]]` arrays, or it lands in the wrong table.
+name = "greenfield-todo-page"
+description = "Create a plain static todo page from nothing"
+prompt = """
+Create a small static todo page in the current directory. Three files: \
+index.html, style.css, script.js. Typing a task and pressing the button must \
+add it to a visible list. No frameworks, no build step, no CDN links - plain \
+HTML, CSS and JS. index.html must link both other files.
+"""
+workspace_template = "../../fixtures/empty"
+timeout = 300
+max_steps = 14
+repeat = 3
+
+[expect]
+status = "completed"
+files_exist = ["index.html", "style.css", "script.js"]
+no_malformed = true
+min_pass_rate = 1.0
+
+# The wiring is what a sloppy agent skips: it writes three files and forgets to
+# reference two of them.
+[[expect.file_matches]]
+path = "index.html"
+pattern = 'style\.css'
+
+[[expect.file_matches]]
+path = "index.html"
+pattern = 'script\.js'
+
+# Something must actually handle the interaction, not merely describe it.
+[[expect.file_matches]]
+path = "script.js"
+pattern = '(?i)addEventListener|onclick'

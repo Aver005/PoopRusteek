@@ -1,0 +1,17 @@
+# The core loop: read the workspace with a shell tool and report a fact from
+# it. Exercises tool call -> approval -> execution -> result -> final answer.
+name = "shell-reads-workspace"
+description = "Find the package version by inspecting the workspace"
+prompt = "Look at the files in the current directory and tell me the version of the package declared in Cargo.toml."
+workspace = "../../fixtures/tiny-repo"
+timeout = 240
+
+[expect]
+status = "completed"
+max_steps = 6
+max_tool_calls = 6
+final_matches = ['0\.4\.2']
+no_malformed = true
+# The model may reach the answer with either shell, or occasionally guess a
+# second read, so this is about the answer, not the exact tool path.
+min_pass_rate = 0.8

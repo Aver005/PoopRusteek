@@ -1,0 +1,5 @@
+# Provider returns 429 forever: the turn must fail cleanly rather than hang
+# or loop.
+[[reply]]
+content = "unused"
+status = 429

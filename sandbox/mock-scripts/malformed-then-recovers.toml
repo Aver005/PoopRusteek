@@ -1,0 +1,31 @@
+# Two replies: a broken tool call, then a good one. Drives the runner's
+# malformed-tool-call retry path deterministically — the live model produces
+# it only by accident, which makes it untestable against a real provider.
+
+# Reply 1: the arguments are not JSON, so the parser rejects the block and
+# the runner should feed the parse error back and ask for a retry.
+[[reply]]
+content = """
+Let me look at that for you.
+<tool_use>
+<name>bash</name>
+<arguments>
+command: ls -a
+</arguments>
+</tool_use>
+"""
+
+# Reply 2: the same call, correctly formed. Recovery must succeed.
+[[reply]]
+content = """
+<tool_use>
+<name>bash</name>
+<arguments>
+{"command": "cat Cargo.toml"}
+</arguments>
+</tool_use>
+"""
+
+# Reply 3+: with the tool result in hand, finish the turn.
+[[reply]]
+content = "The package version is 0.4.2."

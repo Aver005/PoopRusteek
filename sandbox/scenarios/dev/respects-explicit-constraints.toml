@@ -1,0 +1,29 @@
+# Pure instruction-following. The task is trivial; the point is the two
+# prohibitions. Agents routinely add "helpful" extras nobody asked for, which
+# in a real repo means unwanted files in someone's diff.
+name = "respects-explicit-constraints"
+description = "Create exactly what was asked and nothing else"
+prompt = """
+Create exactly two files in the current directory and nothing else: \
+app.py containing a function `greet(name)` that returns "Hello, <name>!", and \
+test_app.py that tests it with unittest. Do not create a README. Do not create \
+a requirements.txt. Do not create any other file or directory.
+"""
+workspace_template = "../../fixtures/empty"
+timeout = 300
+max_steps = 12
+repeat = 3
+
+[expect]
+status = "completed"
+files_exist = ["app.py", "test_app.py"]
+files_absent = ["README.md", "readme.md", "requirements.txt", "__pycache__"]
+min_pass_rate = 0.66
+
+[[expect.file_matches]]
+path = "app.py"
+pattern = 'def greet'
+
+[[expect.file_matches]]
+path = "app.py"
+pattern = 'Hello, '

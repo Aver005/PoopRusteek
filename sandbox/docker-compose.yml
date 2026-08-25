@@ -1,0 +1,75 @@
+# Sandbox services. Driven through `sandbox.ps1` / `sandbox.sh`, but usable
+# directly with plain `docker compose` too.
+#
+# Build context is the repo root (`..`) because the image compiles the crate;
+# `.dockerignore` there keeps the context small.
+
+name: pooprusteek-sandbox
+
+services:
+  # The harness itself. No long-running command: every invocation is a
+  # one-shot `docker compose run --rm sandbox <args>`.
+  sandbox:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        # Override with BUILD_PROFILE=dev for fast rebuild cycles.
+        BUILD_PROFILE: ${BUILD_PROFILE:-release}
+        # Keeps the WSL2 VM from being OOM-killed mid-link. See the Dockerfile.
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-4}
+    image: pooprusteek-sandbox:latest
+    environment:
+      # Read from sandbox/.env — never committed.
+      POOPRUSTEEK_TOKEN: ${POOPRUSTEEK_TOKEN:-}
+    volumes:
+      # The embedding model (~120 MB) and the semantic index: downloaded once,
+      # reused by every later run and by the mock service.
+      - pooprusteek-data:/home/agent/.local/share/pooprusteek
+      # Traces and reports, readable from the host after a run.
+      - ./out:/out
+      # Scenarios and fixtures live-mounted so editing one does not need a
+      # rebuild. Read-only for fixtures: a scenario must not be able to
+      # mutate the workspace other scenarios depend on.
+      - ./scenarios:/opt/sandbox/scenarios:ro
+      - ./mock-scripts:/opt/sandbox/mock-scripts:ro
+      - ./fixtures:/opt/sandbox/fixtures:ro
+    working_dir: /work
+    # The agent runs arbitrary shell commands; drop what it has no business
+    # having. `no-new-privileges` blocks setuid escalation from inside.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # A runaway `while true` in a tool call should not take the host down.
+    pids_limit: 512
+    mem_limit: 4g
+    # No `init: true` here: the image's entrypoint already runs tini, and
+    # compose's own init would take PID 1 and leave tini unable to reap.
+
+  # Scripted provider. Long-running, so scenarios with `provider = "mock"` can
+  # reach it as http://mock:811/v1 on this network.
+  mock:
+    image: pooprusteek-sandbox:latest
+    # No `depends_on: sandbox` — that started a throwaway `sandbox` container
+    # on every `mock` start. The image is shared, not the lifecycle; build it
+    # with `sandbox build` (and `sandbox doctor` reports it missing).
+    command:
+      - mock-provider
+      - --host
+      - 0.0.0.0
+      - --port
+      - "811"
+      - --script
+      - /opt/sandbox/mock-scripts/${MOCK_SCRIPT:-plain-answer.toml}
+    volumes:
+      - ./mock-scripts:/opt/sandbox/mock-scripts:ro
+    expose:
+      - "811"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  pooprusteek-data:

@@ -1,0 +1,8 @@
+# Everything in the sandbox is consumed by Linux inside the container. A
+# Windows clone with core.autocrlf=true would otherwise hand the image a
+# CRLF `entrypoint.sh` (which fails to exec at all, with a misleading "no such
+# file or directory") and a CRLF config template (which the TOML parser
+# rejects with "carriage return must be followed by newline" — the app then
+# falls back to defaults and reports "no provider configured").
+sandbox/** text eol=lf
+*.sh text eol=lf

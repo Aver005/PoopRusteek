@@ -1,0 +1,4 @@
+# Single fixed answer, no tools. The cheapest possible end-to-end check that
+# provider -> agent loop -> trace still works.
+[[reply]]
+content = "Four."
