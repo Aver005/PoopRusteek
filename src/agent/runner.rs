@@ -44,6 +44,7 @@ pub async fn run_agent_loop(
     } = spec;
     let mut collected_tool_calls = Vec::new();
     let mut malformed_retries: u32 = 0;
+    let mut empty_retries: u32 = 0;
 
     inject_semantic_hint(conversation, &semantic, &mut messages).await;
 
@@ -259,6 +260,41 @@ pub async fn run_agent_loop(
                     ),
                 );
                 let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage(conversation));
+
+                // No text and no tool call means the turn did nothing at all.
+                // Reporting that as a success is how "build me a page" came
+                // back in 1.4s with an empty directory and no complaint.
+                // Nudge and retry, bounded, the way a malformed tool call is
+                // handled — and if it keeps happening, say so instead of
+                // pretending the work is done.
+                if empty_retries < MAX_EMPTY_RESPONSE_RETRIES {
+                    empty_retries += 1;
+                    messages.push(ChatMessage::user(EMPTY_RESPONSE_FEEDBACK));
+                    debug_log::log(
+                        "agent.step.empty_retry",
+                        format!(
+                            "conversation={conversation} step={step_number}/{max_steps} retry={empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES}"
+                        ),
+                    );
+                    let _ = event_tx.send(AppEvent::AddMessage(
+                        conversation,
+                        ChatMessage::system(&format!(
+                            "⚠ Empty reply from the model (attempt {empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES}) — retrying"
+                        )),
+                    ));
+                    continue;
+                }
+                debug_log::log(
+                    "agent.turn.error",
+                    format!(
+                        "conversation={conversation} step={step_number}/{max_steps} status=empty_response_exhausted"
+                    ),
+                );
+                let _ = event_tx.send(AppEvent::AgentError(
+                    conversation,
+                    "The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request.".to_string(),
+                ));
+                return;
             }
 
             debug_log::log(
@@ -697,6 +733,20 @@ pub(crate) async fn dispatch_generic_tool(
 /// Shared with the sub-agent loop, which applies the same recovery.
 pub(crate) const MAX_MALFORMED_TOOL_RETRIES: u32 = 2;
 
+/// How many times, within one turn, an entirely empty model reply (no text,
+/// no tool call) may be retried before the turn is reported as failed.
+///
+/// Found by the harness: DeepSeek occasionally closes a stream with
+/// `got_stop=true` and zero bytes, and the loop used to report that as
+/// `turn.done status=success`. A "build me a page" request then returned in
+/// 1.4s having created nothing, with no error shown to anyone.
+pub(crate) const MAX_EMPTY_RESPONSE_RETRIES: u32 = 2;
+
+/// Nudge sent back after an empty reply. Deliberately concrete about the two
+/// acceptable shapes of a turn, since the failure is the model producing
+/// neither.
+pub(crate) const EMPTY_RESPONSE_FEEDBACK: &str = "Your last reply was completely empty. Answer the request now: either      write the text of the answer, or emit a tool call in the documented      <tool_use> form. Do not reply with nothing.";
+
 /// Correction message handed back to the model after it emitted a `<tool_use>`
 /// block that couldn't be parsed. Names each concrete problem and restates the
 /// exact required shape so the model can re-issue the call. Shared by the
@@ -839,11 +889,98 @@ mod tests {
         assert!(error.contains("without stop"));
     }
 
+    /// Found by the harness on a real "build me a page" run: DeepSeek closed
+    /// the stream with `got_stop=true` and zero bytes, and the loop reported
+    /// `turn.done status=success`. The user asked for three files and got an
+    /// empty directory, in 1.4 seconds, with no error anywhere.
+    #[tokio::test]
+    async fn agent_loop_retries_an_empty_reply_then_succeeds() {
+        // Empty, empty, then a real answer: within the retry budget.
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_responses(vec![
+            String::new(),
+            String::new(),
+            "Here is the answer.".to_string(),
+        ]));
+        let (done, error) = drive_turn(provider, 6).await;
+        assert!(error.is_none(), "should have recovered: {error:?}");
+        assert_eq!(
+            done.expect("turn should finish").text,
+            "Here is the answer."
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_reports_an_error_when_every_reply_is_empty() {
+        // One more empty reply than the budget allows.
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_responses(vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ]));
+        let (done, error) = drive_turn(provider, 6).await;
+        assert!(
+            done.is_none(),
+            "an empty turn must not be reported as a success"
+        );
+        let message = error.expect("empty turn should surface an error");
+        assert!(message.contains("empty"), "{message}");
+        assert!(
+            message.contains("Nothing was changed"),
+            "the message must say no work happened: {message}"
+        );
+    }
+
+    /// Run one turn and collect its terminal events.
+    async fn drive_turn(
+        provider: Arc<dyn LLMProvider>,
+        max_steps: usize,
+    ) -> (Option<AgentResult>, Option<String>) {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("hi")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps,
+                max_tools_per_step: 4,
+                auto_approve: true,
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let (mut done, mut error) = (None, None);
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AppEvent::AgentDone(id, result) if id == cid => done = Some(result),
+                AppEvent::AgentError(id, message) if id == cid => error = Some(message),
+                _ => {}
+            }
+        }
+        (done, error)
+    }
+
     #[tokio::test]
     async fn agent_loop_salvages_complete_tool_call_when_stream_ends_early() {
         let response = r#"<tool_use><name>question</name><arguments>{"question":"q","options":[],"allow_custom":false}</arguments></tool_use>"#;
-        let provider: Arc<dyn LLMProvider> =
-            Arc::new(FakeProvider::with_response(response).abrupt_eof());
+        // Two scripted replies: the salvaged tool call, then a normal answer.
+        // A single reply used to be enough because the drained queue returned
+        // an empty string and the loop ended the turn on it — that silent
+        // "success on nothing" is now an error, so the fake has to behave like
+        // a real provider and actually answer.
+        let provider: Arc<dyn LLMProvider> = Arc::new(
+            FakeProvider::with_responses(vec![response.to_string(), "All done.".to_string()])
+                .abrupt_eof(),
+        );
         let tools = Arc::new(ToolRegistry::new());
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
