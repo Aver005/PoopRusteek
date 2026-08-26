@@ -6,6 +6,7 @@
 use super::apply_text_key;
 use crate::app::App;
 use crate::app::events::View;
+use crate::app::list::{ListNav, page_rows, rows};
 use crate::app::themes::{ThemeRowKind, ThemeWizardState, ThemeWizardStep, theme_rows};
 use crate::error::AppResult;
 use crate::tui::theme::{PRESETS, ROLES};
@@ -22,22 +23,23 @@ impl App {
             return Ok(false);
         }
 
-        let rows = theme_rows(&self.config);
-        let max = rows.len().saturating_sub(1);
+        let entries = theme_rows(&self.config);
+        let max = entries.len().saturating_sub(1);
         self.state.themes.selected = self.state.themes.selected.min(max);
+
+        if let Some(nav) = ListNav::from_code_vim(key.code) {
+            let page = page_rows(self.state.terminal_rows, rows::THEME);
+            let selected = self.state.themes.selected;
+            self.state.themes.selected = nav.move_within(selected, entries.len(), page);
+            return Ok(false);
+        }
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.state.view = View::Chat;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.state.themes.selected = self.state.themes.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.state.themes.selected = (self.state.themes.selected + 1).min(max);
-            }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                let Some(row) = rows.get(self.state.themes.selected) else {
+                let Some(row) = entries.get(self.state.themes.selected) else {
                     return Ok(false);
                 };
                 match row.kind {
@@ -55,7 +57,7 @@ impl App {
                 self.state.themes.wizard = Some(ThemeWizardState::new());
             }
             KeyCode::Char('e') => {
-                let Some(row) = rows.get(self.state.themes.selected) else {
+                let Some(row) = entries.get(self.state.themes.selected) else {
                     return Ok(false);
                 };
                 match row.kind {
@@ -79,7 +81,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                let Some(row) = rows.get(self.state.themes.selected) else {
+                let Some(row) = entries.get(self.state.themes.selected) else {
                     return Ok(false);
                 };
                 if row.kind != ThemeRowKind::Custom {
@@ -147,6 +149,17 @@ impl App {
             ThemeWizardStep::Base | ThemeWizardStep::Confirm => false,
         };
 
+        // Шаг выбора базовой палитры — обычный список.
+        if !handled_as_text
+            && wizard.step == ThemeWizardStep::Base
+            && let Some(nav) = ListNav::from_code_vim(key.code)
+        {
+            let page = page_rows(self.state.terminal_rows, rows::THEME);
+            wizard.base_selected = nav.move_within(wizard.base_selected, PRESETS.len(), page);
+            self.state.themes.wizard = Some(wizard);
+            return;
+        }
+
         if !handled_as_text {
             match key.code {
                 KeyCode::Esc => match wizard.step {
@@ -162,12 +175,6 @@ impl App {
                     ThemeWizardStep::Color(index) => wizard.enter_color_step(index - 1),
                     ThemeWizardStep::Confirm => wizard.enter_color_step(ROLES.len() - 1),
                 },
-                KeyCode::Up | KeyCode::Char('k') if wizard.step == ThemeWizardStep::Base => {
-                    wizard.base_selected = wizard.base_selected.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') if wizard.step == ThemeWizardStep::Base => {
-                    wizard.base_selected = (wizard.base_selected + 1).min(PRESETS.len() - 1);
-                }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let ThemeWizardStep::Color(index) = wizard.step {
                         // Commit the current value when it parses, then skip

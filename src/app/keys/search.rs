@@ -6,6 +6,7 @@
 use super::apply_text_key;
 use crate::app::App;
 use crate::app::events::View;
+use crate::app::list::{ListNav, page_rows, rows};
 use crate::app::search::SearchFocus;
 use crate::error::AppResult;
 
@@ -40,6 +41,17 @@ impl App {
                 let search = &mut self.state.search;
                 search.selected = search.selected.min(max);
 
+                let page = page_rows(self.state.terminal_rows, rows::MATCH);
+                if let Some(nav) = ListNav::from_code_vim(key.code) {
+                    // Уход вверх с первой строки возвращает фокус в запрос.
+                    if nav == ListNav::Up && search.selected == 0 {
+                        search.focus = SearchFocus::Query;
+                    } else {
+                        search.selected = nav.move_within(search.selected, visible.len(), page);
+                    }
+                    return Ok(false);
+                }
+
                 match key.code {
                     KeyCode::Esc | KeyCode::Tab => {
                         search.focus = SearchFocus::Query;
@@ -47,19 +59,6 @@ impl App {
                     KeyCode::Char('q') => {
                         self.state.view = View::Chat;
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if search.selected == 0 {
-                            // Off the top of the list = back to the query.
-                            search.focus = SearchFocus::Query;
-                        } else {
-                            search.selected -= 1;
-                        }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        search.selected = (search.selected + 1).min(max);
-                    }
-                    KeyCode::Home | KeyCode::Char('g') => search.selected = 0,
-                    KeyCode::End | KeyCode::Char('G') => search.selected = max,
                     KeyCode::Char('s') => {
                         search.sort = search.sort.next();
                         search.reset_selection();

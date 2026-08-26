@@ -118,8 +118,12 @@ fn default_enabled() -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct McpViewState {
     pub active: bool,
+    /// Курсор по `visible_indices()`. Окно выводится из него на отрисовке
+    /// (`ListWindow::anchored`): высота этой панели известна только там.
     pub selected: usize,
-    pub scroll_offset: usize,
+    /// Скролл текста в панели деталей — не списка. Раньше это было одно поле
+    /// на двоих, и прокрутка деталей оставляла окно списка на чужом смещении.
+    pub details_scroll: usize,
     pub details_server: Option<String>,
     pub servers: Vec<ServerDisplayInfo>,
     pub status_message: String,

@@ -9,34 +9,27 @@
 //! `use crate::app::events::{Modal, PickerState, …}` paths keep resolving —
 //! new code may import from here directly.
 
+use crate::app::list::{ListCursor, ListNav};
 use std::collections::HashSet;
 
-/// Scroll-follows-cursor clamp shared by every list modal: keep
-/// `scroll_offset` positioned so `cursor` stays inside a `visible`-row
-/// window. Was reimplemented three times (picker, delete-sessions,
-/// question) with two different hardcoded window sizes; the window size
-/// stays per-caller (it mirrors each modal's rendered height), the
-/// algorithm lives here.
-pub(crate) fn clamp_scroll(cursor: usize, scroll_offset: usize, visible: usize) -> usize {
-    if cursor < scroll_offset {
-        cursor
-    } else if cursor >= scroll_offset + visible {
-        cursor + 1 - visible
-    } else {
-        scroll_offset
-    }
-}
+/// Высота списка в модалке. Совпадает с тем, что рисует `render_picker` /
+/// `render_delete_sessions` / `render_question`, — модалка сама задаёт свою
+/// высоту, поэтому размер окна известен уже в момент нажатия.
+pub(crate) const MODAL_VISIBLE: usize = 12;
+
+/// Модалка вопроса рисует более низкое тело, чем пикеры.
+pub(crate) const QUESTION_VISIBLE: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct QuestionState {
     pub question: String,
     pub options: Vec<String>,
     pub allow_custom: bool,
-    pub selected: usize,
+    pub cursor: ListCursor,
     pub custom_input: String,
+    /// Позиция каретки в строке своего варианта — к списку отношения не имеет.
     pub custom_cursor: usize,
     pub is_custom_mode: bool,
-    pub scroll_offset: usize,
 }
 
 impl QuestionState {
@@ -45,11 +38,10 @@ impl QuestionState {
             question,
             options,
             allow_custom,
-            selected: 0,
+            cursor: ListCursor::default(),
             custom_input: String::new(),
             custom_cursor: 0,
             is_custom_mode: false,
-            scroll_offset: 0,
         }
     }
 }
@@ -262,8 +254,7 @@ pub struct PickerState {
     pub items: Vec<PickerItem>,
     pub checked: Vec<usize>,
     pub persistent_checked: Vec<String>,
-    pub cursor: usize,
-    pub scroll_offset: usize,
+    pub cursor: ListCursor,
     pub mode: PickerMode,
     pub kind: PickerKind,
     pub search: String,
@@ -278,8 +269,7 @@ impl PickerState {
             items,
             checked: Vec::new(),
             persistent_checked: Vec::new(),
-            cursor: 0,
-            scroll_offset: 0,
+            cursor: ListCursor::default(),
             mode,
             kind: PickerKind::Sessions,
             search: String::new(),
@@ -299,8 +289,7 @@ impl PickerState {
             items,
             checked: Vec::new(),
             persistent_checked: Vec::new(),
-            cursor: 0,
-            scroll_offset: 0,
+            cursor: ListCursor::default(),
             mode,
             kind,
             search: String::new(),
@@ -318,6 +307,21 @@ impl PickerState {
             .collect();
     }
 
+    /// Переключить отметку на строке под курсором (только в Multi-режиме).
+    pub fn toggle_at_cursor(&mut self) {
+        let Some(item) = self.items.get(self.cursor.selected) else {
+            return;
+        };
+        let value = item.value.clone();
+        match self.persistent_checked.iter().position(|x| *x == value) {
+            Some(at) => {
+                self.persistent_checked.remove(at);
+            }
+            None => self.persistent_checked.push(value),
+        }
+        self.sync_checked();
+    }
+
     pub fn update_search(&mut self, query: String) {
         self.search = query;
         let q = self.search.to_lowercase();
@@ -332,12 +336,7 @@ impl PickerState {
                 .collect();
         }
         self.sync_checked();
-        if self.cursor >= self.items.len() {
-            self.cursor = self.items.len().saturating_sub(1);
-        }
-        if self.scroll_offset >= self.items.len() {
-            self.scroll_offset = self.items.len().saturating_sub(1);
-        }
+        self.cursor.clamp(self.items.len(), MODAL_VISIBLE);
     }
 }
 
@@ -349,68 +348,42 @@ pub enum PickerAction {
 }
 
 pub fn handle_picker_key(picker: &mut PickerState, key: crossterm::event::KeyCode) -> PickerAction {
-    const VISIBLE: usize = 12;
+    // Пикер фильтруется набором текста, поэтому навигация здесь только на
+    // стрелках — буква ушла бы в строку поиска (`app/keys/modal.rs`).
+    if let Some(nav) = ListNav::from_code(key) {
+        picker.cursor.apply(nav, picker.items.len(), MODAL_VISIBLE);
+        return PickerAction::None;
+    }
     match key {
         crossterm::event::KeyCode::Esc => PickerAction::Cancelled,
         crossterm::event::KeyCode::Enter => match picker.mode {
             PickerMode::Single => {
-                if !picker.items.is_empty() {
-                    PickerAction::Selected(vec![picker.cursor])
-                } else {
+                if picker.items.is_empty() {
                     PickerAction::Cancelled
+                } else {
+                    PickerAction::Selected(vec![picker.cursor.selected])
                 }
             }
             PickerMode::Multi => {
-                let mut sel = picker.checked.clone();
-                sel.sort();
-                sel.dedup();
-                PickerAction::Selected(sel)
+                let mut selection = picker.checked.clone();
+                selection.sort_unstable();
+                selection.dedup();
+                PickerAction::Selected(selection)
             }
         },
         crossterm::event::KeyCode::Char(' ') => match picker.mode {
             PickerMode::Single => {
-                if !picker.items.is_empty() {
-                    PickerAction::Selected(vec![picker.cursor])
-                } else {
+                if picker.items.is_empty() {
                     PickerAction::None
+                } else {
+                    PickerAction::Selected(vec![picker.cursor.selected])
                 }
             }
             PickerMode::Multi => {
-                let pos = picker.cursor;
-                if let Some(item) = picker.items.get(pos) {
-                    let v = &item.value;
-                    if let Some(p) = picker.persistent_checked.iter().position(|x| x == v) {
-                        picker.persistent_checked.remove(p);
-                    } else {
-                        picker.persistent_checked.push(v.clone());
-                    }
-                }
-                picker.sync_checked();
+                picker.toggle_at_cursor();
                 PickerAction::None
             }
         },
-        crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-            picker.cursor = picker.cursor.saturating_sub(1);
-            picker.scroll_offset = clamp_scroll(picker.cursor, picker.scroll_offset, VISIBLE);
-            PickerAction::None
-        }
-        crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-            let max = picker.items.len().saturating_sub(1);
-            picker.cursor = (picker.cursor + 1).min(max);
-            picker.scroll_offset = clamp_scroll(picker.cursor, picker.scroll_offset, VISIBLE);
-            PickerAction::None
-        }
-        crossterm::event::KeyCode::Home => {
-            picker.cursor = 0;
-            picker.scroll_offset = 0;
-            PickerAction::None
-        }
-        crossterm::event::KeyCode::End => {
-            let max = picker.items.len().saturating_sub(1);
-            picker.cursor = max;
-            picker.scroll_offset = max.saturating_sub(VISIBLE - 1);
-            PickerAction::None
-        }
         _ => PickerAction::None,
     }
 }
@@ -616,8 +589,7 @@ pub struct DeleteSessionsState {
     pub entries: Vec<DeleteEntry>,
     pub filter: SessionScope,
     pub stage: DeleteStage,
-    pub cursor: usize,
-    pub scroll_offset: usize,
+    pub cursor: ListCursor,
     /// Checked ids; survives filter switches, but a confirm only targets ids
     /// visible under the filter active at that moment — what you see is what
     /// you delete.
@@ -637,8 +609,7 @@ impl DeleteSessionsState {
             entries,
             filter,
             stage: DeleteStage::Selecting,
-            cursor: 0,
-            scroll_offset: 0,
+            cursor: ListCursor::default(),
             checked: HashSet::new(),
             confirm_ids: Vec::new(),
             remote_status,
@@ -691,7 +662,7 @@ impl DeleteSessionsState {
             return checked;
         }
         visible
-            .get(self.cursor)
+            .get(self.cursor.selected)
             .map(|e| vec![e.id.clone()])
             .unwrap_or_default()
     }
@@ -713,7 +684,6 @@ pub fn handle_delete_sessions_key(
     key: crossterm::event::KeyCode,
 ) -> DeleteAction {
     use crossterm::event::KeyCode;
-    const VISIBLE: usize = 12;
 
     match state.stage {
         DeleteStage::Confirming => match key {
@@ -728,67 +698,63 @@ pub fn handle_delete_sessions_key(
             }
             _ => DeleteAction::None,
         },
-        DeleteStage::Selecting => match key {
-            KeyCode::Esc | KeyCode::Char('q') => DeleteAction::Close,
-            KeyCode::Up | KeyCode::Char('k') => {
-                state.cursor = state.cursor.saturating_sub(1);
-                state.scroll_offset = clamp_scroll(state.cursor, state.scroll_offset, VISIBLE);
-                DeleteAction::None
+        DeleteStage::Selecting => {
+            if let Some(nav) = ListNav::from_code_vim(key) {
+                state
+                    .cursor
+                    .apply(nav, state.visible().len(), MODAL_VISIBLE);
+                return DeleteAction::None;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let len = state.visible().len();
-                if len > 0 && state.cursor + 1 < len {
-                    state.cursor += 1;
-                }
-                state.scroll_offset = clamp_scroll(state.cursor, state.scroll_offset, VISIBLE);
-                DeleteAction::None
-            }
-            KeyCode::Char(' ') => {
-                if let Some(id) = state.visible().get(state.cursor).map(|e| e.id.clone())
-                    && !state.checked.remove(&id)
-                {
-                    state.checked.insert(id);
-                }
-                DeleteAction::None
-            }
-            KeyCode::Tab | KeyCode::Right => {
-                state.filter = state.filter.next();
-                state.cursor = 0;
-                state.scroll_offset = 0;
-                DeleteAction::None
-            }
-            KeyCode::BackTab | KeyCode::Left => {
-                state.filter = state.filter.prev();
-                state.cursor = 0;
-                state.scroll_offset = 0;
-                DeleteAction::None
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                // Toggle select-all within the current filter view.
-                let visible_ids: Vec<String> =
-                    state.visible().iter().map(|e| e.id.clone()).collect();
-                let all_checked = !visible_ids.is_empty()
-                    && visible_ids.iter().all(|id| state.checked.contains(id));
-                for id in visible_ids {
-                    if all_checked {
-                        state.checked.remove(&id);
-                    } else {
+            match key {
+                KeyCode::Esc | KeyCode::Char('q') => DeleteAction::Close,
+                KeyCode::Char(' ') => {
+                    if let Some(id) = state
+                        .visible()
+                        .get(state.cursor.selected)
+                        .map(|entry| entry.id.clone())
+                        && !state.checked.remove(&id)
+                    {
                         state.checked.insert(id);
                     }
+                    DeleteAction::None
                 }
-                DeleteAction::None
-            }
-            KeyCode::Enter => {
-                let targets = state.confirm_targets();
-                if targets.is_empty() {
-                    return DeleteAction::None;
+                KeyCode::Tab | KeyCode::Right => {
+                    state.filter = state.filter.next();
+                    state.cursor.reset();
+                    DeleteAction::None
                 }
-                state.confirm_ids = targets;
-                state.stage = DeleteStage::Confirming;
-                DeleteAction::None
+                KeyCode::BackTab | KeyCode::Left => {
+                    state.filter = state.filter.prev();
+                    state.cursor.reset();
+                    DeleteAction::None
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    // Toggle select-all within the current filter view.
+                    let visible_ids: Vec<String> =
+                        state.visible().iter().map(|e| e.id.clone()).collect();
+                    let all_checked = !visible_ids.is_empty()
+                        && visible_ids.iter().all(|id| state.checked.contains(id));
+                    for id in visible_ids {
+                        if all_checked {
+                            state.checked.remove(&id);
+                        } else {
+                            state.checked.insert(id);
+                        }
+                    }
+                    DeleteAction::None
+                }
+                KeyCode::Enter => {
+                    let targets = state.confirm_targets();
+                    if targets.is_empty() {
+                        return DeleteAction::None;
+                    }
+                    state.confirm_ids = targets;
+                    state.stage = DeleteStage::Confirming;
+                    DeleteAction::None
+                }
+                _ => DeleteAction::None,
             }
-            _ => DeleteAction::None,
-        },
+        }
     }
 }
 
@@ -879,36 +845,20 @@ pub fn handle_question_key(
                     _ => None,
                 }
             } else {
+                if let Some(nav) = ListNav::from_code_vim(key) {
+                    qs.cursor.apply(nav, qs.options.len(), QUESTION_VISIBLE);
+                    return None;
+                }
                 match key {
-                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        qs.selected = qs.selected.saturating_sub(1);
-                        qs.update_scroll();
-                        None
-                    }
-                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        let max = qs.options.len().saturating_sub(1);
-                        qs.selected = (qs.selected + 1).min(max);
-                        qs.update_scroll();
-                        None
-                    }
-                    crossterm::event::KeyCode::Home => {
-                        qs.selected = 0;
-                        qs.update_scroll();
-                        None
-                    }
-                    crossterm::event::KeyCode::End => {
-                        qs.selected = qs.options.len().saturating_sub(1);
-                        qs.update_scroll();
-                        None
-                    }
                     crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char(' ') => {
-                        if qs.allow_custom && qs.selected >= qs.options.len().saturating_sub(1) {
+                        let selected = qs.cursor.selected;
+                        if qs.allow_custom && selected >= qs.options.len().saturating_sub(1) {
                             qs.is_custom_mode = true;
                             qs.custom_input.clear();
                             qs.custom_cursor = 0;
                             None
                         } else {
-                            Some(qs.options[qs.selected].clone())
+                            Some(qs.options[selected].clone())
                         }
                     }
                     crossterm::event::KeyCode::Esc => Some(String::new()),
@@ -916,14 +866,6 @@ pub fn handle_question_key(
                 }
             }
         }
-    }
-}
-
-impl QuestionState {
-    fn update_scroll(&mut self) {
-        // 10, not the pickers' 12 — the question modal draws a smaller body.
-        const VISIBLE: usize = 10;
-        self.scroll_offset = clamp_scroll(self.selected, self.scroll_offset, VISIBLE);
     }
 }
 
@@ -979,13 +921,13 @@ mod delete_picker_tests {
     #[test]
     fn tab_cycles_filter_and_resets_cursor() {
         let mut s = state(SessionScope::All);
-        s.cursor = 2;
+        s.cursor.selected = 2;
         assert_eq!(
             handle_delete_sessions_key(&mut s, KeyCode::Tab),
             DeleteAction::None
         );
         assert_eq!(s.filter, SessionScope::Local);
-        assert_eq!(s.cursor, 0);
+        assert_eq!(s.cursor, ListCursor::default());
         handle_delete_sessions_key(&mut s, KeyCode::Tab);
         assert_eq!(s.filter, SessionScope::Remote);
         handle_delete_sessions_key(&mut s, KeyCode::Tab);
@@ -1113,5 +1055,79 @@ mod confirm_tests {
         assert_eq!(cs.action, ConfirmAction::Wipe);
         assert!(cs.lines.iter().any(|l| l.kind == ConfirmLineKind::Danger));
         assert_eq!(cs.lines[0].kind, ConfirmLineKind::Normal);
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    fn multi_picker() -> PickerState {
+        PickerState::new(
+            "pick",
+            vec![
+                PickerItem::new("alpha", "a"),
+                PickerItem::new("bravo", "b"),
+                PickerItem::new("gamma", "c"),
+            ],
+            PickerMode::Multi,
+        )
+    }
+
+    #[test]
+    fn picker_navigates_on_arrows_only() {
+        let mut picker = multi_picker();
+        assert_eq!(
+            handle_picker_key(&mut picker, KeyCode::Down),
+            PickerAction::None
+        );
+        assert_eq!(picker.cursor.selected, 1);
+        // Буквы уходят в строку фильтра (`app/keys/modal.rs`), а не курсору.
+        for code in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('g')] {
+            handle_picker_key(&mut picker, code);
+            assert_eq!(picker.cursor.selected, 1, "{code:?} сдвинул курсор");
+        }
+    }
+
+    #[test]
+    fn every_letter_is_searchable_including_j_and_k() {
+        // Раньше 'j' и 'k' были вырезаны из фильтра ради навигации, поэтому
+        // ни "json", ни "kubernetes" в пикере было не найти.
+        let mut picker = PickerState::new(
+            "pick",
+            vec![
+                PickerItem::new("json parser", "a"),
+                PickerItem::new("kubernetes", "b"),
+                PickerItem::new("alpha", "c"),
+            ],
+            PickerMode::Single,
+        );
+        picker.update_search("j".to_string());
+        assert_eq!(picker.items.len(), 1);
+        picker.update_search("kube".to_string());
+        assert_eq!(picker.items.len(), 1);
+    }
+
+    #[test]
+    fn picker_space_toggles_the_row_under_the_cursor() {
+        let mut picker = multi_picker();
+        handle_picker_key(&mut picker, KeyCode::Down);
+        handle_picker_key(&mut picker, KeyCode::Char(' '));
+        assert_eq!(picker.persistent_checked, vec!["b".to_string()]);
+        assert_eq!(picker.checked, vec![1]);
+        handle_picker_key(&mut picker, KeyCode::Char(' '));
+        assert!(picker.persistent_checked.is_empty());
+        assert!(picker.checked.is_empty());
+    }
+
+    #[test]
+    fn a_filter_that_hides_the_cursor_row_pulls_it_back_in() {
+        let mut picker = multi_picker();
+        handle_picker_key(&mut picker, KeyCode::End);
+        assert_eq!(picker.cursor.selected, 2);
+        picker.update_search("alpha".to_string());
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.cursor.selected, 0);
     }
 }

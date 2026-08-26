@@ -10,6 +10,7 @@
 
 use crate::app::App;
 use crate::app::events::{Modal, View};
+use crate::app::list::{ListNav, page_rows, rows};
 
 /// Rows moved per wheel notch — a little faster than a single arrow press.
 const WHEEL_STEP: usize = 3;
@@ -48,25 +49,38 @@ impl App {
             return;
         }
 
+        // Списки прокручиваются курсором — тем же перемещением, что и j/k.
+        let nav = if up { ListNav::Up } else { ListNav::Down };
+        let page = |per_item| page_rows(self.state.terminal_rows, per_item);
         match self.state.view {
             View::Mcp => {
-                let off = &mut self.state.mcp_status.view.scroll_offset;
-                *off = if up {
-                    off.saturating_sub(1)
+                let view = &mut self.state.mcp_status.view;
+                if view.details_server.is_some() {
+                    view.details_scroll = if up {
+                        view.details_scroll.saturating_sub(1)
+                    } else {
+                        view.details_scroll.saturating_add(1)
+                    };
                 } else {
-                    off.saturating_add(1)
-                };
+                    let len = view.visible_indices().len();
+                    view.selected = nav.move_within(view.selected, len, page(rows::SERVER));
+                }
             }
             View::Search => {
-                // The results list is selection-driven; move the cursor like j/k.
-                let visible = self.state.search.visible();
-                let max = visible.len().saturating_sub(1);
+                let len = self.state.search.visible().len();
                 let search = &mut self.state.search;
-                if up {
-                    search.selected = search.selected.saturating_sub(1);
-                } else {
-                    search.selected = (search.selected + 1).min(max);
-                }
+                search.selected = nav.move_within(search.selected, len, page(rows::MATCH));
+            }
+            View::Themes => {
+                let len = crate::app::themes::theme_rows(&self.config).len();
+                let selected = self.state.themes.selected;
+                self.state.themes.selected = nav.move_within(selected, len, page(rows::THEME));
+            }
+            View::Providers => {
+                let len = crate::app::providers::provider_rows(&self.config).len();
+                let selected = self.state.providers_view.selected;
+                self.state.providers_view.selected =
+                    nav.move_within(selected, len, page(rows::PROVIDER));
             }
             _ => {
                 // Chat transcript (the default view). scroll_offset is u32.

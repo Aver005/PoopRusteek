@@ -6,6 +6,7 @@
 //! backgrounds, status colors, selection, the full swatch board).
 
 use super::popup::push_text_box_lines;
+use crate::app::list::{ListWindow, NAV_HINT, rows as list_rows};
 use crate::app::themes::{
     ThemeRowKind, ThemeWizardState, ThemeWizardStep, ThemesViewState, theme_rows,
 };
@@ -74,12 +75,14 @@ pub(super) fn render_themes_view(
     let footer_inner = footer.inner(chunks[2]);
     frame.render_widget(footer, chunks[2]);
     let hint = match &view.wizard {
-        None => "  j/k ↑↓ preview  Enter apply  n new theme  e edit  d delete  Esc/q back  ",
+        None => format!("  {NAV_HINT} preview  Enter apply  n new  e edit  d delete  Esc/q back  "),
         Some(wizard) => match wizard.step {
-            ThemeWizardStep::Base => "  ↑↓ choose palette  Enter next  Esc back  ",
-            ThemeWizardStep::Color(_) => "  Enter keep & next  Ctrl+S finish now  Esc previous  ",
-            ThemeWizardStep::Confirm => "  Enter save & apply  Esc back  ",
-            ThemeWizardStep::Name => "  Enter next  Esc cancel  ",
+            ThemeWizardStep::Base => "  ↑↓ choose palette  Enter next  Esc back  ".to_string(),
+            ThemeWizardStep::Color(_) => {
+                "  Enter keep & next  Ctrl+S finish now  Esc previous  ".to_string()
+            }
+            ThemeWizardStep::Confirm => "  Enter save & apply  Esc back  ".to_string(),
+            ThemeWizardStep::Name => "  Enter next  Esc cancel  ".to_string(),
         },
     };
     frame.render_widget(
@@ -107,12 +110,13 @@ fn render_theme_list(
     frame.render_widget(block, area);
 
     let rows = theme_rows(config);
-    // Keep the selection visible: two lines per row (label + detail).
-    let visible = (inner.height as usize / 2).max(1);
-    let start = view.selected.saturating_sub(visible.saturating_sub(1));
+    // Две строки на тему: название и описание.
+    let capacity = inner.height as usize / list_rows::THEME as usize;
+    let window = ListWindow::anchored(view.selected, rows.len(), capacity);
 
     let mut lines: Vec<Line> = Vec::new();
-    for (i, row) in rows.iter().enumerate().skip(start).take(visible) {
+    for i in window.range() {
+        let row = &rows[i];
         let selected = i == view.selected;
         let bg = if selected { theme.selection } else { theme.bg };
         let marker = if row.active { " ● " } else { "   " };

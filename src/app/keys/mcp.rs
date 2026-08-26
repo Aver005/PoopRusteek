@@ -8,6 +8,7 @@ use super::apply_text_key;
 use crate::app::App;
 use crate::app::events::{self, Modal, View};
 use crate::app::input::InputState;
+use crate::app::list::{ListNav, page_rows, rows};
 use crate::app::mcp_add::{self, McpAddState, TransportChoice, WizardStep};
 use crate::error::AppResult;
 use crate::mcp::types::MCPServerConfig;
@@ -32,21 +33,21 @@ impl App {
 
         let details_open = self.state.mcp_status.view.details_server.is_some();
 
+        // Список навигируется общим словарём; в открытых деталях те же
+        // клавиши прокручивают текст, поэтому список их там не видит.
+        if !details_open && let Some(nav) = ListNav::from_code_vim(key.code) {
+            let page = page_rows(self.state.terminal_rows, rows::SERVER);
+            let view = &mut self.state.mcp_status.view;
+            let len = view.visible_indices().len();
+            view.selected = nav.move_within(view.selected, len, page);
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.state.mcp_status.view.active = false;
                 self.state.mcp_status.view.details_server = None;
                 self.state.view = View::Chat;
-            }
-            KeyCode::Up | KeyCode::Char('k') if !details_open => {
-                self.state.mcp_status.view.selected =
-                    self.state.mcp_status.view.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') if !details_open => {
-                let max = self.state.mcp_status.view.servers.len().saturating_sub(1);
-                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.min(max);
-                self.state.mcp_status.view.selected += 1;
-                self.state.mcp_status.view.selected = self.state.mcp_status.view.selected.min(max);
             }
             KeyCode::Enter => {
                 if details_open {
@@ -59,7 +60,7 @@ impl App {
                     .get(self.state.mcp_status.view.selected)
                 {
                     self.state.mcp_status.view.details_server = Some(info.name.clone());
-                    self.state.mcp_status.view.scroll_offset = 0;
+                    self.state.mcp_status.view.details_scroll = 0;
                 }
             }
             KeyCode::Char(' ') if !details_open => {
@@ -140,11 +141,11 @@ impl App {
                 }
             }
             KeyCode::Up | KeyCode::Char('k') if details_open => {
-                self.state.mcp_status.view.scroll_offset =
-                    self.state.mcp_status.view.scroll_offset.saturating_sub(1);
+                self.state.mcp_status.view.details_scroll =
+                    self.state.mcp_status.view.details_scroll.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') if details_open => {
-                self.state.mcp_status.view.scroll_offset += 1;
+                self.state.mcp_status.view.details_scroll += 1;
             }
             _ => {}
         }
@@ -159,20 +160,18 @@ impl App {
 
         let visible = self.state.mcp_status.view.visible_indices();
 
+        if let Some(nav) = ListNav::from_code_vim(key.code) {
+            let page = page_rows(self.state.terminal_rows, rows::SERVER);
+            let view = &mut self.state.mcp_status.view;
+            view.selected = nav.move_within(view.selected, visible.len(), page);
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.state.mcp_status.view.active = false;
                 self.state.mcp_status.view.auth_mode = false;
                 self.state.view = View::Chat;
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.state.mcp_status.view.selected =
-                    self.state.mcp_status.view.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let max = visible.len().saturating_sub(1);
-                self.state.mcp_status.view.selected =
-                    (self.state.mcp_status.view.selected + 1).min(max);
             }
             KeyCode::Enter => {
                 let selected = self.state.mcp_status.view.selected;

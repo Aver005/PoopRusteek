@@ -4,11 +4,12 @@
 //! [`super::popup`].
 
 use super::popup::{
-    center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
+    center_popup, fill_panel_space, modal_block, overflow_line, push_text_box_lines, separator_line,
 };
 use super::util::{highlight_json, truncate};
 use crate::app::AppState;
 use crate::app::events::{ConfirmState, Modal, PickerMode, PickerState, QuestionState};
+use crate::app::list::{NAV_HINT, NAV_HINT_ARROWS};
 use crate::tui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -280,20 +281,17 @@ fn render_delete_sessions(
         )));
     }
 
-    let end = (st.scroll_offset + VISIBLE).min(visible_entries.len());
-    if st.scroll_offset > 0 {
-        lines.push(Line::from(Span::styled(
-            "  \u{2191} more ",
-            Style::default().fg(theme.text_dim).bg(theme.panel),
-        )));
+    let window = st.cursor.window(visible_entries.len(), VISIBLE);
+    if window.more_above {
+        lines.push(overflow_line(true, theme));
     }
     for (i, entry) in visible_entries
         .iter()
         .enumerate()
-        .take(end)
-        .skip(st.scroll_offset)
+        .take(window.end)
+        .skip(window.start)
     {
-        let is_cursor = i == st.cursor;
+        let is_cursor = i == st.cursor.selected;
         let is_checked = st.checked.contains(&entry.id);
         let bg = if is_cursor {
             theme.selection
@@ -340,11 +338,8 @@ fn render_delete_sessions(
             ),
         ]));
     }
-    if end < visible_entries.len() {
-        lines.push(Line::from(Span::styled(
-            "  \u{2193} more ",
-            Style::default().fg(theme.text_dim).bg(theme.panel),
-        )));
+    if window.more_below {
+        lines.push(overflow_line(false, theme));
     }
 
     fill_panel_space(&mut lines, inner.height.saturating_sub(2) as usize);
@@ -355,7 +350,7 @@ fn render_delete_sessions(
         .count();
     lines.push(Line::from(Span::styled(
         format!(
-            " {checked_visible} selected \u{00B7} \u{2191}\u{2193} move  Space select  A all  Tab filter  Enter delete  Esc close"
+            " {checked_visible} selected \u{00B7} {NAV_HINT} move  Space select  A all  Tab filter  Enter delete  Esc close"
         ),
         Style::default().fg(theme.text_dim).bg(theme.panel),
     )));
@@ -424,10 +419,11 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
     let popup_area = center_popup(area, popup_width, popup_h);
 
     let is_multi = picker.mode == PickerMode::Multi;
+    // Пикер фильтруется набором текста, поэтому навигация только стрелками.
     let hints = if is_multi {
-        " \u{2191}\u{2193} navigate  Space toggle  Ctrl+A all  Enter confirm  Esc cancel "
+        format!(" {NAV_HINT_ARROWS} nav  Space toggle  Ctrl+A all  Enter ok  Esc cancel ")
     } else {
-        " \u{2191}\u{2193} navigate  Enter select  Esc close "
+        format!(" {NAV_HINT_ARROWS} navigate  Enter select  Esc close ")
     };
 
     let block = modal_block(format!(" {} ", picker.title), theme.accent, theme);
@@ -463,17 +459,14 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
     lines.push(separator_line(inner_w, theme));
 
     // Item list
-    let end = (picker.scroll_offset + visible).min(picker.items.len());
+    let window = picker.cursor.window(picker.items.len(), visible);
 
-    if picker.scroll_offset > 0 {
-        lines.push(Line::from(vec![Span::styled(
-            "  \u{2191} more ",
-            Style::default().fg(theme.text_dim).bg(theme.panel),
-        )]));
+    if window.more_above {
+        lines.push(overflow_line(true, theme));
     }
 
-    for i in picker.scroll_offset..end {
-        let is_cursor = i == picker.cursor;
+    for i in window.range() {
+        let is_cursor = i == picker.cursor.selected;
         let is_checked = picker.checked.contains(&i);
 
         let indicator = if is_multi {
@@ -515,11 +508,8 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         ]));
     }
 
-    if picker.scroll_offset + visible < picker.items.len() {
-        lines.push(Line::from(vec![Span::styled(
-            "  \u{2193} more ",
-            Style::default().fg(theme.text_dim).bg(theme.panel),
-        )]));
+    if window.more_below {
+        lines.push(overflow_line(false, theme));
     }
 
     fill_panel_space(&mut lines, inner.height.saturating_sub(3) as usize);
@@ -531,9 +521,9 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
     let count_str = if is_multi {
         format!("{}/{} sel", picker.checked.len(), total)
     } else if shown < total {
-        format!("{}/{} (of {})", picker.cursor + 1, shown, total)
+        format!("{}/{} (of {})", picker.cursor.selected + 1, shown, total)
     } else {
-        format!("{}/{}", picker.cursor + 1, total)
+        format!("{}/{}", picker.cursor.selected + 1, total)
     };
     let total_w = inner_w.saturating_sub(4);
     let pad = total_w.saturating_sub(count_str.len() + hints.len().saturating_sub(2));
@@ -650,17 +640,14 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
     } else {
         // Multiple choice mode
         let visible = inner.height.saturating_sub(4) as usize;
-        let end = (qs.scroll_offset + visible).min(qs.options.len());
+        let window = qs.cursor.window(qs.options.len(), visible);
 
-        if qs.scroll_offset > 0 {
-            lines.push(Line::from(vec![Span::styled(
-                "  \u{2191} more ",
-                Style::default().fg(theme.text_dim).bg(theme.panel),
-            )]));
+        if window.more_above {
+            lines.push(overflow_line(true, theme));
         }
 
-        for i in qs.scroll_offset..end {
-            let is_cursor = i == qs.selected;
+        for i in window.range() {
+            let is_cursor = i == qs.cursor.selected;
             let is_custom_entry = qs.allow_custom && i >= qs.options.len().saturating_sub(1);
             let bg = if is_cursor {
                 theme.selection
@@ -693,11 +680,8 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
             ]));
         }
 
-        if qs.scroll_offset + visible < qs.options.len() {
-            lines.push(Line::from(vec![Span::styled(
-                "  \u{2193} more ",
-                Style::default().fg(theme.text_dim).bg(theme.panel),
-            )]));
+        if window.more_below {
+            lines.push(overflow_line(false, theme));
         }
 
         fill_panel_space(&mut lines, inner.height.saturating_sub(3) as usize);
@@ -706,13 +690,13 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         let count = qs.options.len();
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {}/{}", qs.selected + 1, count),
+                format!("  {}/{}", qs.cursor.selected + 1, count),
                 Style::default()
                     .fg(theme.accent_soft)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("    ".to_string(), Style::default().fg(theme.fg)),
-            Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
+            Span::styled(NAV_HINT, Style::default().fg(theme.accent_soft)),
             Span::styled(" nav  ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 "Enter",
@@ -753,13 +737,12 @@ pub(super) fn render_autocomplete(
     }
     let total = items.len();
 
-    let visible_count = total.min(AUTOCOMPLETE_VISIBLE);
-    let scroll_off = state
+    let window = state
         .autocomplete
-        .scroll_offset
-        .min(total.saturating_sub(1));
-    let view_end = (scroll_off + visible_count).min(total);
-    let vis_items = &items[scroll_off..view_end];
+        .cursor
+        .window(total, AUTOCOMPLETE_VISIBLE);
+    let scroll_off = window.start;
+    let vis_items = &items[window.range()];
 
     let max_name_width = items
         .iter()
@@ -767,7 +750,7 @@ pub(super) fn render_autocomplete(
         .max()
         .unwrap_or(0)
         .max(6) as u16;
-    let popup_h = (visible_count + 2) as u16;
+    let popup_h = (vis_items.len() + 2) as u16;
     let popup_w = input_area
         .width
         .min(64)
@@ -812,7 +795,7 @@ pub(super) fn render_autocomplete(
         .iter()
         .enumerate()
         .map(|(rel, item)| {
-            let is_sel = (scroll_off + rel) == state.autocomplete.selected;
+            let is_sel = (scroll_off + rel) == state.autocomplete.cursor.selected;
             let indicator = if is_sel { "▸ " } else { "  " };
             let prefix = if is_file { "@" } else { "/" };
             let name_full = format!("{prefix}{}", item.name);

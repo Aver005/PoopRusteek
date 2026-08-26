@@ -3,6 +3,7 @@
 //! full-screen views (providers/mcp); the scroll window is derived from
 //! the selection so the state stays render-agnostic.
 
+use crate::app::list::{ListWindow, NAV_HINT};
 use crate::app::search::{SearchFocus, SearchViewState};
 use crate::tui::theme::Theme;
 use ratatui::Frame;
@@ -139,14 +140,14 @@ fn render_results(frame: &mut Frame, area: Rect, view: &SearchViewState, theme: 
         return;
     }
 
-    let capacity = (area.height / ROWS_PER_ITEM).max(1) as usize;
+    let capacity = (area.height / ROWS_PER_ITEM) as usize;
     let selected = view.selected.min(visible.len() - 1);
-    let offset = selected.saturating_sub(capacity - 1);
+    let window = ListWindow::anchored(selected, visible.len(), capacity);
     let list_focused = view.focus == SearchFocus::Results;
 
-    for (slot, &match_index) in visible.iter().enumerate().skip(offset).take(capacity) {
-        let m = &view.matches[match_index];
-        let y = area.y + ((slot - offset) as u16) * ROWS_PER_ITEM;
+    for (row, slot) in window.range().enumerate() {
+        let m = &view.matches[visible[slot]];
+        let y = area.y + (row as u16) * ROWS_PER_ITEM;
         let is_selected = slot == selected && list_focused;
 
         let date = m.timestamp.split('T').next().unwrap_or("—");
@@ -207,9 +208,9 @@ fn render_results(frame: &mut Frame, area: Rect, view: &SearchViewState, theme: 
 
 fn render_footer(frame: &mut Frame, area: Rect, view: &SearchViewState, theme: &Theme) {
     let hints = match view.focus {
-        SearchFocus::Query => "  Enter search   ↓/Tab results   Esc close  ",
+        SearchFocus::Query => "  Enter search   ↓/Tab results   Esc close  ".to_string(),
         SearchFocus::Results => {
-            "  j/k move  Enter open session  s sort  r role  u unique  Tab query  q close  "
+            format!("  {NAV_HINT} move  Enter open  s sort  r role  u unique  Tab query  q close  ")
         }
     };
     let footer = Block::default()

@@ -4,6 +4,7 @@
 use super::popup::{
     center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
 };
+use crate::app::list::{ListWindow, NAV_HINT};
 use crate::mcp::types::McpViewState;
 use crate::tui::theme::Theme;
 use ratatui::Frame;
@@ -61,11 +62,13 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border));
     let hints = if mcp.auth_mode {
-        "  j/k ↑↓ navigate  Enter authorize  Esc/q back  "
+        format!("  {NAV_HINT} navigate  Enter authorize  Esc/q back  ")
     } else if mcp.details_server.is_some() {
-        "  j/k ↑↓ scroll  Enter back  Esc/q close  "
+        "  j/k ↑↓ scroll  Enter back  Esc/q close  ".to_string()
     } else {
-        "  j/k ↑↓ navigate  Space toggle  r reconnect  d remove  Enter details  Esc/q back  "
+        format!(
+            "  {NAV_HINT} navigate  Space toggle  r reconnect  d remove  Enter details  Esc/q back  "
+        )
     };
     let footer_inner = footer.inner(chunks[2]);
     frame.render_widget(footer, chunks[2]);
@@ -96,8 +99,8 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
         return;
     }
 
+    // -1 под строку заголовка.
     let list_height = area.height.saturating_sub(1) as usize;
-    let visible = visible_indices.len().min(list_height);
 
     let header_line = Line::from(vec![
         Span::styled(
@@ -125,12 +128,8 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
     ]);
     frame.render_widget(Paragraph::new(header_line), area);
 
-    let start = mcp.scroll_offset;
-    for i in 0..visible {
-        let pos = start + i;
-        if pos >= visible_indices.len() {
-            break;
-        }
+    let window = ListWindow::anchored(mcp.selected, visible_indices.len(), list_height);
+    for (i, pos) in window.range().enumerate() {
         let idx = visible_indices[pos];
         let server = &mcp.servers[idx];
         let selected = pos == mcp.selected;
@@ -268,7 +267,7 @@ fn render_mcp_details(
         .border_style(Style::default().fg(theme.accent));
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .scroll((mcp.scroll_offset as u16, 0));
+        .scroll((mcp.details_scroll as u16, 0));
     frame.render_widget(paragraph, area);
 }
 

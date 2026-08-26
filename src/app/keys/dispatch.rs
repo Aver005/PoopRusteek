@@ -66,7 +66,7 @@ impl App {
                 self.state.mcp_status.view.auth_mode = true;
                 self.state.mcp_status.view.details_server = None;
                 self.state.mcp_status.view.selected = 0;
-                self.state.mcp_status.view.scroll_offset = 0;
+                self.state.mcp_status.view.details_scroll = 0;
             }
             CommandResult::OpenMcpAdd(args) => match args {
                 None => {

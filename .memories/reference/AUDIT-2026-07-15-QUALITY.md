@@ -176,7 +176,7 @@
   `handle_delete_sessions_key`, `QuestionState::update_scroll`) with
   inconsistent hardcoded VISIBLE (12/12/10) + the same magic `12` again in
   keys/modal.rs and keys/mouse.rs (mouse.rs's comment even says "must mirror
-  the key handler's clamp"). One `visible_rows` const + one `clamp_scroll`.
+  the key handler's clamp"). One `visible_rows` const + one `clamp_scroll`. **[FIXED 2026-08-27, differently than proposed]** — `src/app/list.rs` (`ListNav`/`ListCursor`/`ListWindow`) instead of a bare `clamp_scroll`; window sizes stayed per-surface (`MODAL_VISIBLE` 12, `QUESTION_VISIBLE` 10, `page_rows` from the real terminal height for full-screen panels). `QuestionState::update_scroll` and `clamp_autocomplete_scroll` are gone too. The magic `12` in `keys/modal.rs`/`keys/mouse.rs` is the *tool-approval* scroll, a different thing, and is still open.
 - `[VERIFIED]` char-boundary insert/remove reimplemented ×5 inside
   `app/events.rs` (OnboardingState, QuestionState) while the canonical
   `char_to_byte_pos` already exists in `app/input.rs` (and is imported by

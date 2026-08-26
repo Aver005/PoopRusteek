@@ -29,6 +29,21 @@
 - Prefer **controllers** that own *dependencies* with a narrow API over methods that take `&mut self` (all of `App`) just to touch a few fields/deps: `AgentRuntime` (turn launching), `system_prompt::build(...)` (explicit deps), `BackgroundCounters` (registry sync). New cross-cutting behavior should follow this shape, not grow `mod.rs`.
 - `impl App` may still be split across files (`keys.rs`, `multichat.rs`, `goal.rs`) — that's organizational; the *architectural* win is narrow deps + cohesive state.
 
+### Списки: один словарь на все панели (2026-08-27)
+- Любой новый список — курсор и окно через `src/app/list.rs`, а не своими
+  руками: `ListNav::from_code_vim` для панели со свободными буквами,
+  `ListNav::from_code` для списка, который принимает набор текста (буква там
+  символ запроса, не навигация).
+- Окно: `ListCursor::window` там, где высота известна в момент нажатия
+  (модалка задаёт свою высоту сама), `ListWindow::anchored` — где она
+  известна только на отрисовке (полноэкранные панели).
+- Шаг `PageUp`/`PageDown` — `page_rows(state.terminal_rows, rows::…)`, не
+  константа: иначе страница разойдётся с тем, что видно.
+- Подсказка футера — `NAV_HINT`/`NAV_HINT_ARROWS` оттуда же. Захардкоженный
+  текст расходится с клавишами при первом же изменении, это уже было.
+- Действия (`Enter`, `Space`, буквы) в словарь не входят и остаются за
+  панелью: у пикера `Space` отмечает, у галереи тем — применяет.
+
 ### File-size rule (agreed 2026-07-04)
 - **Line count is a trigger, not a verdict.** ~500+ lines of *non-test* code
   (inline `#[cfg(test)]` modules don't count — never punish a file for being

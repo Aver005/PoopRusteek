@@ -41,6 +41,20 @@ pub(super) fn separator_line(inner_w: usize, theme: &Theme) -> Line<'static> {
     ))
 }
 
+/// Строка «список обрезан» над/под рядами. Пикер, удаление сессий и модалка
+/// вопроса рисовали её тремя одинаковыми копиями.
+pub(super) fn overflow_line(up: bool, theme: &Theme) -> Line<'static> {
+    let text = if up {
+        "  \u{2191} more "
+    } else {
+        "  \u{2193} more "
+    };
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(theme.text_dim).bg(theme.panel),
+    ))
+}
+
 /// Pad `lines` with blanks until it is `target_rows` long, so the footer
 /// lands on the popup's bottom rows. The popup paragraph's own panel-bg
 /// style paints the padding.

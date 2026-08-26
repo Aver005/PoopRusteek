@@ -4,6 +4,7 @@
 use super::popup::{
     center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
 };
+use crate::app::list::{ListWindow, NAV_HINT};
 use crate::app::providers::{
     ProviderAddState, ProviderWizardStep, ProvidersViewState, provider_rows,
 };
@@ -50,10 +51,9 @@ pub(super) fn render_providers_view(
     // Body: one row per provider.
     let rows = provider_rows(config);
     let body = chunks[1];
-    for (i, row) in rows.iter().enumerate() {
-        if i as u16 >= body.height {
-            break;
-        }
+    let window = ListWindow::anchored(view.selected, rows.len(), body.height as usize);
+    for (slot, i) in window.range().enumerate() {
+        let row = &rows[i];
         let selected = i == view.selected;
         let bg = if selected { theme.accent_dim } else { theme.bg };
         let marker = if row.active { " ● " } else { " ○ " };
@@ -87,7 +87,7 @@ pub(super) fn render_providers_view(
         ]);
         frame.render_widget(
             Paragraph::new(line),
-            Rect::new(body.x, body.y + i as u16, body.width, 1),
+            Rect::new(body.x, body.y + slot as u16, body.width, 1),
         );
     }
 
@@ -118,7 +118,7 @@ pub(super) fn render_providers_view(
     frame.render_widget(footer, chunks[2]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "  j/k ↑↓ navigate  Enter/Space activate  a add  d remove  Esc/q back  ",
+            format!("  {NAV_HINT} navigate  Enter/Space activate  a add  d remove  Esc/q back  "),
             Style::default().fg(theme.text_dim),
         )))
         .alignment(Alignment::Center),

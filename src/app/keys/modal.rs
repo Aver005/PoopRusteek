@@ -143,7 +143,7 @@ impl App {
                     return Ok(false);
                 }
                 match key.code {
-                    KeyCode::Char(c) if !matches!(c, 'j' | 'k' | ' ') => {
+                    KeyCode::Char(c) if c != ' ' => {
                         let mut s = picker.search.clone();
                         s.push(c);
                         picker.update_search(s);

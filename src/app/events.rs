@@ -85,13 +85,11 @@ pub enum AppEvent {
     // text field currently has focus so multi-line pastes never fire an early
     // submit. See `keys::paste`.
     Paste(String),
-    // The new size only triggers a redraw (ratatui re-queries the terminal
-    // size when rendering); the dimensions themselves aren't read anywhere.
-    #[expect(
-        dead_code,
-        reason = "resize payload unused — redraw reads terminal size directly"
-    )]
-    Resize(u16, u16),
+    /// Отрисовка сама спрашивает размер у терминала; высота нужна клавишам —
+    /// они приходят раньше кадра, а шаг страницы обязан совпасть с экраном.
+    Resize {
+        rows: u16,
+    },
     Tick,
 
     // Agent events — each carries the conversation it belongs to so background

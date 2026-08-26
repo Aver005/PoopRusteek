@@ -30,15 +30,11 @@ impl App {
         }
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
-                let n = self.state.autocomplete.items.len();
-                self.state.autocomplete.selected = (self.state.autocomplete.selected + 1) % n;
-                self.clamp_autocomplete_scroll();
+                self.step_autocomplete(1);
                 true
             }
             KeyCode::BackTab | KeyCode::Up => {
-                let n = self.state.autocomplete.items.len();
-                self.state.autocomplete.selected = (self.state.autocomplete.selected + n - 1) % n;
-                self.clamp_autocomplete_scroll();
+                self.step_autocomplete(-1);
                 true
             }
             KeyCode::Enter if !self.state.focused_mut().generation.active => {
@@ -114,8 +110,7 @@ impl App {
                 });
                 self.state.autocomplete.items = items;
                 self.state.autocomplete.visible = !self.state.autocomplete.items.is_empty();
-                self.state.autocomplete.selected = 0;
-                self.state.autocomplete.scroll_offset = 0;
+                self.state.autocomplete.cursor.reset();
                 self.state.autocomplete.file_mode = true;
                 return;
             }
@@ -133,29 +128,28 @@ impl App {
         if !active {
             self.state.autocomplete.visible = false;
             self.state.autocomplete.items.clear();
-            self.state.autocomplete.selected = 0;
+            self.state.autocomplete.cursor.reset();
             return;
         }
         let items = self.commands.suggest(query_main);
         self.state.autocomplete.items = items;
         self.state.autocomplete.visible = !self.state.autocomplete.items.is_empty();
-        self.state.autocomplete.selected = 0;
-        self.state.autocomplete.scroll_offset = 0;
+        self.state.autocomplete.cursor.reset();
         self.state.autocomplete.file_mode = false;
     }
 
-    fn clamp_autocomplete_scroll(&mut self) {
+    /// Автодополнение ходит по кругу — своя политика, общее окно.
+    fn step_autocomplete(&mut self, delta: isize) {
         let n = self.state.autocomplete.items.len();
-        if n <= AUTOCOMPLETE_VISIBLE {
+        if n == 0 {
             return;
         }
-        let sel = self.state.autocomplete.selected;
-        let off = &mut self.state.autocomplete.scroll_offset;
-        if sel < *off {
-            *off = sel;
-        } else if sel >= *off + AUTOCOMPLETE_VISIBLE {
-            *off = sel + 1 - AUTOCOMPLETE_VISIBLE;
-        }
+        let current = self.state.autocomplete.cursor.selected as isize;
+        let next = (current + delta).rem_euclid(n as isize) as usize;
+        self.state
+            .autocomplete
+            .cursor
+            .move_to(next, n, AUTOCOMPLETE_VISIBLE);
     }
 
     fn accept_autocomplete(&mut self) {
@@ -165,6 +159,7 @@ impl App {
         let idx = self
             .state
             .autocomplete
+            .cursor
             .selected
             .min(self.state.autocomplete.items.len() - 1);
         let suggestion = &self.state.autocomplete.items[idx];

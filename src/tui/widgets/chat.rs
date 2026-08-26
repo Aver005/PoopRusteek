@@ -648,6 +648,7 @@ mod tests {
             error_count: 0,
             last_error: None,
             scroll_offset: 0,
+            terminal_rows: 40,
             modal: None,
             approved_tools: std::collections::HashSet::new(),
             pending_tool_approval: None,

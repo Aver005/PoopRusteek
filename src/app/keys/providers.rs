@@ -6,6 +6,7 @@
 use super::apply_text_key;
 use crate::app::App;
 use crate::app::events::{Modal, View};
+use crate::app::list::{ListNav, page_rows, rows};
 use crate::app::providers::{ProviderAddState, ProviderWizardStep, provider_rows};
 use crate::error::AppResult;
 
@@ -16,24 +17,23 @@ impl App {
     ) -> AppResult<bool> {
         use crossterm::event::KeyCode;
 
-        let rows = provider_rows(&self.config);
-        let max = rows.len().saturating_sub(1);
+        let entries = provider_rows(&self.config);
+        let max = entries.len().saturating_sub(1);
         self.state.providers_view.selected = self.state.providers_view.selected.min(max);
+
+        if let Some(nav) = ListNav::from_code_vim(key.code) {
+            let page = page_rows(self.state.terminal_rows, rows::PROVIDER);
+            let selected = self.state.providers_view.selected;
+            self.state.providers_view.selected = nav.move_within(selected, entries.len(), page);
+            return Ok(false);
+        }
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.state.view = View::Chat;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.state.providers_view.selected =
-                    self.state.providers_view.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.state.providers_view.selected =
-                    (self.state.providers_view.selected + 1).min(max);
-            }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                let Some(row) = rows.get(self.state.providers_view.selected) else {
+                let Some(row) = entries.get(self.state.providers_view.selected) else {
                     return Ok(false);
                 };
                 if row.active {
@@ -77,7 +77,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                let Some(row) = rows.get(self.state.providers_view.selected) else {
+                let Some(row) = entries.get(self.state.providers_view.selected) else {
                     return Ok(false);
                 };
                 if row.builtin {
@@ -139,6 +139,18 @@ impl App {
             ProviderWizardStep::Protocol | ProviderWizardStep::Confirm => false,
         };
 
+        // Шаг выбора протокола — обычный список.
+        if !handled_as_text
+            && wizard.step == ProviderWizardStep::Protocol
+            && let Some(nav) = ListNav::from_code_vim(key.code)
+        {
+            let choices = crate::app::providers::PROTOCOL_CHOICES.len();
+            let page = page_rows(self.state.terminal_rows, rows::PROVIDER);
+            wizard.protocol_selected = nav.move_within(wizard.protocol_selected, choices, page);
+            self.state.modal = Some(Modal::ProviderAdd(wizard));
+            return Ok(false);
+        }
+
         if !handled_as_text {
             match key.code {
                 KeyCode::Esc => {
@@ -154,15 +166,6 @@ impl App {
                         ProviderWizardStep::Confirm => wizard.step = ProviderWizardStep::Model,
                     }
                     wizard.error = None;
-                }
-                KeyCode::Up | KeyCode::Char('k') if wizard.step == ProviderWizardStep::Protocol => {
-                    wizard.protocol_selected = wizard.protocol_selected.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j')
-                    if wizard.step == ProviderWizardStep::Protocol =>
-                {
-                    wizard.protocol_selected = (wizard.protocol_selected + 1)
-                        .min(crate::app::providers::PROTOCOL_CHOICES.len() - 1);
                 }
                 KeyCode::Enter => match wizard.step {
                     ProviderWizardStep::Name => {

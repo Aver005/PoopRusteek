@@ -25,7 +25,7 @@ impl Command for McpCommand {
             state.mcp_status.view = crate::mcp::types::McpViewState {
                 active: true,
                 selected: 0,
-                scroll_offset: 0,
+                details_scroll: 0,
                 details_server: None,
                 servers: Vec::new(),
                 status_message: String::new(),

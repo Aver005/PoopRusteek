@@ -5,6 +5,7 @@ pub mod generation;
 mod goal;
 pub mod input;
 mod keys;
+pub mod list;
 pub mod mcp_add;
 pub mod mcp_status;
 mod multichat;
@@ -221,6 +222,9 @@ pub struct AppState {
     pub error_count: usize,
     pub last_error: Option<String>,
     pub scroll_offset: u32,
+    /// Высота терминала, обновляется на `Resize`. Клавиши приходят раньше
+    /// отрисовки, а шаг `PageUp`/`PageDown` должен совпадать с экраном.
+    pub terminal_rows: u16,
     pub modal: Option<Modal>,
     pub approved_tools: std::collections::HashSet<String>,
     /// The interaction currently on screen (tool approval / question)…
@@ -286,8 +290,7 @@ impl AppState {
 pub struct AutocompleteState {
     pub visible: bool,
     pub items: Vec<CommandSuggestion>,
-    pub selected: usize,
-    pub scroll_offset: usize,
+    pub cursor: list::ListCursor,
     pub file_mode: bool,
 }
 
@@ -341,6 +344,7 @@ impl App {
             error_count: 0,
             last_error: None,
             scroll_offset: 0,
+            terminal_rows: 0,
             modal: None,
             approved_tools: crate::whitelist::load(),
             pending_tool_approval: None,
@@ -462,6 +466,10 @@ impl App {
 
     pub async fn run(&mut self) -> AppResult<()> {
         let mut terminal = crate::tui::init()?;
+        // До первого Resize размер знает только терминал.
+        if let Ok((_, rows)) = crossterm::terminal::size() {
+            self.state.terminal_rows = rows;
+        }
         let result = self.run_loop(&mut terminal).await;
         // Kill any running foreground child before restoring terminal.
         kill_foreground_child();
@@ -557,9 +565,9 @@ impl App {
                             dirty = true;
                             self.handle_event(AppEvent::Paste(text)).await?;
                         }
-                        crossterm::event::Event::Resize(w, h) => {
+                        crossterm::event::Event::Resize(_, rows) => {
                             dirty = true;
-                            self.handle_event(AppEvent::Resize(w, h)).await?;
+                            self.handle_event(AppEvent::Resize { rows }).await?;
                         }
                         _ => {}
                     }
@@ -689,6 +697,7 @@ impl App {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
+            AppEvent::Resize { rows } => self.state.terminal_rows = rows,
             AppEvent::Paste(text) => self.handle_paste(text),
             AppEvent::AgentStarted(_) => {
                 self.state
@@ -979,7 +988,6 @@ impl App {
                     }
                 }
             }
-            _ => {}
         }
         Ok(false)
     }
@@ -1407,6 +1415,7 @@ mod window_tests {
             error_count: 0,
             last_error: None,
             scroll_offset: 0,
+            terminal_rows: 0,
             modal: None,
             approved_tools: std::collections::HashSet::new(),
             pending_tool_approval: None,
