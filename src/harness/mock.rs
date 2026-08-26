@@ -174,10 +174,21 @@ async fn route(
     Ok(response)
 }
 
+/// `context_length` is the field `CompatClient::context_window` reads (the
+/// OpenRouter extension to OpenAI's schema). Serving it is what lets a mock
+/// run exercise the provider-reported window at all — a scenario that pins
+/// `[context] window` still overrides it, as config always does.
+const MOCK_CONTEXT_LENGTH: u32 = 32_768;
+
 fn models_payload() -> serde_json::Value {
     serde_json::json!({
         "object": "list",
-        "data": [{ "id": "mock", "object": "model", "owned_by": "harness" }],
+        "data": [{
+            "id": "mock",
+            "object": "model",
+            "owned_by": "harness",
+            "context_length": MOCK_CONTEXT_LENGTH,
+        }],
     })
 }
 
@@ -409,6 +420,15 @@ mod tests {
         });
         assert_eq!(last_user_message(&payload), "second part");
         assert_eq!(last_user_message(&serde_json::json!({})), "");
+    }
+
+    /// Without this field the mock cannot report a window, and the driver's
+    /// `ContextWindowLearned` path has nothing to carry.
+    #[test]
+    fn the_model_listing_reports_a_context_window() {
+        let entry = &models_payload()["data"][0];
+        assert_eq!(entry["id"], "mock");
+        assert_eq!(entry["context_length"], MOCK_CONTEXT_LENGTH);
     }
 
     #[test]

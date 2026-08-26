@@ -416,7 +416,9 @@ pub struct ContextConfig {
     /// to no compaction if it can't say.
     #[serde(default = "default_context_window")]
     pub context_window: u32,
-    /// Headroom subtracted from the window for the model's own answer.
+    /// Ceiling on the headroom kept for the model's own answer. The reserve
+    /// actually applied is `min(this, [provider] max_tokens)`, at most half
+    /// the window.
     #[serde(default = "default_context_reserved_tokens")]
     pub reserved_tokens: u32,
     /// Verbatim tail kept past the summary boundary, in tokens. `0` =

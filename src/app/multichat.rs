@@ -93,7 +93,8 @@ impl App {
                 &self.config.context,
                 self.state.provider_context_window,
                 &session_id,
-            ),
+            )
+            .with_output_cap(self.config.provider.max_tokens),
         });
 
         self.state
@@ -466,11 +467,10 @@ impl App {
                 .unwrap_or_else(|| self.config.context.effective_compact_mode()),
         );
         let messages = chat.messages.clone();
-        let mut budget = crate::context::ContextBudget::from_config(
-            self.config.context.context_window,
-            self.config.context.reserved_tokens,
+        let budget = crate::context::spec::budget_from_config(
+            &self.config,
+            self.state.provider_context_window,
         );
-        budget.learn_provider_window(self.state.provider_context_window);
         // No window means no budget to plan against; mode 1 needs one to judge
         // whether the opening turn is small enough to keep.
         let usable = budget.usable().unwrap_or(0);

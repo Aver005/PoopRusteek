@@ -36,6 +36,21 @@ rate_limit_ms = 3000
 rate_limit_per_minute = 0
 max_retries = 2
 
+# The compaction ladder. Present so a container run has something to edit and
+# so `ctx:` in the status line is not blank; a scenario's own `[context]` table
+# overrides all of it per run, which is how rungs 1-3 are reached.
+[context]
+auto_compact = true
+# 0 = ask the provider. DeepSeek web reports nothing, so on the default
+# provider the ladder stays off until a scenario or this line names a window.
+context_window = 0
+reserved_tokens = 20000
+# 0 = clamp(usable / 4, 2000..15000).
+preserve_recent_tokens = 0
+# Characters per tool result, capped when the result is captured.
+tool_output_limit = 10000
+compact_mode = 1
+
 [mcp]
 cache_ttl = 300
 

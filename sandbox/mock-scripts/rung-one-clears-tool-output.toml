@@ -1,0 +1,49 @@
+# Script for `rung-one-clears-tool-output.toml`. Three big reads, then an
+# answer — enough tool output to push the conversation past rung 1's 70%
+# trigger while the turn is still running.
+#
+# TOML like every other mock script; the extension is not `.toml` only because
+# it lives beside the scenario (the harness owns `scenarios/`, not
+# `mock-scripts/`) and `suite <dir>` collects every `.toml` under the tree as a
+# scenario.
+#
+#   pooprusteek mock-provider --port 811 \
+#     --script sandbox/scenarios/mock/rung-one-clears-tool-output.mock-script
+
+[[reply]]
+content = """
+Reading the first log.
+<tool_use>
+<name>read_file</name>
+<arguments>
+{"path": "alpha.txt"}
+</arguments>
+</tool_use>
+"""
+
+[[reply]]
+content = """
+Reading the second log.
+<tool_use>
+<name>read_file</name>
+<arguments>
+{"path": "beta.txt"}
+</arguments>
+</tool_use>
+"""
+
+[[reply]]
+content = """
+Reading the third log.
+<tool_use>
+<name>read_file</name>
+<arguments>
+{"path": "gamma.txt"}
+</arguments>
+</tool_use>
+"""
+
+# The last positional reply repeats, so the turn ends here however many steps
+# the loop has left.
+[[reply]]
+content = "All three logs are compaction fixtures: 120 lines each, worker 0 through 2."

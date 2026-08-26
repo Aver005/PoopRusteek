@@ -24,6 +24,8 @@ pub mod action {
     pub const SUB_AGENT: &str = "harness.sub_agent";
     pub const MESSAGE: &str = "harness.message";
     pub const TOOL_RESULT: &str = "harness.tool.result";
+    pub const CONTEXT_WINDOW: &str = "harness.context.window";
+    pub const TOOL_OUTPUT_CLEARED: &str = "harness.context.tool_output_cleared";
 }
 
 /// One line of a trace file.

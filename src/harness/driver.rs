@@ -113,6 +113,50 @@ pub enum SemanticMode {
     Ready(Duration),
 }
 
+/// Compaction settings a run overrides on top of the config it loaded.
+///
+/// The ladder only runs against a *known* window (invariant 12), and neither
+/// the sandbox config nor a scenario file could name one — so rungs 1-3 were
+/// unreachable from a scenario. Every field is optional: absent leaves
+/// `[context]` exactly as the config had it.
+///
+/// Deserialised straight from a scenario's `[context]` table, so the flags and
+/// the TOML keys cannot drift apart.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextOverrides {
+    /// `[context] context_window`. The one setting the ladder cannot run
+    /// without, and the only one that makes a run deterministic — a provider's
+    /// own answer arrives asynchronously and may not arrive at all.
+    pub window: Option<u32>,
+    pub reserved_tokens: Option<u32>,
+    pub preserve_recent_tokens: Option<u32>,
+    /// Rung 0's cap, in characters.
+    pub tool_output_limit: Option<u32>,
+    /// Master switch for the whole ladder.
+    pub auto_compact: Option<bool>,
+}
+
+impl ContextOverrides {
+    fn apply(&self, config: &mut crate::config::ContextConfig) {
+        if let Some(window) = self.window {
+            config.context_window = window;
+        }
+        if let Some(reserved) = self.reserved_tokens {
+            config.reserved_tokens = reserved;
+        }
+        if let Some(preserve) = self.preserve_recent_tokens {
+            config.preserve_recent_tokens = preserve;
+        }
+        if let Some(limit) = self.tool_output_limit {
+            config.tool_output_limit = limit;
+        }
+        if let Some(auto) = self.auto_compact {
+            config.auto_compact = auto;
+        }
+    }
+}
+
 /// Everything one headless run needs.
 #[derive(Debug, Clone)]
 pub struct ExecOptions {
@@ -146,6 +190,9 @@ pub struct ExecOptions {
     /// wording is the cheapest variable to change and one of the most
     /// influential, so it is a first-class knob here.
     pub system_append: Option<PathBuf>,
+    /// Compaction settings layered over the config, so a scenario can put the
+    /// ladder in reach without anyone hand-editing a config file.
+    pub context: ContextOverrides,
 }
 
 /// How a run ended.
@@ -275,6 +322,7 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
     if options.semantic == SemanticMode::Off {
         config.semantic.enabled = false;
     }
+    options.context.apply(&mut config.context);
 
     let workspace = std::env::current_dir()
         .map(|path| path.to_string_lossy().to_string())
@@ -295,6 +343,16 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
             "mcp": options.mcp,
             "max_steps": config.agent.max_steps_per_turn,
             "timeout_ms": options.timeout.as_millis(),
+            // Recorded because the ladder's whole behaviour hangs off these,
+            // and a trace read later has no other way to know what they were.
+            "context": {
+                "auto_compact": config.context.auto_compact,
+                "context_window": config.context.context_window,
+                "reserved_tokens": config.context.reserved_tokens,
+                "preserve_recent_tokens": config.context.preserve_recent_tokens,
+                "tool_output_limit": config.context.tool_output_limit,
+                "max_tokens": config.provider.max_tokens,
+            },
         }),
     );
 
@@ -343,6 +401,20 @@ async fn assemble(
             "no provider configured: set [provider].token or pick a /providers entry".to_string(),
         )
     })?;
+
+    // Same shape as `App::new`: ask once, in the background, and let the
+    // answer arrive as an event. A provider that cannot say never sends one,
+    // and `[context] context_window` outranks it either way — which is why a
+    // scenario that needs a guaranteed window pins it rather than hoping.
+    {
+        let handle = Arc::clone(&provider);
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            if let Some(window) = handle.context_window().await {
+                let _ = event_tx.send(AppEvent::ContextWindowLearned(window));
+            }
+        });
+    }
 
     let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
     let tools = Arc::new(ToolRegistry::new());
@@ -451,9 +523,12 @@ async fn drive(
     // History is accumulated through the app's own reducer, so turn two sees
     // exactly what turn two in the TUI would see.
     let mut history = Conversation::fresh_main(None);
-    // No provider window is known here, so the ladder only runs on an explicit
-    // `[context] context_window`; this id just namespaces its spill directory.
+    // Namespaces this run's spill directory, the way a session id does in the app.
     let run_id = crate::session::create_session_id();
+    // Filled in by `ContextWindowLearned` if the provider answers. Read when
+    // each turn's `ContextSpec` is built, exactly as `App` reads its own
+    // `provider_context_window`: a window learned during turn 1 governs turn 2.
+    let mut provider_window = 0u32;
 
     let mut tools: Vec<ToolInvocation> = Vec::new();
     let mut questions = Vec::new();
@@ -493,7 +568,8 @@ async fn drive(
             max_tools_per_step: config.agent.max_tools_per_step.max(1),
             auto_approve: false,
             tool_output_limit: config.context.tool_output_limit as usize,
-            context: crate::context::ContextSpec::new(&config.context, 0, &run_id),
+            context: crate::context::ContextSpec::new(&config.context, provider_window, &run_id)
+                .with_output_cap(config.provider.max_tokens),
         });
 
         let mut pending: HashSet<ConversationId> = HashSet::from([root]);
@@ -637,10 +713,40 @@ async fn drive(
                                 tool_output_limit: config.context.tool_output_limit as usize,
                                 context: crate::context::ContextSpec::new(
                                     &config.context,
-                                    0,
+                                    provider_window,
                                     &run_id,
-                                ),
+                                )
+                                .with_output_cap(config.provider.max_tokens),
                             }));
+                        }
+                        AppEvent::ContextWindowLearned(window) => {
+                            provider_window = window;
+                            debug_log::log_json(
+                                action::CONTEXT_WINDOW,
+                                &serde_json::json!({ "provider_window": window }),
+                            );
+                        }
+                        // Rung 1 rewrote the turn's copy of the history; the
+                        // app applies the same edit to its own, so the harness
+                        // must too — otherwise the next turn is driven from a
+                        // history the TUI would never have had, in exactly the
+                        // dimension compaction is about.
+                        AppEvent::ToolOutputCleared {
+                            conversation,
+                            cleared,
+                            freed_tokens,
+                        } => {
+                            if conversation == root {
+                                apply_cleared_tool_output(&mut history.messages, &cleared);
+                            }
+                            debug_log::log_json(
+                                action::TOOL_OUTPUT_CLEARED,
+                                &serde_json::json!({
+                                    "conversation": conversation.0,
+                                    "cleared": cleared.len(),
+                                    "freed_tokens": freed_tokens,
+                                }),
+                            );
                         }
                         // Everything else is TUI chrome (status lines, server
                         // and update events) with no bearing on the run.
@@ -681,6 +787,22 @@ async fn drive(
         error,
         session_id,
         semantic_ready: false,
+    }
+}
+
+/// Replace the bodies rung 1 cleared with their markers, the way
+/// `App::handle_event` does for the TUI's own history.
+///
+/// Matched by tool-call id, never by index: the agent loop works on a copy
+/// with the `ui_only` messages dropped, so the two lists never line up.
+fn apply_cleared_tool_output(messages: &mut [ChatMessage], cleared: &[(String, String)]) {
+    for (tool_call_id, marker) in cleared {
+        if let Some(message) = messages
+            .iter_mut()
+            .find(|m| m.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
+        {
+            message.content = marker.clone();
+        }
     }
 }
 
@@ -790,6 +912,83 @@ mod tests {
         assert_eq!(answer_for(&options, &empty), "");
     }
 
+    /// Rung 1 rewrites the turn's copy of the history and tells the app to do
+    /// the same. The harness ignoring that message is how a multi-turn run
+    /// diverges from the TUI in exactly the dimension compaction is about:
+    /// turn 2 would be driven from bodies the TUI no longer had.
+    #[test]
+    fn cleared_tool_output_is_applied_the_way_the_tui_applies_it() {
+        let mut messages = vec![
+            ChatMessage::user("read both files"),
+            // A UI-only message: present here, absent from the agent loop's
+            // copy, so any index-based edit would land on the wrong message.
+            ChatMessage {
+                ui_only: true,
+                ..ChatMessage::assistant("(status line)")
+            },
+            ChatMessage::assistant("reading"),
+            ChatMessage::tool("call-a", "a".repeat(4000).as_str()),
+            ChatMessage::tool("call-b", "b".repeat(4000).as_str()),
+        ];
+        apply_cleared_tool_output(
+            &mut messages,
+            &[(
+                "call-a".to_string(),
+                "[cleared: /spill/call-a.txt]".to_string(),
+            )],
+        );
+        assert_eq!(messages[3].content, "[cleared: /spill/call-a.txt]");
+        // Untouched: only what rung 1 actually spilled may be replaced.
+        assert_eq!(messages[4].content.len(), 4000);
+        assert_eq!(messages[1].content, "(status line)");
+    }
+
+    /// An id the harness's history does not carry is dropped, not applied to
+    /// whatever happened to be at that position.
+    #[test]
+    fn an_unknown_tool_call_id_clears_nothing() {
+        let mut messages = vec![ChatMessage::tool("call-a", "body")];
+        apply_cleared_tool_output(
+            &mut messages,
+            &[("call-z".to_string(), "[cleared]".to_string())],
+        );
+        assert_eq!(messages[0].content, "body");
+    }
+
+    #[test]
+    fn context_overrides_rewrite_only_what_they_name() {
+        let mut config = crate::config::ContextConfig::default();
+        let before = config.clone();
+        ContextOverrides {
+            window: Some(12_000),
+            preserve_recent_tokens: Some(500),
+            ..ContextOverrides::default()
+        }
+        .apply(&mut config);
+        assert_eq!(config.context_window, 12_000);
+        assert_eq!(config.preserve_recent_tokens, 500);
+        // Everything unset keeps whatever the config file said.
+        assert_eq!(config.reserved_tokens, before.reserved_tokens);
+        assert_eq!(config.tool_output_limit, before.tool_output_limit);
+        assert_eq!(config.auto_compact, before.auto_compact);
+    }
+
+    /// A scenario window has to reach the budget the ladder measures against,
+    /// or the plumbing is decorative.
+    #[test]
+    fn a_scenario_window_produces_a_usable_budget() {
+        let mut config = Config::default();
+        ContextOverrides {
+            window: Some(12_000),
+            reserved_tokens: Some(1_000),
+            ..ContextOverrides::default()
+        }
+        .apply(&mut config.context);
+        let spec = crate::context::ContextSpec::new(&config.context, 0, "run")
+            .with_output_cap(config.provider.max_tokens);
+        assert_eq!(spec.budget().usable(), Some(11_000));
+    }
+
     fn probe_options() -> ExecOptions {
         ExecOptions {
             prompts: Vec::new(),
@@ -805,6 +1004,7 @@ mod tests {
             model: None,
             save_session: false,
             system_append: None,
+            context: ContextOverrides::default(),
         }
     }
 

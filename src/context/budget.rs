@@ -59,6 +59,8 @@ pub struct ContextBudget {
 
 impl ContextBudget {
     /// `context_window == 0` means "unknown, ask the provider later".
+    /// `reserved_tokens` is the *effective* reserve — bounded by the model's
+    /// output cap upstream, in [`crate::context::ContextSpec::with_output_cap`].
     pub fn from_config(context_window: u32, reserved_tokens: u32) -> Self {
         let (window, source) = match context_window {
             0 => (0, WindowSource::Unknown),
@@ -81,21 +83,24 @@ impl ContextBudget {
         self.source = WindowSource::Provider;
     }
 
+    /// Half the window is the hard ceiling: a reserve must never leave the
+    /// conversation less room than the answer it holds back (§4).
+    fn reserve(&self) -> u32 {
+        self.reserved.min(self.window / 2)
+    }
+
     /// Room for the conversation once the model's own answer is reserved.
-    /// `None` whenever the ladder must stay off: unknown window, or a reserve
-    /// that swallows it whole.
+    /// `None` only for an unknown window — the reserve can no longer switch
+    /// the ladder off on a small model (see `reserve`).
     pub fn usable(&self) -> Option<u32> {
         if self.source == WindowSource::Unknown || self.window == 0 {
             return None;
         }
-        self.window
-            .checked_sub(self.reserved)
-            .filter(|left| *left > 0)
+        Some(self.window - self.reserve())
     }
 
     pub fn snapshot(&self, used: u32) -> Option<BudgetSnapshot> {
         Some(BudgetSnapshot {
-            window: self.window,
             usable: self.usable()?,
             used,
             source: self.source,
@@ -106,23 +111,25 @@ impl ContextBudget {
 /// One reading of how full the window is.
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetSnapshot {
-    pub window: u32,
     pub usable: u32,
     pub used: u32,
     pub source: WindowSource,
 }
 
 impl BudgetSnapshot {
+    /// Percent of the **usable** window, the scale every ladder threshold is
+    /// written against: 100 is the overflow point, not "the window is full".
     pub fn percent_used(&self) -> u8 {
         if self.usable == 0 {
             return 100;
         }
         let percent = (u64::from(self.used) * 100) / u64::from(self.usable);
-        percent.min(100) as u8
+        // Not clamped at 100: over budget the user needs to see by how much.
+        percent.min(u64::from(u8::MAX)) as u8
     }
 
-    /// Compact status-bar form. A hand-set window is marked `*`: it is the one
-    /// case where the number can disagree with the model's real limit.
+    /// Compact status-bar form. Prints the same usable window `percent_used`
+    /// divides by; `*` marks a hand-set window, the one number that can lie.
     pub fn label(&self) -> String {
         let hand_set = if self.source == WindowSource::Config {
             "*"
@@ -132,7 +139,7 @@ impl BudgetSnapshot {
         format!(
             "{}% of {}k{}",
             self.percent_used(),
-            self.window.div_ceil(1_000),
+            self.usable.div_ceil(1_000),
             hand_set
         )
     }
@@ -169,9 +176,24 @@ mod tests {
     }
 
     #[test]
-    fn reserve_larger_than_window_yields_no_budget() {
+    fn a_small_window_keeps_the_ladder_on() {
+        // The default 20k reserve used to zero out every window under it —
+        // switching the ladder off on exactly the models that need it.
         let budget = ContextBudget::from_config(8_000, 20_000);
-        assert!(budget.usable().is_none());
+        assert_eq!(budget.usable(), Some(4_000));
+        assert!(budget.snapshot(3_000).is_some());
+    }
+
+    #[test]
+    fn the_reserve_never_takes_more_than_half_the_window() {
+        assert_eq!(
+            ContextBudget::from_config(2_000, 20_000).usable(),
+            Some(1_000)
+        );
+        assert_eq!(
+            ContextBudget::from_config(4_096, 4_096).usable(),
+            Some(2_048)
+        );
     }
 
     #[test]
@@ -212,17 +234,29 @@ mod tests {
     }
 
     #[test]
-    fn label_marks_a_hand_set_window() {
+    fn percent_used_reports_how_far_past_the_budget_it_is() {
+        let over = ContextBudget::from_config(10_000, 2_000)
+            .snapshot(12_000)
+            .expect("known window");
+        assert_eq!(over.percent_used(), 150);
+        assert_eq!(over.label(), "150% of 8k*");
+    }
+
+    #[test]
+    fn label_prints_the_denominator_percent_used_divides_by() {
+        // 108 000 usable of a 128k window: half of it is 50%, and the label
+        // must name 108k, not the raw 128k the reader would divide by.
         let hand_set = ContextBudget::from_config(128_000, 20_000)
             .snapshot(54_000)
             .expect("known window");
-        assert_eq!(hand_set.label(), "50% of 128k*");
+        assert_eq!(hand_set.percent_used(), 50);
+        assert_eq!(hand_set.label(), "50% of 108k*");
 
-        let mut learned = ContextBudget::from_config(0, 20_000);
+        let mut learned = ContextBudget::from_config(0, 4_096);
         learned.learn_provider_window(32_000);
-        assert_eq!(
-            learned.snapshot(6_000).expect("known window").label(),
-            "50% of 32k"
-        );
+        let snapshot = learned.snapshot(13_952).expect("known window");
+        assert_eq!(snapshot.usable, 27_904);
+        // No `*`: the provider named this window, so it cannot disagree.
+        assert_eq!(snapshot.label(), "50% of 28k");
     }
 }

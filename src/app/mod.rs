@@ -1087,7 +1087,8 @@ impl App {
                 &self.config.context,
                 self.state.provider_context_window,
                 &self.state.focused().session_id,
-            ),
+            )
+            .with_output_cap(self.config.provider.max_tokens),
         };
 
         let _ = self.event_tx.send(AppEvent::AgentStarted(conversation));

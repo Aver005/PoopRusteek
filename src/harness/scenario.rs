@@ -13,10 +13,10 @@
 //! that can be killed without taking the runner down with it.
 
 use crate::error::{AppError, AppResult};
-use crate::harness::driver::{RunOutcome, RunStatus};
+use crate::harness::driver::{ContextOverrides, RunOutcome, RunStatus};
 use crate::harness::metrics::RunMetrics;
 use crate::harness::report::{self, RunReport, ScenarioReport, SuiteReport};
-use crate::harness::trace::Trace;
+use crate::harness::trace::{Trace, TraceRecord};
 use crate::harness::{ScenarioArgs, SuiteArgs, run_stamp};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -77,6 +77,11 @@ pub struct Scenario {
     pub save_session: bool,
     /// Default repeat count; `--repeat` on the command line wins.
     pub repeat: Option<usize>,
+    /// Compaction settings for this scenario's turns, forwarded to the child
+    /// as flags. Without them the ladder measures against an unknown window
+    /// and never runs, which is why no scenario could reach rungs 1-3.
+    #[serde(default)]
+    pub context: ContextOverrides,
     #[serde(default)]
     pub expect: Expect,
 }
@@ -134,8 +139,57 @@ pub struct Expect {
     /// Regexes that must match the contents of a file in the workspace.
     #[serde(default)]
     pub file_matches: Vec<FileExpect>,
+    /// Assertions about the trace itself — the only window onto what happened
+    /// *inside* the agent loop, which is where the compaction ladder lives.
+    #[serde(default)]
+    pub trace: Vec<TraceExpect>,
     /// Fraction of repeats that must pass. Defaults to 1.0.
     pub min_pass_rate: Option<f64>,
+}
+
+/// One assertion about the run's trace records.
+///
+/// The trace is the harness's only evidence for anything the agent loop does
+/// without touching the filesystem or the answer text: a cleared tool body, a
+/// session re-seed, a skipped rung. Reading it here follows the same shape
+/// [`crate::harness::metrics`] already uses — `data.<field>` when the call
+/// site logged JSON, the `key=value` message form when it did not.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceExpect {
+    /// Action of the records to look at, e.g. `context.prune`.
+    pub action: String,
+    /// Fewest matching records. **Defaults to 1**, so naming an action that
+    /// never fired is a failure rather than a silent pass.
+    pub min_count: Option<usize>,
+    /// Most matching records. `0` asserts the action never happened at all.
+    pub max_count: Option<usize>,
+    /// Numeric field totalled across the matching records.
+    pub field: Option<String>,
+    pub min_total: Option<u64>,
+    pub max_total: Option<u64>,
+}
+
+impl TraceExpect {
+    fn min_count(&self) -> usize {
+        self.min_count.unwrap_or(1)
+    }
+
+    /// A `field` with nothing to compare it against, or a bound with no field
+    /// to read, asserts nothing — exactly the silent pass `deny_unknown_fields`
+    /// exists to prevent, so it is a config error.
+    fn validate(&self, origin: &str, index: usize) -> AppResult<()> {
+        let bounded = self.min_total.is_some() || self.max_total.is_some();
+        match (&self.field, bounded) {
+            (Some(field), false) => Err(AppError::Custom(format!(
+                "{origin}: expect.trace[{index}] reads field '{field}' but sets neither `min_total` nor `max_total`"
+            ))),
+            (None, true) => Err(AppError::Custom(format!(
+                "{origin}: expect.trace[{index}] sets a total bound but no `field` to read"
+            ))),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// One "this file must contain this" assertion.
@@ -156,6 +210,17 @@ impl Expect {
         self.min_pass_rate.unwrap_or(1.0)
     }
 
+    /// True when the scenario said, in so many words, that it expects the run
+    /// not to finish. Only an explicit failing `status` counts: everything
+    /// here is optional, so a run that never happened must never be *given*
+    /// a pass by omission.
+    fn expects_a_failed_run(&self) -> bool {
+        matches!(
+            self.status.as_deref(),
+            Some("failed" | "timed_out" | "setup_failed")
+        )
+    }
+
     /// Reasons this run failed. Empty means it passed. `workspace` is where
     /// the file expectations are resolved; `None` skips them (nothing was
     /// writable, so there is nothing to inspect).
@@ -163,9 +228,12 @@ impl Expect {
         &self,
         outcome: &RunOutcome,
         metrics: &RunMetrics,
+        trace: &Trace,
         workspace: Option<&Path>,
     ) -> AppResult<Vec<String>> {
         let mut failures = Vec::new();
+
+        self.check_ran_at_all(outcome, metrics, &mut failures);
 
         if let Some(expected) = &self.status {
             let actual = status_name(outcome.status);
@@ -226,8 +294,94 @@ impl Expect {
             }
         }
 
+        self.check_trace(trace, &mut failures);
         self.check_files(workspace, &mut failures)?;
         Ok(failures)
+    }
+
+    /// A run that never produced a turn clears every expectation above, because
+    /// each one is optional: a token-less config used to report
+    /// `1/1 passed (100%)` over `status: setup_failed, turns: 0`. So the
+    /// absence of a turn is a failure in its own right, and the only way out is
+    /// to say so — `status = "setup_failed"` (or `failed`/`timed_out`).
+    fn check_ran_at_all(
+        &self,
+        outcome: &RunOutcome,
+        metrics: &RunMetrics,
+        failures: &mut Vec<String>,
+    ) {
+        if self.expects_a_failed_run() {
+            return;
+        }
+        let reason = if outcome.status == RunStatus::SetupFailed {
+            "the run never started".to_string()
+        } else if outcome.turns == 0 {
+            "no turn was driven".to_string()
+        } else if metrics.steps == 0 {
+            format!(
+                "{} turn(s) started but the agent loop never ran a step",
+                outcome.turns
+            )
+        } else {
+            return;
+        };
+        let detail = outcome
+            .error
+            .as_deref()
+            .map(|error| format!(" ({error})"))
+            .unwrap_or_default();
+        failures.push(format!(
+            "produced nothing to judge: {reason}{detail} — declare `status = \"{}\"` if that is the expectation",
+            status_name(outcome.status)
+        ));
+    }
+
+    /// Assertions against the trace. Unknown actions are not an error anywhere
+    /// else in the harness, so `min_count` defaulting to 1 is what turns a
+    /// typo'd action into a loud failure instead of a vacuous pass.
+    fn check_trace(&self, trace: &Trace, failures: &mut Vec<String>) {
+        for expect in &self.trace {
+            let records: Vec<&TraceRecord> = trace.by_action(&expect.action).collect();
+            let count = records.len();
+            let min = expect.min_count();
+            if count < min {
+                failures.push(format!(
+                    "trace has {count} '{}' record(s), wanted at least {min}",
+                    expect.action
+                ));
+            }
+            if let Some(max) = expect.max_count
+                && count > max
+            {
+                failures.push(format!(
+                    "trace has {count} '{}' record(s), wanted at most {max}",
+                    expect.action
+                ));
+            }
+            let Some(field) = &expect.field else {
+                continue;
+            };
+            let total: u64 = records
+                .iter()
+                .filter_map(|record| record_number(record, field))
+                .sum();
+            if let Some(min_total) = expect.min_total
+                && total < min_total
+            {
+                failures.push(format!(
+                    "'{}' {field} totals {total}, wanted at least {min_total}",
+                    expect.action
+                ));
+            }
+            if let Some(max_total) = expect.max_total
+                && total > max_total
+            {
+                failures.push(format!(
+                    "'{}' {field} totals {total}, wanted at most {max_total}",
+                    expect.action
+                ));
+            }
+        }
     }
 
     /// The expectations that look at what the agent actually produced. A task
@@ -279,6 +433,16 @@ impl Expect {
     }
 }
 
+/// A number off a trace record, from either shape a `debug_log` call site
+/// produces: a JSON `data` payload, or a `key=value` message line.
+fn record_number(record: &TraceRecord, field: &str) -> Option<u64> {
+    record.number(field).or_else(|| {
+        crate::harness::metrics::message_field(record, field)?
+            .parse()
+            .ok()
+    })
+}
+
 fn compile(pattern: &str) -> AppResult<regex::Regex> {
     regex::Regex::new(pattern)
         .map_err(|e| AppError::Custom(format!("bad expectation regex /{pattern}/: {e}")))
@@ -323,6 +487,9 @@ impl Scenario {
             return Err(AppError::Custom(format!(
                 "{origin}: prompts[{index}] is empty — every turn needs a user message"
             )));
+        }
+        for (index, expect) in scenario.expect.trace.iter().enumerate() {
+            expect.validate(origin, index)?;
         }
         Ok(scenario)
     }
@@ -490,7 +657,7 @@ async fn execute(
         let metrics = RunMetrics::from_trace(&trace);
         let failures = scenario
             .expect
-            .check(&outcome, &metrics, scratch.as_deref())?;
+            .check(&outcome, &metrics, &trace, scratch.as_deref())?;
         runs.push(RunReport {
             index,
             trace_path,
@@ -546,6 +713,28 @@ fn exec_args(
     }
     if scenario.mcp {
         args.push("--mcp".into());
+    }
+    // Compaction settings travel as flags for the same reason every other
+    // scenario knob does: the repeat is a separate process, and a setting that
+    // belongs to *this* behaviour test has no business in a shared config file.
+    if let Some(window) = scenario.context.window {
+        push_flag(&mut args, "--context-window", window.to_string());
+    }
+    if let Some(reserved) = scenario.context.reserved_tokens {
+        push_flag(&mut args, "--context-reserved-tokens", reserved.to_string());
+    }
+    if let Some(preserve) = scenario.context.preserve_recent_tokens {
+        push_flag(
+            &mut args,
+            "--context-preserve-recent-tokens",
+            preserve.to_string(),
+        );
+    }
+    if let Some(limit) = scenario.context.tool_output_limit {
+        push_flag(&mut args, "--tool-output-limit", limit.to_string());
+    }
+    if let Some(auto) = scenario.context.auto_compact {
+        push_flag(&mut args, "--auto-compact", auto.to_string());
     }
     if scenario.save_session {
         args.push("--save-session".into());
@@ -732,6 +921,20 @@ mod tests {
         metrics
     }
 
+    /// A run that did happen. `RunMetrics::default()` has `steps == 0`, which
+    /// the "produced nothing to judge" guard now treats as a non-run, so any
+    /// test about some *other* expectation has to start from a real one.
+    fn ran() -> RunMetrics {
+        RunMetrics {
+            steps: 1,
+            ..RunMetrics::default()
+        }
+    }
+
+    fn no_trace() -> Trace {
+        Trace::default()
+    }
+
     #[test]
     fn satisfied_expectations_yield_no_failures() {
         let expect = Expect {
@@ -748,6 +951,7 @@ mod tests {
             .check(
                 &outcome(RunStatus::Completed, "found Cargo.toml"),
                 &metrics_with_tool("bash", 2),
+                &no_trace(),
                 None,
             )
             .unwrap();
@@ -772,6 +976,7 @@ mod tests {
             .check(
                 &outcome(RunStatus::Failed, "an error happened"),
                 &metrics,
+                &no_trace(),
                 None,
             )
             .unwrap();
@@ -788,7 +993,8 @@ mod tests {
             expect
                 .check(
                     &outcome(RunStatus::Completed, "x"),
-                    &RunMetrics::default(),
+                    &ran(),
+                    &no_trace(),
                     None
                 )
                 .is_err()
@@ -823,7 +1029,8 @@ mod tests {
         let passing = expect
             .check(
                 &outcome(RunStatus::Completed, "done"),
-                &RunMetrics::default(),
+                &ran(),
+                &no_trace(),
                 Some(&dir),
             )
             .unwrap();
@@ -836,7 +1043,8 @@ mod tests {
         let failing = expect
             .check(
                 &outcome(RunStatus::Completed, "I created the page"),
-                &RunMetrics::default(),
+                &ran(),
+                &no_trace(),
                 Some(&empty),
             )
             .unwrap();
@@ -853,7 +1061,8 @@ mod tests {
         let failures = expect
             .check(
                 &outcome(RunStatus::Completed, "done"),
-                &RunMetrics::default(),
+                &ran(),
+                &no_trace(),
                 None,
             )
             .unwrap();
@@ -939,6 +1148,311 @@ mod tests {
         assert_eq!(scenario.timeout, 300);
         assert!(!scenario.mcp);
         assert_eq!(scenario.expect.min_pass_rate(), 1.0);
+    }
+
+    fn setup_failed_outcome() -> RunOutcome {
+        RunOutcome {
+            status: RunStatus::SetupFailed,
+            trace_path: PathBuf::from("t.jsonl"),
+            duration_ms: 0,
+            turns: 0,
+            final_text: String::new(),
+            tools: Vec::new(),
+            sub_agents: 0,
+            questions: Vec::new(),
+            error: Some("no provider configured".into()),
+            session_id: None,
+            semantic_ready: false,
+        }
+    }
+
+    /// The regression this guard exists for: a token-less config reported
+    /// `1/1 passed (100%)` over `status: setup_failed, turns: 0`, because
+    /// every `Expect` field is optional and none of them were set.
+    #[test]
+    fn a_run_that_never_started_fails_even_with_no_expectations() {
+        let failures = Expect::default()
+            .check(
+                &setup_failed_outcome(),
+                &RunMetrics::default(),
+                &no_trace(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("never started"), "{failures:?}");
+        // The report must say how to opt in, not just that something is wrong.
+        assert!(failures[0].contains("setup_failed"), "{failures:?}");
+        assert!(
+            failures[0].contains("no provider configured"),
+            "{failures:?}"
+        );
+    }
+
+    /// Expecting a failure has to stay expressible — the denied-tools and 429
+    /// scenarios are about failure paths.
+    #[test]
+    fn a_scenario_can_opt_in_to_expecting_a_failed_run() {
+        let expect = Expect {
+            status: Some("setup_failed".into()),
+            ..Expect::default()
+        };
+        let failures = expect
+            .check(
+                &setup_failed_outcome(),
+                &RunMetrics::default(),
+                &no_trace(),
+                None,
+            )
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// Opting in is per status: a scenario that wanted a completed run does
+    /// not get to inherit the exemption.
+    #[test]
+    fn expecting_completion_does_not_excuse_a_run_that_never_started() {
+        let expect = Expect {
+            status: Some("completed".into()),
+            ..Expect::default()
+        };
+        let failures = expect
+            .check(
+                &setup_failed_outcome(),
+                &RunMetrics::default(),
+                &no_trace(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(failures.len(), 2, "{failures:?}");
+    }
+
+    /// The subtler shape: the child reported `completed`, but the agent loop
+    /// never ran a step, so there is nothing behind the verdict.
+    #[test]
+    fn a_completed_run_with_no_steps_is_still_nothing_to_judge() {
+        let failures = Expect::default()
+            .check(
+                &outcome(RunStatus::Completed, "done"),
+                &RunMetrics::default(),
+                &no_trace(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("never ran a step"), "{failures:?}");
+    }
+
+    fn prune_trace() -> Trace {
+        Trace::parse(concat!(
+            r#"{"seq":0,"ts":"t","action":"context.prune","message":"conversation=1 cleared=2 spill_failed=0 freed_tokens=3100 percent_used=88"}"#,
+            "\n",
+            r#"{"seq":1,"ts":"t","action":"context.prune","message":"conversation=1 cleared=1 spill_failed=0 freed_tokens=1200 percent_used=74"}"#,
+        ))
+    }
+
+    /// The assertion the compaction scenarios are built on: the rung fired,
+    /// and it actually cleared something.
+    #[test]
+    fn a_trace_expectation_counts_records_and_totals_a_field() {
+        let expect = Expect {
+            trace: vec![TraceExpect {
+                action: "context.prune".into(),
+                min_count: Some(1),
+                max_count: None,
+                field: Some("cleared".into()),
+                min_total: Some(3),
+                max_total: None,
+            }],
+            ..Expect::default()
+        };
+        let failures = expect
+            .check(
+                &outcome(RunStatus::Completed, "done"),
+                &ran(),
+                &prune_trace(),
+                None,
+            )
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// A scenario that cannot fail when the rung does not fire is worth
+    /// nothing, so this is the half that matters.
+    #[test]
+    fn a_trace_expectation_fails_when_the_action_never_happened() {
+        let expect = Expect {
+            trace: vec![TraceExpect {
+                action: "context.prune".into(),
+                min_count: None,
+                max_count: None,
+                field: None,
+                min_total: None,
+                max_total: None,
+            }],
+            ..Expect::default()
+        };
+        let failures = expect
+            .check(
+                &outcome(RunStatus::Completed, "done"),
+                &ran(),
+                &no_trace(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("at least 1"), "{failures:?}");
+    }
+
+    #[test]
+    fn a_trace_expectation_bounds_counts_and_totals_from_above() {
+        let expect = Expect {
+            trace: vec![
+                TraceExpect {
+                    action: "context.prune".into(),
+                    min_count: Some(1),
+                    max_count: Some(1),
+                    field: Some("freed_tokens".into()),
+                    min_total: None,
+                    max_total: Some(4000),
+                },
+                // `max_count = 0` is how a scenario asserts a rung was *not*
+                // skipped — the shape a DeepSeek-backed run would produce.
+                TraceExpect {
+                    action: "context.prune.skipped".into(),
+                    min_count: Some(0),
+                    max_count: Some(0),
+                    field: None,
+                    min_total: None,
+                    max_total: None,
+                },
+            ],
+            ..Expect::default()
+        };
+        let failures = expect
+            .check(
+                &outcome(RunStatus::Completed, "done"),
+                &ran(),
+                &prune_trace(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures.iter().any(|f| f.contains("at most 1")),
+            "{failures:?}"
+        );
+        assert!(
+            failures.iter().any(|f| f.contains("totals 4300")),
+            "{failures:?}"
+        );
+    }
+
+    /// Numbers also come off JSON payloads, not only `key=value` lines.
+    #[test]
+    fn a_trace_expectation_reads_json_payload_fields_too() {
+        let trace = Trace::parse(
+            r#"{"seq":0,"ts":"t","action":"harness.context.tool_output_cleared","data":{"cleared":2,"freed_tokens":900}}"#,
+        );
+        let expect = Expect {
+            trace: vec![TraceExpect {
+                action: "harness.context.tool_output_cleared".into(),
+                min_count: Some(1),
+                max_count: None,
+                field: Some("freed_tokens".into()),
+                min_total: Some(900),
+                max_total: None,
+            }],
+            ..Expect::default()
+        };
+        assert!(
+            expect
+                .check(&outcome(RunStatus::Completed, "done"), &ran(), &trace, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An assertion that asserts nothing is the failure mode this harness
+    /// cares about most, so it is rejected at load time.
+    #[test]
+    fn a_trace_expectation_that_asserts_nothing_is_a_config_error() {
+        let unbounded = concat!(
+            "name = \"x\"\nprompt = \"y\"\n",
+            "[[expect.trace]]\naction = \"context.prune\"\nfield = \"cleared\"\n",
+        );
+        let error = Scenario::from_toml(unbounded, "t.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("min_total"), "{error}");
+
+        let fieldless = concat!(
+            "name = \"x\"\nprompt = \"y\"\n",
+            "[[expect.trace]]\naction = \"context.prune\"\nmin_total = 1\n",
+        );
+        let error = Scenario::from_toml(fieldless, "t.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no `field`"), "{error}");
+    }
+
+    /// The child is a separate process, so a `[context]` table that never
+    /// reaches its command line is a table that does nothing.
+    #[test]
+    fn context_overrides_reach_the_child_command_line() {
+        let scenario = Scenario::from_toml(
+            concat!(
+                "name = \"x\"\nprompt = \"y\"\n",
+                "[context]\n",
+                "window = 12000\n",
+                "reserved_tokens = 1000\n",
+                "preserve_recent_tokens = 500\n",
+                "tool_output_limit = 20000\n",
+                "auto_compact = true\n",
+            ),
+            "t.toml",
+        )
+        .unwrap();
+        let rendered: Vec<String> = exec_args(&scenario, Path::new("t.jsonl"), None)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        for (flag, value) in [
+            ("--context-window", "12000"),
+            ("--context-reserved-tokens", "1000"),
+            ("--context-preserve-recent-tokens", "500"),
+            ("--tool-output-limit", "20000"),
+            ("--auto-compact", "true"),
+        ] {
+            let at = rendered
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{flag} is not on the child command line: {rendered:?}"));
+            assert_eq!(rendered[at + 1], value, "{rendered:?}");
+        }
+    }
+
+    /// A scenario without the table must not start passing flags it never
+    /// declared — the child's own config has to keep deciding.
+    #[test]
+    fn without_a_context_table_no_context_flag_is_passed() {
+        let scenario = Scenario::from_toml("name = \"x\"\nprompt = \"y\"\n", "t.toml").unwrap();
+        let rendered: Vec<String> = exec_args(&scenario, Path::new("t.jsonl"), None)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !rendered.iter().any(|arg| arg.starts_with("--context-")
+                || arg == "--tool-output-limit"
+                || arg == "--auto-compact"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_context_key_is_rejected() {
+        let toml = "name = \"x\"\nprompt = \"y\"\n[context]\nwindwo = 100\n";
+        assert!(Scenario::from_toml(toml, "t.toml").is_err());
     }
 
     #[test]

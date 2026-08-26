@@ -1,0 +1,82 @@
+# Rung 1 of the compaction ladder, exercised end to end.
+#
+# Why mock and not live: `mock-provider` is reached through `CompatClient`, so
+# `keeps_server_side_history()` is false and rung 1 applies to it — unlike
+# every DeepSeek scenario, where rung 1 is skipped outright and the trace only
+# ever shows `context.prune.skipped`.
+#
+# The `[context]` table is the point of the scenario as much as the prompt is:
+# without a window the ladder has nothing to measure against and stays off
+# (invariant 12), which is why no scenario could reach rungs 1-3 before.
+#
+# Needs the mock service:
+#   pooprusteek mock-provider --port 811 \
+#     --script sandbox/scenarios/mock/rung-one-clears-tool-output.mock-script
+#
+# Three 12 000-char reads at ~4 000 budget tokens each cross 70% of an 11 000
+# usable window while the turn is still running, so the check that fires is
+# the per-step one, not a turn boundary.
+name = "rung-one-clears-tool-output"
+description = "Rung 1 clears an old tool body once the window passes 70%"
+prompt = "Read alpha.txt, then beta.txt, then gamma.txt, then tell me what they are."
+workspace = "rung-one-workspace"
+provider = "mock"
+timeout = 120
+max_steps = 6
+
+[context]
+# 12000 - min(1000, max_tokens, 12000/2) = 11000 usable; the trigger is 7700.
+window = 12000
+reserved_tokens = 1000
+# Explicit, because the derived tail is `clamp(usable / 4, 2000..15000)` and a
+# 2000-token floor would protect most of a small window — rung 1 would then
+# find nothing to clear for a reason unrelated to what this scenario tests.
+preserve_recent_tokens = 500
+# Above the 12 000-char files, so rung 0 does not trim them first and rung 1 is
+# measured against the real thing.
+tool_output_limit = 20000
+auto_compact = true
+
+[expect]
+status = "completed"
+tools_used = ["read_file"]
+no_malformed = true
+min_pass_rate = 1.0
+
+# The evidence. Without this block the scenario cannot fail when the rung does
+# not fire, and is worth nothing.
+[[expect.trace]]
+action = "context.prune"
+min_count = 1
+field = "cleared"
+min_total = 1
+
+# Nothing may be lost on the way to disk: a marker pointing at a file that was
+# never written is the defect this field was added for.
+[[expect.trace]]
+action = "context.prune"
+field = "spill_failed"
+max_total = 0
+
+# `context.prune.skipped` means the provider keeps history server-side and the
+# rung never ran — the shape every live scenario produces, and the reason this
+# one is a mock.
+[[expect.trace]]
+action = "context.prune.skipped"
+min_count = 0
+max_count = 0
+
+# The provider's own window reached the driver. Config still outranks it, but
+# the event has to arrive for a provider-reported window to be honoured at all.
+[[expect.trace]]
+action = "harness.context.window"
+min_count = 1
+field = "provider_window"
+min_total = 1
+
+# The driver applied rung 1's edit to its own history, the way the TUI does.
+[[expect.trace]]
+action = "harness.context.tool_output_cleared"
+min_count = 1
+field = "cleared"
+min_total = 1

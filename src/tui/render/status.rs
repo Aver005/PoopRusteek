@@ -186,11 +186,7 @@ pub(super) fn render_mini_status(
     // Window fullness. Absent whenever the window size is unknown — showing a
     // plausible-looking percentage against a guessed window is how Goose let a
     // session run 36% past its limit with the indicator still looking fine.
-    let mut budget = crate::context::ContextBudget::from_config(
-        config.context.context_window,
-        config.context.reserved_tokens,
-    );
-    budget.learn_provider_window(state.provider_context_window);
+    let budget = crate::context::spec::budget_from_config(config, state.provider_context_window);
     // `srv` = the provider keeps the history, so the number is what the server
     // has accumulated for the session, not what we send each step.
     let ctx_mode = match &state.focused().provider {

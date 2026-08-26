@@ -44,7 +44,9 @@ const DEFAULT_OUT_DIR: &str = ".dev/harness";
 #[derive(Subcommand)]
 pub enum Command {
     /// Run one agent turn headlessly and write a JSONL trace.
-    Exec(ExecArgs),
+    /// Boxed: `exec` carries every knob a run has, so it dwarfs the other
+    /// variants and clippy refuses the unboxed enum.
+    Exec(Box<ExecArgs>),
     /// Run one scenario file, repeated, and report aggregated metrics.
     Scenario(ScenarioArgs),
     /// Run every scenario in a directory.
@@ -112,6 +114,28 @@ pub struct ExecArgs {
     /// Save the turn as a session file (feeds `mine` and the history index).
     #[arg(long)]
     pub save_session: bool,
+
+    /// Model context window in tokens. Without one the compaction ladder has
+    /// nothing to measure against and never runs (invariant 12), which is what
+    /// made rungs 1-3 untestable.
+    #[arg(long)]
+    pub context_window: Option<u32>,
+
+    /// Headroom reserved from the window for the model's own answer.
+    #[arg(long)]
+    pub context_reserved_tokens: Option<u32>,
+
+    /// Verbatim tail kept out of rung 1's reach, in tokens.
+    #[arg(long)]
+    pub context_preserve_recent_tokens: Option<u32>,
+
+    /// Rung 0's per-result cap, in characters. `0` disables it.
+    #[arg(long)]
+    pub tool_output_limit: Option<u32>,
+
+    /// Master switch for the compaction ladder.
+    #[arg(long)]
+    pub auto_compact: Option<bool>,
 
     /// Print the outcome as JSON instead of a human summary.
     #[arg(long)]
@@ -202,7 +226,7 @@ pub struct MockArgs {
 /// real config instead of the one this run was pointed at.
 pub async fn run(command: Command, config: Config, config_path: Option<PathBuf>) -> AppResult<i32> {
     match command {
-        Command::Exec(args) => exec(args, config).await,
+        Command::Exec(args) => exec(*args, config).await,
         Command::Scenario(args) => scenario::run_one(args, config_path).await,
         Command::Suite(args) => scenario::run_suite(args, config_path).await,
         Command::Mine(args) => mine::run(args),
@@ -225,6 +249,13 @@ async fn exec(args: ExecArgs, config: Config) -> AppResult<i32> {
         model: args.model,
         save_session: args.save_session,
         system_append: args.system_append.clone(),
+        context: driver::ContextOverrides {
+            window: args.context_window,
+            reserved_tokens: args.context_reserved_tokens,
+            preserve_recent_tokens: args.context_preserve_recent_tokens,
+            tool_output_limit: args.tool_output_limit,
+            auto_compact: args.auto_compact,
+        },
     };
 
     let outcome = driver::exec(config, options).await?;
