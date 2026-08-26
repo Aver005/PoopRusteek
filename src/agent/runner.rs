@@ -499,6 +499,9 @@ fn context_used(
 struct CompactionState {
     prune_skip_logged: bool,
     session_reset_done: bool,
+    /// A re-seed judged pointless once stays judged: retrying it every step
+    /// would repeat the whole estimate and the log line with it.
+    reset_refused: bool,
     reset_skip_logged: bool,
 }
 
@@ -554,49 +557,62 @@ async fn prune_tool_output(
     clear_tool_bodies(ctx, &snapshot, messages).await
 }
 
+/// Verbatim tail kept out of every rung's reach, in tokens: the explicit
+/// setting, or a quarter of the usable window.
+fn protect_tokens(
+    ctx: &CompactionCtx<'_>,
+    snapshot: &crate::context::budget::BudgetSnapshot,
+) -> u32 {
+    match ctx.context.preserve_recent_tokens {
+        0 => (snapshot.usable / 4).clamp(2_000, 15_000),
+        explicit => explicit,
+    }
+}
+
 /// The clearing itself, without the decision to run it: spill the bodies of
 /// the settled tool results, leave a marker in their place, tell the app.
 /// Shared by rung 1 and by rung 2, which applies the same edit to the history
 /// it is about to re-seed a fresh session with.
+///
+/// A body is traded for its marker only once it is on disk: a failed spill
+/// leaves the result whole rather than naming a file that is not there.
 async fn clear_tool_bodies(
     ctx: &CompactionCtx<'_>,
     snapshot: &crate::context::budget::BudgetSnapshot,
     messages: &mut [ChatMessage],
 ) -> bool {
-    let protect = match ctx.context.preserve_recent_tokens {
-        0 => (snapshot.usable / 4).clamp(2_000, 15_000),
-        explicit => explicit,
-    };
-    let victims = crate::context::prune::plan_prune(messages, protect);
+    let victims = crate::context::prune::plan_prune(
+        messages,
+        protect_tokens(ctx, snapshot),
+        &ctx.context.spill_dir,
+    );
     if victims.is_empty() {
         return false;
     }
-    let freed = crate::context::prune::freed_tokens(messages, &victims);
 
     let mut spills = Vec::with_capacity(victims.len());
-    let mut cleared = Vec::with_capacity(victims.len());
+    let mut markers = Vec::with_capacity(victims.len());
     for index in &victims {
-        let Some(message) = messages.get_mut(*index) else {
+        let Some(message) = messages.get(*index) else {
             continue;
         };
         // Named by tool-call id so a re-clear overwrites the same file; the id
         // is model output, so `spill_file_name` sanitises it into a file name.
         let name = crate::context::prune::spill_file_name(message.tool_call_id.as_deref(), *index);
         let path = ctx.context.spill_dir.join(name);
-        let marker = crate::context::prune::cleared_marker(&path.to_string_lossy());
-        let body = std::mem::replace(&mut message.content, marker.clone());
-        if let Some(id) = message.tool_call_id.clone() {
-            cleared.push((id, marker));
-        }
-        spills.push((path, body));
+        markers.push((
+            *index,
+            crate::context::prune::cleared_marker(&path.to_string_lossy()),
+        ));
+        spills.push((*index, path, message.content.clone()));
     }
     // Blocking file I/O never runs on an async worker (invariant 9); awaited so
     // the spill exists before the model can be told to read it back.
-    let spilled = tokio::task::spawn_blocking(move || {
-        let mut written = 0usize;
-        for (path, content) in spills {
+    let written: Vec<usize> = tokio::task::spawn_blocking(move || {
+        let mut written = Vec::with_capacity(spills.len());
+        for (index, path, content) in spills {
             match crate::util::atomic_write(&path, content.as_bytes()) {
-                Ok(()) => written += 1,
+                Ok(()) => written.push(index),
                 Err(e) => tracing::warn!("Failed to spill tool output to {}: {e}", path.display()),
             }
         }
@@ -605,15 +621,33 @@ async fn clear_tool_bodies(
     .await
     .unwrap_or_else(|e| {
         tracing::warn!("Tool-output spill task failed: {e}");
-        0
+        Vec::new()
     });
+
+    let mut cleared = Vec::with_capacity(written.len());
+    let mut freed = 0u32;
+    let mut rewrote = 0usize;
+    for (index, marker) in markers {
+        if !written.contains(&index) {
+            continue;
+        }
+        let Some(message) = messages.get_mut(index) else {
+            continue;
+        };
+        freed = freed.saturating_add(crate::context::budget_tokens(&message.content));
+        rewrote += 1;
+        if let Some(id) = message.tool_call_id.clone() {
+            cleared.push((id, marker.clone()));
+        }
+        message.content = marker;
+    }
 
     debug_log::log(
         "context.prune",
         format!(
-            "conversation={} cleared={} spilled={spilled} freed_tokens={freed} percent_used={}",
+            "conversation={} cleared={rewrote} spill_failed={} freed_tokens={freed} percent_used={}",
             ctx.conversation,
-            victims.len(),
+            victims.len().saturating_sub(rewrote),
             snapshot.percent_used()
         ),
     );
@@ -627,7 +661,7 @@ async fn clear_tool_bodies(
             freed_tokens: freed,
         });
     }
-    true
+    rewrote > 0
 }
 
 /// Rung 2 for providers that keep the history on their side (DeepSeek's web
@@ -638,11 +672,12 @@ async fn clear_tool_bodies(
 ///
 /// Rung 1's clearing is applied here even though it is normally skipped for
 /// these providers: it is worthless while nothing is re-sent, and it is the
-/// whole point once everything is. The old server-side session is deliberately
-/// left in place — it stays in the user's account as an ordinary chat.
+/// whole point once everything is — so it runs only on the path that actually
+/// re-seeds: a refused or failed reset must not cost a single body. The old
+/// server-side session is left in place, an ordinary chat in the account.
 ///
 /// Returns whether it rewrote the history, which makes the caller's `used`
-/// stale — true also when the reset itself was refused.
+/// stale.
 async fn reset_server_session(
     ctx: &CompactionCtx<'_>,
     used: u32,
@@ -659,15 +694,20 @@ async fn reset_server_session(
         return false;
     }
     let conversation = ctx.conversation;
-    if state.session_reset_done {
-        // A second reset in one turn means the re-seed did not help; looping
-        // would mint a new server session per step.
+    if state.session_reset_done || state.reset_refused {
+        // A second reset in one turn means the re-seed did not help, and a
+        // refusal stands: the history only grows from here.
         if !state.reset_skip_logged {
             state.reset_skip_logged = true;
+            let reason = if state.session_reset_done {
+                "already_reset_this_turn"
+            } else {
+                "still_over_usable"
+            };
             debug_log::log(
                 "context.session_reset.skipped",
                 format!(
-                    "conversation={conversation} reason=already_reset_this_turn percent_used={}",
+                    "conversation={conversation} reason={reason} percent_used={}",
                     snapshot.percent_used()
                 ),
             );
@@ -675,13 +715,32 @@ async fn reset_server_session(
         return false;
     }
 
-    let rewrote = clear_tool_bodies(ctx, &snapshot, messages).await;
-    // The re-seed carries the whole local history, so it is measured locally.
-    // `used` is what the *old* session held — a different number on purpose.
-    let after = crate::context::conversation_tokens(ctx.system_prompt, messages);
+    // Prospective, before anything is touched: the local history the re-seed
+    // would carry, less what clearing frees, plus the markers it leaves.
+    let victims = crate::context::prune::plan_prune(
+        messages,
+        protect_tokens(ctx, &snapshot),
+        &ctx.context.spill_dir,
+    );
+    let markers: u32 = victims
+        .iter()
+        .filter_map(|index| messages.get(*index).map(|message| (*index, message)))
+        .map(|(index, message)| {
+            crate::context::prune::marker_tokens(
+                &ctx.context.spill_dir,
+                message.tool_call_id.as_deref(),
+                index,
+            )
+        })
+        .sum();
+    let after = crate::context::conversation_tokens(ctx.system_prompt, messages)
+        .saturating_sub(crate::context::prune::freed_tokens(messages, &victims))
+        .saturating_add(markers);
     if after > snapshot.usable {
-        // The re-seed would be oversized too: one refused request instead of
-        // two. Rung 3 is what handles a history this big.
+        // The re-seed would be oversized too — rung 3's job. Nothing is
+        // cleared: a body that is never re-sent is cleared for nothing.
+        state.reset_refused = true;
+        state.reset_skip_logged = true;
         debug_log::log(
             "context.session_reset.skipped",
             format!(
@@ -689,7 +748,7 @@ async fn reset_server_session(
                 snapshot.usable
             ),
         );
-        return rewrote;
+        return false;
     }
     if let Err(e) = ctx.provider.reset().await {
         tracing::warn!("Context session reset failed: {e}");
@@ -697,10 +756,14 @@ async fn reset_server_session(
             "context.session_reset.failed",
             format!("conversation={conversation} error={e}"),
         );
-        return rewrote;
+        return false;
     }
 
     state.session_reset_done = true;
+    // Only now: the bodies are cleared for the re-seed that is actually going
+    // to happen, and the real figure replaces the estimate.
+    clear_tool_bodies(ctx, &snapshot, messages).await;
+    let after = crate::context::conversation_tokens(ctx.system_prompt, messages);
     debug_log::log(
         "context.session_reset",
         format!(
@@ -1742,6 +1805,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A spill that cannot be written leaves the body where it is. The marker
+    /// would name a file that is not there, and the text is gone from the
+    /// runner's history, the app's, and the saved session at once.
+    #[tokio::test]
+    async fn a_body_whose_spill_fails_is_never_replaced_by_a_marker() {
+        let old_body = "o".repeat(30_000);
+        // Unwritable in a portable way: the spill directory's parent is an
+        // ordinary file, so `create_dir_all` cannot succeed on any platform.
+        let blocker =
+            std::env::temp_dir().join(format!("pooprusteek-blocked-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("the blocking file is created");
+        let dir = blocker.join("spill");
+
+        let fake = Arc::new(FakeProvider::with_response("Done."));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                messages: vec![
+                    ChatMessage::user("go"),
+                    ChatMessage::assistant("<tool_use>…</tool_use>"),
+                    ChatMessage::tool("call-old-1", &old_body),
+                    ChatMessage::assistant("<tool_use>…</tool_use>"),
+                    ChatMessage::tool("call-new-2", &"r".repeat(300)),
+                ],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 1,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    // The same over-the-trigger window as the rung-1 test.
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let request = fake.request(0).expect("one request went to the provider");
+        let tool_messages: Vec<&ChatMessage> =
+            request.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(
+            tool_messages[0].content, old_body,
+            "the body outlives a spill that could not be written"
+        );
+        while let Ok(ev) = event_rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::ToolOutputCleared { .. }),
+                "the app must not be told to clear what is only in memory"
+            );
+        }
+        assert!(!dir.exists(), "the spill directory could not be created");
+
+        let _ = std::fs::remove_file(&blocker);
+    }
+
     /// A history that is over rung 2's trigger: one old tool result, one
     /// in-flight one, and an assistant reply between them.
     fn overfull_history(user_body: &str, old_body: &str, recent_body: &str) -> Vec<ChatMessage> {
@@ -1832,9 +1967,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Step 4 of rung 2: when the cleared history still does not fit, a reset
-    /// would only re-send something oversized, so it does not happen. Here the
-    /// bulk is a user message, which no rung below 3 can touch.
+    /// Step 4 of rung 2: when even the cleared history would not fit, a reset
+    /// would only re-send something oversized, so it does not happen — and
+    /// nothing is cleared either. For a provider that keeps the history, a body
+    /// cleared without a re-seed never goes on the wire again: it is pure loss,
+    /// and the app applies the same edit to the session it saves. Here the bulk
+    /// is a user message, which no rung below 3 can touch.
     #[tokio::test]
     async fn no_session_reset_when_the_cleared_history_still_overflows() {
         let dir = std::env::temp_dir().join(format!("pooprusteek-reset-{}", uuid::Uuid::new_v4()));
@@ -1873,13 +2011,14 @@ mod tests {
         .await;
 
         let request = fake.request(0).expect("one request went to the provider");
-        let cleared = request
+        let old = request
             .iter()
             .find(|m| m.role == Role::Tool)
             .expect("the old tool result is still in the history");
-        assert!(
-            crate::context::prune::is_cleared(&cleared.content),
-            "the clearing runs first — this test is about what happens after it"
+        assert_eq!(
+            old.content,
+            "o".repeat(30_000),
+            "a refused re-seed must not cost a single body"
         );
         assert_eq!(
             fake.resets(),
@@ -1888,11 +2027,94 @@ mod tests {
         );
         while let Ok(ev) = event_rx.try_recv() {
             assert!(
-                !matches!(ev, AppEvent::SessionReset { .. }),
-                "nothing was reset, so nothing may be announced"
+                !matches!(
+                    ev,
+                    AppEvent::SessionReset { .. } | AppEvent::ToolOutputCleared { .. }
+                ),
+                "nothing was reset or cleared, so nothing may be announced"
             );
         }
+        assert!(!dir.exists(), "nothing may be spilled on the refusal path");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The refusal is decided once per turn, like every other skip: without a
+    /// guard the estimate is redone — and its trace line repeated — on every
+    /// step, since `session_reset_done` is only set by a reset that happened.
+    #[tokio::test]
+    async fn a_refused_session_reset_is_decided_once_per_turn() {
+        let trace =
+            std::env::temp_dir().join(format!("pooprusteek-trace-{}.log", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pooprusteek-reset-{}", uuid::Uuid::new_v4()));
+        crate::debug_log::configure(trace.clone(), crate::debug_log::Format::Human);
+        crate::debug_log::set_enabled(true).expect("the trace sink opens");
+
+        let call = r#"<tool_use><name>loud</name><arguments>{}</arguments></tool_use>"#;
+        let fake = Arc::new(
+            FakeProvider::with_responses(vec![
+                call.to_string(),
+                call.to_string(),
+                "Done.".to_string(),
+            ])
+            .server_side_history(),
+        );
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(LoudTool));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                // The same history rung 2 refuses to re-seed, over three steps.
+                messages: overfull_history(&"u".repeat(45_000), &"o".repeat(30_000), "r"),
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 5,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            tools,
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+        crate::debug_log::set_enabled(false).expect("the trace is closed again");
+
+        assert!(
+            fake.request(2).is_some(),
+            "the turn has to run more than one step for this to mean anything"
+        );
+        assert_eq!(fake.resets(), 0, "the re-seed is refused, not performed");
+        assert!(
+            trace.exists(),
+            "the trace went elsewhere: the sink was already configured"
+        );
+        // The id makes the count immune to whatever else logs in parallel.
+        let needle = format!("conversation={cid} reason=still_over_usable");
+        let refusals = std::fs::read_to_string(&trace)
+            .expect("the trace is readable")
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .count();
+        assert_eq!(refusals, 1, "one refusal per turn, not one per step");
+
+        let _ = std::fs::remove_file(&trace);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

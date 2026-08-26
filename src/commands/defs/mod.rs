@@ -6,6 +6,7 @@ pub mod clear;
 pub mod compact;
 pub mod cwd;
 pub mod debug;
+pub mod default_compact;
 pub mod delete;
 pub mod export;
 pub mod goal;

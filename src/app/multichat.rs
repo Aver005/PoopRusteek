@@ -112,6 +112,8 @@ impl App {
                 tag: None,
                 broken: false,
                 context_used: 0,
+                compact_mode: None,
+                compacting: None,
             });
         Ok(())
     }
@@ -299,6 +301,8 @@ impl App {
             tag: None,
             broken: false,
             context_used: 0,
+            compact_mode: None,
+            compacting: None,
         });
         self.state.scroll_offset = 0;
         self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();
@@ -429,5 +433,94 @@ impl App {
             PickerKind::Agents,
         );
         self.state.modal = Some(Modal::Picker(picker));
+    }
+}
+
+impl App {
+    /// `/compact [1|2|3]` — run rung 3 by hand. Spawned, never awaited on the
+    /// event loop (invariant 1): summarising is one model call per chunk.
+    pub(crate) fn spawn_compaction(&mut self, requested: Option<u8>) {
+        let conversation = self.state.conversations.focused_id();
+        let Some(chat) = self.state.conversations.get(conversation) else {
+            return;
+        };
+        // Both refusals guard the same thing: the task rewrites a snapshot of
+        // the history, so nothing else may be appending to it meanwhile.
+        if chat.compacting.is_some() {
+            self.state.status_message =
+                "Already compacting this chat — wait for it to finish.".to_string();
+            return;
+        }
+        if chat.is_streaming() {
+            self.state.status_message =
+                "Cannot compact while the chat is streaming — stop the turn or wait.".to_string();
+            return;
+        }
+        let Some(provider) = chat.provider.clone() else {
+            self.state.status_message = "No provider configured — cannot compact.".to_string();
+            return;
+        };
+        let mode = crate::context::modes::CompactMode::from_number(
+            requested
+                .or(chat.compact_mode)
+                .unwrap_or_else(|| self.config.context.effective_compact_mode()),
+        );
+        let messages = chat.messages.clone();
+        let mut budget = crate::context::ContextBudget::from_config(
+            self.config.context.context_window,
+            self.config.context.reserved_tokens,
+        );
+        budget.learn_provider_window(self.state.provider_context_window);
+        // No window means no budget to plan against; mode 1 needs one to judge
+        // whether the opening turn is small enough to keep.
+        let usable = budget.usable().unwrap_or(0);
+        let model = self.config.active_model().to_string();
+        let event_tx = self.event_tx.clone();
+        let snapshot_len = messages.len();
+        self.state.status_message = format!("Compacting with mode {}…", mode.number());
+        let handle = tokio::spawn(async move {
+            // Summarise on a throwaway fork, never on the chat's own handle: a
+            // DeepSeek provider would otherwise write the summariser prompt and
+            // its reply into the live server branch the user can open in the
+            // web UI.
+            let summariser = provider.fork();
+            let outcome =
+                crate::context::compact::compact(&summariser, &messages, mode, usable, &model)
+                    .await;
+            let _ = summariser.discard_remote_session().await;
+            // A provider that keeps history server-side still holds the old,
+            // uncompacted branch. Rewriting the local copy changes nothing until
+            // the server is made to forget it, so re-seed from the summary.
+            if outcome.is_ok() && provider.keeps_server_side_history() {
+                let _ = provider.reset().await;
+            }
+            let (messages, status) = match outcome {
+                Ok(done) => (
+                    Some(done.messages),
+                    format!(
+                        "Compacted with mode {}: ~{} tokens instead of ~{} ({} model call(s))",
+                        mode.number(),
+                        done.after_tokens,
+                        done.before_tokens,
+                        done.calls
+                    ),
+                ),
+                Err(reason) => (None, reason),
+            };
+            let _ = event_tx.send(AppEvent::CompactFinished {
+                conversation,
+                messages,
+                status,
+            });
+        });
+        if let Some(target) = self.state.conversations.get_mut(conversation) {
+            if let Some(number) = requested {
+                target.compact_mode = Some(number);
+            }
+            target.begin_compaction(snapshot_len, std::time::Instant::now());
+            // Kept so Ctrl+C / Esc can abort the run; that path clears the flag
+            // itself, because an aborted task sends no `CompactFinished`.
+            target.agent_task = Some(handle);
+        }
     }
 }

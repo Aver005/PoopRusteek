@@ -75,6 +75,12 @@ pub struct Conversation {
     /// measured by `crate::context::conversation_tokens`. 0 until the first
     /// step reports one. An estimate for thresholds, never a token count.
     pub context_used: u32,
+    /// `/compact <n>` for this chat only. `None` falls back to
+    /// `[context] compact_mode`.
+    pub compact_mode: Option<u8>,
+    /// Rung 3 in flight: how many messages the compaction task snapshotted.
+    /// `None` when idle — set for the whole run, cleared on every exit path.
+    pub compacting: Option<usize>,
 }
 
 impl Conversation {
@@ -95,6 +101,8 @@ impl Conversation {
             tag: None,
             broken: false,
             context_used: 0,
+            compact_mode: None,
+            compacting: None,
         }
     }
 
@@ -154,6 +162,37 @@ impl Conversation {
         self.generation.last_status = Some(status.to_string());
         self.agent_task = None;
         self.discard_empty_assistant();
+    }
+
+    // ─── Rung 3 (`/compact`) lifecycle ─────────────────────────
+    // The busy flag doubles as the snapshot length, so the finishing side can
+    // tell whether the history it is about to replace is still the one it read.
+
+    /// Mark a compaction as started over `snapshot_len` messages. Busy is held
+    /// on `generation` too, so the Enter guard blocks a turn meanwhile.
+    pub fn begin_compaction(&mut self, snapshot_len: usize, now: std::time::Instant) {
+        self.compacting = Some(snapshot_len);
+        self.generation.begin(now);
+    }
+
+    /// Release the busy state and hand back the snapshot length. `None` means
+    /// this run was already dropped (cancelled) and its result must be ignored.
+    pub fn end_compaction(&mut self) -> Option<usize> {
+        let base = self.compacting.take()?;
+        self.generation.active = false;
+        self.agent_task = None;
+        Some(base)
+    }
+
+    /// Swap in a compacted history, keeping whatever arrived after the
+    /// snapshot. `None` = the history shrank under the task; nothing is
+    /// touched.
+    pub fn swap_compacted(&mut self, base: usize, mut rebuilt: Vec<ChatMessage>) -> Option<usize> {
+        let appended = self.messages.len().checked_sub(base)?;
+        rebuilt.extend_from_slice(&self.messages[base..]);
+        self.messages = rebuilt;
+        self.context_used = crate::context::conversation_tokens("", &self.messages);
+        Some(appended)
     }
 }
 
@@ -294,5 +333,77 @@ mod tests {
         let b = ConversationId::next();
         assert_ne!(a, b);
         assert!(b.0 > a.0);
+    }
+
+    fn chat(messages: &[&str]) -> Conversation {
+        let mut conv = Conversation::fresh_main(None);
+        conv.messages = messages.iter().map(|m| ChatMessage::user(m)).collect();
+        conv
+    }
+
+    #[test]
+    fn a_running_compaction_marks_the_chat_busy() {
+        let mut conv = chat(&["a", "b"]);
+        assert!(!conv.is_streaming());
+        conv.begin_compaction(2, std::time::Instant::now());
+        assert_eq!(conv.compacting, Some(2));
+        // The Enter guard in `keys/chat.rs` reads exactly this flag.
+        assert!(conv.is_streaming());
+    }
+
+    #[test]
+    fn ending_a_compaction_releases_the_chat_once() {
+        let mut conv = chat(&["a"]);
+        conv.begin_compaction(1, std::time::Instant::now());
+        assert_eq!(conv.end_compaction(), Some(1));
+        assert!(!conv.is_streaming());
+        assert_eq!(conv.compacting, None);
+        // A second result for the same run finds no claim and must be ignored.
+        assert_eq!(conv.end_compaction(), None);
+    }
+
+    #[test]
+    fn messages_that_arrived_during_a_compaction_survive_the_swap() {
+        let mut conv = chat(&["one", "two", "three"]);
+        conv.begin_compaction(3, std::time::Instant::now());
+        conv.messages.push(ChatMessage::user("sent meanwhile"));
+        let base = conv.end_compaction().expect("claim held");
+        let rebuilt = vec![ChatMessage::user("[Context summary] …")];
+
+        assert_eq!(conv.swap_compacted(base, rebuilt), Some(1));
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[1].content, "sent meanwhile");
+    }
+
+    #[test]
+    fn a_history_that_shrank_is_never_overwritten() {
+        let mut conv = chat(&["one", "two", "three"]);
+        conv.begin_compaction(3, std::time::Instant::now());
+        conv.messages.clear(); // Esc / a loaded session
+        let base = conv.end_compaction().expect("claim held");
+
+        assert_eq!(
+            conv.swap_compacted(base, vec![ChatMessage::user("x")]),
+            None
+        );
+        assert!(conv.messages.is_empty());
+    }
+
+    #[test]
+    fn a_swap_refreshes_the_context_indicator() {
+        let mut conv = chat(&["a very long opening message"; 40]);
+        conv.context_used = 9_999;
+        conv.begin_compaction(40, std::time::Instant::now());
+        let base = conv.end_compaction().expect("claim held");
+
+        assert!(
+            conv.swap_compacted(base, vec![ChatMessage::user("short summary")])
+                .is_some()
+        );
+        assert_eq!(
+            conv.context_used,
+            crate::context::conversation_tokens("", &conv.messages)
+        );
+        assert!(conv.context_used < 9_999);
     }
 }

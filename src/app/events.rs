@@ -103,6 +103,14 @@ pub enum AppEvent {
     BeginAssistantMessage(ConversationId),
     DiscardEmptyAssistantMessage(ConversationId),
     AddMessage(ConversationId, ChatMessage),
+    /// `/compact` finished. `messages` is `Some` only when the summary was
+    /// accepted; on refusal the history is left exactly as it was and only the
+    /// status line changes.
+    CompactFinished {
+        conversation: ConversationId,
+        messages: Option<Vec<ChatMessage>>,
+        status: String,
+    },
     /// The active provider answered with its model's context window. Sent
     /// once at startup; absent whenever the provider cannot say.
     ContextWindowLearned(u32),

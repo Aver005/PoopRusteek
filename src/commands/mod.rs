@@ -108,6 +108,12 @@ pub enum CommandResult {
     ToggleSkill(String, bool),
     /// `/btw <question>` — run a one-shot side-answer in the background.
     Sidechat(String),
+    /// `/compact [1|2|3]` — run the compaction ladder by hand. `Some(mode)`
+    /// sets the focused chat's mode as well as running with it; `None` runs
+    /// with whatever the chat already has (falling back to
+    /// `[context] compact_mode`). Summarising needs a model call, which a
+    /// synchronous command cannot make — the work belongs to the interpreter.
+    Compact(Option<u8>),
     /// `/new` — open a fresh parallel chat and focus it.
     NewChat,
     /// `/chats` — open the chat switcher picker.
@@ -230,6 +236,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::quit::QuitCommand));
         self.register(Box::new(defs::version::VersionCommand));
         self.register(Box::new(defs::compact::CompactCommand));
+        self.register(Box::new(defs::default_compact::DefaultCompactCommand));
         self.register(Box::new(defs::last::LastCommand));
         self.register(Box::new(defs::load::LoadCommand));
         self.register(Box::new(defs::session_info::SessionInfoCommand));

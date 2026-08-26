@@ -426,6 +426,11 @@ pub struct ContextConfig {
     /// Characters kept per tool result before it is truncated.
     #[serde(default = "default_context_tool_output_limit")]
     pub tool_output_limit: u32,
+    /// Which summary mode `/compact` uses when a chat has not overridden it.
+    /// 1 = first and last turn verbatim, middle summarised; 2 = map-reduce
+    /// over the oldest half; 3 = everything before the last turn.
+    #[serde(default = "default_context_compact_mode")]
+    pub compact_mode: u8,
 }
 
 fn default_context_auto_compact() -> bool {
@@ -451,6 +456,10 @@ fn default_context_tool_output_limit() -> u32 {
     10_000
 }
 
+fn default_context_compact_mode() -> u8 {
+    ContextConfig::DEFAULT_COMPACT_MODE
+}
+
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
@@ -459,6 +468,25 @@ impl Default for ContextConfig {
             reserved_tokens: default_context_reserved_tokens(),
             preserve_recent_tokens: default_context_preserve_recent_tokens(),
             tool_output_limit: default_context_tool_output_limit(),
+            compact_mode: default_context_compact_mode(),
+        }
+    }
+}
+
+impl ContextConfig {
+    /// The mode `/compact` falls back to.
+    pub const DEFAULT_COMPACT_MODE: u8 = 1;
+    /// Highest mode the ladder knows.
+    pub const MAX_COMPACT_MODE: u8 = 3;
+
+    /// `compact_mode`, or `DEFAULT_COMPACT_MODE` if it is outside 1-3.
+    /// Parsing stays permissive on purpose: a config written by a newer
+    /// build (or hand-edited) must still load, so the value is checked here
+    /// at use time instead of being rejected at parse time.
+    pub fn effective_compact_mode(&self) -> u8 {
+        match self.compact_mode {
+            m if (1..=Self::MAX_COMPACT_MODE).contains(&m) => m,
+            _ => Self::DEFAULT_COMPACT_MODE,
         }
     }
 }
@@ -932,6 +960,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(off.rag_limit, RagLimit::Off);
+    }
+
+    #[test]
+    fn compact_mode_defaults_to_one() {
+        assert_eq!(ContextConfig::default().compact_mode, 1);
+        // A [context] section written before the field existed still loads.
+        let parsed: ContextConfig = toml::from_str("auto_compact = true\n").unwrap();
+        assert_eq!(parsed.compact_mode, 1);
+        assert_eq!(parsed.effective_compact_mode(), 1);
+    }
+
+    #[test]
+    fn out_of_range_compact_mode_parses_and_falls_back() {
+        // Parsing stays permissive; the helper is what guards the range.
+        for (text, raw) in [("compact_mode = 0\n", 0), ("compact_mode = 9\n", 9)] {
+            let parsed: ContextConfig = toml::from_str(text).unwrap();
+            assert_eq!(parsed.compact_mode, raw);
+            assert_eq!(parsed.effective_compact_mode(), 1);
+        }
+        let ok: ContextConfig = toml::from_str("compact_mode = 3\n").unwrap();
+        assert_eq!(ok.effective_compact_mode(), 3);
     }
 
     #[test]

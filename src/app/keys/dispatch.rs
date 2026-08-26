@@ -121,6 +121,9 @@ impl App {
             CommandResult::Sidechat(question) => {
                 self.spawn_sidechat(question).await?;
             }
+            CommandResult::Compact(mode) => {
+                self.spawn_compaction(mode);
+            }
             CommandResult::NewChat => {
                 self.new_conversation();
             }

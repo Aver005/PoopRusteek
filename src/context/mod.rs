@@ -9,8 +9,11 @@
 //! model receives; the untrimmed text still reaches the UI and the trace.
 
 pub mod budget;
+pub mod compact;
+pub mod modes;
 pub mod prune;
 pub mod spec;
+pub mod summary;
 
 /// How full the window must be before rung 1 starts clearing tool bodies.
 /// Below the summary threshold on purpose: the cheap rung runs first.

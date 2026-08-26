@@ -638,6 +638,39 @@ impl App {
                     .begin(std::time::Instant::now());
                 self.state.status_message = "Thinking...".to_string();
             }
+            AppEvent::CompactFinished {
+                conversation,
+                messages,
+                status,
+            } => {
+                let mut status = status;
+                if let Some(target) = self.state.conversations.get_mut(conversation) {
+                    match (target.end_compaction(), messages) {
+                        // Splice rather than refuse: the summary is already paid
+                        // for, and appending newcomers loses nothing either way.
+                        (Some(base), Some(rebuilt)) => {
+                            match target.swap_compacted(base, rebuilt) {
+                                Some(0) => {}
+                                Some(extra) => {
+                                    status = format!("{status}; kept {extra} newer message(s)");
+                                }
+                                None => {
+                                    status = "Compaction dropped: this chat's history changed while it ran.".to_string();
+                                }
+                            }
+                        }
+                        (Some(_), None) => {}
+                        // No flag: the run was cancelled, so its history is stale
+                        // by definition and the current one wins.
+                        (None, _) => {
+                            status = "Compaction dropped: it was cancelled.".to_string();
+                        }
+                    }
+                }
+                if conversation == self.state.conversations.focused_id() {
+                    self.state.status_message = status;
+                }
+            }
             AppEvent::ContextWindowLearned(window) => {
                 self.state.provider_context_window = window;
             }
@@ -981,6 +1014,9 @@ impl App {
         self.purge_interactions_for(conversation).await;
         let killed = self.state.background.shutdown_all().await;
         self.state.focused_mut().generation.active = false;
+        // The aborted task may have been a `/compact`: drop its claim here, or
+        // the command stays refused for this chat forever.
+        self.state.focused_mut().compacting = None;
         self.state.status_message = if killed > 0 {
             format!("Cancelled; killed {killed} background process(es)")
         } else {
