@@ -10,7 +10,8 @@
 //! calls — neither runs the agent loop.
 //!
 //! Subcommands:
-//! - `exec` — one turn, one JSONL trace ([`driver`]).
+//! - `exec` — one turn (or several, in one conversation), one JSONL trace
+//!   ([`driver`]).
 //! - `scenario` / `suite` — a turn repeated N times with expectations, since
 //!   one sample of a nondeterministic model proves nothing ([`scenario`]).
 //! - `mine` — bucket failure patterns across traces and saved sessions
@@ -56,8 +57,10 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct ExecArgs {
-    /// The user message to send.
-    pub prompt: String,
+    /// The user message to send. Give several and they run as several turns
+    /// in one conversation, sharing history and the provider session.
+    #[arg(required = true, num_args = 1..)]
+    pub prompts: Vec<String>,
 
     /// Working directory for the turn (tools run here).
     #[arg(long, short = 'C')]
@@ -209,7 +212,7 @@ pub async fn run(command: Command, config: Config, config_path: Option<PathBuf>)
 
 async fn exec(args: ExecArgs, config: Config) -> AppResult<i32> {
     let options = ExecOptions {
-        prompt: args.prompt,
+        prompts: args.prompts,
         workspace: args.workspace,
         trace_path: args.trace.unwrap_or_else(default_trace_path),
         approve: args.approve,

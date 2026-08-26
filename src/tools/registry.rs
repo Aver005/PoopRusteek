@@ -33,6 +33,7 @@ impl ToolRegistry {
         self.register(Arc::new(shell_control::ShellKillTool));
         self.register(Arc::new(shell_control::ShellListTool));
         self.register(Arc::new(shell_control::ShellInputTool));
+        self.register(Arc::new(read_file::ReadFileTool));
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {

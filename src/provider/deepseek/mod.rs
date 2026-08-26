@@ -167,11 +167,28 @@ impl DeepseekProvider {
         }
     }
 
+    /// Wrapper that books the reply into the session tally on every exit
+    /// path: a torn stream still left its text in the server's branch.
     async fn drive_completion_once(
         &self,
         request: &CompletionRequest,
         log_tag: &str,
         on_text: &mut (impl FnMut(String) + Send),
+    ) -> AppResult<()> {
+        let mut reply_chars = 0usize;
+        let result = self
+            .stream_completion_once(request, log_tag, on_text, &mut reply_chars)
+            .await;
+        self.add_session_tokens(crate::context::budget_tokens_for_chars(reply_chars));
+        result
+    }
+
+    async fn stream_completion_once(
+        &self,
+        request: &CompletionRequest,
+        log_tag: &str,
+        on_text: &mut (impl FnMut(String) + Send),
+        reply_chars: &mut usize,
     ) -> AppResult<()> {
         let (response, session_id) = self.send_request(request).await?;
         let mut stream = response.bytes_stream();
@@ -250,6 +267,7 @@ impl DeepseekProvider {
                         format!("text_chunk={}", text),
                     );
                     text_bytes += text.len();
+                    *reply_chars += text.chars().count();
                     on_text(text);
                 }
                 if event.finished {
@@ -330,7 +348,20 @@ impl LLMProvider for DeepseekProvider {
         &self.model
     }
 
+    fn keeps_server_side_history(&self) -> bool {
+        // `build_prompt` sends only the tail after the last assistant message;
+        // the branch itself lives on the server (`session.rs`).
+        true
+    }
+
+    fn session_tokens(&self) -> Option<u32> {
+        // What this session was actually fed, which after a reset is far less
+        // than the local history — the number the compaction ladder needs.
+        self.session_tokens_used()
+    }
+
     fn fork(&self) -> Arc<dyn LLMProvider> {
+        // A fork is still DeepSeek: fresh session, same server-side history.
         Arc::new(self.fork_session())
     }
 
@@ -400,6 +431,9 @@ impl LLMProvider for DeepseekProvider {
         // The remote thread already has the system prompt/history from
         // whatever session created it — resending it would duplicate context.
         state.system_sent_for_session = true;
+        // How much that thread already holds is unknowable from here, so the
+        // meter says so and callers fall back to the local history.
+        state.session_tokens = None;
         debug_log::log(
             "session.adopt",
             format!("resumed session_id={session_id} parent_message_id={parent_message_id:?}"),
@@ -535,5 +569,58 @@ mod tests {
         // Must be true — otherwise the next turn would resend the system
         // prompt + local history into a thread that already has them.
         assert!(s.system_sent_for_session);
+    }
+
+    /// The counter's own arithmetic. The send path that feeds it needs the
+    /// network, so what is checked here is the accounting, not the wiring.
+    #[tokio::test]
+    async fn the_session_tally_grows_with_what_is_sent_and_zeroes_on_reset() {
+        let p = provider();
+        assert_eq!(p.session_tokens(), Some(0), "nothing sent yet");
+
+        p.add_session_tokens(crate::context::budget_tokens(&"x".repeat(300)));
+        p.add_session_tokens(crate::context::budget_tokens(&"y".repeat(600)));
+        assert_eq!(
+            p.session_tokens(),
+            Some(300),
+            "100 for the prompt, 200 back"
+        );
+
+        p.reset().await.unwrap();
+        assert_eq!(
+            p.session_tokens(),
+            Some(0),
+            "a fresh session means the server forgot; so must the meter"
+        );
+    }
+
+    #[test]
+    fn a_fork_starts_its_tally_at_zero() {
+        let parent = provider();
+        parent.add_session_tokens(1_000);
+
+        // A fork is a different session — it inherits nothing to account for.
+        let forked = parent.fork_session();
+        assert_eq!(forked.session_tokens(), Some(0));
+        assert_eq!(
+            parent.session_tokens(),
+            Some(1_000),
+            "and the parent's own tally is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adopted_session_reports_an_unknown_tally() {
+        let p = provider();
+        p.adopt_session("resumed-sess", Some(17)).await.unwrap();
+        // Zero would claim the resumed thread is empty and keep rung 2 asleep
+        // forever; `None` sends the caller back to the local history.
+        assert_eq!(p.session_tokens(), None);
+        p.add_session_tokens(500);
+        assert_eq!(
+            p.session_tokens(),
+            None,
+            "unknown plus a known send is still unknown"
+        );
     }
 }

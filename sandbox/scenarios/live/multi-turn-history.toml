@@ -1,0 +1,38 @@
+# Three turns in one conversation. Each turn reads a file in full, so history
+# grows across turns — which is where the compaction ladder lives (clearing,
+# session reset, summarising between turns). The last turn forbids re-reading,
+# so the summary can only be written from what earlier turns put in history:
+# if a turn is started on a fresh or truncated history, `largest` (turn 1) and
+# the failing test (turn 2) cannot appear in the file.
+name = "multi-turn-history"
+description = "Three turns, one conversation — the last answers from earlier turns' history"
+prompts = [
+  "Read every file in this directory. Quote calculator.py in full in your answer, then list the functions it defines.",
+  "Now read test_calculator.py in full, quote it in your answer, and say which of those functions the tests cover and which test currently fails.",
+  "Do not read or run anything else. From what you already have, write summary.md listing every function defined in calculator.py, one per line, and a final line naming the function whose test fails.",
+]
+workspace_template = "../../fixtures/broken-calc"
+timeout = 420
+max_steps = 8
+repeat = 2
+
+[expect]
+status = "completed"
+# Across all three turns, not per turn.
+max_steps = 24
+files_exist = ["summary.md", "calculator.py", "test_calculator.py"]
+min_pass_rate = 0.66
+
+# Only turn 1 saw calculator.py, and turn 3 was told not to look again.
+[[expect.file_matches]]
+path = "summary.md"
+pattern = '(?i)\btotal\b'
+
+[[expect.file_matches]]
+path = "summary.md"
+pattern = '(?i)\blargest\b'
+
+# `average` is the failing one — it comes out of turn 2's reading of the tests.
+[[expect.file_matches]]
+path = "summary.md"
+pattern = '(?i)\baverage\b'

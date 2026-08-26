@@ -9,7 +9,18 @@
 //! model receives; the untrimmed text still reaches the UI and the trace.
 
 pub mod budget;
+pub mod prune;
+pub mod spec;
+
+/// How full the window must be before rung 1 starts clearing tool bodies.
+/// Below the summary threshold on purpose: the cheap rung runs first.
+pub const PRUNE_TRIGGER_PERCENT: u8 = 70;
+
+/// How full the window must be before rung 2 resets a server-side session.
+/// Above rung 1's trigger: clearing bodies is free, a re-seeded session is not.
+pub const SESSION_RESET_PERCENT: u8 = 90;
 mod tool_output;
 
-pub use budget::{ContextBudget, conversation_tokens};
+pub use budget::{ContextBudget, budget_tokens, budget_tokens_for_chars, conversation_tokens};
+pub use spec::ContextSpec;
 pub use tool_output::cap_tool_output;

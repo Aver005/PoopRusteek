@@ -9,11 +9,29 @@ use serde_json::{Value, json};
 
 const CREATE_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct SessionState {
     pub(super) session_id: Option<String>,
     pub(super) parent_message_id: Option<i64>,
     pub(super) system_sent_for_session: bool,
+    /// Budget tokens this server-side session has been fed since it was
+    /// minted. `None` = the session came from elsewhere (`adopt_session`), so
+    /// what the server still holds is unknown.
+    pub(super) session_tokens: Option<u32>,
+}
+
+impl Default for SessionState {
+    /// No session yet means nothing has been sent yet — zero, not unknown.
+    /// Every reset path goes through here, which is what keeps the counter
+    /// honest across `reset()`, `discard_remote_session()` and `fork()`.
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            parent_message_id: None,
+            system_sent_for_session: false,
+            session_tokens: Some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +106,8 @@ impl DeepseekProvider {
         state.session_id = Some(session_id.clone());
         state.parent_message_id = None;
         state.system_sent_for_session = false;
+        // The server just forgot everything; so does the meter.
+        state.session_tokens = Some(0);
         debug_log::log(
             "session.ensure",
             format!("initialized fresh session_id={session_id}, reset={should_reset}"),
@@ -98,6 +118,25 @@ impl DeepseekProvider {
             parent_message_id: None,
             system_sent_for_session: false,
         })
+    }
+
+    /// Add what was actually put on the wire to the current session's tally.
+    /// A session whose size is unknown stays unknown — adding to a guess would
+    /// invent a number the caller then trusts.
+    pub(super) fn add_session_tokens(&self, tokens: u32) {
+        if tokens == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.session_state.lock()
+            && let Some(total) = state.session_tokens.as_mut()
+        {
+            *total = total.saturating_add(tokens);
+        }
+    }
+
+    /// What this instance's live session has accumulated, in budget tokens.
+    pub(super) fn session_tokens_used(&self) -> Option<u32> {
+        self.session_state.lock().ok()?.session_tokens
     }
 
     pub(super) fn mark_session_after_success(

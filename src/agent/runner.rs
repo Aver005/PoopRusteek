@@ -42,12 +42,22 @@ pub async fn run_agent_loop(
         max_tools_per_step,
         auto_approve,
         tool_output_limit,
+        context,
     } = spec;
     let mut collected_tool_calls = Vec::new();
     let mut malformed_retries: u32 = 0;
     let mut empty_retries: u32 = 0;
+    let mut compaction = CompactionState::default();
 
     inject_semantic_hint(conversation, &semantic, &mut messages).await;
+
+    let compaction_ctx = CompactionCtx {
+        conversation,
+        provider: &provider,
+        context: &context,
+        system_prompt: &system_prompt,
+        event_tx: &event_tx,
+    };
 
     let ctx = ToolExecContext {
         conversation,
@@ -74,15 +84,24 @@ pub async fn run_agent_loop(
                 messages.len()
             ),
         );
+        // Measured here because this is the one place that sees exactly what
+        // goes on the wire. Runs on the agent task, never the event loop.
+        let mut used = context_used(&provider, &system_prompt, &messages);
+        // Every step, not just the turn boundary: one turn can run a dozen
+        // tool calls and never be checked again after the history grows.
+        if prune_tool_output(&compaction_ctx, used, &mut messages, &mut compaction).await {
+            used = context_used(&provider, &system_prompt, &messages);
+        }
+        // Rung 2, same checkpoint and a higher threshold: rung 1 is free, so it
+        // gets first refusal, and only what it leaves behind reaches this.
+        if reset_server_session(&compaction_ctx, used, &mut messages, &mut compaction).await {
+            used = context_used(&provider, &system_prompt, &messages);
+        }
+
         let _ = event_tx.send(AppEvent::BeginAssistantMessage(conversation));
         let request =
             build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
-        // Measured here because this is the one place that sees exactly what
-        // goes on the wire. Runs on the agent task, never the event loop.
-        let _ = event_tx.send(AppEvent::ContextUsage {
-            conversation,
-            used: crate::context::conversation_tokens(&system_prompt, &messages),
-        });
+        let _ = event_tx.send(AppEvent::ContextUsage { conversation, used });
 
         let outcome = stream_step(conversation, &provider, request, &event_tx).await;
 
@@ -457,6 +476,246 @@ pub async fn run_agent_loop(
     ));
 }
 
+/// How full the window is, from the one source that knows. A provider holding
+/// the history itself counts what it was actually sent since its session
+/// began; everyone else is measured by the local history we re-send each step.
+///
+/// The single caller feeds all three consumers — `AppEvent::ContextUsage`,
+/// rung 1 and rung 2 — from the same value, so the status bar can never
+/// disagree with what the ladder acted on.
+fn context_used(
+    provider: &Arc<dyn LLMProvider>,
+    system_prompt: &str,
+    messages: &[ChatMessage],
+) -> u32 {
+    provider
+        .session_tokens()
+        .unwrap_or_else(|| crate::context::conversation_tokens(system_prompt, messages))
+}
+
+/// What the ladder already did this turn. Each skip is logged once per turn,
+/// not once per step, and rung 2 resets the session at most once.
+#[derive(Default)]
+struct CompactionState {
+    prune_skip_logged: bool,
+    session_reset_done: bool,
+    reset_skip_logged: bool,
+}
+
+/// What every rung of the ladder needs and no rung changes. Built once per
+/// turn; the history and the per-turn state are passed alongside it.
+struct CompactionCtx<'a> {
+    conversation: ConversationId,
+    provider: &'a Arc<dyn LLMProvider>,
+    context: &'a crate::context::ContextSpec,
+    system_prompt: &'a str,
+    event_tx: &'a mpsc::UnboundedSender<AppEvent>,
+}
+
+/// Rung 1 of the compaction ladder: once the window is filling up, clear the
+/// bodies of the oldest tool results, spilling each full text to disk so
+/// `read_file` can fetch it back. Rewrites this turn's message copy and emits
+/// `ToolOutputCleared` so the app applies the same edit to its own history.
+///
+/// Takes the caller's already-computed `used` (one history walk per step) and
+/// returns whether it rewrote anything, which makes that number stale.
+///
+/// Skipped entirely when the provider keeps the history on its own side: those
+/// messages are never sent again, so clearing them costs a disk write for
+/// nothing (`.docs/context-compaction.md` §2.1).
+async fn prune_tool_output(
+    ctx: &CompactionCtx<'_>,
+    used: u32,
+    messages: &mut [ChatMessage],
+    state: &mut CompactionState,
+) -> bool {
+    if !ctx.context.auto_compact {
+        return false;
+    }
+    if ctx.provider.keeps_server_side_history() {
+        if !state.prune_skip_logged {
+            state.prune_skip_logged = true;
+            debug_log::log(
+                "context.prune.skipped",
+                format!(
+                    "conversation={} reason=server_side_history",
+                    ctx.conversation
+                ),
+            );
+        }
+        return false;
+    }
+    let Some(snapshot) = ctx.context.budget().snapshot(used) else {
+        return false; // Unknown window: the ladder stays off (invariant 12).
+    };
+    if snapshot.percent_used() < crate::context::PRUNE_TRIGGER_PERCENT {
+        return false;
+    }
+    clear_tool_bodies(ctx, &snapshot, messages).await
+}
+
+/// The clearing itself, without the decision to run it: spill the bodies of
+/// the settled tool results, leave a marker in their place, tell the app.
+/// Shared by rung 1 and by rung 2, which applies the same edit to the history
+/// it is about to re-seed a fresh session with.
+async fn clear_tool_bodies(
+    ctx: &CompactionCtx<'_>,
+    snapshot: &crate::context::budget::BudgetSnapshot,
+    messages: &mut [ChatMessage],
+) -> bool {
+    let protect = match ctx.context.preserve_recent_tokens {
+        0 => (snapshot.usable / 4).clamp(2_000, 15_000),
+        explicit => explicit,
+    };
+    let victims = crate::context::prune::plan_prune(messages, protect);
+    if victims.is_empty() {
+        return false;
+    }
+    let freed = crate::context::prune::freed_tokens(messages, &victims);
+
+    let mut spills = Vec::with_capacity(victims.len());
+    let mut cleared = Vec::with_capacity(victims.len());
+    for index in &victims {
+        let Some(message) = messages.get_mut(*index) else {
+            continue;
+        };
+        // Named by tool-call id so a re-clear overwrites the same file; the id
+        // is model output, so `spill_file_name` sanitises it into a file name.
+        let name = crate::context::prune::spill_file_name(message.tool_call_id.as_deref(), *index);
+        let path = ctx.context.spill_dir.join(name);
+        let marker = crate::context::prune::cleared_marker(&path.to_string_lossy());
+        let body = std::mem::replace(&mut message.content, marker.clone());
+        if let Some(id) = message.tool_call_id.clone() {
+            cleared.push((id, marker));
+        }
+        spills.push((path, body));
+    }
+    // Blocking file I/O never runs on an async worker (invariant 9); awaited so
+    // the spill exists before the model can be told to read it back.
+    let spilled = tokio::task::spawn_blocking(move || {
+        let mut written = 0usize;
+        for (path, content) in spills {
+            match crate::util::atomic_write(&path, content.as_bytes()) {
+                Ok(()) => written += 1,
+                Err(e) => tracing::warn!("Failed to spill tool output to {}: {e}", path.display()),
+            }
+        }
+        written
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("Tool-output spill task failed: {e}");
+        0
+    });
+
+    debug_log::log(
+        "context.prune",
+        format!(
+            "conversation={} cleared={} spilled={spilled} freed_tokens={freed} percent_used={}",
+            ctx.conversation,
+            victims.len(),
+            snapshot.percent_used()
+        ),
+    );
+
+    // Sent after the spill so the marker never points at a file that is not
+    // there yet.
+    if !cleared.is_empty() {
+        let _ = ctx.event_tx.send(AppEvent::ToolOutputCleared {
+            conversation: ctx.conversation,
+            cleared,
+            freed_tokens: freed,
+        });
+    }
+    true
+}
+
+/// Rung 2 for providers that keep the history on their side (DeepSeek's web
+/// API). Their branch lives on the server, so the only lever is a new session:
+/// `reset()` drops the session state, and the next request re-seeds a fresh
+/// one with the system prompt plus the local history as `LOCAL MEMORY`
+/// (`.docs/context-compaction.md` §2.1).
+///
+/// Rung 1's clearing is applied here even though it is normally skipped for
+/// these providers: it is worthless while nothing is re-sent, and it is the
+/// whole point once everything is. The old server-side session is deliberately
+/// left in place — it stays in the user's account as an ordinary chat.
+///
+/// Returns whether it rewrote the history, which makes the caller's `used`
+/// stale — true also when the reset itself was refused.
+async fn reset_server_session(
+    ctx: &CompactionCtx<'_>,
+    used: u32,
+    messages: &mut [ChatMessage],
+    state: &mut CompactionState,
+) -> bool {
+    if !ctx.context.auto_compact || !ctx.provider.keeps_server_side_history() {
+        return false;
+    }
+    let Some(snapshot) = ctx.context.budget().snapshot(used) else {
+        return false; // Unknown window: the ladder stays off (invariant 12).
+    };
+    if snapshot.percent_used() < crate::context::SESSION_RESET_PERCENT {
+        return false;
+    }
+    let conversation = ctx.conversation;
+    if state.session_reset_done {
+        // A second reset in one turn means the re-seed did not help; looping
+        // would mint a new server session per step.
+        if !state.reset_skip_logged {
+            state.reset_skip_logged = true;
+            debug_log::log(
+                "context.session_reset.skipped",
+                format!(
+                    "conversation={conversation} reason=already_reset_this_turn percent_used={}",
+                    snapshot.percent_used()
+                ),
+            );
+        }
+        return false;
+    }
+
+    let rewrote = clear_tool_bodies(ctx, &snapshot, messages).await;
+    // The re-seed carries the whole local history, so it is measured locally.
+    // `used` is what the *old* session held — a different number on purpose.
+    let after = crate::context::conversation_tokens(ctx.system_prompt, messages);
+    if after > snapshot.usable {
+        // The re-seed would be oversized too: one refused request instead of
+        // two. Rung 3 is what handles a history this big.
+        debug_log::log(
+            "context.session_reset.skipped",
+            format!(
+                "conversation={conversation} reason=still_over_usable before_tokens={used} after_tokens={after} usable={}",
+                snapshot.usable
+            ),
+        );
+        return rewrote;
+    }
+    if let Err(e) = ctx.provider.reset().await {
+        tracing::warn!("Context session reset failed: {e}");
+        debug_log::log(
+            "context.session_reset.failed",
+            format!("conversation={conversation} error={e}"),
+        );
+        return rewrote;
+    }
+
+    state.session_reset_done = true;
+    debug_log::log(
+        "context.session_reset",
+        format!(
+            "conversation={conversation} before_tokens={used} after_tokens={after} percent_used={}",
+            snapshot.percent_used()
+        ),
+    );
+    let _ = ctx.event_tx.send(AppEvent::SessionReset {
+        conversation,
+        before_tokens: used,
+        after_tokens: after,
+    });
+    true
+}
+
 /// Semantic hint: match the newest user message against the skill and
 /// MCP-tool corpora and insert an advisory note the model can act on
 /// (`skill` tool / listed MCP tools). Mutates only this turn's local message
@@ -824,6 +1083,7 @@ mod tests {
                 max_tools_per_step: 4,
                 auto_approve: false,
                 tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
             },
             tools,
             mcp,
@@ -887,6 +1147,7 @@ mod tests {
                 max_tools_per_step: 4,
                 auto_approve: false,
                 tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
             },
             tools,
             mcp,
@@ -972,6 +1233,7 @@ mod tests {
                 max_tools_per_step: 4,
                 auto_approve: true,
                 tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
             },
             Arc::new(ToolRegistry::new()),
             Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
@@ -1021,6 +1283,7 @@ mod tests {
                 max_tools_per_step: 4,
                 auto_approve: true,
                 tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
             },
             tools,
             mcp,
@@ -1094,6 +1357,7 @@ mod tests {
                 max_tools_per_step: 4,
                 auto_approve: true,
                 tool_output_limit: 500,
+                context: crate::context::ContextSpec::default(),
             },
             tools,
             mcp,
@@ -1131,6 +1395,668 @@ mod tests {
             reported.chars().count() > 5_000,
             "event stream keeps the full output, got {}",
             reported.chars().count()
+        );
+    }
+
+    /// A tool whose single result on its own crosses the prune trigger.
+    struct HugeTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for HugeTool {
+        fn definition(&self) -> crate::tools::ToolDefinition {
+            crate::tools::ToolDefinition {
+                name: "huge".to_string(),
+                description: "emits a whole context window".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> crate::tools::ToolResult {
+            crate::tools::ToolResult {
+                content: "h".repeat(30_000),
+                is_error: false,
+            }
+        }
+    }
+
+    /// A turn that fills the window with its own tool calls. Rung 1 has to run
+    /// per step: checked once at the turn boundary it would never fire again.
+    #[tokio::test]
+    async fn an_old_tool_result_is_cleared_mid_turn() {
+        let call = r#"<tool_use><name>huge</name><arguments>{}</arguments></tool_use>"#;
+        let dir = std::env::temp_dir().join(format!("pooprusteek-prune-{}", uuid::Uuid::new_v4()));
+        let fake = Arc::new(FakeProvider::with_responses(vec![
+            call.to_string(),
+            call.to_string(),
+            "Done.".to_string(),
+        ]));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(HugeTool));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                messages: vec![ChatMessage::user("go")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 5,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            tools,
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let tool_bodies = |n: usize| -> Vec<String> {
+            fake.request(n)
+                .unwrap_or_else(|| panic!("request {n} went to the provider"))
+                .iter()
+                .filter(|m| m.role == Role::Tool)
+                .map(|m| m.content.clone())
+                .collect()
+        };
+
+        // Second step: the only result so far is the one just handed back, so
+        // it is still whole even though the window is already over the trigger.
+        let second = tool_bodies(1);
+        assert_eq!(second.len(), 1);
+        assert!(
+            !crate::context::prune::is_cleared(&second[0]),
+            "the in-flight result must survive"
+        );
+
+        // Third step: the first result is settled now, and goes.
+        let third = tool_bodies(2);
+        assert_eq!(third.len(), 2);
+        assert!(
+            crate::context::prune::is_cleared(&third[0]),
+            "the older result should be a marker by now, got {} chars",
+            third[0].chars().count()
+        );
+        assert_eq!(third[1], "h".repeat(30_000), "the newest one is untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same turn, but the provider keeps the history on its side: clearing a
+    /// local message would change nothing that is ever sent again, so rung 1
+    /// must not run at all (`.docs/context-compaction.md` §2.1). The window is
+    /// sized to land between the two triggers — over rung 1's, under rung 2's,
+    /// which does clear for these providers before resetting the session.
+    #[tokio::test]
+    async fn rung_one_does_nothing_when_the_provider_keeps_the_history() {
+        let call = r#"<tool_use><name>huge</name><arguments>{}</arguments></tool_use>"#;
+        let dir = std::env::temp_dir().join(format!("pooprusteek-prune-{}", uuid::Uuid::new_v4()));
+        let fake = Arc::new(
+            FakeProvider::with_responses(vec![
+                call.to_string(),
+                call.to_string(),
+                "Done.".to_string(),
+            ])
+            .server_side_history(),
+        );
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(HugeTool));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                messages: vec![ChatMessage::user("go")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 5,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    // usable = 25k against ~20k on the third step: 80%.
+                    context_window: 28_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            tools,
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        // The same third step that clears the older result for a local-history
+        // provider: here both bodies reach the model whole.
+        let third: Vec<String> = fake
+            .request(2)
+            .expect("request 2 went to the provider")
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(third.len(), 2);
+        assert_eq!(third[0], "h".repeat(30_000), "nothing may be cleared");
+        assert_eq!(third[1], "h".repeat(30_000), "nothing may be cleared");
+
+        let mut cleared_events = 0;
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, AppEvent::ToolOutputCleared { .. }) {
+                cleared_events += 1;
+            }
+        }
+        assert_eq!(cleared_events, 0, "no ToolOutputCleared may be emitted");
+        assert_eq!(fake.resets(), 0, "80% is below rung 2's trigger");
+        assert!(!dir.exists(), "no spill file may be written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Property: a result the model has not reacted to yet is never cleared,
+    /// whatever the budget says — otherwise it gets a marker for what it just
+    /// asked for (`.docs/context-compaction.md` §5.3).
+    #[tokio::test]
+    async fn a_tool_result_the_model_has_not_answered_yet_is_never_cleared() {
+        let call = r#"<tool_use><name>huge</name><arguments>{}</arguments></tool_use>"#;
+        let dir = std::env::temp_dir().join(format!("pooprusteek-prune-{}", uuid::Uuid::new_v4()));
+        let fake = Arc::new(FakeProvider::with_responses(vec![
+            call.to_string(),
+            "Done.".to_string(),
+        ]));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(HugeTool));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                messages: vec![ChatMessage::user("go")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 5,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    // Absurdly low on purpose: only the tail guard can save it.
+                    preserve_recent_tokens: 1,
+                    spill_dir: dir.clone(),
+                },
+            },
+            tools,
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let request = fake
+            .request(1)
+            .expect("a second request after the tool ran");
+        let tool_message = request
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("the tool result reaches the model");
+        assert_eq!(
+            tool_message.content,
+            "h".repeat(30_000),
+            "the model must see the result it just asked for, not a marker"
+        );
+
+        while let Ok(ev) = event_rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::ToolOutputCleared { .. }),
+                "nothing was settled enough to clear"
+            );
+        }
+        assert!(!dir.exists(), "nothing should have been spilled");
+    }
+
+    /// Rung 1 end to end: an old tool body reaches the provider as a marker,
+    /// the recent one is untouched, the original text is on disk under the
+    /// tool-call id, and the app is told so it can clear its own history.
+    #[tokio::test]
+    async fn old_tool_output_is_cleared_and_spilled_before_the_first_step() {
+        let old_body = "o".repeat(30_000);
+        let recent_body = "r".repeat(300);
+        let dir = std::env::temp_dir().join(format!("pooprusteek-prune-{}", uuid::Uuid::new_v4()));
+
+        let fake = Arc::new(FakeProvider::with_response("Done."));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                // Ids deliberately unlike the message indices, so a spill named
+                // after the index would not pass.
+                messages: vec![
+                    ChatMessage::user("go"),
+                    ChatMessage::assistant("<tool_use>…</tool_use>"),
+                    ChatMessage::tool("call/old..9", &old_body),
+                    ChatMessage::assistant("<tool_use>…</tool_use>"),
+                    ChatMessage::tool("call-new-8", &recent_body),
+                ],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 1,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    // usable = 12k against ~10k used: over the 70% trigger.
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let request = fake.request(0).expect("one request went to the provider");
+        let tool_messages: Vec<&ChatMessage> =
+            request.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert!(
+            crate::context::prune::is_cleared(&tool_messages[0].content),
+            "old body replaced by the marker, got {}",
+            &tool_messages[0].content
+        );
+        assert_eq!(
+            tool_messages[1].content, recent_body,
+            "the protected tail is untouched"
+        );
+
+        // Named after the sanitised tool-call id, not the message index.
+        let spilled = dir.join("call_old__9.txt");
+        let on_disk = std::fs::read_to_string(&spilled)
+            .unwrap_or_else(|e| panic!("spill at {}: {e}", spilled.display()));
+        assert_eq!(on_disk, old_body);
+        assert!(
+            tool_messages[0].content.contains("call_old__9.txt"),
+            "the marker names the spill path, got {}",
+            &tool_messages[0].content
+        );
+
+        // The app needs the same edit applied to its own history.
+        let mut cleared_event = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let AppEvent::ToolOutputCleared {
+                conversation,
+                cleared,
+                freed_tokens,
+            } = ev
+            {
+                assert_eq!(conversation, cid);
+                assert!(freed_tokens > 0, "the freed estimate is reported");
+                cleared_event = Some(cleared);
+            }
+        }
+        let cleared = cleared_event.expect("ToolOutputCleared emitted");
+        assert_eq!(cleared.len(), 1, "only the old result was cleared");
+        assert_eq!(cleared[0].0, "call/old..9", "carries the raw tool-call id");
+        assert_eq!(
+            cleared[0].1, tool_messages[0].content,
+            "the marker matches what the provider saw"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A history that is over rung 2's trigger: one old tool result, one
+    /// in-flight one, and an assistant reply between them.
+    fn overfull_history(user_body: &str, old_body: &str, recent_body: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user(user_body),
+            ChatMessage::assistant("<tool_use>…</tool_use>"),
+            ChatMessage::tool("call-old-1", old_body),
+            ChatMessage::assistant("<tool_use>…</tool_use>"),
+            ChatMessage::tool("call-new-2", recent_body),
+        ]
+    }
+
+    /// Rung 2 end to end: over 90%, the server-side history is re-seeded — the
+    /// bodies are cleared first (rung 1's edit, applied here because this is
+    /// the moment it starts to count), then the session is dropped once and
+    /// the app is told (`.docs/context-compaction.md` §2.1).
+    #[tokio::test]
+    async fn a_full_server_side_history_is_cleared_and_the_session_reset() {
+        let dir = std::env::temp_dir().join(format!("pooprusteek-reset-{}", uuid::Uuid::new_v4()));
+        let fake = Arc::new(FakeProvider::with_response("Done.").server_side_history());
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: overfull_history("go", &"o".repeat(33_000), &"r".repeat(300)),
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 1,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    // usable = 12k against ~11.1k used: over the 90% trigger.
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let request = fake.request(0).expect("one request went to the provider");
+        let tool_messages: Vec<&ChatMessage> =
+            request.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert!(
+            crate::context::prune::is_cleared(&tool_messages[0].content),
+            "the settled body is cleared before the session is re-seeded"
+        );
+        assert_eq!(
+            tool_messages[1].content,
+            "r".repeat(300),
+            "the in-flight tail survives rung 2 exactly as it survives rung 1"
+        );
+        assert_eq!(fake.resets(), 1, "the session is reset exactly once");
+
+        let mut reset_event = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let AppEvent::SessionReset {
+                conversation,
+                before_tokens,
+                after_tokens,
+            } = ev
+            {
+                assert_eq!(conversation, cid);
+                reset_event = Some((before_tokens, after_tokens));
+            }
+        }
+        let (before, after) = reset_event.expect("SessionReset emitted");
+        assert!(
+            after < before,
+            "the fresh session is re-seeded with less than the old one held: {after} vs {before}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Step 4 of rung 2: when the cleared history still does not fit, a reset
+    /// would only re-send something oversized, so it does not happen. Here the
+    /// bulk is a user message, which no rung below 3 can touch.
+    #[tokio::test]
+    async fn no_session_reset_when_the_cleared_history_still_overflows() {
+        let dir = std::env::temp_dir().join(format!("pooprusteek-reset-{}", uuid::Uuid::new_v4()));
+        let fake = Arc::new(FakeProvider::with_response("Done.").server_side_history());
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                // 15k tokens of user text alone, against a 12k usable window.
+                messages: overfull_history(&"u".repeat(45_000), &"o".repeat(30_000), "r"),
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 1,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let request = fake.request(0).expect("one request went to the provider");
+        let cleared = request
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("the old tool result is still in the history");
+        assert!(
+            crate::context::prune::is_cleared(&cleared.content),
+            "the clearing runs first — this test is about what happens after it"
+        );
+        assert_eq!(
+            fake.resets(),
+            0,
+            "a re-seed that does not fit is worse than no re-seed"
+        );
+        while let Ok(ev) = event_rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::SessionReset { .. }),
+                "nothing was reset, so nothing may be announced"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rung 2 is only a lever for providers whose history lives upstream. A
+    /// provider that is sent the whole array every step is compacted by rungs 1
+    /// and 3 instead, and its session is never reset.
+    #[tokio::test]
+    async fn a_local_history_provider_never_resets_the_session() {
+        let dir = std::env::temp_dir().join(format!("pooprusteek-reset-{}", uuid::Uuid::new_v4()));
+        let fake = Arc::new(FakeProvider::with_response("Done."));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                // The same 92%-full history that resets a server-side session.
+                messages: overfull_history("go", &"o".repeat(33_000), &"r".repeat(300)),
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 1,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        assert_eq!(fake.resets(), 0, "rung 2 is not for this provider");
+        while let Ok(ev) = event_rx.try_recv() {
+            assert!(!matches!(ev, AppEvent::SessionReset { .. }));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One turn against a provider that reports its own session tally, with a
+    /// `ContextSpec` that leaves `usable` at 12k.
+    async fn turn_with_session_tokens(
+        fake: &Arc<FakeProvider>,
+        messages: Vec<ChatMessage>,
+    ) -> (ConversationId, mpsc::UnboundedReceiver<AppEvent>) {
+        let dir = std::env::temp_dir().join(format!("pooprusteek-tally-{}", uuid::Uuid::new_v4()));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider: Arc::clone(fake) as Arc<dyn LLMProvider>,
+                messages,
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 1,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec {
+                    auto_compact: true,
+                    context_window: 15_000,
+                    provider_window: 0,
+                    reserved_tokens: 3_000,
+                    preserve_recent_tokens: 500,
+                    spill_dir: dir.clone(),
+                },
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+        (cid, event_rx)
+    }
+
+    fn reported_usage(event_rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> Option<u32> {
+        let mut used_reported = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let AppEvent::ContextUsage { used, .. } = ev {
+                used_reported = Some(used);
+            }
+        }
+        used_reported
+    }
+
+    /// The live defect: after a session reset the server holds only the
+    /// re-seed, but the local history is as long as ever. Measured locally,
+    /// the meter reads full again on the very next turn and the session is
+    /// reset every turn. A provider that reports its own tally is believed.
+    #[tokio::test]
+    async fn a_reported_session_tally_outranks_the_local_history() {
+        let fake = Arc::new(
+            FakeProvider::with_response("Done.")
+                .server_side_history()
+                // The freshly re-seeded session: 8% of the 12k usable window,
+                // while the local history below is over 90% of it.
+                .with_session_tokens(1_000),
+        );
+
+        let (_, mut event_rx) =
+            turn_with_session_tokens(&fake, overfull_history("go", &"o".repeat(33_000), "r")).await;
+
+        assert_eq!(
+            fake.resets(),
+            0,
+            "the session the provider actually holds is nearly empty"
+        );
+        assert_eq!(
+            reported_usage(&mut event_rx),
+            Some(1_000),
+            "the status bar is fed the same number the rungs judged"
+        );
+    }
+
+    /// And the other direction: a short local history does not excuse a
+    /// session the provider says is full.
+    #[tokio::test]
+    async fn a_full_reported_tally_resets_even_with_a_short_local_history() {
+        let fake = Arc::new(
+            FakeProvider::with_response("Done.")
+                .server_side_history()
+                // 95% of the 12k usable window, against ~2 tokens of history.
+                .with_session_tokens(11_500),
+        );
+
+        let (cid, mut event_rx) =
+            turn_with_session_tokens(&fake, vec![ChatMessage::user("go")]).await;
+
+        assert_eq!(fake.resets(), 1, "rung 2 acted on the provider's number");
+        let mut reset_event = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let AppEvent::SessionReset {
+                conversation,
+                before_tokens,
+                ..
+            } = ev
+            {
+                assert_eq!(conversation, cid);
+                reset_event = Some(before_tokens);
+            }
+        }
+        assert_eq!(
+            reset_event,
+            Some(11_500),
+            "what was reset is what the provider reported holding"
         );
     }
 

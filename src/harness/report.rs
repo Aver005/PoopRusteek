@@ -229,6 +229,9 @@ pub fn render_run(outcome: &RunOutcome) -> String {
     if let Some(error) = &outcome.error {
         lines.push(format!("  error:      {error}"));
     }
+    if outcome.turns > 1 {
+        lines.push(format!("  turns:      {}", outcome.turns));
+    }
     if !outcome.tools.is_empty() {
         let names: Vec<String> = outcome
             .tools
@@ -304,6 +307,19 @@ pub fn render_scenario(report: &ScenarioReport) -> String {
             report.aggregate.hint_rate * 100.0
         ),
     ];
+    // Only shown for a conversation: a one-turn run is the norm and saying so
+    // on every line would be noise.
+    let turns: Vec<usize> = report.runs.iter().map(|run| run.outcome.turns).collect();
+    if let (Some(&low), Some(&high)) = (turns.iter().min(), turns.iter().max())
+        && high > 1
+    {
+        let range = if low == high {
+            high.to_string()
+        } else {
+            format!("{low}–{high}")
+        };
+        lines.push(format!("  turns      {range} per run"));
+    }
     if !report.aggregate.tools.is_empty() {
         let tools: Vec<String> = report
             .aggregate
@@ -412,6 +428,7 @@ mod tests {
                 status: RunStatus::Completed,
                 trace_path: PathBuf::from("t.jsonl"),
                 duration_ms: 1000,
+                turns: 1,
                 final_text: String::new(),
                 tools: Vec::new(),
                 sub_agents: 0,

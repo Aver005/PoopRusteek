@@ -1,6 +1,10 @@
-//! Scenario files: a prompt, the conditions to run it under, and what the
-//! result must look like — repeated, because one sample of a
+//! Scenario files: one or more user turns, the conditions to run them under,
+//! and what the result must look like — repeated, because one sample of a
 //! nondeterministic model is not evidence.
+//!
+//! `prompt` is one turn; `prompts` is a conversation, run in order against one
+//! accumulating history. Expectations always describe the *final* state: the
+//! last turn's answer and the workspace once every turn is done.
 //!
 //! Each repeat runs as a **child process** (`pooprusteek exec --json`)
 //! rather than an in-process loop. That buys three things worth the spawn
@@ -32,7 +36,13 @@ pub struct Scenario {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    pub prompt: String,
+    /// One user turn. Mutually exclusive with `prompts`; folded into it at
+    /// load time, so [`Scenario::turns`] is the only reader either way.
+    prompt: Option<String>,
+    /// Several user turns, run in order in **one** conversation against one
+    /// accumulating history — what makes anything between turns testable.
+    #[serde(default)]
+    prompts: Vec<String>,
     /// Workspace for the turn, resolved relative to the scenario file. Shared
     /// by every repeat and treated as read-only — use `workspace_template` for
     /// anything the agent is meant to write to.
@@ -51,7 +61,10 @@ pub struct Scenario {
     #[serde(default = "default_approve")]
     pub approve: String,
     pub answer: Option<String>,
+    /// Step cap for *each* turn, unlike `expect.max_steps` which is the total.
     pub max_steps: Option<usize>,
+    /// Wall-clock budget for the whole run in seconds — every turn together,
+    /// not one budget per turn.
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     #[serde(default = "default_semantic")]
@@ -80,7 +93,8 @@ fn default_semantic() -> String {
     "off".to_string()
 }
 
-/// What a run must look like to count as a pass.
+/// What a run must look like to count as a pass. Always the *final* state:
+/// the last turn's answer and the workspace after every turn has run.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expect {
@@ -92,7 +106,8 @@ pub struct Expect {
     /// None of these may have been called.
     #[serde(default)]
     pub tools_forbidden: Vec<String>,
-    /// Upper bound on agent steps — catches a turn that wanders.
+    /// Upper bound on agent steps — catches a turn that wanders. Counted
+    /// across every turn, not per turn.
     pub max_steps: Option<usize>,
     pub max_tool_calls: Option<usize>,
     /// No malformed `<tool_use>` blocks at all.
@@ -279,11 +294,43 @@ fn status_name(status: RunStatus) -> &'static str {
 }
 
 impl Scenario {
+    /// The user turns, in order. Always at least one — `load` rejects a
+    /// scenario that declares none.
+    pub fn turns(&self) -> &[String] {
+        &self.prompts
+    }
+
+    /// Parse and validate, without touching the filesystem. `origin` only
+    /// prefixes error messages.
+    pub fn from_toml(text: &str, origin: &str) -> AppResult<Self> {
+        let mut scenario: Self =
+            toml::from_str(text).map_err(|e| AppError::Custom(format!("{origin}: {e}")))?;
+        match (scenario.prompt.take(), scenario.prompts.is_empty()) {
+            (Some(_), false) => {
+                return Err(AppError::Custom(format!(
+                    "{origin}: set either `prompt` (one turn) or `prompts` (several), not both"
+                )));
+            }
+            (Some(prompt), true) => scenario.prompts = vec![prompt],
+            (None, true) => {
+                return Err(AppError::Custom(format!(
+                    "{origin}: needs `prompt = \"…\"` or `prompts = [\"…\", \"…\"]`"
+                )));
+            }
+            (None, false) => {}
+        }
+        if let Some(index) = scenario.prompts.iter().position(|p| p.trim().is_empty()) {
+            return Err(AppError::Custom(format!(
+                "{origin}: prompts[{index}] is empty — every turn needs a user message"
+            )));
+        }
+        Ok(scenario)
+    }
+
     pub fn load(path: &Path) -> AppResult<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| AppError::Custom(format!("{}: {e}", path.display())))?;
-        let mut scenario: Self = toml::from_str(&text)
-            .map_err(|e| AppError::Custom(format!("{}: {e}", path.display())))?;
+        let mut scenario = Self::from_toml(&text, &path.display().to_string())?;
         // A workspace in the file is relative to the file, not to wherever
         // the harness happens to be invoked from.
         let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -460,6 +507,62 @@ async fn execute(
     Ok(report)
 }
 
+/// The child's whole command line. Every flag comes first and the turns last,
+/// after `--`, so a prompt starting with `-` is never read as a flag.
+fn exec_args(
+    scenario: &Scenario,
+    trace_path: &Path,
+    config_path: Option<&Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+
+    // `--config` is a global flag, so it goes before the subcommand.
+    if let Some(path) = config_path {
+        push_flag(&mut args, "--config", path);
+    }
+    args.push("exec".into());
+    args.push("--json".into());
+    push_flag(&mut args, "--trace", trace_path);
+    push_flag(&mut args, "--approve", &scenario.approve);
+    push_flag(&mut args, "--timeout", scenario.timeout.to_string());
+    push_flag(&mut args, "--semantic", &scenario.semantic);
+    if let Some(workspace) = &scenario.workspace {
+        push_flag(&mut args, "--workspace", workspace);
+    }
+    if let Some(append) = &scenario.system_prompt_append {
+        push_flag(&mut args, "--system-append", append);
+    }
+    if let Some(answer) = &scenario.answer {
+        push_flag(&mut args, "--answer", answer);
+    }
+    if let Some(max_steps) = scenario.max_steps {
+        push_flag(&mut args, "--max-steps", max_steps.to_string());
+    }
+    if let Some(provider) = &scenario.provider {
+        push_flag(&mut args, "--provider", provider);
+    }
+    if let Some(model) = &scenario.model {
+        push_flag(&mut args, "--model", model);
+    }
+    if scenario.mcp {
+        args.push("--mcp".into());
+    }
+    if scenario.save_session {
+        args.push("--save-session".into());
+    }
+
+    args.push("--".into());
+    for prompt in scenario.turns() {
+        args.push(prompt.into());
+    }
+    args
+}
+
+fn push_flag(args: &mut Vec<std::ffi::OsString>, name: &str, value: impl AsRef<std::ffi::OsStr>) {
+    args.push(name.into());
+    args.push(value.as_ref().to_owned());
+}
+
 /// Run one repeat as `pooprusteek exec --json`, killing it if it outlives
 /// its own timeout by a margin.
 async fn spawn_run(
@@ -471,50 +574,11 @@ async fn spawn_run(
         .map_err(|e| AppError::Custom(format!("cannot locate own binary: {e}")))?;
 
     let mut command = tokio::process::Command::new(exe);
-    // `--config` is a global flag, so it goes before the subcommand.
-    if let Some(path) = config_path {
-        command.arg("--config").arg(path);
-    }
     command
-        .arg("exec")
-        .arg(&scenario.prompt)
-        .arg("--json")
-        .arg("--trace")
-        .arg(trace_path)
-        .arg("--approve")
-        .arg(&scenario.approve)
-        .arg("--timeout")
-        .arg(scenario.timeout.to_string())
-        .arg("--semantic")
-        .arg(&scenario.semantic)
+        .args(exec_args(scenario, trace_path, config_path))
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-
-    if let Some(workspace) = &scenario.workspace {
-        command.arg("--workspace").arg(workspace);
-    }
-    if let Some(append) = &scenario.system_prompt_append {
-        command.arg("--system-append").arg(append);
-    }
-    if let Some(answer) = &scenario.answer {
-        command.arg("--answer").arg(answer);
-    }
-    if let Some(max_steps) = scenario.max_steps {
-        command.arg("--max-steps").arg(max_steps.to_string());
-    }
-    if let Some(provider) = &scenario.provider {
-        command.arg("--provider").arg(provider);
-    }
-    if let Some(model) = &scenario.model {
-        command.arg("--model").arg(model);
-    }
-    if scenario.mcp {
-        command.arg("--mcp");
-    }
-    if scenario.save_session {
-        command.arg("--save-session");
-    }
 
     let child = command
         .spawn()
@@ -562,6 +626,7 @@ fn child_failed(trace_path: &Path, error: String) -> RunOutcome {
         status: RunStatus::SetupFailed,
         trace_path: trace_path.to_path_buf(),
         duration_ms: 0,
+        turns: 0,
         final_text: String::new(),
         tools: Vec::new(),
         sub_agents: 0,
@@ -644,6 +709,7 @@ mod tests {
             status,
             trace_path: PathBuf::from("t.jsonl"),
             duration_ms: 10,
+            turns: 1,
             final_text: text.to_string(),
             tools: vec![ToolInvocation {
                 name: "bash".into(),
@@ -798,12 +864,76 @@ mod tests {
     #[test]
     fn unknown_scenario_field_is_rejected() {
         let toml = "name = \"x\"\nprompt = \"y\"\ntypo_field = 1\n";
-        assert!(toml::from_str::<Scenario>(toml).is_err());
+        assert!(Scenario::from_toml(toml, "t.toml").is_err());
+    }
+
+    #[test]
+    fn a_lone_prompt_is_one_turn() {
+        let scenario = Scenario::from_toml("name = \"x\"\nprompt = \"y\"\n", "t.toml").unwrap();
+        assert_eq!(scenario.turns().to_vec(), ["y"]);
+    }
+
+    #[test]
+    fn a_prompt_list_is_several_turns_in_order() {
+        let scenario = Scenario::from_toml(
+            "name = \"x\"\nprompts = [\"first\", \"second\", \"third\"]\n",
+            "t.toml",
+        )
+        .unwrap();
+        assert_eq!(scenario.turns().to_vec(), ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn prompt_and_prompts_together_are_a_config_error() {
+        let error = Scenario::from_toml(
+            "name = \"x\"\nprompt = \"y\"\nprompts = [\"a\", \"b\"]\n",
+            "t.toml",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not both"), "{error}");
+        assert!(error.contains("t.toml"), "{error}");
+    }
+
+    #[test]
+    fn a_scenario_with_no_prompt_at_all_is_a_config_error() {
+        for toml in ["name = \"x\"\n", "name = \"x\"\nprompts = []\n"] {
+            let error = Scenario::from_toml(toml, "t.toml").unwrap_err().to_string();
+            assert!(error.contains("prompts"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_empty_turn_is_a_config_error() {
+        let error = Scenario::from_toml("name = \"x\"\nprompts = [\"a\", \"  \"]\n", "t.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prompts[1]"), "{error}");
+    }
+
+    #[test]
+    fn every_turn_reaches_the_child_after_the_separator() {
+        let scenario = Scenario::from_toml(
+            "name = \"x\"\nprompts = [\"one\", \"two\", \"-three\"]\n",
+            "t.toml",
+        )
+        .unwrap();
+        let rendered: Vec<String> = exec_args(&scenario, Path::new("t.jsonl"), None)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let separator = rendered
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("prompts are passed after `--`");
+        // A prompt that looks like a flag must survive as a prompt.
+        assert_eq!(rendered[separator + 1..].to_vec(), ["one", "two", "-three"]);
+        assert_eq!(rendered.first().map(String::as_str), Some("exec"));
     }
 
     #[test]
     fn defaults_fill_in_for_a_minimal_scenario() {
-        let scenario: Scenario = toml::from_str("name = \"x\"\nprompt = \"y\"\n").unwrap();
+        let scenario = Scenario::from_toml("name = \"x\"\nprompt = \"y\"\n", "t.toml").unwrap();
         assert_eq!(scenario.approve, "all");
         assert_eq!(scenario.semantic, "off");
         assert_eq!(scenario.timeout, 300);

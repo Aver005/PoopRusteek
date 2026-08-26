@@ -1,6 +1,7 @@
 pub mod background;
 pub mod history_search;
 pub mod question;
+pub mod read_file;
 pub mod registry;
 pub mod shell;
 pub mod shell_control;

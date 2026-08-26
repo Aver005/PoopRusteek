@@ -32,6 +32,9 @@ pub struct TurnSpec {
     /// Chars kept per tool result before it enters the history (rung 0 of
     /// the compaction ladder). `0` = uncapped.
     pub tool_output_limit: usize,
+    /// Rung 1: window settings and spill directory for clearing old tool
+    /// bodies. A default `ContextSpec` keeps the ladder off.
+    pub context: crate::context::ContextSpec,
 }
 
 /// Owns the dependencies for running agent turns and centralizes spawning.

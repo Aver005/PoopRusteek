@@ -25,10 +25,18 @@ pub struct FakeProvider {
     /// count is decremented per streamed call, so tests can model "fail once,
     /// recover next call" flows.
     abrupt_eof_remaining: Mutex<usize>,
+    /// What `keeps_server_side_history` answers — lets a test model a provider
+    /// whose history lives upstream (DeepSeek's web API).
+    server_side_history: bool,
+    /// What `session_tokens` answers. `None` is the default "no idea", which
+    /// sends the agent loop back to counting the local history.
+    session_tokens: Option<u32>,
     /// Every request the loop sent, in order. Lets a test assert on what the
     /// model actually received — the only way to observe history rewriting
     /// (tool-output caps, compaction) from outside the loop.
     seen_requests: Mutex<Vec<Vec<ChatMessage>>>,
+    /// How many times the loop asked for a fresh session (rung 2).
+    resets: Mutex<usize>,
 }
 
 impl FakeProvider {
@@ -44,7 +52,10 @@ impl FakeProvider {
             responses: Mutex::new(responses.into_iter().collect()),
             chunk_count: 1,
             abrupt_eof_remaining: Mutex::new(0),
+            server_side_history: false,
+            session_tokens: None,
             seen_requests: Mutex::new(Vec::new()),
+            resets: Mutex::new(0),
         }
     }
 
@@ -61,9 +72,28 @@ impl FakeProvider {
         self
     }
 
+    /// Report that the conversation history lives on the provider's side.
+    pub fn server_side_history(mut self) -> Self {
+        self.server_side_history = true;
+        self
+    }
+
+    /// Report a session tally of its own, as a server-side-history provider
+    /// does — the number the compaction ladder must prefer over the local
+    /// history.
+    pub fn with_session_tokens(mut self, tokens: u32) -> Self {
+        self.session_tokens = Some(tokens);
+        self
+    }
+
     /// The messages carried by the `n`-th request this provider received.
     pub fn request(&self, n: usize) -> Option<Vec<ChatMessage>> {
         self.seen_requests.lock().unwrap().get(n).cloned()
+    }
+
+    /// How many times `reset` was called — rung 2's only observable effect.
+    pub fn resets(&self) -> usize {
+        *self.resets.lock().unwrap()
     }
 
     fn record(&self, request: &CompletionRequest) {
@@ -131,8 +161,27 @@ impl LLMProvider for FakeProvider {
         &self.model
     }
 
+    fn keeps_server_side_history(&self) -> bool {
+        self.server_side_history
+    }
+
+    fn session_tokens(&self) -> Option<u32> {
+        self.session_tokens
+    }
+
+    async fn reset(&self) -> AppResult<()> {
+        *self.resets.lock().unwrap() += 1;
+        Ok(())
+    }
+
     fn fork(&self) -> std::sync::Arc<dyn LLMProvider> {
-        // A fork starts empty — tests script it independently of the parent.
-        std::sync::Arc::new(FakeProvider::with_responses(Vec::new()))
+        // A fork starts empty — tests script it independently of the parent —
+        // but keeps the parent's wire behaviour.
+        let fork = FakeProvider::with_responses(Vec::new());
+        std::sync::Arc::new(if self.server_side_history {
+            fork.server_side_history()
+        } else {
+            fork
+        })
     }
 }

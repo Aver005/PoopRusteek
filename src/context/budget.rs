@@ -11,7 +11,13 @@ const PER_MESSAGE_OVERHEAD: u32 = 4;
 /// Deliberately pessimistic token estimate — see `CHARS_PER_TOKEN`. Not a
 /// tokenizer: use it for thresholds, never to report a token count.
 pub fn budget_tokens(text: &str) -> u32 {
-    (text.chars().count() as u32).div_ceil(CHARS_PER_TOKEN)
+    budget_tokens_for_chars(text.chars().count())
+}
+
+/// Same estimate for text that was measured while it streamed by and is no
+/// longer held as one string.
+pub fn budget_tokens_for_chars(chars: usize) -> u32 {
+    (chars.min(u32::MAX as usize) as u32).div_ceil(CHARS_PER_TOKEN)
 }
 
 /// What the whole conversation costs on the wire. `ui_only` messages are

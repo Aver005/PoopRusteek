@@ -44,14 +44,26 @@ pub struct Config {
 }
 
 /// `[update]` — the self-updater (`/update`, `/autoupdate`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateConfig {
     /// `/autoupdate on|off` — when true, every TUI startup checks the
     /// `latest` release in the background and installs it on hash mismatch
     /// (takes effect on the next launch). Off by default: replacing the
     /// binary behind the user's back must be an explicit opt-in.
-    #[serde(default)]
+    #[serde(default = "default_update_auto")]
     pub auto: bool,
+}
+
+fn default_update_auto() -> bool {
+    false
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto: default_update_auto(),
+        }
+    }
 }
 
 /// `[provider_models]` — how the per-provider model catalogs (fetched via
@@ -471,7 +483,9 @@ impl Default for McpConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillsConfig {
+    #[serde(default)]
     pub enabled: Vec<String>,
+    #[serde(default)]
     pub paths: Vec<String>,
     /// How enabled skills reach the system prompt — see [`SkillInjectionMode`].
     #[serde(default)]
@@ -516,13 +530,16 @@ impl SkillInjectionMode {
 /// `Config::data_dir()/models` once; everything after that is offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticConfig {
+    #[serde(default = "default_semantic_enabled")]
     pub enabled: bool,
     /// Max suggestions per corpus (skills, MCP tools) per turn.
+    #[serde(default = "default_semantic_top_k")]
     pub top_k: usize,
     /// Dense-cosine floor a candidate must clear when it has no lexical
     /// overlap with the prompt. e5 cosines cluster high, so this is tighter
     /// than it looks — tune against the `semantic::eval` harness
     /// (`cargo test semantic::eval -- --ignored --nocapture`), not by feel.
+    #[serde(default = "default_semantic_min_dense_score")]
     pub min_dense_score: f32,
     /// How MCP tool schemas reach the system prompt — see [`McpSchemaMode`].
     #[serde(default)]
@@ -532,12 +549,24 @@ pub struct SemanticConfig {
     pub rag_limit: RagLimit,
 }
 
+fn default_semantic_enabled() -> bool {
+    true
+}
+
+fn default_semantic_top_k() -> usize {
+    3
+}
+
+fn default_semantic_min_dense_score() -> f32 {
+    0.80
+}
+
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            top_k: 3,
-            min_dense_score: 0.80,
+            enabled: default_semantic_enabled(),
+            top_k: default_semantic_top_k(),
+            min_dense_score: default_semantic_min_dense_score(),
             mcp_schemas: McpSchemaMode::default(),
             rag_limit: RagLimit::default(),
         }
@@ -850,6 +879,17 @@ mod tests {
     }
 
     #[test]
+    fn semantic_config_enabled_only_still_loads() {
+        // Reproduces a real harness failure: `[semantic]\nenabled = false`
+        // alone died with "missing field top_k" before enabled/top_k/
+        // min_dense_score got named defaults.
+        let parsed: SemanticConfig = toml::from_str("enabled = false\n").unwrap();
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.top_k, 3);
+        assert_eq!(parsed.min_dense_score, 0.8);
+    }
+
+    #[test]
     fn rag_limit_auto_scales_with_ram_and_clamps() {
         // Unknown RAM → the conservative fallback.
         assert_eq!(RagLimit::auto_batch(None), RagLimit::FALLBACK_BATCH);
@@ -922,6 +962,16 @@ mod tests {
     }
 
     #[test]
+    fn skills_config_partial_fill_still_loads() {
+        // `enabled`/`paths` had no serde default at all — a section
+        // carrying only `injection` used to fail the parse.
+        let parsed: SkillsConfig = toml::from_str("injection = \"full\"\n").unwrap();
+        assert!(parsed.enabled.is_empty());
+        assert!(parsed.paths.is_empty());
+        assert_eq!(parsed.injection, SkillInjectionMode::Full);
+    }
+
+    #[test]
     fn config_without_provider_entries_still_loads() {
         // A pre-/providers config.toml has no `providers` array and no
         // `active_provider` — both must default instead of failing the parse.
@@ -966,6 +1016,12 @@ mod tests {
     }
 
     #[test]
+    fn update_config_empty_table_still_loads() {
+        let parsed: UpdateConfig = toml::from_str("").unwrap();
+        assert!(!parsed.auto);
+    }
+
+    #[test]
     fn config_without_server_section_still_loads() {
         // Pre-server config files carry no [server] table — every field
         // must default instead of failing the parse.
@@ -981,6 +1037,24 @@ mod tests {
         assert_eq!(parsed.server.host, "127.0.0.1");
         assert_eq!(parsed.server.api, ServerApi::Openai);
         assert!(parsed.server.api_key.is_none());
+    }
+
+    #[test]
+    fn server_config_partial_fill_still_loads() {
+        // A section carrying only `port` must still parse.
+        let parsed: ServerConfig = toml::from_str("port = 9000\n").unwrap();
+        assert_eq!(parsed.port, 9000);
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.api, ServerApi::Openai);
+        assert!(parsed.api_key.is_none());
+    }
+
+    #[test]
+    fn provider_models_config_partial_fill_still_loads() {
+        // A section carrying only `refetch_ms` must still parse.
+        let parsed: ProviderModelsConfig = toml::from_str("refetch_ms = 5000\n").unwrap();
+        assert_eq!(parsed.refetch_ms, 5000);
+        assert_eq!(parsed.cache_ms, ProviderModelsConfig::DEFAULT_MS);
     }
 
     #[test]

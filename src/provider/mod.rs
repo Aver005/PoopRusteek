@@ -327,6 +327,20 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
+    /// True when the provider keeps conversation history on its own side and
+    /// the client sends only the newest turn (DeepSeek's web API). Rewriting
+    /// old local messages then changes nothing that will be sent again.
+    fn keeps_server_side_history(&self) -> bool {
+        false
+    }
+
+    /// Budget tokens this provider has accumulated in its *current* session,
+    /// when it keeps history server-side. `None` means "no idea, count the
+    /// local history instead".
+    fn session_tokens(&self) -> Option<u32> {
+        None
+    }
+
     /// Create a sibling instance that shares this provider's configuration
     /// (and connection) but starts a **fresh session** — no shared
     /// `parent_message_id`/`session_id`. Each parallel conversation and

@@ -646,6 +646,43 @@ impl App {
                     target.context_used = used;
                 }
             }
+            AppEvent::ToolOutputCleared {
+                conversation,
+                cleared,
+                freed_tokens,
+            } => {
+                let count = cleared.len();
+                if let Some(target) = self.state.conversations.get_mut(conversation) {
+                    // Matched by tool-call id, never by index: the agent loop's
+                    // copy drops `ui_only` messages, so the two never line up.
+                    for (tool_call_id, marker) in cleared {
+                        if let Some(message) = target
+                            .messages
+                            .iter_mut()
+                            .find(|m| m.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
+                        {
+                            message.content = marker;
+                        }
+                    }
+                }
+                self.state.status_message =
+                    format!("Cleared {count} old tool output(s), ~{freed_tokens} tokens freed");
+            }
+            AppEvent::SessionReset {
+                conversation,
+                before_tokens,
+                after_tokens,
+            } => {
+                // Nothing to apply to the local history: the reset happened on
+                // the provider's side, and rung 1 already sent its own edit.
+                // A background turn's reset must not overwrite the status the
+                // user is reading for the chat in front of them.
+                if conversation == self.state.conversations.focused_id() {
+                    self.state.status_message = format!(
+                        "Started a fresh provider session, re-seeding ~{after_tokens} tokens instead of ~{before_tokens}"
+                    );
+                }
+            }
             AppEvent::BeginAssistantMessage(_) => {
                 self.state.focused_mut().begin_assistant_message();
             }
@@ -1010,6 +1047,11 @@ impl App {
             max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
             auto_approve: false, // focused turn: interactive approval
             tool_output_limit: self.config.context.tool_output_limit as usize,
+            context: crate::context::ContextSpec::new(
+                &self.config.context,
+                self.state.provider_context_window,
+                &self.state.focused().session_id,
+            ),
         };
 
         let _ = self.event_tx.send(AppEvent::AgentStarted(conversation));

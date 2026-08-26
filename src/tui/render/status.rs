@@ -191,9 +191,15 @@ pub(super) fn render_mini_status(
         config.context.reserved_tokens,
     );
     budget.learn_provider_window(state.provider_context_window);
+    // `srv` = the provider keeps the history, so the number is what the server
+    // has accumulated for the session, not what we send each step.
+    let ctx_mode = match &state.focused().provider {
+        Some(provider) if provider.keeps_server_side_history() => " srv",
+        _ => "",
+    };
     let ctx_tag = budget
         .snapshot(state.focused().context_used)
-        .map(|budget| format!(" ctx:{}", budget.label()))
+        .map(|budget| format!(" ctx:{}{}", budget.label(), ctx_mode))
         .unwrap_or_default();
     let right = format!(
         "{} msgs:{} tot:{}{} | {} ",

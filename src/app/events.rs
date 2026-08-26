@@ -112,6 +112,25 @@ pub enum AppEvent {
         conversation: ConversationId,
         used: u32,
     },
+    /// Rung 1 cleared old tool bodies in the turn's message copy. The app
+    /// applies the same edit to its own history so the change survives the
+    /// turn and shrinks the saved session.
+    ToolOutputCleared {
+        conversation: ConversationId,
+        /// (tool_call_id, marker) for each cleared result.
+        cleared: Vec<(String, String)>,
+        freed_tokens: u32,
+    },
+    /// Rung 2 dropped the provider's server-side session. The next request
+    /// re-seeds a fresh one with the cleared local history, so the branch the
+    /// server remembered is replaced by a smaller one.
+    SessionReset {
+        conversation: ConversationId,
+        /// What the server had accumulated before the reset.
+        before_tokens: u32,
+        /// What the fresh session will be re-seeded with.
+        after_tokens: u32,
+    },
 
     // Tool events
     ToolStarted {

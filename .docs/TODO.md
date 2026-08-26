@@ -63,7 +63,7 @@
 > Full research + plan: `context-compaction.md`
 - [x] Step 1: measurement only, no behavior change — window size (provider `context_window()` + `[context] context_window` override), local `chars/3` estimate (real `prompt_tokens` not wired yet, see `context-compaction.md`), `ctx:` status-bar indicator (`src/context/`, `src/provider/compat_client.rs`, `src/provider/mod.rs`)
 - [x] Step 2: rung 0 — tool output cap at capture time, before it enters history (`src/context/tool_output.rs`, applied in `src/agent/runner.rs` and `src/agent/sub_agent.rs`)
-- [ ] Step 3: rung 1 — clear old tool-result bodies, full output spilled to disk (`src/context/`, `util::atomic_write`)
+- [x] Step 3: rung 1 — clear old tool-result bodies, full output spilled to disk (`src/context/prune.rs`, `src/context/spec.rs`, `util::atomic_write`, new `read_file` tool). Checked before every step, in-flight tail protected. **Skipped for DeepSeek** — its wire format never resends a cleared local message (`LLMProvider::keeps_server_side_history()`); rung 1 only does anything for OpenAI-compatible providers until rung 2 (session reset) ships
 - [ ] Step 4: rung 2 for DeepSeek — reset the server session with a compressed `LOCAL MEMORY` (`src/provider/deepseek/stream.rs`, `src/provider/prompt.rs`)
 - [ ] Step 5: rung 3 — LLM summary (`src/context/`, `src/agent/runner.rs`)
 - [ ] Step 6: `/compact` — manual trigger of the same ladder, replacing today's stub; update this file (`src/commands/defs/compact.rs`)

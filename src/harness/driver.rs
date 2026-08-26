@@ -1,4 +1,8 @@
-//! Runs one real agent turn without a terminal.
+//! Runs real agent turns without a terminal.
+//!
+//! One prompt is one turn; several prompts are one conversation, driven in
+//! order against one accumulating history and one provider session — which is
+//! the only way to reach what happens *between* turns (the compaction ladder).
 //!
 //! This is the same turn the TUI runs — same provider, same `ToolRegistry`,
 //! same system prompt, same `AgentRuntime::spawn` — with the human replaced
@@ -16,7 +20,7 @@
 //! at the run's trace file and adds only what it alone knows — the policy
 //! decisions it made and the run's verdict.
 
-use crate::app::conversation::ConversationId;
+use crate::app::conversation::{Conversation, ConversationId};
 use crate::app::events::{AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest};
 use crate::app::runtime::{AgentRuntime, TurnSpec};
 use crate::config::Config;
@@ -35,6 +39,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Marks where one user turn ends and the next begins in the trace.
+const TURN_STARTED: &str = "harness.turn.started";
 
 /// How the driver answers `RequestToolApproval`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,10 +113,12 @@ pub enum SemanticMode {
     Ready(Duration),
 }
 
-/// Everything one headless turn needs.
+/// Everything one headless run needs.
 #[derive(Debug, Clone)]
 pub struct ExecOptions {
-    pub prompt: String,
+    /// User turns, in order. Several are driven against one accumulating
+    /// history — the only way to reach what happens *between* turns.
+    pub prompts: Vec<String>,
     /// Working directory tools run in, and the workspace the system prompt
     /// describes. `None` keeps the process's own cwd.
     pub workspace: Option<PathBuf>,
@@ -180,7 +189,11 @@ pub struct RunOutcome {
     pub status: RunStatus,
     pub trace_path: PathBuf,
     pub duration_ms: u64,
-    /// Assistant text of the final step, i.e. the turn's answer.
+    /// User turns actually driven. Older reports predate the field and read
+    /// back as the single turn they were.
+    #[serde(default = "one_turn")]
+    pub turns: usize,
+    /// Assistant text of the final step, i.e. the last turn's answer.
     pub final_text: String,
     pub tools: Vec<ToolInvocation>,
     pub sub_agents: usize,
@@ -191,12 +204,17 @@ pub struct RunOutcome {
     pub semantic_ready: bool,
 }
 
+fn one_turn() -> usize {
+    1
+}
+
 impl RunOutcome {
     fn setup_failed(trace_path: PathBuf, error: impl Into<String>) -> Self {
         Self {
             status: RunStatus::SetupFailed,
             trace_path,
             duration_ms: 0,
+            turns: 0,
             final_text: String::new(),
             tools: Vec::new(),
             sub_agents: 0,
@@ -265,7 +283,10 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
     debug_log::log_json(
         action::RUN_STARTED,
         &serde_json::json!({
-            "prompt": options.prompt,
+            // `prompt` stays the first turn so existing trace readers keep working.
+            "prompt": options.prompts.first().cloned().unwrap_or_default(),
+            "prompts": options.prompts,
+            "turns": options.prompts.len(),
             "workspace": workspace,
             "model": config.active_model(),
             "provider": config.active_provider.clone().unwrap_or_else(|| "deepseek".into()),
@@ -414,8 +435,9 @@ async fn await_semantic(semantic: &Arc<SemanticService>, budget: Duration) -> bo
     semantic.is_ready()
 }
 
-/// Spawn the turn and service its events until every conversation in the
-/// tree is done or the budget runs out.
+/// Drive every turn in order, servicing each one's events until its whole
+/// conversation tree is done. One history, one provider session, one budget:
+/// the turns are a conversation, not a batch of independent runs.
 async fn drive(
     config: &Config,
     options: &ExecOptions,
@@ -426,159 +448,223 @@ async fn drive(
 ) -> RunOutcome {
     let whitelist = crate::whitelist::load();
     let root = ConversationId::next();
-    let user_message = ChatMessage::user(&options.prompt);
-    let mut transcript = vec![user_message.clone()];
+    // History is accumulated through the app's own reducer, so turn two sees
+    // exactly what turn two in the TUI would see.
+    let mut history = Conversation::fresh_main(None);
+    // No provider window is known here, so the ladder only runs on an explicit
+    // `[context] context_window`; this id just namespaces its spill directory.
+    let run_id = crate::session::create_session_id();
 
-    let root_handle = harness.runtime.spawn(TurnSpec {
-        conversation: root,
-        provider: Arc::clone(&harness.provider),
-        messages: vec![user_message],
-        system_prompt: harness.system_prompt.clone(),
-        model: config.provider.model.clone(),
-        temperature: config.provider.temperature,
-        max_tokens: config.provider.max_tokens,
-        max_steps: config.agent.max_steps_per_turn.max(1),
-        max_tools_per_step: config.agent.max_tools_per_step.max(1),
-        auto_approve: false,
-        tool_output_limit: config.context.tool_output_limit as usize,
-    });
-
-    let mut pending: HashSet<ConversationId> = HashSet::from([root]);
-    let mut handles = vec![root_handle];
     let mut tools: Vec<ToolInvocation> = Vec::new();
     let mut questions = Vec::new();
     let mut sub_agents = 0usize;
     let mut final_text = String::new();
     let mut error = None;
     let mut status = RunStatus::Completed;
+    let mut turns = 0usize;
 
+    // One budget for the whole run. Arming it per turn would let a three-turn
+    // scenario quietly spend three times its declared timeout.
     let deadline = tokio::time::sleep(options.timeout);
     tokio::pin!(deadline);
 
-    while !pending.is_empty() {
-        tokio::select! {
-            () = &mut deadline => {
-                status = RunStatus::TimedOut;
-                error = Some(format!(
-                    "run exceeded {}s with {} conversation(s) still active",
-                    options.timeout.as_secs(),
-                    pending.len()
-                ));
-                break;
-            }
-            event = event_rx.recv() => {
-                let Some(event) = event else { break };
-                match event {
-                    AppEvent::AgentDone(conversation, result) => {
-                        if conversation == root {
-                            final_text = result.text.clone();
+    for prompt in &options.prompts {
+        turns += 1;
+        history.messages.push(ChatMessage::user(prompt));
+        debug_log::log_json(
+            TURN_STARTED,
+            &serde_json::json!({
+                "turn": turns,
+                "of": options.prompts.len(),
+                "prompt": prompt,
+                "history_messages": history.messages.len(),
+            }),
+        );
+
+        let root_handle = harness.runtime.spawn(TurnSpec {
+            conversation: root,
+            provider: Arc::clone(&harness.provider),
+            messages: history.messages.clone(),
+            system_prompt: harness.system_prompt.clone(),
+            model: config.provider.model.clone(),
+            temperature: config.provider.temperature,
+            max_tokens: config.provider.max_tokens,
+            max_steps: config.agent.max_steps_per_turn.max(1),
+            max_tools_per_step: config.agent.max_tools_per_step.max(1),
+            auto_approve: false,
+            tool_output_limit: config.context.tool_output_limit as usize,
+            context: crate::context::ContextSpec::new(&config.context, 0, &run_id),
+        });
+
+        let mut pending: HashSet<ConversationId> = HashSet::from([root]);
+        let mut handles = vec![root_handle];
+        let mut stopped = false;
+
+        while !pending.is_empty() {
+            tokio::select! {
+                () = &mut deadline => {
+                    status = RunStatus::TimedOut;
+                    error = Some(format!(
+                        "run exceeded {}s during turn {}/{} with {} conversation(s) still active",
+                        options.timeout.as_secs(),
+                        turns,
+                        options.prompts.len(),
+                        pending.len()
+                    ));
+                    stopped = true;
+                    break;
+                }
+                event = event_rx.recv() => {
+                    let Some(event) = event else {
+                        stopped = true;
+                        break;
+                    };
+                    match event {
+                        AppEvent::AgentDone(conversation, result) => {
+                            if conversation == root {
+                                final_text = result.text.clone();
+                                history.discard_empty_assistant();
+                            }
+                            pending.remove(&conversation);
                         }
-                        pending.remove(&conversation);
-                    }
-                    AppEvent::AgentError(conversation, message) => {
-                        if error.is_none() {
-                            error = Some(message.clone());
-                            status = RunStatus::Failed;
+                        AppEvent::AgentError(conversation, message) => {
+                            if error.is_none() {
+                                error = Some(message.clone());
+                                status = RunStatus::Failed;
+                            }
+                            if conversation == root {
+                                history.discard_empty_assistant();
+                            }
+                            debug_log::log_json(
+                                action::MESSAGE,
+                                &serde_json::json!({
+                                    "conversation": conversation.0,
+                                    "role": "error",
+                                    "content": message,
+                                }),
+                            );
+                            pending.remove(&conversation);
                         }
-                        debug_log::log_json(
-                            action::MESSAGE,
-                            &serde_json::json!({
-                                "conversation": conversation.0,
-                                "role": "error",
-                                "content": message,
-                            }),
-                        );
-                        pending.remove(&conversation);
-                    }
-                    AppEvent::AddMessage(conversation, message) => {
-                        if conversation == root {
-                            transcript.push(message.clone());
+                        AppEvent::AddMessage(conversation, message) => {
+                            if conversation == root {
+                                history.messages.push(message.clone());
+                            }
+                            debug_log::log_json(
+                                action::MESSAGE,
+                                &serde_json::json!({
+                                    "conversation": conversation.0,
+                                    "role": &message.role,
+                                    "content": message.content,
+                                    "tool_error": message.tool_error,
+                                }),
+                            );
                         }
-                        debug_log::log_json(
-                            action::MESSAGE,
-                            &serde_json::json!({
-                                "conversation": conversation.0,
-                                "role": &message.role,
-                                "content": message.content,
-                                "tool_error": message.tool_error,
-                            }),
-                        );
-                    }
-                    AppEvent::RequestToolApproval(request) => {
-                        let approved = options.approve.decide(&request.tool_name, &whitelist);
-                        record_approval(&request, approved);
-                        tools.push(ToolInvocation {
-                            name: request.tool_name.clone(),
-                            approved,
-                            ok: approved,
-                        });
-                        tokio::spawn(async move { request.resolve(approved).await });
-                    }
-                    AppEvent::RequestQuestion(request, state) => {
-                        let answer = answer_for(options, &state);
-                        questions.push(state.question.clone());
-                        debug_log::log_json(
-                            action::QUESTION,
-                            &serde_json::json!({
-                                "question": state.question,
-                                "options": state.options,
-                                "answered": answer,
-                            }),
-                        );
-                        record_question(&request, answer);
-                    }
-                    AppEvent::ToolError { conversation: _, error: message } => {
-                        if let Some(last) = tools.last_mut() {
-                            last.ok = false;
+                        // The three events the TUI builds assistant messages
+                        // from; without them the next turn loses what the
+                        // model said in this one.
+                        AppEvent::BeginAssistantMessage(conversation) => {
+                            if conversation == root {
+                                history.begin_assistant_message();
+                            }
                         }
-                        debug_log::log_json(
-                            action::TOOL_RESULT,
-                            &serde_json::json!({ "ok": false, "error": message }),
-                        );
+                        AppEvent::AgentChunk(conversation, chunk) => {
+                            if conversation == root {
+                                history.append_chunk(&chunk);
+                            }
+                        }
+                        AppEvent::DiscardEmptyAssistantMessage(conversation) => {
+                            if conversation == root {
+                                history.discard_empty_assistant();
+                            }
+                        }
+                        AppEvent::RequestToolApproval(request) => {
+                            let approved = options.approve.decide(&request.tool_name, &whitelist);
+                            record_approval(&request, approved);
+                            tools.push(ToolInvocation {
+                                name: request.tool_name.clone(),
+                                approved,
+                                ok: approved,
+                            });
+                            tokio::spawn(async move { request.resolve(approved).await });
+                        }
+                        AppEvent::RequestQuestion(request, state) => {
+                            let answer = answer_for(options, &state);
+                            questions.push(state.question.clone());
+                            debug_log::log_json(
+                                action::QUESTION,
+                                &serde_json::json!({
+                                    "question": state.question,
+                                    "options": state.options,
+                                    "answered": answer,
+                                }),
+                            );
+                            record_question(&request, answer);
+                        }
+                        AppEvent::ToolError { conversation: _, error: message } => {
+                            if let Some(last) = tools.last_mut() {
+                                last.ok = false;
+                            }
+                            debug_log::log_json(
+                                action::TOOL_RESULT,
+                                &serde_json::json!({ "ok": false, "error": message }),
+                            );
+                        }
+                        AppEvent::SpawnSubAgent { parent, label, prompt } => {
+                            sub_agents += 1;
+                            let id = ConversationId::next();
+                            debug_log::log_json(
+                                action::SUB_AGENT,
+                                &serde_json::json!({
+                                    "parent": parent.0,
+                                    "conversation": id.0,
+                                    "label": label,
+                                    "prompt": prompt,
+                                }),
+                            );
+                            pending.insert(id);
+                            handles.push(harness.runtime.spawn(TurnSpec {
+                                conversation: id,
+                                provider: harness.provider.fork(),
+                                messages: vec![ChatMessage::user(&prompt)],
+                                system_prompt: harness.system_prompt.clone(),
+                                model: config.provider.model.clone(),
+                                temperature: config.provider.temperature,
+                                max_tokens: config.provider.max_tokens,
+                                // Same clamp the TUI applies to background turns.
+                                max_steps: config.agent.max_steps_per_turn.clamp(1, 8),
+                                max_tools_per_step: config.agent.max_tools_per_step.max(1),
+                                auto_approve: true,
+                                tool_output_limit: config.context.tool_output_limit as usize,
+                                context: crate::context::ContextSpec::new(
+                                    &config.context,
+                                    0,
+                                    &run_id,
+                                ),
+                            }));
+                        }
+                        // Everything else is TUI chrome (status lines, server
+                        // and update events) with no bearing on the run.
+                        _ => {}
                     }
-                    AppEvent::SpawnSubAgent { parent, label, prompt } => {
-                        sub_agents += 1;
-                        let id = ConversationId::next();
-                        debug_log::log_json(
-                            action::SUB_AGENT,
-                            &serde_json::json!({
-                                "parent": parent.0,
-                                "conversation": id.0,
-                                "label": label,
-                                "prompt": prompt,
-                            }),
-                        );
-                        pending.insert(id);
-                        handles.push(harness.runtime.spawn(TurnSpec {
-                            conversation: id,
-                            provider: harness.provider.fork(),
-                            messages: vec![ChatMessage::user(&prompt)],
-                            system_prompt: harness.system_prompt.clone(),
-                            model: config.provider.model.clone(),
-                            temperature: config.provider.temperature,
-                            max_tokens: config.provider.max_tokens,
-                            // Same clamp the TUI applies to background turns.
-                            max_steps: config.agent.max_steps_per_turn.clamp(1, 8),
-                            max_tools_per_step: config.agent.max_tools_per_step.max(1),
-                            auto_approve: true,
-                            tool_output_limit: config.context.tool_output_limit as usize,
-                        }));
-                    }
-                    // Everything else is TUI chrome (chunks, status lines,
-                    // server and update events) with no bearing on the run.
-                    _ => {}
                 }
             }
         }
+
+        for handle in handles {
+            handle.abort();
+        }
+        // A turn that timed out, errored, or lost its event channel leaves a
+        // half-written history; running the next prompt on top of it would
+        // measure nothing useful.
+        if stopped || status != RunStatus::Completed {
+            break;
+        }
     }
 
-    for handle in handles {
-        handle.abort();
-    }
     drop(event_tx);
 
     let session_id = if options.save_session {
-        persist(config, &transcript)
+        persist(config, &history.messages)
     } else {
         None
     };
@@ -587,6 +673,7 @@ async fn drive(
         status,
         trace_path: options.trace_path.clone(),
         duration_ms: started.elapsed().as_millis() as u64,
+        turns,
         final_text,
         tools,
         sub_agents,
@@ -705,7 +792,7 @@ mod tests {
 
     fn probe_options() -> ExecOptions {
         ExecOptions {
-            prompt: String::new(),
+            prompts: Vec::new(),
             workspace: None,
             trace_path: PathBuf::from("trace.jsonl"),
             approve: ApprovePolicy::All,
@@ -718,6 +805,102 @@ mod tests {
             model: None,
             save_session: false,
             system_append: None,
+        }
+    }
+
+    /// The whole point of multi-turn: the second request must carry the first
+    /// turn's user message *and* the answer to it, with the new prompt last.
+    #[tokio::test]
+    async fn a_second_turn_is_sent_the_first_turns_history() {
+        let fake = Arc::new(crate::provider::fake::FakeProvider::with_responses(vec![
+            "first answer".to_string(),
+            "second answer".to_string(),
+        ]));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let harness = probe_harness(Arc::clone(&fake) as Arc<dyn LLMProvider>, event_tx.clone());
+        let options = ExecOptions {
+            prompts: vec!["one".to_string(), "two".to_string()],
+            timeout: Duration::from_secs(30),
+            ..probe_options()
+        };
+
+        let outcome = drive(
+            &probe_config(),
+            &options,
+            &harness,
+            event_tx,
+            event_rx,
+            Instant::now(),
+        )
+        .await;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(outcome.turns, 2);
+        assert_eq!(outcome.final_text, "second answer");
+
+        let first = fake.request(0).expect("first turn was sent");
+        assert!(
+            !first.iter().any(|m| m.content.contains("two")),
+            "the first turn must not see the second prompt: {first:?}"
+        );
+        let second = fake.request(1).expect("second turn was sent");
+        let contents: Vec<&str> = second.iter().map(|m| m.content.as_str()).collect();
+        assert!(contents.contains(&"one"), "{contents:?}");
+        assert!(
+            contents.iter().any(|c| c.contains("first answer")),
+            "{contents:?}"
+        );
+        assert_eq!(contents.last(), Some(&"two"), "{contents:?}");
+    }
+
+    /// A single prompt must still be a single turn, sent with nothing in front
+    /// of it — the shape every existing scenario relies on.
+    #[tokio::test]
+    async fn a_single_prompt_is_still_one_turn() {
+        let fake = Arc::new(crate::provider::fake::FakeProvider::with_response("done"));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let harness = probe_harness(Arc::clone(&fake) as Arc<dyn LLMProvider>, event_tx.clone());
+        let options = ExecOptions {
+            prompts: vec!["only".to_string()],
+            timeout: Duration::from_secs(30),
+            ..probe_options()
+        };
+
+        let outcome = drive(
+            &probe_config(),
+            &options,
+            &harness,
+            event_tx,
+            event_rx,
+            Instant::now(),
+        )
+        .await;
+
+        assert_eq!(outcome.turns, 1);
+        assert_eq!(outcome.final_text, "done");
+        assert!(fake.request(1).is_none(), "a second turn was sent");
+    }
+
+    fn probe_config() -> Config {
+        let mut config = Config::default();
+        config.semantic.enabled = false;
+        config.agent.max_steps_per_turn = 2;
+        config
+    }
+
+    fn probe_harness(
+        provider: Arc<dyn LLMProvider>,
+        event_tx: mpsc::UnboundedSender<AppEvent>,
+    ) -> Harness {
+        let config = probe_config();
+        let tools = Arc::new(ToolRegistry::new());
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+        let semantic = SemanticService::start(&config, Vec::new(), event_tx.clone());
+        Harness {
+            runtime: AgentRuntime::new(tools, mcp, semantic, event_tx),
+            provider,
+            system_prompt: "You are a test.".to_string(),
+            semantic_ready: false,
         }
     }
 }

@@ -61,6 +61,7 @@ impl App {
         };
 
         let id = conversation::ConversationId::next();
+        let session_id = crate::session::create_session_id();
         let messages = vec![ChatMessage::user(&prompt)];
         let system_prompt = super::system_prompt::build(
             &self.prompts,
@@ -88,6 +89,11 @@ impl App {
             max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
             auto_approve: true, // background: auto-approve, never block on a modal
             tool_output_limit: self.config.context.tool_output_limit as usize,
+            context: crate::context::ContextSpec::new(
+                &self.config.context,
+                self.state.provider_context_window,
+                &session_id,
+            ),
         });
 
         self.state
@@ -97,7 +103,7 @@ impl App {
                 kind,
                 parent: Some(parent),
                 title,
-                session_id: crate::session::create_session_id(),
+                session_id,
                 session_started_at: chrono::Utc::now().to_rfc3339(),
                 messages,
                 provider: Some(provider),

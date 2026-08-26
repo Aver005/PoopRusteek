@@ -124,6 +124,9 @@ impl DeepseekProvider {
             &system_prompt,
             session.system_sent_for_session,
         );
+        // Counted from the prompt that is really sent — for a continuing
+        // session that is only the tail, not the whole local history.
+        let prompt_tokens = crate::context::budget_tokens(&prompt);
         let body = self.build_body(request, prompt, &session);
         debug_log::log_json(
             "completion.context",
@@ -155,6 +158,7 @@ impl DeepseekProvider {
             )
             .await);
         }
+        self.add_session_tokens(prompt_tokens);
 
         Ok((response, session.session_id))
     }

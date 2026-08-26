@@ -1,7 +1,7 @@
 # HARNESS — headless behaviour testing
 
 > Deep reference for `src/harness/` + `sandbox/`. Added 2026-08-25.
-> Last updated: 2026-08-25
+> Last updated: 2026-08-26 (multi-turn conversations — §5, §10)
 
 ## 1. WHY IT EXISTS
 
@@ -18,8 +18,9 @@ existing headless modes do **not** run the agent loop:
 | `--acp` | 190-line prompt relay. No tools, hardcoded system prompt. | `src/acp/server.rs` |
 | `--proxy` / `--serve --uiless` | Provider gateway. Stateless per request; inbound `tools` explicitly ignored with a `tracing::warn`. | `src/server/openai.rs::chat_completions` |
 
-So the harness adds a third: **`pooprusteek exec`** — one real turn, no
-terminal, one machine-readable trace.
+So the harness adds a third: **`pooprusteek exec`** — one real turn (or
+several, run in order as one conversation — see §5), no terminal, one
+machine-readable trace.
 
 ## 2. TRACE = THE EXISTING DEBUG LOG, IN JSONL
 
@@ -78,7 +79,7 @@ the tree is done, so sub-agent work is inside the measured window.
 | File | Purpose |
 |------|---------|
 | `harness/mod.rs` | clap subcommands (`exec`, `scenario`, `suite`, `mine`, `mock-provider`) + dispatch. Returns a process exit code. |
-| `harness/driver.rs` | One turn: assembles the same deps as `App::new`, spawns a `TurnSpec`, services events under a wall-clock deadline. |
+| `harness/driver.rs` | One or more turns in one conversation: assembles the same deps as `App::new`, spawns a `TurnSpec` per turn against one accumulating `Conversation`, services events under a single wall-clock deadline for the whole run. |
 | `harness/trace.rs` | `TraceRecord` / `Trace` — the reading side of the JSONL. |
 | `harness/metrics.rs` | `RunMetrics::from_trace` — steps, tool calls/errors, malformed count, stream timeouts, `TurnEnd`. |
 | `harness/scenario.rs` | Scenario + `Expect` TOML model, expectation checking, child-process orchestration. |
@@ -108,6 +109,32 @@ that silently passes is the worst failure mode a harness can have.
 **Gotcha:** regex expectations must use TOML *literal* strings
 (`final_matches = ['0\.4\.2']`). A basic `"…"` string consumes the
 backslashes and the file fails to parse.
+
+### Multi-turn scenarios (2026-08-26)
+
+A scenario is one *conversation*, not necessarily one turn. `prompt = "…"`
+still works and is still one turn; `prompts = ["…", "…", …]` runs several
+turns in order against **one** accumulating history and one provider
+session — the only way to reach behaviour that only shows up *between*
+turns (clearing old tool output, a session reset, a summary). The two keys
+are mutually exclusive (`Scenario::from_toml` rejects both together, and
+rejects neither present); either way `Scenario::turns()` is the one reader.
+`Expect` always describes the **final** state — the last turn's answer, the
+workspace after every turn has run, `max_steps`/`max_tool_calls` summed
+across the whole run, not per turn. `timeout` is likewise one budget for the
+whole run, not one per turn, so a stalled turn 1 fails the run instead of
+quietly eating three turns' worth of wall clock.
+
+Under the hood, `exec`'s positional argument is `ExecArgs.prompts: Vec<String>`
+(clap `num_args = 1..`) — `pooprusteek exec "one" "two" "three"` runs three
+turns. The child command line puts every flag first and every prompt last,
+after a literal `--`, so a prompt that happens to start with `-` is never
+misread as a flag (`exec_args`/`push_flag` in `scenario.rs`).
+
+The trace gets one `harness.turn.started` record per turn
+(`turn`/`of`/`prompt`/`history_messages`), and `RunOutcome`/`ScenarioReport`
+carry a `turns` count — `report.rs` only prints it when it's above 1, so an
+ordinary one-turn scenario's output is unchanged.
 
 ## 6. JUDGING BY THE FILESYSTEM, NOT THE ANSWER
 
@@ -243,6 +270,13 @@ cargo build --bin pooprusteek
 `--config` (new, global) keeps a run off the real config and token. Note the
 *data* dir is still the real one on Windows — `dirs::data_dir()` has no env
 override there, unlike XDG on Linux.
+
+Several prompts after `--trace` (and any other flags) run as one multi-turn
+conversation (§5):
+
+```
+./target/debug/pooprusteek --config .dev/harness-config.toml exec --trace .dev/t.jsonl -- "read the file" "now summarise it"
+```
 
 ## 11. WHAT THE HARNESS FOUND ON ITS FIRST RUNS
 
