@@ -75,9 +75,7 @@ impl DeepseekProvider {
         let session_id = payload["data"]["biz_data"]["chat_session"]["id"]
             .as_str()
             .map(|id| id.to_string())
-            .ok_or_else(|| {
-                AppError::Provider("Invalid session payload: missing chat_session.id".to_string())
-            })?;
+            .ok_or_else(|| AppError::Provider(session_create_error(&payload)))?;
         debug_log::log("session.create.success", format!("session_id={session_id}"));
         Ok(session_id)
     }
@@ -157,5 +155,59 @@ impl DeepseekProvider {
         }
 
         Ok(())
+    }
+}
+
+/// Причина отказа из конверта ответа, а не следствие.
+///
+/// DeepSeek отвечает HTTP 200 и кладёт ошибку внутрь тела (`code`/`msg`),
+/// поэтому проверка статуса её пропускает. Без этого протухший токен
+/// выглядел как «missing chat_session.id» — симптом вместо причины.
+fn session_create_error(payload: &Value) -> String {
+    let message = payload["msg"].as_str().unwrap_or_default().trim();
+    match (payload["code"].as_i64(), message) {
+        (Some(code), msg) if !msg.is_empty() => {
+            format!("DeepSeek refused the session: {msg} (code {code})")
+        }
+        (_, msg) if !msg.is_empty() => format!("DeepSeek refused the session: {msg}"),
+        _ => "Invalid session payload: missing chat_session.id".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_expired_token_reports_the_reason_the_server_gave() {
+        let payload = json!({
+            "code": 40003,
+            "msg": "Authorization Failed (invalid token)",
+            "data": null
+        });
+        let message = session_create_error(&payload);
+        assert!(
+            message.contains("Authorization Failed (invalid token)"),
+            "{message}"
+        );
+        assert!(message.contains("40003"), "{message}");
+    }
+
+    #[test]
+    fn a_payload_without_a_message_keeps_the_structural_error() {
+        let payload = json!({ "data": { "biz_data": {} } });
+        assert_eq!(
+            session_create_error(&payload),
+            "Invalid session payload: missing chat_session.id"
+        );
+    }
+
+    #[test]
+    fn a_message_without_a_code_is_still_reported() {
+        let payload = json!({ "msg": "service unavailable" });
+        assert_eq!(
+            session_create_error(&payload),
+            "DeepSeek refused the session: service unavailable"
+        );
     }
 }
