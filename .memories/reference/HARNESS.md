@@ -1,7 +1,8 @@
 # HARNESS — headless behaviour testing
 
 > Deep reference for `src/harness/` + `sandbox/`. Added 2026-08-25.
-> Last updated: 2026-08-26 (multi-turn conversations — §5, §10)
+> Last updated: 2026-08-26 (scenario `[context]` table, `[[expect.trace]]`,
+> a run that produced nothing is a failure — §4, §5, §6)
 
 ## 1. WHY IT EXISTS
 
@@ -79,7 +80,7 @@ the tree is done, so sub-agent work is inside the measured window.
 | File | Purpose |
 |------|---------|
 | `harness/mod.rs` | clap subcommands (`exec`, `scenario`, `suite`, `mine`, `mock-provider`) + dispatch. Returns a process exit code. |
-| `harness/driver.rs` | One or more turns in one conversation: assembles the same deps as `App::new`, spawns a `TurnSpec` per turn against one accumulating `Conversation`, services events under a single wall-clock deadline for the whole run. |
+| `harness/driver.rs` | One or more turns in one conversation: assembles the same deps as `App::new`, spawns a `TurnSpec` per turn against one accumulating `Conversation`, services events under a single wall-clock deadline for the whole run. Also owns `ContextOverrides` (the scenario's `[context]` table, layered over the loaded config before anything reads it), asks the provider for its window in the background like `App::new` does (`ContextWindowLearned` → `harness.context.window`), and applies `ToolOutputCleared` to its own history the way the TUI does, matching by tool-call id. |
 | `harness/trace.rs` | `TraceRecord` / `Trace` — the reading side of the JSONL. |
 | `harness/metrics.rs` | `RunMetrics::from_trace` — steps, tool calls/errors, malformed count, stream timeouts, `TurnEnd`. |
 | `harness/scenario.rs` | Scenario + `Expect` TOML model, expectation checking, child-process orchestration. |
@@ -136,6 +137,51 @@ The trace gets one `harness.turn.started` record per turn
 carry a `turns` count — `report.rs` only prints it when it's above 1, so an
 ordinary one-turn scenario's output is unchanged.
 
+### The `[context]` table (2026-08-26)
+
+A scenario can pin the compaction settings its behaviour depends on:
+
+```toml
+[context]
+window                 = 12000   # [context] context_window — tokens
+reserved_tokens        = 1000    # headroom for the model's own answer
+preserve_recent_tokens = 500     # verbatim tail rung 1 may not touch; 0 = derive
+tool_output_limit      = 20000   # rung 0's per-result cap, in characters
+auto_compact           = true    # master switch for the ladder
+```
+
+**Why it exists.** The ladder only runs against a *known* window (invariant
+12), and until today nothing in a scenario could name one: `driver.rs` passed
+`provider_window: 0` at both spawn sites, `sandbox/config.template.toml` had no
+`[context]` section, and `Scenario` is `deny_unknown_fields`, so a scenario
+file could not supply one either. The consequence was not "compaction is
+lightly tested" — **no scenario could reach rungs 1, 2 or 3 at all**, and every
+live trace showed the same shape: `context.prune.skipped`, never
+`context.prune`. The ladder shipped on unit tests and hand-driven `--config`
+runs.
+
+Every field is optional and absence means "leave the config alone" — a
+scenario without the table passes no context flag at all, so the child's own
+config keeps deciding (`without_a_context_table_no_context_flag_is_passed`).
+The table is deserialised straight into `driver::ContextOverrides`, the same
+struct the `exec` flags fill, so TOML keys and flags cannot drift; each repeat
+is a separate process, so they travel as `--context-window`,
+`--context-reserved-tokens`, `--context-preserve-recent-tokens`,
+`--tool-output-limit`, `--auto-compact`
+(`context_overrides_reach_the_child_command_line`).
+
+Pinning the window is also what makes a compaction run *deterministic*. The
+driver does now ask the provider (the mock's `/models` reports
+`context_length`, and `harness.context.window` records the answer), but that
+answer arrives asynchronously and may never arrive at all; `[context] window`
+outranks it, as config always does.
+
+The first scenario built on this is
+`sandbox/scenarios/mock/rung-one-clears-tool-output.toml`. It is a *mock*
+scenario on purpose: `mock-provider` is reached through `CompatClient`, so
+`keeps_server_side_history()` is false and rung 1 applies to it — on DeepSeek
+rung 1 is skipped outright.
+
 ## 6. JUDGING BY THE FILESYSTEM, NOT THE ANSWER
 
 For a development task the answer text is the least reliable evidence
@@ -143,7 +189,7 @@ available: a model will describe three files it never wrote, confidently and in
 detail. Two fields exist for this.
 
 `workspace_template` is copied into a **fresh scratch directory per repeat**,
-which is where the turn then runs. So a writing task starts from a known state
+which is where the run's turns then happen. So a writing task starts from a known state
 every time, repeats cannot see each other's output, and the copies are kept
 under the report directory so what the agent produced can be read afterwards.
 An empty template is a greenfield task. It is mutually exclusive with
@@ -180,6 +226,66 @@ build a static page, fix a failing test, respect explicit constraints, explain
 without editing. `python3` is in the image so the red-to-green loop is real
 work rather than a simulation of it.
 
+### Judging by the trace: `[[expect.trace]]` (2026-08-26)
+
+The filesystem and the answer text cover everything the agent *produces*.
+Everything it does **inside the loop** — clearing a tool body, re-seeding a
+session, skipping a rung — leaves no trace anywhere else, so a scenario could
+only ever assert that such a run finished, never that the thing under test
+happened. `[[expect.trace]]` reads the trace itself:
+
+```toml
+[[expect.trace]]
+action    = "context.prune"   # required
+min_count = 1                 # default 1 — a named action that never fired fails
+max_count = 0                 # 0 asserts the action never happened
+field     = "cleared"         # numeric field, totalled across matching records
+min_total = 1
+max_total = 0
+```
+
+Rules worth knowing:
+
+- `min_count` **defaults to 1**. A typo'd action is then a loud failure, not a
+  vacuous pass — the same reasoning as `deny_unknown_fields`.
+- `field` reads both shapes a `debug_log` call site produces: a JSON `data`
+  payload, and the `key=value` message line (via `metrics::message_field`), so
+  the assertion does not depend on how the call site happened to log.
+- A `field` with no bound, or a bound with no `field`, asserts nothing and is
+  rejected at **load** time (`TraceExpect::validate`), not silently ignored.
+- Totals are summed across every matching record, so `min_total` on a
+  multi-step run is "at least this much in total", not "on some step".
+
+This is what lets a scenario prove a rung *fired*. The mock rung-1 scenario
+asserts five things at once: `context.prune` happened with `cleared >= 1`,
+`spill_failed` totals 0 (a marker naming a file that was never written is the
+defect the field was added for), `context.prune.skipped` never happened
+(`max_count = 0` — the shape a DeepSeek-backed run produces), the provider's
+window reached the driver (`harness.context.window`), and the driver applied
+the edit to its own history (`harness.context.tool_output_cleared`).
+
+### A run that produced nothing to judge is a failure (2026-08-26)
+
+Every `Expect` field is optional and `Expect` itself is `#[serde(default)]`,
+so a child that never started cleared every check: a token-less config reported
+`1/1 passed (100%)` over `status: setup_failed, turns: 0`. `Expect::check` now
+fails a run outright when it produced nothing to judge — `setup_failed`, zero
+turns, or turns that started but never ran a step — and the message names the
+actual status so the way out is visible.
+
+The way out is to *declare* it: only an explicit `status = "failed" |
+"timed_out" | "setup_failed"` waives the guard, and the waiver is per status —
+a scenario expecting `completed` does not inherit it. So the failure-path
+scenarios (`fails-cleanly-on-429`, which declares `status = "failed"`) keep
+working, while a scenario that meant to test a real run can no longer pass
+without one.
+
+Exactly one committed scenario was passing vacuously before this:
+`scenarios/live/reports-denied-tools.toml` declares no `status`, and its
+remaining checks (`max_steps`, a `final_not_matches` regex) are all satisfied
+by an empty run. It needs no edit — it wanted a real run all along; it just had
+no way of saying so.
+
 ## 7. LIVE VS MOCK
 
 `scenarios/live/` hits the real DeepSeek web API — the source of live answers
@@ -192,6 +298,15 @@ paths the live model produces by accident. `mock-scripts/` scripts support
 `when` (substring match on the last user message), positional order with the
 last reply repeating, `delay_ms` for timeout tests and `status` for error
 paths (429/500).
+
+**Scripts live in `sandbox/mock-scripts/`, scenarios in
+`sandbox/scenarios/`** — `./sandbox.ps1 mock <name>` appends `.toml` and both
+control CLIs list only `mock-scripts/*.toml`, so a script kept anywhere else
+cannot be started by name. The two directories are mounted separately and
+`suite <dir>` only ever walks `scenarios/`, so a script being a `.toml` is
+safe there; a `.toml` *under `scenarios/`* would be collected as a scenario
+(and would also make `scenario <name>` ambiguous), which is the constraint
+that pushed `rung-one-clears-tool-output` out of the scenario directory.
 
 The mock's JSON is hand-rolled rather than reusing `openai_compat`'s
 serializers on purpose: a double that shares wire code with the thing under

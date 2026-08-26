@@ -1762,7 +1762,7 @@ mod tests {
         assert!(
             crate::context::prune::is_cleared(&tool_messages[0].content),
             "old body replaced by the marker, got {}",
-            &tool_messages[0].content
+            tool_messages[0].content
         );
         assert_eq!(
             tool_messages[1].content, recent_body,
@@ -1777,7 +1777,7 @@ mod tests {
         assert!(
             tool_messages[0].content.contains("call_old__9.txt"),
             "the marker names the spill path, got {}",
-            &tool_messages[0].content
+            tool_messages[0].content
         );
 
         // The app needs the same edit applied to its own history.

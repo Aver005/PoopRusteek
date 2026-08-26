@@ -111,7 +111,27 @@ min_pass_rate = 0.8
 ```
 
 `deny_unknown_fields` is on for both tables: a mistyped expectation is an
-error, not a silent pass.
+error, not a silent pass. And a run that produced nothing to judge — the child
+never started, no turn ran, or no step ran — **fails**, whatever `[expect]`
+says. Expecting a failure is still possible; it has to be declared
+(`status = "failed" | "timed_out" | "setup_failed"`).
+
+Two optional tables do the rest of the work:
+
+```toml
+[context]                    # compaction settings, forwarded to the child as flags
+window = 12000               # without a window the ladder has nothing to measure
+reserved_tokens = 1000       # against and stays off — so rungs 1-3 were untestable
+preserve_recent_tokens = 500
+tool_output_limit = 20000
+auto_compact = true
+
+[[expect.trace]]             # assertions over the trace, i.e. over what happened
+action = "context.prune"     # *inside* the loop, not just over how the run ended
+min_count = 1                # (default 1: a typo'd action fails, never passes)
+field = "cleared"            # numeric field totalled across matching records
+min_total = 1                # `max_count = 0` asserts an action never happened
+```
 
 Each repeat runs as its own child process. That gives one trace file per
 repeat, no state bleeding between them, and a hung turn that can be killed
@@ -127,7 +147,16 @@ OpenAI-compatible endpoint. Same client, same streaming path, same tool
 parser — fixed replies. That is what makes a *regression gate* possible, and
 it is the only way to reliably reach failure paths the live model produces
 only by accident. `mock-scripts/malformed-then-recovers.toml` drives the
-malformed-tool-call retry path on demand.
+malformed-tool-call retry path on demand, and
+`mock-scripts/rung-one-clears-tool-output.toml` drives three large reads that
+push the window past rung 1's trigger — the mock is where the compaction
+ladder can be exercised at all, because DeepSeek keeps its history server-side
+and skips rung 1 outright:
+
+```powershell
+./sandbox.ps1 mock rung-one-clears-tool-output
+./sandbox.ps1 scenario rung-one-clears-tool-output -Repeat 2
+```
 
 ## Reading a trace
 

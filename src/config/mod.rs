@@ -41,6 +41,10 @@ pub struct Config {
     /// Self-update from the rolling `latest` release — see `crate::update`.
     #[serde(default)]
     pub update: UpdateConfig,
+    /// What a migration changed while loading this file. Never a config key —
+    /// `App::new` shows these once so a moved setting is not applied silently.
+    #[serde(skip)]
+    pub migration_notices: Vec<String>,
 }
 
 /// `[update]` — the self-updater (`/update`, `/autoupdate`).
@@ -808,6 +812,51 @@ impl Config {
     }
 }
 
+/// Keys that moved between sections. Unknown keys are dropped on parse (there
+/// is no `deny_unknown_fields`), so a moved one has to be re-read from the text.
+#[derive(Debug, Default, Deserialize)]
+struct LegacyKeys {
+    #[serde(default)]
+    agent: LegacyAutoCompact,
+    #[serde(default)]
+    context: LegacyAutoCompact,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyAutoCompact {
+    /// `Option`, not `bool`: the migration hinges on telling an absent
+    /// `[context] auto_compact` from an explicit `auto_compact = false`.
+    #[serde(default)]
+    auto_compact: Option<bool>,
+}
+
+/// Carry `[agent] auto_compact` over to `[context]` when the new section does
+/// not set it — an upgrade must not switch the ladder back on behind the user.
+fn apply_migrations(text: &str, config: &mut Config) {
+    let Ok(legacy) = toml::from_str::<LegacyKeys>(text) else {
+        return;
+    };
+    if legacy.context.auto_compact.is_some() {
+        return;
+    }
+    let Some(legacy_value) = legacy.agent.auto_compact else {
+        return;
+    };
+    config.context.auto_compact = legacy_value;
+    config.migration_notices.push(format!(
+        "`auto_compact` moved from [agent] to [context]. Your `auto_compact = {legacy_value}` \
+         was carried over; the next config save rewrites it under [context]."
+    ));
+}
+
+/// Parse config text and apply the migrations for keys that changed section.
+/// The one entry point for reading a config file — `toml::from_str` skips them.
+pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
+    let mut config: Config = toml::from_str(text)?;
+    apply_migrations(text, &mut config);
+    Ok(config)
+}
+
 /// `--config <file>` when given, the user's real config otherwise.
 pub fn load_from_optional(explicit: Option<&std::path::Path>) -> AppResult<Config> {
     match explicit {
@@ -822,7 +871,7 @@ pub fn load_from_optional(explicit: Option<&std::path::Path>) -> AppResult<Confi
 pub fn load_from(path: &std::path::Path) -> AppResult<Config> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| AppError::Config(format!("{}: {e}", path.display())))?;
-    toml::from_str(&content).map_err(|e| AppError::Config(format!("{}: {e}", path.display())))
+    parse(&content).map_err(|e| AppError::Config(format!("{}: {e}", path.display())))
 }
 
 pub fn load() -> AppResult<Config> {
@@ -831,7 +880,7 @@ pub fn load() -> AppResult<Config> {
         return Ok(Config::default());
     }
     let content = std::fs::read_to_string(&path).map_err(|e| AppError::Config(e.to_string()))?;
-    toml::from_str(&content).map_err(|e| AppError::Config(e.to_string()))
+    parse(&content).map_err(|e| AppError::Config(e.to_string()))
 }
 
 pub fn save(config: &Config) -> AppResult<()> {
@@ -1230,10 +1279,80 @@ mod tests {
     }
 
     #[test]
-    fn stale_auto_compact_under_agent_section_is_ignored_not_an_error() {
-        // Old configs still carry `auto_compact` under [agent] — it must be
-        // silently ignored (no deny_unknown_fields), not fail to parse.
-        let parsed: Config = toml::from_str("[agent]\nauto_compact = false\n").unwrap();
-        assert!(parsed.context.auto_compact, "the moved-out key stays true");
+    fn legacy_auto_compact_under_agent_section_is_migrated_and_announced() {
+        // Old configs still carry `auto_compact` under [agent]. It must parse
+        // (no deny_unknown_fields) *and* keep the user's answer.
+        let parsed = parse("[agent]\nauto_compact = false\n").unwrap();
+        assert!(
+            !parsed.context.auto_compact,
+            "an upgrade must not switch the ladder back on"
+        );
+        assert_eq!(parsed.migration_notices.len(), 1);
+        assert!(
+            parsed.migration_notices[0].contains("[agent]")
+                && parsed.migration_notices[0].contains("[context]"),
+            "the notice must name both sections: {}",
+            parsed.migration_notices[0]
+        );
+    }
+
+    #[test]
+    fn legacy_auto_compact_true_is_migrated_too() {
+        let parsed = parse("[agent]\nauto_compact = true\n").unwrap();
+        assert!(parsed.context.auto_compact);
+        assert_eq!(parsed.migration_notices.len(), 1);
+    }
+
+    #[test]
+    fn an_explicit_context_auto_compact_outranks_the_legacy_key() {
+        // Both present: the new section wins and nothing is announced. This is
+        // the case a plain `bool` cannot tell from "the key is absent".
+        let parsed =
+            parse("[agent]\nauto_compact = false\n[context]\nauto_compact = true\n").unwrap();
+        assert!(parsed.context.auto_compact);
+        assert!(parsed.migration_notices.is_empty());
+
+        let parsed =
+            parse("[agent]\nauto_compact = true\n[context]\nauto_compact = false\n").unwrap();
+        assert!(!parsed.context.auto_compact);
+        assert!(parsed.migration_notices.is_empty());
+    }
+
+    #[test]
+    fn a_config_with_neither_key_is_untouched() {
+        let parsed =
+            parse("[agent]\nmax_retries = 3\n[context]\ntool_output_limit = 500\n").unwrap();
+        assert!(
+            parsed.context.auto_compact,
+            "the default still applies when nobody set the key"
+        );
+        assert_eq!(parsed.agent.max_retries, 3);
+        assert_eq!(parsed.context.tool_output_limit, 500);
+        assert!(parsed.migration_notices.is_empty());
+
+        assert!(parse("").unwrap().migration_notices.is_empty());
+    }
+
+    #[test]
+    fn loading_a_real_file_applies_the_migration() {
+        // The wiring, not just the parser: `load`/`load_from` are the only
+        // places a legacy config reaches the app.
+        let path = std::env::temp_dir().join("pooprusteek-legacy-auto-compact-test.toml");
+        std::fs::write(&path, "[agent]\nauto_compact = false\n").unwrap();
+        let loaded = load_from(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let loaded = loaded.unwrap();
+        assert!(!loaded.context.auto_compact);
+        assert_eq!(loaded.migration_notices.len(), 1);
+    }
+
+    #[test]
+    fn migration_notices_are_never_written_back_to_the_file() {
+        let mut config = Config::default();
+        config.migration_notices.push("moved".to_string());
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(!text.contains("migration_notices"));
+        assert!(parse(&text).unwrap().migration_notices.is_empty());
     }
 }

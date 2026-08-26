@@ -504,6 +504,9 @@ impl crate::app::App {
                     .push_system(&format!("Model switched to {model}."));
             }
             Err(error) => {
+                // The model changed in memory even though the save failed, so
+                // the window the old one reported no longer describes it.
+                self.invalidate_provider_context_window();
                 self.state
                     .push_system(&format!("Failed to save config: {error}"));
             }

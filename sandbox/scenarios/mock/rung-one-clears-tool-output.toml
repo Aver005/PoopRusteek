@@ -10,8 +10,10 @@
 # (invariant 12), which is why no scenario could reach rungs 1-3 before.
 #
 # Needs the mock service:
+#   ./sandbox.ps1 mock rung-one-clears-tool-output
+# or, on the host:
 #   pooprusteek mock-provider --port 811 \
-#     --script sandbox/scenarios/mock/rung-one-clears-tool-output.mock-script
+#     --script sandbox/mock-scripts/rung-one-clears-tool-output.toml
 #
 # Three 12 000-char reads at ~4 000 budget tokens each cross 70% of an 11 000
 # usable window while the turn is still running, so the check that fires is

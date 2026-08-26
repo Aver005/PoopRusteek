@@ -1,14 +1,12 @@
-# Script for `rung-one-clears-tool-output.toml`. Three big reads, then an
-# answer — enough tool output to push the conversation past rung 1's 70%
-# trigger while the turn is still running.
+# Script for `scenarios/mock/rung-one-clears-tool-output.toml`. Three big
+# reads, then an answer — enough tool output to push the conversation past
+# rung 1's 70% trigger while the turn is still running.
 #
-# TOML like every other mock script; the extension is not `.toml` only because
-# it lives beside the scenario (the harness owns `scenarios/`, not
-# `mock-scripts/`) and `suite <dir>` collects every `.toml` under the tree as a
-# scenario.
+#   ./sandbox.ps1 mock rung-one-clears-tool-output
 #
+# On the host, without Docker:
 #   pooprusteek mock-provider --port 811 \
-#     --script sandbox/scenarios/mock/rung-one-clears-tool-output.mock-script
+#     --script sandbox/mock-scripts/rung-one-clears-tool-output.toml
 
 [[reply]]
 content = """

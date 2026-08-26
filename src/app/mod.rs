@@ -34,7 +34,7 @@ use events::{
     QuestionState, ToolApprovalRequest, View,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 /// PID of the foreground child process (if any), for killing on abort.
@@ -86,6 +86,54 @@ fn agent_event_target(event: &AppEvent) -> Option<conversation::ConversationId> 
     }
 }
 
+/// Ask the active provider for its context window off the event loop
+/// (invariant 1). The answer is dropped when the provider or model changed
+/// again while the request was in flight.
+fn spawn_window_poll(
+    provider: Option<Arc<dyn LLMProvider>>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+    epoch_cell: Arc<AtomicU64>,
+    epoch: u64,
+) {
+    let Some(handle) = provider else {
+        return;
+    };
+    tokio::spawn(async move {
+        let Some(window) = handle.context_window().await else {
+            return;
+        };
+        if epoch_cell.load(Ordering::SeqCst) == epoch {
+            let _ = event_tx.send(AppEvent::ContextWindowLearned(window));
+        }
+    });
+}
+
+/// A window belongs to the provider/model that reported it, so a switch puts it
+/// back to unknown — that switches the ladder off, which is the safe direction.
+fn invalidate_context_window(state: &mut AppState, epoch_cell: &AtomicU64) -> u64 {
+    state.provider_context_window = 0;
+    epoch_cell.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Point the focused conversation at `provider`, start a fresh session id and
+/// re-poll the window. Every provider/model switch goes through here.
+fn switch_provider(
+    state: &mut AppState,
+    provider: Option<Arc<dyn LLMProvider>>,
+    epoch_cell: &Arc<AtomicU64>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    state.focused_mut().provider = provider;
+    state.focused_mut().session_id = crate::session::create_session_id();
+    let epoch = invalidate_context_window(state, epoch_cell);
+    spawn_window_poll(
+        state.focused().provider.clone(),
+        event_tx.clone(),
+        Arc::clone(epoch_cell),
+        epoch,
+    );
+}
+
 pub struct App {
     pub config: Config,
     pub state: AppState,
@@ -118,6 +166,9 @@ pub struct App {
     /// True while a self-update pass runs (startup auto-check or `/update`) —
     /// two concurrent passes would race on the binary swap.
     update_in_flight: Arc<AtomicBool>,
+    /// Bumped on every provider/model switch. A window poll answers with the
+    /// epoch it started under, so a slow one can never overwrite a newer.
+    provider_window_epoch: Arc<AtomicU64>,
 }
 
 /// Run one self-update pass off the event loop and report through
@@ -266,17 +317,16 @@ impl App {
         tools.update_skills(skills.clone());
 
         let has_provider = provider.is_some();
-        if let Some(handle) = provider.clone() {
-            let event_tx = event_tx.clone();
-            tokio::spawn(async move {
-                if let Some(window) = handle.context_window().await {
-                    let _ = event_tx.send(AppEvent::ContextWindowLearned(window));
-                }
-            });
-        }
+        let provider_window_epoch = Arc::new(AtomicU64::new(0));
+        spawn_window_poll(
+            provider.clone(),
+            event_tx.clone(),
+            Arc::clone(&provider_window_epoch),
+            0,
+        );
         let main_conversation = conversation::Conversation::fresh_main(provider);
 
-        let state = AppState {
+        let mut state = AppState {
             conversations: conversation::Conversations::new(main_conversation),
             input: input::InputState {
                 history: crate::session::load_history(),
@@ -318,6 +368,12 @@ impl App {
             background: background_stats::BackgroundCounters::default(),
             provider_context_window: 0,
         };
+
+        // A setting that changed section was applied from its old place — say
+        // so, so the change is never silent (`config::apply_migrations`).
+        for notice in &config.migration_notices {
+            state.push_message(ChatMessage::ui_system(notice));
+        }
 
         // Semantic matcher: background init (first run downloads the
         // embedding model); turns get skill/MCP-tool hints once it's ready.
@@ -398,6 +454,7 @@ impl App {
             provider_models,
             last_models_refetch: std::time::Instant::now(),
             update_in_flight,
+            provider_window_epoch,
         })
     }
 
@@ -1189,8 +1246,18 @@ impl App {
     /// fresh session id so the next turn can't thread onto state that
     /// belonged to the previous provider.
     pub(crate) fn rebuild_provider(&mut self) {
-        self.state.focused_mut().provider = crate::provider::build_provider(&self.config);
-        self.state.focused_mut().session_id = crate::session::create_session_id();
+        switch_provider(
+            &mut self.state,
+            crate::provider::build_provider(&self.config),
+            &self.provider_window_epoch,
+            &self.event_tx,
+        );
+    }
+
+    /// Drop the learned window without re-polling — for a model switch that
+    /// changed the config but left the provider handle on the old model.
+    pub(crate) fn invalidate_provider_context_window(&mut self) {
+        invalidate_context_window(&mut self.state, &self.provider_window_epoch);
     }
 
     fn record_gen_stats(&mut self) {
@@ -1275,5 +1342,165 @@ mod wipe_tests {
             "wipe_roots must return deduped paths"
         );
         assert!(!roots.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::provider::{CompletionChunk, CompletionRequest, CompletionResponse};
+    use async_trait::async_trait;
+    use tokio::time::{Duration, timeout};
+
+    /// Reports a fixed window after an optional delay — enough to model both
+    /// "the catalogue answers" and "the answer is slow".
+    struct WindowProvider {
+        window: Option<u32>,
+        delay_ms: u64,
+    }
+
+    impl WindowProvider {
+        fn new(window: Option<u32>, delay_ms: u64) -> Self {
+            Self { window, delay_ms }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for WindowProvider {
+        async fn complete(&self, _request: CompletionRequest) -> AppResult<CompletionResponse> {
+            unreachable!("the window poll never completes a turn")
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+            _tx: mpsc::UnboundedSender<CompletionChunk>,
+        ) -> AppResult<()> {
+            unreachable!("the window poll never completes a turn")
+        }
+
+        fn model(&self) -> &str {
+            "window-test"
+        }
+
+        async fn context_window(&self) -> Option<u32> {
+            if self.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            }
+            self.window
+        }
+
+        fn fork(&self) -> Arc<dyn LLMProvider> {
+            Arc::new(Self::new(self.window, self.delay_ms))
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState {
+            conversations: conversation::Conversations::new(
+                conversation::Conversation::fresh_main(None),
+            ),
+            input: input::InputState::default(),
+            status_message: String::new(),
+            error_count: 0,
+            last_error: None,
+            scroll_offset: 0,
+            modal: None,
+            approved_tools: std::collections::HashSet::new(),
+            pending_tool_approval: None,
+            pending_question: None,
+            pending_interactions: std::collections::VecDeque::new(),
+            autocomplete: AutocompleteState::default(),
+            view: View::Chat,
+            onboarding: OnboardingState::default(),
+            mcp_status: mcp_status::McpStatus::default(),
+            providers_view: providers::ProvidersViewState::default(),
+            search: search::SearchViewState::default(),
+            themes: themes::ThemesViewState::default(),
+            workspace_path: String::new(),
+            show_stats_panel: true,
+            attached_files: Vec::new(),
+            goal: goal::GoalState::default(),
+            needs_terminal_restore: false,
+            background: background_stats::BackgroundCounters::default(),
+            provider_context_window: 1_000_000,
+        }
+    }
+
+    async fn next_window(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> u32 {
+        match timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(AppEvent::ContextWindowLearned(window))) => window,
+            other => panic!("expected a re-polled window, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_provider_forgets_the_old_window_and_re_polls() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        let epoch = Arc::new(AtomicU64::new(0));
+
+        switch_provider(
+            &mut state,
+            Some(Arc::new(WindowProvider::new(Some(32_000), 0))),
+            &epoch,
+            &tx,
+        );
+
+        assert_eq!(
+            state.provider_context_window, 0,
+            "the previous provider's window must go unknown the moment we switch"
+        );
+        assert_eq!(next_window(&mut rx).await, 32_000);
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_cannot_say_leaves_the_window_unknown() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        let epoch = Arc::new(AtomicU64::new(0));
+
+        switch_provider(
+            &mut state,
+            Some(Arc::new(WindowProvider::new(None, 0))),
+            &epoch,
+            &tx,
+        );
+
+        assert_eq!(state.provider_context_window, 0);
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a provider with no catalogue window must not report one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_answer_from_the_previous_provider_is_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        let epoch = Arc::new(AtomicU64::new(0));
+
+        switch_provider(
+            &mut state,
+            Some(Arc::new(WindowProvider::new(Some(1_000_000), 150))),
+            &epoch,
+            &tx,
+        );
+        switch_provider(
+            &mut state,
+            Some(Arc::new(WindowProvider::new(Some(32_000), 0))),
+            &epoch,
+            &tx,
+        );
+
+        assert_eq!(next_window(&mut rx).await, 32_000);
+        assert!(
+            timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "the provider we switched away from must not overwrite the new window"
+        );
     }
 }

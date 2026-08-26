@@ -100,13 +100,6 @@ fn range_tokens(messages: &[ChatMessage], range: &Range<usize>) -> u32 {
 pub fn plan(messages: &[ChatMessage], mode: CompactMode, usable: u32) -> CompactPlan {
     let starts = turn_starts(messages);
     // Fewer than two turns: there is no "before the last turn" to summarise.
-    let (Some(&first), Some(&last)) = (starts.first(), starts.last()) else {
-        return CompactPlan {
-            head: None,
-            summarize: Vec::new(),
-            tail: 0..messages.len(),
-        };
-    };
     if starts.len() < 2 {
         return CompactPlan {
             head: None,
@@ -114,6 +107,7 @@ pub fn plan(messages: &[ChatMessage], mode: CompactMode, usable: u32) -> Compact
             tail: 0..messages.len(),
         };
     }
+    let last = starts[starts.len() - 1];
 
     match mode {
         CompactMode::AllButLast => CompactPlan {
@@ -122,7 +116,9 @@ pub fn plan(messages: &[ChatMessage], mode: CompactMode, usable: u32) -> Compact
             tail: last..messages.len(),
         },
         CompactMode::FirstAndLast => {
-            let opening = first..starts[1];
+            // From 0, not from the first user message: whatever precedes it is
+            // history too, and modes 2 and 3 summarise it rather than drop it.
+            let opening = 0..starts[1];
             let budget = usable / MODE1_HEAD_SHARE;
             // Over budget, the opening turn is summarised with the middle
             // instead of being kept — see MODE1_HEAD_SHARE.
@@ -277,6 +273,38 @@ mod tests {
                 messages[range.start].role,
                 Role::User,
                 "chunk {range:?} starts mid-turn"
+            );
+        }
+    }
+
+    #[test]
+    fn no_mode_silently_drops_a_message() {
+        // Anything ahead of the first user message is still history: it must be
+        // kept verbatim or summarised, never simply lost.
+        let mut messages = vec![ChatMessage::system("project rules")];
+        messages.extend(history(4, 100));
+        for mode in [
+            CompactMode::FirstAndLast,
+            CompactMode::ChunkedHead,
+            CompactMode::AllButLast,
+        ] {
+            let plan = plan(&messages, mode, 10_000);
+            let mut covered = vec![false; messages.len()];
+            for range in plan
+                .head
+                .iter()
+                .cloned()
+                .chain(plan.summarize.iter().cloned())
+                .chain(std::iter::once(plan.tail.clone()))
+            {
+                for index in range {
+                    covered[index] = true;
+                }
+            }
+            let lost: Vec<usize> = (0..messages.len()).filter(|i| !covered[*i]).collect();
+            assert!(
+                lost.is_empty(),
+                "{mode:?} dropped messages {lost:?}: {plan:?}"
             );
         }
     }
