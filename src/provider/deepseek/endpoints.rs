@@ -584,9 +584,7 @@ impl DeepseekProvider {
     }
 }
 
-/// Simple URL encoding for query parameters. Only used by the unused
-/// optional API surface above (`get_client_settings`).
-#[expect(dead_code)]
+/// Простое URL-кодирование параметров запроса.
 fn urlencoding(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     for byte in input.bytes() {
