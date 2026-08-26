@@ -3,9 +3,9 @@
 //! `impl LLMProvider`) is on the hot path this TUI actually exercises; the
 //! rest models the broader reverse-engineered API (session CRUD, sharing,
 //! search, file upload, user settings) for the unused-but-kept client
-//! methods in `deepseek.rs`. See the `#[allow(dead_code)]` on that impl
+//! methods in `deepseek.rs`. See the `#[expect(dead_code)]` on that impl
 //! block for why it's suppressed here rather than deleted.
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

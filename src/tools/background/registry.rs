@@ -31,7 +31,7 @@ fn registry() -> &'static Mutex<BackgroundRegistry> {
 }
 
 /// Register a freshly-spawned process and return its assigned id.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn insert_handle(
     pid: Option<u32>,
     command_str: String,

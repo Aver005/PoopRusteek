@@ -200,7 +200,7 @@ pub async fn spawn_background(
 /// Detached PTY-based interactive process. The command runs in a pseudo-terminal
 /// so arrow-key menus, REPLs and other TUI selectors work. Use `shell_input` to
 /// send keystrokes; `shell_output`/`shell_kill`/`shell_list` work as usual.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn spawn_interactive(
     program: &str,
     args: &[String],

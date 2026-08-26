@@ -101,7 +101,7 @@ impl App {
                     .get(self.state.mcp_status.view.selected)
                     .cloned()
                 {
-                    let name = info.name.clone();
+                    let name = info.name;
                     self.state.mcp_status.view.status_message = format!("Reconnecting {name}...");
                     let mcp = Arc::clone(&self.mcp);
                     let event_tx = self.event_tx.clone();
@@ -123,7 +123,7 @@ impl App {
                     .get(self.state.mcp_status.view.selected)
                     .cloned()
                 {
-                    let name = info.name.clone();
+                    let name = info.name;
                     self.state.mcp_status.view.status_message = format!("Removing {name}...");
                     // Removing closes the child process and rewrites mcp.json —
                     // off the loop, like toggle/reconnect above. The view

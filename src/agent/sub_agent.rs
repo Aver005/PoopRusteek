@@ -18,7 +18,7 @@ use crate::tools::registry::ToolRegistry;
 use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
 use std::sync::Arc;
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn run_sub_agent(
     provider: Arc<dyn LLMProvider>,
     tools: Arc<ToolRegistry>,

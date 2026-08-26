@@ -6,7 +6,7 @@
 //! `LLMProvider` impl (`delete_remote_session`, called from
 //! `discard_remote_session`) lives in this file too since it shares the same
 //! endpoint-URL neighborhood, but the rest of the surface is
-//! `#[allow(dead_code)]` — suppressed as a block rather than deleted: unlike
+//! `#[expect(dead_code)]` — suppressed as a block rather than deleted: unlike
 //! the verified-dead code removed elsewhere, this is intentionally-kept API
 //! modeling, not litter.
 
@@ -181,7 +181,7 @@ impl DeepseekProvider {
 // See the module doc comment for why this block is suppressed rather than
 // pruned: it's intentionally-kept API modeling for future feature work, not
 // verified-dead litter.
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl DeepseekProvider {
     /// Delete all remote sessions.
     pub async fn delete_all_remote_sessions(&self) -> AppResult<()> {
@@ -586,7 +586,7 @@ impl DeepseekProvider {
 
 /// Simple URL encoding for query parameters. Only used by the unused
 /// optional API surface above (`get_client_settings`).
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn urlencoding(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     for byte in input.bytes() {

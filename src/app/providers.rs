@@ -463,7 +463,7 @@ impl crate::app::App {
             .into_iter()
             .map(|model| {
                 let marker = if model == current { "\u{25CF}" } else { " " };
-                PickerItem::new(format!("{marker} {model}"), model.clone())
+                PickerItem::new(format!("{marker} {model}"), model)
             })
             .collect();
         self.state.status_message.clear();

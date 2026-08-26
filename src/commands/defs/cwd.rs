@@ -42,7 +42,7 @@ impl Command for CwdCommand {
                         .map(|p| strip_verbatim(&p.to_string_lossy()))
                         .unwrap_or_else(|_| absolute.to_string_lossy().to_string());
                     state.push_system(&format!("Changed directory to {cwd}"));
-                    state.workspace_path = cwd.clone();
+                    state.workspace_path = cwd;
                     CommandResult::Handled
                 }
                 Err(e) => {

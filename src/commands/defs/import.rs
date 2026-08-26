@@ -66,7 +66,7 @@ impl Command for ImportCommand {
             // this session) would silently overwrite the file's tag back to
             // `None` — `auto_save_session` only ever persists what's mirrored on
             // the live `Conversation`, not what's already on disk.
-            state.focused_mut().tag = session.tag.clone();
+            state.focused_mut().tag = session.tag;
             state.focused_mut().broken = false;
             state.scroll_offset = 0;
             state.input.buffer.clear();

@@ -14,7 +14,6 @@ use crate::prompts::PromptFiles;
 use crate::skills::SkillDefinition;
 use crate::tools::registry::ToolRegistry;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn build(
     prompts: &PromptFiles,
     skills: &[SkillDefinition],

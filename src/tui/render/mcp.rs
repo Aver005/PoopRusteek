@@ -114,7 +114,7 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
         ),
         Span::raw(
             " ".repeat(area.width.saturating_sub(30) as usize)
-                .min(" ".repeat(20).to_string()),
+                .min(" ".repeat(20)),
         ),
         Span::styled(
             "TYPE   TOOLS",

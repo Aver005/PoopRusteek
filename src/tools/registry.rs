@@ -36,7 +36,7 @@ impl ToolRegistry {
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {
-        let name = tool.definition().name.clone();
+        let name = tool.definition().name;
         self.tools.lock().unwrap().insert(name, tool);
     }
 

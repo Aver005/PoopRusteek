@@ -528,10 +528,7 @@ async fn legacy_blocking(
     let usage = response
         .usage
         .unwrap_or_else(|| openai_compat::estimated_usage(&[prompt], &text));
-    let finish = response
-        .finish_reason
-        .clone()
-        .unwrap_or_else(|| "stop".to_string());
+    let finish = response.finish_reason.unwrap_or_else(|| "stop".to_string());
     json_response(
         StatusCode::OK,
         &serde_json::json!({

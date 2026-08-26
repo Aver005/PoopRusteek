@@ -10,7 +10,7 @@
 //! - `session`: server-side chat session lifecycle (create/ensure/mark).
 //! - `stream`: request-body building and SSE event parsing helpers.
 //! - `endpoints`: the full reverse-engineered REST surface, including the
-//!   large `#[allow(dead_code)]` collection of wrappers kept for parity with
+//!   large `#[expect(dead_code)]` collection of wrappers kept for parity with
 //!   the upstream API but not yet driven by this TUI.
 mod endpoints;
 mod http;

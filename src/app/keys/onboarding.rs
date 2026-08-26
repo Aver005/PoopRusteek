@@ -33,7 +33,7 @@ impl App {
             KeyCode::Enter => {
                 if let Some(token) = self.state.onboarding.submit() {
                     // Commit token + model to config and save.
-                    self.config.provider.token = token.clone();
+                    self.config.provider.token = token;
                     self.config.provider.model = self.state.onboarding.model_str().to_string();
                     if let Err(e) = crate::config::save(&self.config) {
                         tracing::warn!("Onboarding: failed to save config: {e}");
