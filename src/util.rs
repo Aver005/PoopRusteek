@@ -113,32 +113,46 @@ pub fn truncate_with_ellipsis(s: &str, max_bytes: usize) -> String {
     format!("{head}...")
 }
 
-/// Write `contents` to `path` atomically: write to a sibling `.tmp` file, then
-/// rename over the target. A crash mid-write leaves the old file intact instead
-/// of a truncated one. Use for every persisted file (sessions, config,
-/// whitelist, mcp.json) — never `std::fs::write` directly on user data.
+/// Write `contents` to `path` atomically: fsync a uniquely-named sibling
+/// `.tmp` file, then rename over the target. A crash mid-write leaves the old
+/// file intact instead of a truncated one. Use for every persisted file
+/// (sessions, config, whitelist, mcp.json) — never `std::fs::write` directly.
 pub fn atomic_write(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    // Unique per call so two concurrent writers to the same path never share
+    // (and clobber) a temp file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let tmp = path.with_extension({
         let mut ext = path
             .extension()
             .map(|e| e.to_string_lossy().into_owned())
             .unwrap_or_default();
-        ext.push_str(".tmp");
+        ext.push_str(&format!(".{}-{unique}.tmp", std::process::id()));
         ext
     });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&tmp, contents)?;
-    // On Windows, `rename` fails if the target exists; remove it first. The
-    // window between remove and rename is smaller than a truncate-in-place.
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
+
+    // Fsync orders the data before the rename, so a crash can't leave a
+    // zero-length file at `path`.
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
     }
-    std::fs::rename(&tmp, path)
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Expand a leading `~` or `~/` to the user's home directory. Plain `~foo`
@@ -295,15 +309,43 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_creates_and_replaces() {
-        let dir = std::env::temp_dir().join("pooprusteek_util_test");
+    fn atomic_write_creates_fresh_file_with_right_bytes() {
+        let dir =
+            std::env::temp_dir().join(format!("pooprusteek_util_test_a_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("data.json");
+        atomic_write(&path, b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_overwrite_replaces_contents_and_leaves_no_tmp() {
+        let dir =
+            std::env::temp_dir().join(format!("pooprusteek_util_test_b_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("data.json");
         atomic_write(&path, b"first").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
         atomic_write(&path, b"second").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
-        assert!(!path.with_extension("json.tmp").exists());
+        let leftover_tmp = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover_tmp, "temp file left behind after atomic_write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_sequential_writes_both_succeed() {
+        let dir =
+            std::env::temp_dir().join(format!("pooprusteek_util_test_c_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("data.json");
+        atomic_write(&path, b"one").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        atomic_write(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

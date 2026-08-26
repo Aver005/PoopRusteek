@@ -2,11 +2,15 @@ use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub provider: ProviderConfig,
+    #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -169,12 +173,51 @@ impl ServerApi {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    #[serde(default = "default_provider_kind")]
     pub kind: ProviderKind,
+    #[serde(default = "default_provider_token")]
     pub token: String,
+    #[serde(default = "default_provider_model")]
     pub model: String,
+    #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default = "default_provider_temperature")]
     pub temperature: f32,
+    #[serde(default = "default_provider_max_tokens")]
     pub max_tokens: u32,
+}
+
+fn default_provider_kind() -> ProviderKind {
+    ProviderKind::Deepseek
+}
+
+fn default_provider_token() -> String {
+    String::new()
+}
+
+fn default_provider_model() -> String {
+    "deepseek-chat".to_string()
+}
+
+fn default_provider_temperature() -> f32 {
+    0.7
+}
+
+fn default_provider_max_tokens() -> u32 {
+    4096
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_provider_kind(),
+            token: default_provider_token(),
+            model: default_provider_model(),
+            base_url: None,
+            temperature: default_provider_temperature(),
+            max_tokens: default_provider_max_tokens(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -249,10 +292,24 @@ pub struct UiConfig {
     /// Active theme: a preset name from `crate::tui::theme::PRESETS` or the
     /// name of a `custom_themes` entry. Unknown names fall back to the
     /// default theme — see `Theme::resolve`.
+    #[serde(default = "default_ui_theme")]
     pub theme: String,
     /// User-made themes from the `/themes` wizard.
     #[serde(default)]
     pub custom_themes: Vec<CustomTheme>,
+}
+
+fn default_ui_theme() -> String {
+    "default".to_string()
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_ui_theme(),
+            custom_themes: Vec::new(),
+        }
+    }
 }
 
 /// One `/themes`-wizard theme: a preset to inherit from plus per-role
@@ -270,17 +327,65 @@ pub struct CustomTheme {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    #[serde(default = "default_agent_max_steps_per_turn")]
     pub max_steps_per_turn: usize,
+    #[serde(default = "default_agent_max_tools_per_step")]
     pub max_tools_per_step: usize,
+    #[serde(default = "default_agent_max_context_messages")]
     pub max_context_messages: usize,
+    #[serde(default = "default_agent_auto_compact")]
     pub auto_compact: bool,
+    #[serde(default = "default_agent_rate_limit_ms")]
     pub rate_limit_ms: u64,
     /// Max requests allowed in any rolling 60s window (0 = no cap). Applied
     /// alongside `rate_limit_ms` rather than replacing it — the two catch
     /// different shapes of abuse (burst vs. steady-state).
-    #[serde(default)]
+    #[serde(default = "default_agent_rate_limit_per_minute")]
     pub rate_limit_per_minute: u32,
+    #[serde(default = "default_agent_max_retries")]
     pub max_retries: i32,
+}
+
+fn default_agent_max_steps_per_turn() -> usize {
+    256
+}
+
+fn default_agent_max_tools_per_step() -> usize {
+    10
+}
+
+fn default_agent_max_context_messages() -> usize {
+    256
+}
+
+fn default_agent_auto_compact() -> bool {
+    true
+}
+
+fn default_agent_rate_limit_ms() -> u64 {
+    0
+}
+
+fn default_agent_rate_limit_per_minute() -> u32 {
+    0
+}
+
+fn default_agent_max_retries() -> i32 {
+    0
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_steps_per_turn: default_agent_max_steps_per_turn(),
+            max_tools_per_step: default_agent_max_tools_per_step(),
+            max_context_messages: default_agent_max_context_messages(),
+            auto_compact: default_agent_auto_compact(),
+            rate_limit_ms: default_agent_rate_limit_ms(),
+            rate_limit_per_minute: default_agent_rate_limit_per_minute(),
+            max_retries: default_agent_max_retries(),
+        }
+    }
 }
 
 impl AgentConfig {
@@ -302,12 +407,19 @@ impl AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
+    #[serde(default = "default_mcp_cache_ttl")]
     pub cache_ttl: u64,
+}
+
+fn default_mcp_cache_ttl() -> u64 {
+    300
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
-        Self { cache_ttl: 300 }
+        Self {
+            cache_ttl: default_mcp_cache_ttl(),
+        }
     }
 }
 
@@ -521,42 +633,6 @@ impl McpSchemaMode {
             McpSchemaMode::Full => false,
             McpSchemaMode::Deferred => tool_count > 0,
             McpSchemaMode::Auto => tool_count > Self::AUTO_DEFER_THRESHOLD,
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            provider: ProviderConfig {
-                kind: ProviderKind::Deepseek,
-                token: String::new(),
-                model: "deepseek-chat".to_string(),
-                base_url: None,
-                temperature: 0.7,
-                max_tokens: 4096,
-            },
-            ui: UiConfig {
-                theme: "default".to_string(),
-                custom_themes: Vec::new(),
-            },
-            agent: AgentConfig {
-                max_steps_per_turn: 256,
-                max_tools_per_step: 10,
-                max_context_messages: 256,
-                auto_compact: true,
-                rate_limit_ms: 0,
-                rate_limit_per_minute: 0,
-                max_retries: 0,
-            },
-            mcp: McpConfig::default(),
-            skills: SkillsConfig::default(),
-            semantic: SemanticConfig::default(),
-            providers: Vec::new(),
-            active_provider: None,
-            server: ServerConfig::default(),
-            provider_models: ProviderModelsConfig::default(),
-            update: UpdateConfig::default(),
         }
     }
 }
@@ -887,5 +963,71 @@ mod tests {
         // The reserved built-in name behaves like None.
         config.active_provider = Some(BUILTIN_PROVIDER_NAME.to_string());
         assert_eq!(config.active_model(), "deepseek-chat");
+    }
+
+    #[test]
+    fn empty_toml_parses_to_defaults() {
+        // No sections at all — every field of every section must default.
+        let parsed: Config = toml::from_str("").unwrap();
+        let default = Config::default();
+        assert_eq!(parsed.provider.kind, default.provider.kind);
+        assert_eq!(parsed.provider.token, default.provider.token);
+        assert_eq!(parsed.provider.model, default.provider.model);
+        assert_eq!(parsed.provider.base_url, default.provider.base_url);
+        assert_eq!(parsed.provider.temperature, default.provider.temperature);
+        assert_eq!(parsed.provider.max_tokens, default.provider.max_tokens);
+        assert_eq!(parsed.ui.theme, default.ui.theme);
+        assert_eq!(parsed.ui.custom_themes, default.ui.custom_themes);
+        assert_eq!(
+            parsed.agent.max_steps_per_turn,
+            default.agent.max_steps_per_turn
+        );
+        assert_eq!(
+            parsed.agent.max_tools_per_step,
+            default.agent.max_tools_per_step
+        );
+        assert_eq!(
+            parsed.agent.max_context_messages,
+            default.agent.max_context_messages
+        );
+        assert_eq!(parsed.agent.auto_compact, default.agent.auto_compact);
+        assert_eq!(parsed.agent.rate_limit_ms, default.agent.rate_limit_ms);
+        assert_eq!(
+            parsed.agent.rate_limit_per_minute,
+            default.agent.rate_limit_per_minute
+        );
+        assert_eq!(parsed.agent.max_retries, default.agent.max_retries);
+        assert_eq!(parsed.mcp.cache_ttl, default.mcp.cache_ttl);
+    }
+
+    #[test]
+    fn provider_section_with_only_token_keeps_other_defaults() {
+        // A [provider] table naming just `token` must still fill in every
+        // other provider field, plus the untouched agent/ui/mcp sections.
+        let parsed: Config = toml::from_str("[provider]\ntoken = \"x\"\n").unwrap();
+        assert_eq!(parsed.provider.token, "x");
+        assert_eq!(parsed.provider.model, "deepseek-chat");
+        assert_eq!(parsed.provider.temperature, 0.7);
+        assert_eq!(parsed.provider.max_tokens, 4096);
+        assert_eq!(parsed.agent.max_steps_per_turn, 256);
+        assert_eq!(parsed.ui.theme, "default");
+        assert_eq!(parsed.mcp.cache_ttl, 300);
+    }
+
+    #[test]
+    fn agent_section_with_only_max_retries_keeps_other_defaults() {
+        // Regression: a bare `#[serde(default)]` would zero/false the rest
+        // of [agent] instead of keeping the real defaults.
+        let parsed: Config = toml::from_str("[agent]\nmax_retries = 3\n").unwrap();
+        assert_eq!(parsed.agent.max_retries, 3);
+        assert_eq!(parsed.agent.max_steps_per_turn, 256);
+        assert!(parsed.agent.auto_compact);
+    }
+
+    #[test]
+    fn unknown_key_in_known_section_still_parses() {
+        let parsed: Config =
+            toml::from_str("[agent]\nmax_retries = 3\nsome_future_field = 1\n").unwrap();
+        assert_eq!(parsed.agent.max_retries, 3);
     }
 }

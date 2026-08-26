@@ -1,12 +1,15 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
-> Last updated: 2026-08-26 (the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
-> Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure)
+> Last updated: 2026-08-26 (full-codebase review `.docs/review-2026-08-26-rust.md`, 20 findings — same-day fix batch closed 6 (1,2,5,11,12,16), see RESOLVED and `JOURNAL/2026-08-26.md`; the other 14 added below by severity, source of record is the review doc. Before, same day: the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
+> Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure), `.docs/review-2026-08-26-rust.md` (2026-08-26 full-codebase review, 20 numbered findings — 6 closed, 14 open, referenced by number below)
 
 ## CRITICAL
-None currently known.
+
+- `[BUG]` review-2026-08-26 #3: `max_context_messages`/`auto_compact` are declared, defaulted, and serialized into `config.toml`, but never read anywhere — no automatic context trimming happens despite being configurable. `→ src/config/mod.rs` Not a crash: `build_step_request` resends the whole message array every step, so token cost grows quadratically within a turn (DeepSeek is partly shielded by server-side session threading). Severity as rated in the review.
 
 ## HIGH
+
+- `[BUG]` review-2026-08-26 #4: `/compact` is a stub presented as a feature — "summary" is every user message's `content` joined with `"; "`, assistant/tool messages dropped outright, `.docs/TODO.md` lists it as complete. `→ src/commands/defs/compact.rs`
 
 ### Announcing work ends the turn as if it were done
 
@@ -26,6 +29,11 @@ turn by announcing work you have not done"). A loop-side nudge on
 announcement-shaped endings is the fallback, and needs the harness to show it
 does not cost anything elsewhere.
 
+- `[BUG]` review-2026-08-26 #6: `MCPManager` lock held across network I/O on admin paths (`keys/dispatch.rs`, `keys/mcp.rs` reload/toggle/reconnect/remove) — the same class already fixed for tool dispatch (`dispatch_generic_tool`), but the admin paths never got the short-lock shape. `settle_frame` polls the same mutex every frame, so `View::Mcp` freezes for the duration. `→ src/app/keys/mcp.rs`, `src/app/keys/dispatch.rs`
+- `[BUG]` review-2026-08-26 #7: background agents (`/btw`) run with `auto_approve: true`, bypassing both the approval modal and the persisted `/whitelist` — arbitrary `shell`/`powershell` execute with no prompt. `→ src/app/multichat.rs`
+- `[BUG]` review-2026-08-26 #8: harness attributes a `ToolError` to `tools.last_mut()` instead of correlating by `(conversation, tool_id)` — wrong per-tool metrics with more than one tool per step or concurrent sub-agents sharing the event channel. `→ src/harness/driver.rs`
+- `[BUG]` review-2026-08-26 #9: `--config` does not redirect `Config::data_dir()` — a harness run still writes to the real sessions dir, reads the real whitelist, and shares the semantic index with the live TUI, contrary to the function's own doc comment promising a throwaway data set. `→ src/config/mod.rs`
+
 ## MEDIUM
 
 - `[BUG]` MCP tool arguments are passed to `tools/call` with **no schema validation**. `→ src/mcp/client.rs`
@@ -33,6 +41,10 @@ does not cost anything elsewhere.
 - `[BUG]` PoW challenge is solved once before the retry loop, not re-solved per attempt — deliberately left (changing it changes the request pattern); a stale challenge on a slow retry can be rejected. (~~solve ran on the async task~~ — fixed 2026-07-04, now `spawn_blocking`.) `→ src/provider/pow.rs` + `src/provider/deepseek/stream.rs`
 - `[BUG]` Legacy `[TOOL:name] {json}` regex uses a non-nesting brace pattern and can't parse nested JSON objects. `→ src/agent/tool_parser.rs`
 - `[BUG]` Fenced code-block examples containing tool-call syntax can be parsed and executed as real tool calls during auto-approve (background) turns. `→ src/agent/tool_parser.rs`
+- `[BUG]` review-2026-08-26 #10: check-then-add on the shared shell output budget (load → compute → `fetch_add`, three unsynchronized steps across two readers) can overshoot the 1 MiB cap by up to one chunk. `→ src/tools/shell.rs`
+- `[BUG]` review-2026-08-26 #13: tests write into the real `Config::data_dir()`/`sessions_dir()` (a non-injectable global) at ~13 call sites — parallel test runs share state, a failing test leaves files behind. `→ src/session.rs`
+- `[BUG]` review-2026-08-26 #14: `AppError::Custom(String)` (24 call sites) has no `#[source]` — `.to_string()` severs the chain, losing `io::ErrorKind` and the root cause. `→ src/error.rs`
+- `[BUG]` review-2026-08-26 #15: `Cargo.toml` has `[lints.rust]` but no `[lints.clippy]` — the `perf` group and lints like `redundant_clone`/`large_enum_variant` aren't enforced beyond default `-D warnings`. `→ Cargo.toml`
 
 ## LOW
 
@@ -46,6 +58,10 @@ does not cost anything elsewhere.
 - `[BUG]` History deduplication only catches **consecutive** duplicates. `→ src/session.rs`
 - `[BUG]` `"model"` field in the outgoing request body is a hardcoded literal `"deepseek-chat"`, ignoring the user's configured model. `→ src/provider/deepseek.rs`
 - `[BUG]` Foreground child PID tracking is a single global slot (`AtomicU32`), not per-conversation — Esc/Ctrl+C in one conversation can kill a different conversation's foreground process; also an upward `tools`→`app` dependency. `→ src/app/mod.rs` (`FOREGROUND_CHILD_PID`) + `src/tools/shell.rs`
+- `[BUG]` review-2026-08-26 #17: harness driver calls `std::env::set_current_dir` (process-global) while the runtime has live background tasks (semantic init, MCP connects) — a logical race on relative paths; harmless today (one turn per process) but blocks any future in-process `exec`. `→ src/harness/driver.rs`
+- `[BUG]` review-2026-08-26 #18: `copy_tree` (blocking fs) runs inside an `async fn` during scenario workspace setup — stalls a runtime worker; invisible on small fixtures, blocks the whole suite on a large `workspace_template`. `→ src/harness/scenario.rs`
+- `[BUG]` review-2026-08-26 #19 (informational): UTF-16 detection samples only the first 512 bytes and treats any byte < 0x20 as implausible in text, including ESC — dense-ANSI PTY output or a mid-stream encoding change can decode wrong. `→ src/util.rs`
+- `[BUG]` review-2026-08-26 #20 (informational): `/serve` bearer-token comparison uses `==`, not constant-time — a timing channel on the key, exploitable only over a non-loopback exposure. `→ src/server/http.rs`
 
 ## WONTFIX / ACCEPTED
 
@@ -54,6 +70,15 @@ does not cost anything elsewhere.
 - `[?]` `bash`/`powershell` run arbitrary commands with no sandbox — by design; trust = tool-approval + `/whitelist`.
 
 ## RESOLVED / MOOT
+
+- ✅ **2026-08-26 review fix batch** — full-codebase review `.docs/review-2026-08-26-rust.md` (20 numbered findings), 6 closed same day:
+  - **#1 (Critical) — `atomic_write` could lose data entirely on Windows, not just truncate it.** The `#[cfg(windows)]` remove-before-rename block claimed `std::fs::rename` fails when the target exists on Windows — false, `MoveFileExW`/`MOVEFILE_REPLACE_EXISTING` already replaces; the remove opened a window where a crash left no file at all. Also folds in **#12 (Medium)**: `File::sync_all()` before the rename, and a unique temp name (pid + `AtomicU64`) so concurrent writers to one path can't share a temp file. `→ src/util.rs` (`atomic_write`); consequence in `src/app/persist.rs`'s module doc, which no longer cites the fixed `.tmp` path.
+  - **#2 (Critical) — a config.toml missing one section/key failed to parse and the TUI silently fell back to full defaults for the whole run.** `provider`/`ui`/`agent`/`mcp` got `#[serde(default)]` on `Config`; every scalar field of `ProviderConfig`/`UiConfig`/`AgentConfig` got `#[serde(default = "named_fn")]` (named functions, not bare `#[serde(default)]` — that would zero/false the real defaults). `Config` now derives `Default`. No `deny_unknown_fields`. `→ src/config/mod.rs`
+  - **#5 (High) — CORS headers went out on every `/serve` response regardless of whether auth was configured**, while the bearer check only engages when `api_key` is set — any open web page could cross-origin read a loopback reply with no key configured. Now gated on `context.api_key.is_some()`. `→ src/server/http.rs`
+  - **#11 (Medium) — bare `String::from_utf8_lossy` on child output inside the harness itself**, violating invariant 4 in code written after the invariant. Replaced with `util::decode_process_output`. `→ src/harness/scenario.rs`
+  - **#16 (Low) — `sandbox/config.template.toml` advertised three `[ui]` keys removed from `UiConfig` in the 2026-07-15 sweepables pass.** Dropped. `→ sandbox/config.template.toml`
+  - Plus, outside the review, **Stage 0 of `.docs/vision-local-image-understanding.md`**: `/attach`'s `submit_input` used `read_to_string(...).ok()?` inside a `filter_map`, so a non-UTF-8 file (e.g. a PNG) vanished entirely — status bar said "1 file attached", model got nothing. Moved to a pure `build_attachment_section` helper that always names the file and always emits a block (placeholder text for unreadable content, the OS error for an open failure). `→ src/app/keys/chat.rs` (`build_attachment_section`)
+  - Tests 493→504 passing (508 total, 4 `#[ignore]`d), clippy 0, fmt clean. The other 14 findings are open — see CRITICAL/HIGH/MEDIUM/LOW above (prefixed `review-2026-08-26 #N`) and `.docs/review-2026-08-26-rust.md`. Full write-up: `JOURNAL/2026-08-26.md`.
 
 - ✅ **Tool output in UTF-16 was decoded as UTF-8, handing the model mojibake instead of the error** (found 2026-08-25 by `harness mine` on its first trace corpus; fixed same day). On Windows `bash` commonly resolves to WSL, and `wsl.exe` writes *its own* diagnostics in UTF-16LE — a failed ext4.vhdx mount arrived as `1d 04 35 04 20 00 43 04 34 04`, unreadable to model and human alike. New shared `util::decode_process_output`: BOM first, then endianness inferred from which side of each byte pair carries a byte that cannot occur in text (< 0x20 excluding tab/CR/LF, or 0x7F). Counting NULs is not enough — `Н` (U+041D) is `1D 04`, so a Russian message has none; the first attempt at this heuristic failed its own test for exactly that reason. Both streaming readers now keep **raw bytes** (as their doc comments always claimed) instead of decoding per line and re-encoding — a UTF-16 newline is `0A 00`, so `read_until(b'
 ')` yields half-aligned chunks that cannot be decoded in isolation; one decode of the finished buffer replaces four scattered `from_utf8_lossy` calls. `→ src/util.rs` (`decode_process_output`), `src/tools/shell.rs` (`capped_pipe_reader` + collection site), `src/tools/background/spawn.rs`, `src/tools/background/types.rs` (`sanitize_terminal_output`)

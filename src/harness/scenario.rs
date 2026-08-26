@@ -539,11 +539,11 @@ async fn spawn_run(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = crate::util::decode_process_output(&output.stdout);
     match serde_json::from_str::<RunOutcome>(stdout.trim()) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = crate::util::decode_process_output(&output.stderr);
             Ok(child_failed(
                 trace_path,
                 format!(

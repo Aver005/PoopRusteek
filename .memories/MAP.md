@@ -160,7 +160,7 @@
 | `assets/sha3_wasm_bg.*.wasm` | DeepSeek PoW solver blob |
 | `.github/workflows/ci.yml` | CI: build+test on Windows and Linux, clippy advisory |
 | `CLAUDE.md` | Repo-root bridge that points Claude Code at `.memories/INDEX.md` |
-| `.docs/` | Human docs (partly aspirational — trust code/`.memories` over it) |
+| `.docs/` | Human docs (partly aspirational — trust code/`.memories` over it). `review-2026-08-26-rust.md`: full-codebase review, 20 findings, source of record for BUGS.md's open review items. `vision-local-image-understanding.md`: local image-understanding research/plan, Stage 0 done (see JOURNAL/2026-08-26.md) |
 
 > Sizes above are **approximate** (rounded, several files grew/shrank this session) — anchor to function/struct names, not line counts, when citing something specific.
 

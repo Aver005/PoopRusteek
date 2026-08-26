@@ -205,23 +205,25 @@ async fn handle_request(
             ),
         });
     }
-    // Permissive CORS so browser-based OpenAI clients can call a local
-    // gateway; the bearer check (when enabled) remains the actual gate.
-    let headers = response.headers_mut();
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        "*".parse().expect("static header value"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        "GET, POST, OPTIONS".parse().expect("static header value"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        "authorization, content-type"
-            .parse()
-            .expect("static header value"),
-    );
+    // CORS only when a bearer token is configured — otherwise the browser's
+    // same-origin policy is the only thing stopping a page from reading replies.
+    if context.api_key.is_some() {
+        let headers = response.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            "*".parse().expect("static header value"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, POST, OPTIONS".parse().expect("static header value"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            "authorization, content-type"
+                .parse()
+                .expect("static header value"),
+        );
+    }
     Ok(response)
 }
 
@@ -430,5 +432,64 @@ mod tests {
                 None => panic!("server task ended without ServerStopped"),
             }
         }
+    }
+
+    /// CORS headers are the actual cross-origin gate when no bearer token is
+    /// configured — they must not be sent, or any page could read replies.
+    #[tokio::test]
+    async fn cors_headers_follow_api_key_presence() {
+        async fn cors_headers_present(api_key: Option<&str>) -> bool {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
+            let handle = spawn(test_settings(api_key), models, 1, event_tx);
+            let addr = match event_rx.recv().await {
+                Some(AppEvent::ServerStarted { addr, .. }) => addr,
+                _ => panic!("expected ServerStarted"),
+            };
+            let base = format!("http://{addr}");
+            let client = reqwest::Client::new();
+
+            // /health (open route) and the OPTIONS preflight must agree.
+            let health = client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .expect("health request");
+            let preflight = client
+                .request(
+                    reqwest::Method::OPTIONS,
+                    format!("{base}/v1/chat/completions"),
+                )
+                .send()
+                .await
+                .expect("preflight request");
+            let present = health
+                .headers()
+                .contains_key(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN);
+            assert_eq!(
+                present,
+                preflight
+                    .headers()
+                    .contains_key(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                "health and preflight must agree on CORS presence"
+            );
+
+            handle.request_shutdown();
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event, AppEvent::ServerStopped { .. }) {
+                    break;
+                }
+            }
+            present
+        }
+
+        assert!(
+            !cors_headers_present(None).await,
+            "no api_key configured → no CORS headers (browser same-origin policy stays the gate)"
+        );
+        assert!(
+            cors_headers_present(Some("sekret")).await,
+            "api_key configured → CORS headers present (bearer check is the real gate)"
+        );
     }
 }

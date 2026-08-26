@@ -6,7 +6,7 @@
 
 use crate::app::{App, AutocompleteState};
 use crate::error::AppResult;
-use crate::provider::ChatMessage;
+use crate::provider::{AttachedFile, ChatMessage};
 
 /// How `submit_input` left the turn: keep processing the key normally
 /// (refresh autocomplete), swallow the key, or quit the app.
@@ -14,6 +14,40 @@ enum SubmitOutcome {
     Continue,
     Consumed,
     Quit,
+}
+
+/// Builds the fenced block sent to the model for each attached file, plus
+/// the display names for the "📎 attached: …" summary. Never drops a file:
+/// content that cannot be read as text becomes a placeholder note instead.
+fn build_attachment_section(files: &[AttachedFile]) -> (String, Vec<String>) {
+    let mut names = Vec::with_capacity(files.len());
+    let blocks: Vec<String> = files
+        .iter()
+        .map(|f| {
+            names.push(f.display_name.clone());
+            let header = format!(
+                "File: {} ({}):",
+                f.display_name,
+                crate::util::format_size(f.size)
+            );
+            // Not-UTF-8 and could-not-open are different facts: saying
+            // "binary content" about a missing file misleads the model.
+            let body = match std::fs::read_to_string(&f.path) {
+                Ok(content) => content,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    let kind = if f.is_image {
+                        "Image file"
+                    } else {
+                        "Binary file"
+                    };
+                    format!("{kind} — content not read as text.")
+                }
+                Err(e) => format!("Could not read file: {e}"),
+            };
+            format!("```\n{header}\n{body}\n```")
+        })
+        .collect();
+    (blocks.join("\n"), names)
 }
 
 impl App {
@@ -225,22 +259,8 @@ impl App {
             } else {
                 "\n\n".to_string()
             };
-            let attach_section: String = self
-                .state
-                .attached_files
-                .iter()
-                .filter_map(|f| {
-                    let content = std::fs::read_to_string(&f.path).ok()?;
-                    let header = format!(
-                        "File: {} ({}):",
-                        f.display_name,
-                        crate::util::format_size(f.size)
-                    );
-                    attached_names.push(f.display_name.clone());
-                    Some(format!("```\n{}\n{}\n```", header, content))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let (attach_section, names) = build_attachment_section(&self.state.attached_files);
+            attached_names = names;
             if !attach_section.is_empty() {
                 expanded.push_str(&attach_header);
                 expanded.push_str(&attach_section);
@@ -260,5 +280,85 @@ impl App {
         };
         self.send_focused_turn(Some(message)).await?;
         Ok(SubmitOutcome::Continue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_file(test_name: &str, name: &str, content: &str) -> String {
+        let dir = std::env::temp_dir()
+            .join("pooprusteek_attach_section_test")
+            .join(test_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn readable_text_file_is_inlined() {
+        let path = scratch_file("readable", "notes.txt", "hello world");
+        let files = [AttachedFile {
+            display_name: "notes.txt".to_string(),
+            path,
+            size: 11,
+            is_image: false,
+        }];
+        let (section, names) = build_attachment_section(&files);
+        assert_eq!(names, vec!["notes.txt".to_string()]);
+        assert!(section.contains("File: notes.txt"));
+        assert!(section.contains("hello world"));
+    }
+
+    #[test]
+    fn binary_image_gets_a_placeholder_not_dropped() {
+        let dir = std::env::temp_dir()
+            .join("pooprusteek_attach_section_test")
+            .join("binary");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.png");
+        std::fs::write(&path, [0x89u8, 0x50, 0x4E, 0x47, 0xFF, 0xFE, 0x00]).unwrap();
+        let files = [AttachedFile {
+            display_name: "photo.png".to_string(),
+            path: path.to_string_lossy().into_owned(),
+            size: 7,
+            is_image: true,
+        }];
+        let (section, names) = build_attachment_section(&files);
+        assert_eq!(names, vec!["photo.png".to_string()]);
+        assert!(section.contains("File: photo.png"));
+        assert!(section.contains("Image file — content not read as text."));
+    }
+
+    #[test]
+    fn missing_image_reports_the_open_error_not_binary_content() {
+        let files = [AttachedFile {
+            display_name: "photo.png".to_string(),
+            path: "does-not-exist.png".to_string(),
+            size: 1024,
+            is_image: true,
+        }];
+        let (section, names) = build_attachment_section(&files);
+        assert_eq!(names, vec!["photo.png".to_string()]);
+        assert!(section.contains("Could not read file:"));
+        assert!(!section.contains("not read as text"));
+    }
+
+    #[test]
+    fn missing_path_gets_a_placeholder_not_dropped() {
+        let files = [AttachedFile {
+            display_name: "gone.txt".to_string(),
+            path: "does-not-exist.txt".to_string(),
+            size: 0,
+            is_image: false,
+        }];
+        let (section, names) = build_attachment_section(&files);
+        assert_eq!(names, vec!["gone.txt".to_string()]);
+        assert!(section.contains("File: gone.txt"));
+        assert!(section.contains("Could not read file:"));
     }
 }

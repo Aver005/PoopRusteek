@@ -7,11 +7,8 @@
 //! the event loop" invariant). This worker executes those writes on
 //! `spawn_blocking`, one at a time in submission order.
 //!
-//! Ordering is load-bearing twice over: each job snapshots full state at
-//! enqueue time, so the newest snapshot must also be the *last* write to
-//! its file; and `util::atomic_write` uses a fixed sibling `.tmp` path, so
-//! two concurrent writes to the same file would clobber each other's temp
-//! file mid-rename.
+//! Ordering is load-bearing: each job snapshots full state at enqueue time,
+//! so the newest snapshot must also be the *last* write to its file.
 
 use crate::provider::ChatMessage;
 use crate::semantic::SemanticService;

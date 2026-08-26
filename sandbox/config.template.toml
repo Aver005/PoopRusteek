@@ -18,9 +18,6 @@ max_tokens = 4096
 
 [ui]
 theme = "catppuccin"
-show_status_bar = true
-show_line_numbers = false
-max_message_length = 4096
 custom_themes = []
 
 [agent]
