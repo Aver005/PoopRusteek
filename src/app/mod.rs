@@ -370,9 +370,11 @@ impl App {
         };
 
         // A setting that changed section was applied from its old place — say
-        // so, so the change is never silent (`config::apply_migrations`).
-        for notice in &config.migration_notices {
-            state.push_message(ChatMessage::ui_system(notice));
+        // so, so the change is never silent (`config::apply_migrations`). Goes
+        // to the status line, not the transcript: a message here would leave
+        // the chat non-empty and replace the home screen on every launch.
+        if !config.migration_notices.is_empty() {
+            state.status_message = config.migration_notices.join(" · ");
         }
 
         // Semantic matcher: background init (first run downloads the
