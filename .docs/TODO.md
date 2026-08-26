@@ -51,5 +51,13 @@
 - [ ] GitHub Actions CI/CD
 - [ ] Man page
 
+## Phase 6: Local vision (planned)
+> Full research + plan: `vision-local-image-understanding.md`
+- [ ] Stage 0: stop dropping attached images silently (`app/keys/chat.rs`)
+- [ ] Stage 1: `VisionService` + OCR backend (`ocrs`) + `image_read` tool
+- [ ] Stage 2: Florence-2-base-ft ONNX backend via the already-linked `ort`
+- [ ] Stage 3: `remote` backend over `CompatClient` (local Ollama / llama.cpp)
+- [ ] Stage 4: keep MCP screenshot bytes instead of `[Image: image/png]`
+
 ## Known Issues
 - (none yet)
