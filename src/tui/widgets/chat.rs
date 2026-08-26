@@ -666,6 +666,7 @@ mod tests {
             goal: Default::default(),
             needs_terminal_restore: false,
             background: crate::app::background_stats::BackgroundCounters::default(),
+            provider_context_window: 0,
         };
 
         for i in 0..100 {

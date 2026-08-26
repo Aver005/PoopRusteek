@@ -71,6 +71,10 @@ pub struct Conversation {
     /// the yellow flag in `/sessions` and is cleared again once a fresh
     /// remote session is established (see `App::auto_save_session`).
     pub broken: bool,
+    /// Budget tokens the last request for this conversation carried, as
+    /// measured by `crate::context::conversation_tokens`. 0 until the first
+    /// step reports one. An estimate for thresholds, never a token count.
+    pub context_used: u32,
 }
 
 impl Conversation {
@@ -90,6 +94,7 @@ impl Conversation {
             agent_task: None,
             tag: None,
             broken: false,
+            context_used: 0,
         }
     }
 

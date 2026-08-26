@@ -42,7 +42,7 @@
 | `src/provider/openai_client.rs` | `OpenAiCompatProvider` — `LLMProvider` over any OpenAI-compatible endpoint (2026-07-05): one POST per turn, SSE via `SseLineBuffer`, `data: [DONE]` terminator, bearer auth, stateless `fork()`. Built from `config::ProviderEntry` by `provider::build_provider` (the single provider-construction point: `App::new`, `rebuild_provider`, onboarding) | ~150 |
 | `src/app/providers.rs` | `/providers` state + pure logic (2026-07-05): `ProvidersViewState`, `provider_rows` (built-in deepseek row + entries), `ProviderAddState` wizard (Name→BaseUrl→ApiKey→Model→Confirm), `parse_quick_add`, name/URL validation — tests included | ~270 |
 | `src/provider/openai_compat.rs` | OpenAI Chat Completions wire types + both-direction conversions to/from internal `CompletionRequest`/`Response`/`Chunk` (2026-07-05): inbound `to_internal_request` (content-parts flattening, role aliases, max_completion_tokens precedence), outbound `response_to_openai`/`delta_chunk`/`final_chunk` (streaming protocol), reverse `request_to_openai`/`response_from_openai`/`chunk_from_openai` for a future OpenAI-client provider, `model_list`, error envelope. Pure data mapping, no I/O; parked under a documented `allow(dead_code)` until server mode lands (PLANS.md). | ~430 |
-| `src/provider/fake.rs` | `FakeProvider` test double (impls `fork()`) — `#[cfg(test)]` | ~80 |
+| `src/provider/fake.rs` | `FakeProvider` test double (impls `fork()`) — `#[cfg(test)]`. Since 2026-08-26 records every request it receives (`request(n)`), letting a test assert on what the model actually gets (history-rewriting rungs — tool-output caps, compaction) | ~80 |
 | `src/provider/prompt.rs` | Prompt/history assembly for the web API (extracted from deepseek.rs) | — |
 | `src/provider/sse.rs` | `SseLineBuffer` — now byte-based (not string-slicing, was O(n²)) with a 4MiB cap | — |
 | `src/provider/pow.rs` | SHA-3 PoW solver via `wasmtime` (native reimpl planned to drop the wasm dep) | ~245 |
@@ -148,6 +148,9 @@
 | `src/semantic/matcher.rs` | Typed corpora over `HybridIndex`: `SkillCorpus` (skips enabled), `McpCorpus` (carries input_schema in matches) |
 | `src/semantic/history.rs` | `HistoryStore` — persistent message-history index (chunked user/assistant messages of saved sessions; JSON + base64 vectors via `atomic_write`; per-session watermarks; model-stamp wipe; 50k cap) |
 | `src/semantic/eval.rs` | Retrieval eval: skill + MCP fixtures → MRR, history E2E roundtrip (`#[ignore]`, need the model). Latest: skills 0.927, MCP 0.836 |
+| `src/context/mod.rs` | Context-compaction ladder, peer of `semantic/` — module doc points at `.docs/context-compaction.md`; re-exports `budget::{ContextBudget, conversation_tokens}` |
+| `src/context/budget.rs` | Step 1 (measurement only, 2026-08-26): `budget_tokens` (`chars/3` estimate), `conversation_tokens`, `ContextBudget`/`BudgetSnapshot`/`WindowSource` — `usable()` returns `None` when the window is unknown or the reserve swallows it (invariant 12) |
+| `src/context/tool_output.rs` | Step 2 / ladder rung 0 (2026-08-26): `cap_tool_output(text, limit_chars)` — keeps 20% head + 80% tail with a cut-count marker, char-boundary safe. Applied in `run_agent_loop` (`src/agent/runner.rs`) and `run_sub_agent` (`src/agent/sub_agent.rs`), both fed `TurnSpec.tool_output_limit` / `[context] tool_output_limit` (default 10 000 chars) |
 | `src/tools/tool_search.rs` | `tool_search` builtin — capability search over MCP tools, returns full definitions; lexical fallback pre-init. The escape hatch for deferred MCP schemas |
 | `src/tools/history_search.rs` | `history_search` builtin — agent-facing search over past sessions (session id + title + date + excerpt per hit) |
 | `src/app/search.rs` | `View::Search` state: query `InputState`, matches in ranker order, pure `visible_indices` (role filter → per-session dedup → sort), `spawn_history_search` |
@@ -160,7 +163,7 @@
 | `assets/sha3_wasm_bg.*.wasm` | DeepSeek PoW solver blob |
 | `.github/workflows/ci.yml` | CI: build+test on Windows and Linux, clippy advisory |
 | `CLAUDE.md` | Repo-root bridge that points Claude Code at `.memories/INDEX.md` |
-| `.docs/` | Human docs (partly aspirational — trust code/`.memories` over it). `review-2026-08-26-rust.md`: full-codebase review, 20 findings, source of record for BUGS.md's open review items. `vision-local-image-understanding.md`: local image-understanding research/plan, Stage 0 done (see JOURNAL/2026-08-26.md) |
+| `.docs/` | Human docs (partly aspirational — trust code/`.memories` over it). `review-2026-08-26-rust.md`: full-codebase review, 20 findings, source of record for BUGS.md's open review items. `vision-local-image-understanding.md`: local image-understanding research/plan, Stage 0 done (see JOURNAL/2026-08-26.md). `context-compaction.md`: context-compaction research/plan (decided 2026-08-26; step 1/measurement shipped same day, rest not implemented), closes review #3/#4 — see `PLANS.md`/`BUGS.md` |
 
 > Sizes above are **approximate** (rounded, several files grew/shrank this session) — anchor to function/struct names, not line counts, when citing something specific.
 

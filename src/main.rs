@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod commands;
 mod config;
+mod context;
 mod debug_log;
 mod error;
 mod harness;

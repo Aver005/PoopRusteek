@@ -18,7 +18,7 @@
 - [x] Session persistence (save/load)
 - [x] Slash commands (/help, /clear, /compact, etc.)
 - [x] Markdown rendering in TUI (pulldown-cmark)
-- [x] Context compaction (/compact command)
+- [ ] Context compaction — **stub only**: `/compact` exists, but its "summary" is user messages joined with "; " and assistant/tool messages are dropped. Real implementation is Phase 7
 - [x] File mentions (@file with line ranges)
 - [x] Syntax highlighting for code blocks (syntect)
 - [x] Tool approval dialog (modal overlay, Y/N)
@@ -58,6 +58,15 @@
 - [ ] Stage 2: Florence-2-base-ft ONNX backend via the already-linked `ort`
 - [ ] Stage 3: `remote` backend over `CompatClient` (local Ollama / llama.cpp)
 - [ ] Stage 4: keep MCP screenshot bytes instead of `[Image: image/png]`
+
+## Phase 7: Context compaction (planned)
+> Full research + plan: `context-compaction.md`
+- [x] Step 1: measurement only, no behavior change — window size (provider `context_window()` + `[context] context_window` override), local `chars/3` estimate (real `prompt_tokens` not wired yet, see `context-compaction.md`), `ctx:` status-bar indicator (`src/context/`, `src/provider/compat_client.rs`, `src/provider/mod.rs`)
+- [x] Step 2: rung 0 — tool output cap at capture time, before it enters history (`src/context/tool_output.rs`, applied in `src/agent/runner.rs` and `src/agent/sub_agent.rs`)
+- [ ] Step 3: rung 1 — clear old tool-result bodies, full output spilled to disk (`src/context/`, `util::atomic_write`)
+- [ ] Step 4: rung 2 for DeepSeek — reset the server session with a compressed `LOCAL MEMORY` (`src/provider/deepseek/stream.rs`, `src/provider/prompt.rs`)
+- [ ] Step 5: rung 3 — LLM summary (`src/context/`, `src/agent/runner.rs`)
+- [ ] Step 6: `/compact` — manual trigger of the same ladder, replacing today's stub; update this file (`src/commands/defs/compact.rs`)
 
 ## Known Issues
 - (none yet)

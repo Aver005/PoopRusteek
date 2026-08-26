@@ -5,11 +5,11 @@
 
 ## CRITICAL
 
-- `[BUG]` review-2026-08-26 #3: `max_context_messages`/`auto_compact` are declared, defaulted, and serialized into `config.toml`, but never read anywhere — no automatic context trimming happens despite being configurable. `→ src/config/mod.rs` Not a crash: `build_step_request` resends the whole message array every step, so token cost grows quadratically within a turn (DeepSeek is partly shielded by server-side session threading). Severity as rated in the review.
+- `[BUG]` review-2026-08-26 #3: `max_context_messages`/`auto_compact` are declared, defaulted, and serialized into `config.toml`, but never read anywhere — no automatic context trimming happens despite being configurable. `→ src/config/mod.rs` Not a crash: `build_step_request` resends the whole message array every step, so token cost grows quadratically within a turn (DeepSeek is partly shielded by server-side session threading). Severity as rated in the review. Plan decided, not yet implemented: `.docs/context-compaction.md` (tracked in `PLANS.md`).
 
 ## HIGH
 
-- `[BUG]` review-2026-08-26 #4: `/compact` is a stub presented as a feature — "summary" is every user message's `content` joined with `"; "`, assistant/tool messages dropped outright, `.docs/TODO.md` lists it as complete. `→ src/commands/defs/compact.rs`
+- `[BUG]` review-2026-08-26 #4: `/compact` is a stub presented as a feature — "summary" is every user message's `content` joined with `"; "`, assistant/tool messages dropped outright, `.docs/TODO.md` lists it as complete. `→ src/commands/defs/compact.rs` Plan decided, not yet implemented: `.docs/context-compaction.md` (tracked in `PLANS.md`).
 
 ### Announcing work ends the turn as if it were done
 

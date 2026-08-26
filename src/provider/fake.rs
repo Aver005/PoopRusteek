@@ -25,6 +25,10 @@ pub struct FakeProvider {
     /// count is decremented per streamed call, so tests can model "fail once,
     /// recover next call" flows.
     abrupt_eof_remaining: Mutex<usize>,
+    /// Every request the loop sent, in order. Lets a test assert on what the
+    /// model actually received — the only way to observe history rewriting
+    /// (tool-output caps, compaction) from outside the loop.
+    seen_requests: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
 impl FakeProvider {
@@ -40,6 +44,7 @@ impl FakeProvider {
             responses: Mutex::new(responses.into_iter().collect()),
             chunk_count: 1,
             abrupt_eof_remaining: Mutex::new(0),
+            seen_requests: Mutex::new(Vec::new()),
         }
     }
 
@@ -56,6 +61,18 @@ impl FakeProvider {
         self
     }
 
+    /// The messages carried by the `n`-th request this provider received.
+    pub fn request(&self, n: usize) -> Option<Vec<ChatMessage>> {
+        self.seen_requests.lock().unwrap().get(n).cloned()
+    }
+
+    fn record(&self, request: &CompletionRequest) {
+        self.seen_requests
+            .lock()
+            .unwrap()
+            .push(request.messages.clone());
+    }
+
     fn next_body(&self) -> String {
         self.responses
             .lock()
@@ -67,7 +84,8 @@ impl FakeProvider {
 
 #[async_trait]
 impl LLMProvider for FakeProvider {
-    async fn complete(&self, _request: CompletionRequest) -> AppResult<CompletionResponse> {
+    async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
+        self.record(&request);
         Ok(CompletionResponse {
             content: self.next_body(),
             finish_reason: Some("stop".to_string()),
@@ -77,9 +95,10 @@ impl LLMProvider for FakeProvider {
 
     async fn complete_stream(
         &self,
-        _request: CompletionRequest,
+        request: CompletionRequest,
         tx: UnboundedSender<CompletionChunk>,
     ) -> AppResult<()> {
+        self.record(&request);
         let chars: Vec<char> = self.next_body().chars().collect();
         let per = chars.len().div_ceil(self.chunk_count).max(1);
         for piece in chars.chunks(per) {

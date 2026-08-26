@@ -1,6 +1,6 @@
 # PLANS
 > Roadmap, active priorities, and ideas.
-> Last updated: 2026-07-06 (OpenAI-compatible server mode SHIPPED — moved off ACTIVE)
+> Last updated: 2026-08-26 (context-compaction ladder decided, not built — SHORT-TERM P0 + `.docs/context-compaction.md`). Before: 2026-07-06 (OpenAI-compatible server mode SHIPPED — moved off ACTIVE)
 
 ## RECENTLY SHIPPED (`[DONE]` — was on this roadmap)
 
@@ -28,6 +28,7 @@
 
 | Priority | What | Why |
 |----------|------|-----|
+| P0 | **Context compaction — four-rung ladder** (decided 2026-08-26, not implemented) | Closes review findings #3 (`max_context_messages`/`auto_compact` never read) and #4 (`/compact` is a stub). Compaction is a ladder of four rungs, cheapest first: (0) budget tool output at capture, (1) clear old tool-result bodies with the full output spilled to disk, (2) a history boundary — for DeepSeek this means resetting the server-side session — (3) an LLM summary as the last resort. Checked only at turn boundaries, never mid tool-chain. The summary is written by the same model that runs the conversation, not a separate cheap model. Computable facts — file lists, commands run, error text — are filled in by the harness from tool-call history, not asked of the model. Full reasoning and the rejected alternatives (separate summarizer model, 9/18-field summary schemas, mid-chain compaction, reactive-only triggers, post-hoc size rollback): `.docs/context-compaction.md`. |
 | P0 | **Auto-load `.memories/` into the agent** | The "Integrate memories" commit only created the docs; `build_system_prompt` still doesn't read them. Goal: agents understand the project cold. (`app/mod.rs:1480`) |
 | P1 | MCP tool-arg schema validation | Args passed unchecked to `tools/call` |
 | P1 | `cargo clippy` clean pass | Lint debt |
@@ -57,3 +58,8 @@
 
 - `[IDEA]` Electron/GUI wrapper — TUI is the identity, keep it terminal-native
 - `[IDEA]` Database-backed sessions — JSON files are simpler and debuggable
+- Compaction by a **separate cheaper model** — Roo removed the option (PR #10901) and Goose reverted to the main model (PR #11255); a summariser that drops a constraint or a path corrupts every turn after it. Reasoning: `.docs/context-compaction.md` §5.1
+- Compaction **mid tool-chain** (Codex does it) — a chain that compacts between a call and its result leaves the model unable to say what it was doing. Accepted cost: a long chain can hit the limit without ever being checked. §5.3
+- **Reactive-only** compaction on a provider overflow error — LM Studio answers `finish_reason: "length"` instead of an error, so the refusal is not reliably detectable. §5.3
+- Summary schemas of **9 or 18 fields** (Claude Code, OpenHands) — measured worse than prose on token cost at 18 fields, and unusable output length at 9 for small models. Six sections. §5.2
+- **Post-hoc rollback** when a summary comes out larger than what it replaced — Roo shipped that guard and later deleted it (PR #10920); check that the summary prompt fits *before* calling instead. §5.5

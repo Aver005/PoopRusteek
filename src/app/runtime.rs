@@ -29,6 +29,9 @@ pub struct TurnSpec {
     /// Background turns (sidechats / sub-agents) auto-approve tools so they
     /// never block on an approval modal.
     pub auto_approve: bool,
+    /// Chars kept per tool result before it enters the history (rung 0 of
+    /// the compaction ladder). `0` = uncapped.
+    pub tool_output_limit: usize,
 }
 
 /// Owns the dependencies for running agent turns and centralizes spawning.

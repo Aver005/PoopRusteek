@@ -41,6 +41,7 @@ pub async fn run_agent_loop(
         max_steps,
         max_tools_per_step,
         auto_approve,
+        tool_output_limit,
     } = spec;
     let mut collected_tool_calls = Vec::new();
     let mut malformed_retries: u32 = 0;
@@ -60,6 +61,7 @@ pub async fn run_agent_loop(
         max_steps,
         max_tools_per_step,
         auto_approve,
+        tool_output_limit,
         event_tx: &event_tx,
     };
 
@@ -75,6 +77,12 @@ pub async fn run_agent_loop(
         let _ = event_tx.send(AppEvent::BeginAssistantMessage(conversation));
         let request =
             build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
+        // Measured here because this is the one place that sees exactly what
+        // goes on the wire. Runs on the agent task, never the event loop.
+        let _ = event_tx.send(AppEvent::ContextUsage {
+            conversation,
+            used: crate::context::conversation_tokens(&system_prompt, &messages),
+        });
 
         let outcome = stream_step(conversation, &provider, request, &event_tx).await;
 
@@ -374,6 +382,13 @@ pub async fn run_agent_loop(
 
             let preview = summarize_tool_result(&tool_result);
             let display = preview.clone();
+            // What the model actually receives — capped at capture (rung 0 of
+            // the compaction ladder). The trace below still logs the uncapped
+            // `tool_result` so it never misleads about what the tool produced.
+            let content_for_model =
+                crate::context::cap_tool_output(&tool_result, tool_output_limit);
+            let result_capped =
+                tool_output_limit != 0 && tool_result.chars().count() > tool_output_limit;
             debug_log::log(
                 "agent.tool.result",
                 format!(
@@ -395,13 +410,15 @@ pub async fn run_agent_loop(
                     "result_chars": tool_result.chars().count(),
                     "result": tool_result,
                     "preview": preview,
+                    "result_capped": result_capped,
+                    "result_chars_sent": content_for_model.chars().count(),
                 }),
             );
 
             let tool_message = ChatMessage::tool_with_display(
                 &tool_id,
                 &tool_name,
-                &tool_result,
+                &content_for_model,
                 &display,
                 is_error,
             );
@@ -537,6 +554,7 @@ struct ToolExecContext<'turn> {
     max_steps: usize,
     max_tools_per_step: usize,
     auto_approve: bool,
+    tool_output_limit: usize,
     event_tx: &'turn mpsc::UnboundedSender<AppEvent>,
 }
 
@@ -629,6 +647,7 @@ async fn execute_tool_call(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> 
             ctx.max_tokens,
             ctx.max_steps.min(8),
             ctx.max_tools_per_step,
+            ctx.tool_output_limit,
         )
         .await
         {
@@ -804,6 +823,7 @@ mod tests {
                 max_steps: 4,
                 max_tools_per_step: 4,
                 auto_approve: false,
+                tool_output_limit: 0,
             },
             tools,
             mcp,
@@ -866,6 +886,7 @@ mod tests {
                 max_steps: 4,
                 max_tools_per_step: 4,
                 auto_approve: false,
+                tool_output_limit: 0,
             },
             tools,
             mcp,
@@ -950,6 +971,7 @@ mod tests {
                 max_steps,
                 max_tools_per_step: 4,
                 auto_approve: true,
+                tool_output_limit: 0,
             },
             Arc::new(ToolRegistry::new()),
             Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
@@ -998,6 +1020,7 @@ mod tests {
                 max_steps: 4,
                 max_tools_per_step: 4,
                 auto_approve: true,
+                tool_output_limit: 0,
             },
             tools,
             mcp,
@@ -1020,6 +1043,95 @@ mod tests {
         let done = saw_done.expect("salvaged tool call should still finish the turn");
         assert_eq!(done.tool_calls.len(), 1);
         assert_eq!(done.tool_calls[0].name, "question");
+    }
+
+    /// A tool whose output is deliberately larger than any sane cap.
+    struct LoudTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for LoudTool {
+        fn definition(&self) -> crate::tools::ToolDefinition {
+            crate::tools::ToolDefinition {
+                name: "loud".to_string(),
+                description: "emits a lot".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> crate::tools::ToolResult {
+            crate::tools::ToolResult {
+                content: format!("START{}END", "x".repeat(5_000)),
+                is_error: false,
+            }
+        }
+    }
+
+    /// Rung 0 end to end: the model's next request must carry the capped tool
+    /// result, while the event stream still reports what the tool really said.
+    #[tokio::test]
+    async fn tool_output_is_capped_before_it_reaches_the_model() {
+        let call = r#"<tool_use><name>loud</name><arguments>{}</arguments></tool_use>"#;
+        let fake = Arc::new(FakeProvider::with_responses(vec![
+            call.to_string(),
+            "Done.".to_string(),
+        ]));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(LoudTool));
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("go")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 500,
+            },
+            tools,
+            mcp,
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let second = fake
+            .request(1)
+            .expect("a second request after the tool ran");
+        let tool_message = second
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool result in the follow-up request");
+        assert!(
+            tool_message.content.chars().count() < 1_000,
+            "capped, got {} chars",
+            tool_message.content.chars().count()
+        );
+        assert!(tool_message.content.starts_with("START"), "head kept");
+        assert!(tool_message.content.ends_with("END"), "tail kept");
+
+        // The event stream is the user's and the harness's view: uncapped.
+        let mut reported = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let AppEvent::AgentDone(id, result) = ev
+                && id == cid
+            {
+                reported = result.tool_calls.first().and_then(|c| c.result.clone());
+            }
+        }
+        let reported = reported.expect("tool call reported on the event stream");
+        assert!(
+            reported.chars().count() > 5_000,
+            "event stream keeps the full output, got {}",
+            reported.chars().count()
+        );
     }
 
     #[test]

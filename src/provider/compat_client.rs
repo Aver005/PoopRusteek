@@ -253,6 +253,33 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
         P::parse_models(&body)
     }
 
+    /// OpenAI's `/models` schema has no window field, but OpenRouter and
+    /// several compatible gateways add `context_length` — read it when it is
+    /// there, stay silent when it is not. LM Studio and Ollama expose theirs
+    /// on non-OpenAI routes (`/api/v0/models`, `/api/show`) and are not
+    /// covered here.
+    async fn context_window(&self) -> Option<u32> {
+        let response = P::apply_headers(
+            self.client.get(P::models_url(&self.base_url)),
+            self.api_key.as_deref(),
+        )
+        .send()
+        .await
+        .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = response.json().await.ok()?;
+        body.get("data")?
+            .as_array()?
+            .iter()
+            .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some(self.model.as_str()))?
+            .get("context_length")?
+            .as_u64()?
+            .try_into()
+            .ok()
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

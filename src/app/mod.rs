@@ -193,6 +193,9 @@ pub struct AppState {
 
     pub needs_terminal_restore: bool,
     pub background: background_stats::BackgroundCounters,
+    /// Context window the provider reported, 0 while unknown. Config wins over
+    /// it — see `context::ContextBudget::learn_provider_window`.
+    pub provider_context_window: u32,
 }
 
 impl AppState {
@@ -263,6 +266,14 @@ impl App {
         tools.update_skills(skills.clone());
 
         let has_provider = provider.is_some();
+        if let Some(handle) = provider.clone() {
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                if let Some(window) = handle.context_window().await {
+                    let _ = event_tx.send(AppEvent::ContextWindowLearned(window));
+                }
+            });
+        }
         let main_conversation = conversation::Conversation::fresh_main(provider);
 
         let state = AppState {
@@ -305,6 +316,7 @@ impl App {
             goal: goal::GoalState::default(),
             needs_terminal_restore: false,
             background: background_stats::BackgroundCounters::default(),
+            provider_context_window: 0,
         };
 
         // Semantic matcher: background init (first run downloads the
@@ -625,6 +637,14 @@ impl App {
                     .generation
                     .begin(std::time::Instant::now());
                 self.state.status_message = "Thinking...".to_string();
+            }
+            AppEvent::ContextWindowLearned(window) => {
+                self.state.provider_context_window = window;
+            }
+            AppEvent::ContextUsage { conversation, used } => {
+                if let Some(target) = self.state.conversations.get_mut(conversation) {
+                    target.context_used = used;
+                }
             }
             AppEvent::BeginAssistantMessage(_) => {
                 self.state.focused_mut().begin_assistant_message();
@@ -989,6 +1009,7 @@ impl App {
             max_steps: self.config.agent.max_steps_per_turn.max(1),
             max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
             auto_approve: false, // focused turn: interactive approval
+            tool_output_limit: self.config.context.tool_output_limit as usize,
         };
 
         let _ = self.event_tx.send(AppEvent::AgentStarted(conversation));

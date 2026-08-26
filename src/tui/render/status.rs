@@ -183,9 +183,21 @@ pub(super) fn render_mini_status(
         " {}",
         view_model::session_label(&state.focused().session_id)
     );
+    // Window fullness. Absent whenever the window size is unknown — showing a
+    // plausible-looking percentage against a guessed window is how Goose let a
+    // session run 36% past its limit with the indicator still looking fine.
+    let mut budget = crate::context::ContextBudget::from_config(
+        config.context.context_window,
+        config.context.reserved_tokens,
+    );
+    budget.learn_provider_window(state.provider_context_window);
+    let ctx_tag = budget
+        .snapshot(state.focused().context_used)
+        .map(|budget| format!(" ctx:{}", budget.label()))
+        .unwrap_or_default();
     let right = format!(
-        "{} msgs:{} tot:{} | {} ",
-        goal_tag, msg_count, total_tokens, session_label
+        "{} msgs:{} tot:{}{} | {} ",
+        goal_tag, msg_count, total_tokens, ctx_tag, session_label
     );
 
     // Red error marker — only here when the panel (its primary home) is hidden.

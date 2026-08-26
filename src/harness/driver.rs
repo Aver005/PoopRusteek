@@ -440,6 +440,7 @@ async fn drive(
         max_steps: config.agent.max_steps_per_turn.max(1),
         max_tools_per_step: config.agent.max_tools_per_step.max(1),
         auto_approve: false,
+        tool_output_limit: config.context.tool_output_limit as usize,
     });
 
     let mut pending: HashSet<ConversationId> = HashSet::from([root]);
@@ -560,6 +561,7 @@ async fn drive(
                             max_steps: config.agent.max_steps_per_turn.clamp(1, 8),
                             max_tools_per_step: config.agent.max_tools_per_step.max(1),
                             auto_approve: true,
+                            tool_output_limit: config.context.tool_output_limit as usize,
                         }));
                     }
                     // Everything else is TUI chrome (chunks, status lines,

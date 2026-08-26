@@ -87,6 +87,7 @@ impl App {
             max_steps: self.config.agent.max_steps_per_turn.clamp(1, 8),
             max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
             auto_approve: true, // background: auto-approve, never block on a modal
+            tool_output_limit: self.config.context.tool_output_limit as usize,
         });
 
         self.state
@@ -104,6 +105,7 @@ impl App {
                 agent_task: Some(handle),
                 tag: None,
                 broken: false,
+                context_used: 0,
             });
         Ok(())
     }
@@ -290,6 +292,7 @@ impl App {
             agent_task: None,
             tag: None,
             broken: false,
+            context_used: 0,
         });
         self.state.scroll_offset = 0;
         self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();

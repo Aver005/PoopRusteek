@@ -30,6 +30,9 @@ pub async fn run_sub_agent(
     max_tokens: u32,
     max_steps: usize,
     max_tools_per_step: usize,
+    // Inherited from the spawning turn: a sub-agent's history grows the same
+    // way, so it gets the same rung-0 cap.
+    tool_output_limit: usize,
 ) -> Result<String, String> {
     let mut messages = vec![ChatMessage::user(&user_prompt)];
     let mut malformed_retries: u32 = 0;
@@ -101,7 +104,10 @@ pub async fn run_sub_agent(
                     .await
                     .0
             };
-            messages.push(ChatMessage::tool(&tool_id, &result));
+            messages.push(ChatMessage::tool(
+                &tool_id,
+                &crate::context::cap_tool_output(&result, tool_output_limit),
+            ));
         }
     }
 
@@ -138,6 +144,7 @@ mod tests {
             128,
             4,
             4,
+            0,
         )
         .await;
 
@@ -167,6 +174,7 @@ mod tests {
             128,
             4,
             4,
+            0,
         )
         .await;
 

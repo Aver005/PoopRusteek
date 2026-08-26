@@ -320,6 +320,13 @@ pub trait LLMProvider: Send + Sync {
         ))
     }
 
+    /// The active model's context window in tokens, when the provider's own
+    /// catalogue reports one. `None` means "don't know" — never a guess, since
+    /// compaction stays off rather than act on a wrong number (invariant 12).
+    async fn context_window(&self) -> Option<u32> {
+        None
+    }
+
     /// Create a sibling instance that shares this provider's configuration
     /// (and connection) but starts a **fresh session** — no shared
     /// `parent_message_id`/`session_id`. Each parallel conversation and

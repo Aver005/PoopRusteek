@@ -10,6 +10,9 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    /// The compaction ladder — see `crate::config::ContextConfig`.
+    #[serde(default)]
+    pub context: ContextConfig,
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
@@ -331,10 +334,6 @@ pub struct AgentConfig {
     pub max_steps_per_turn: usize,
     #[serde(default = "default_agent_max_tools_per_step")]
     pub max_tools_per_step: usize,
-    #[serde(default = "default_agent_max_context_messages")]
-    pub max_context_messages: usize,
-    #[serde(default = "default_agent_auto_compact")]
-    pub auto_compact: bool,
     #[serde(default = "default_agent_rate_limit_ms")]
     pub rate_limit_ms: u64,
     /// Max requests allowed in any rolling 60s window (0 = no cap). Applied
@@ -354,14 +353,6 @@ fn default_agent_max_tools_per_step() -> usize {
     10
 }
 
-fn default_agent_max_context_messages() -> usize {
-    256
-}
-
-fn default_agent_auto_compact() -> bool {
-    true
-}
-
 fn default_agent_rate_limit_ms() -> u64 {
     0
 }
@@ -379,8 +370,6 @@ impl Default for AgentConfig {
         Self {
             max_steps_per_turn: default_agent_max_steps_per_turn(),
             max_tools_per_step: default_agent_max_tools_per_step(),
-            max_context_messages: default_agent_max_context_messages(),
-            auto_compact: default_agent_auto_compact(),
             rate_limit_ms: default_agent_rate_limit_ms(),
             rate_limit_per_minute: default_agent_rate_limit_per_minute(),
             max_retries: default_agent_max_retries(),
@@ -401,6 +390,63 @@ impl AgentConfig {
             (Some(a), None) => a,
             (None, Some(b)) => b,
             (Some(a), Some(b)) => format!("{a}, {b}"),
+        }
+    }
+}
+
+/// `[context]` — the compaction ladder. See `.docs/context-compaction.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextConfig {
+    /// Master switch for the whole ladder.
+    #[serde(default = "default_context_auto_compact")]
+    pub auto_compact: bool,
+    /// Model context window in tokens. `0` = ask the provider, falling back
+    /// to no compaction if it can't say.
+    #[serde(default = "default_context_window")]
+    pub context_window: u32,
+    /// Headroom subtracted from the window for the model's own answer.
+    #[serde(default = "default_context_reserved_tokens")]
+    pub reserved_tokens: u32,
+    /// Verbatim tail kept past the summary boundary, in tokens. `0` =
+    /// compute as `clamp(usable * 0.25, 2000..15000)`.
+    #[serde(default = "default_context_preserve_recent_tokens")]
+    pub preserve_recent_tokens: u32,
+    /// Characters kept per tool result before it is truncated.
+    #[serde(default = "default_context_tool_output_limit")]
+    pub tool_output_limit: u32,
+}
+
+fn default_context_auto_compact() -> bool {
+    true
+}
+
+fn default_context_window() -> u32 {
+    0
+}
+
+fn default_context_reserved_tokens() -> u32 {
+    20_000
+}
+
+fn default_context_preserve_recent_tokens() -> u32 {
+    0
+}
+
+// Cline/opencode use 2000 chars when serialising for a *summariser*; this cap
+// applies at *capture* instead, where Codex uses 10 000 — 2000 here would
+// cut an ordinary build log before the model ever saw it.
+fn default_context_tool_output_limit() -> u32 {
+    10_000
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            auto_compact: default_context_auto_compact(),
+            context_window: default_context_window(),
+            reserved_tokens: default_context_reserved_tokens(),
+            preserve_recent_tokens: default_context_preserve_recent_tokens(),
+            tool_output_limit: default_context_tool_output_limit(),
         }
     }
 }
@@ -986,17 +1032,29 @@ mod tests {
             parsed.agent.max_tools_per_step,
             default.agent.max_tools_per_step
         );
-        assert_eq!(
-            parsed.agent.max_context_messages,
-            default.agent.max_context_messages
-        );
-        assert_eq!(parsed.agent.auto_compact, default.agent.auto_compact);
         assert_eq!(parsed.agent.rate_limit_ms, default.agent.rate_limit_ms);
         assert_eq!(
             parsed.agent.rate_limit_per_minute,
             default.agent.rate_limit_per_minute
         );
         assert_eq!(parsed.agent.max_retries, default.agent.max_retries);
+        assert_eq!(parsed.context.auto_compact, default.context.auto_compact);
+        assert_eq!(
+            parsed.context.context_window,
+            default.context.context_window
+        );
+        assert_eq!(
+            parsed.context.reserved_tokens,
+            default.context.reserved_tokens
+        );
+        assert_eq!(
+            parsed.context.preserve_recent_tokens,
+            default.context.preserve_recent_tokens
+        );
+        assert_eq!(
+            parsed.context.tool_output_limit,
+            default.context.tool_output_limit
+        );
         assert_eq!(parsed.mcp.cache_ttl, default.mcp.cache_ttl);
     }
 
@@ -1021,7 +1079,6 @@ mod tests {
         let parsed: Config = toml::from_str("[agent]\nmax_retries = 3\n").unwrap();
         assert_eq!(parsed.agent.max_retries, 3);
         assert_eq!(parsed.agent.max_steps_per_turn, 256);
-        assert!(parsed.agent.auto_compact);
     }
 
     #[test]
@@ -1029,5 +1086,29 @@ mod tests {
         let parsed: Config =
             toml::from_str("[agent]\nmax_retries = 3\nsome_future_field = 1\n").unwrap();
         assert_eq!(parsed.agent.max_retries, 3);
+    }
+
+    #[test]
+    fn context_section_with_only_tool_output_limit_keeps_other_defaults() {
+        let parsed: Config = toml::from_str("[context]\ntool_output_limit = 500\n").unwrap();
+        assert_eq!(parsed.context.tool_output_limit, 500);
+        assert!(parsed.context.auto_compact);
+        assert_eq!(parsed.context.context_window, 0);
+        assert_eq!(parsed.context.reserved_tokens, 20_000);
+        assert_eq!(parsed.context.preserve_recent_tokens, 0);
+    }
+
+    #[test]
+    fn context_auto_compact_reads_from_context_section() {
+        let parsed: Config = toml::from_str("[context]\nauto_compact = false\n").unwrap();
+        assert!(!parsed.context.auto_compact);
+    }
+
+    #[test]
+    fn stale_auto_compact_under_agent_section_is_ignored_not_an_error() {
+        // Old configs still carry `auto_compact` under [agent] — it must be
+        // silently ignored (no deny_unknown_fields), not fail to parse.
+        let parsed: Config = toml::from_str("[agent]\nauto_compact = false\n").unwrap();
+        assert!(parsed.context.auto_compact, "the moved-out key stays true");
     }
 }

@@ -103,6 +103,15 @@ pub enum AppEvent {
     BeginAssistantMessage(ConversationId),
     DiscardEmptyAssistantMessage(ConversationId),
     AddMessage(ConversationId, ChatMessage),
+    /// The active provider answered with its model's context window. Sent
+    /// once at startup; absent whenever the provider cannot say.
+    ContextWindowLearned(u32),
+    /// How full the window was for the request just sent. Measurement only —
+    /// nothing acts on it yet. See `.docs/context-compaction.md`.
+    ContextUsage {
+        conversation: ConversationId,
+        used: u32,
+    },
 
     // Tool events
     ToolStarted {
