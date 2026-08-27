@@ -388,9 +388,7 @@ async fn post_form(
 }
 
 fn http_client() -> AppResult<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?)
+    super::http::client(super::http::AUTH_TIMEOUT)
 }
 
 fn token_response_to_set(

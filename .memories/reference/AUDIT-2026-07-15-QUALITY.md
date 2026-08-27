@@ -221,7 +221,7 @@
   limit-clamp consts; background kill-dispatch ×4 + capture-initial-output ×2
   (spawn.rs); shell.rs `capped_pipe_reader` vs spawn.rs `pipe_reader_loop` —
   two different byte-cap strategies for the same problem (document or merge).
-- `[REPORTED]` `mcp/oauth.rs::http_client` (flat 15s) still diverges from
+- `[DONE 2026-08-27 — one `mcp/http.rs::client(request_timeout)`; the request budget is the only axis that legitimately differs (PROTOCOL 60s / AUTH 15s), pinned by a build-time assert. `load_own_config_file` parsing mcp.json 3× is still open.]` `mcp/oauth.rs::http_client` (flat 15s) still diverges from
   `transport.rs::build_http_client` (10s/60s/60s + cookies) — this exact item
   was `[REPORTED]` on 2026-07-04 and was **not** done (unlike the other MCP
   items, which stuck). `load_own_config_file` parses `mcp.json` 3× per

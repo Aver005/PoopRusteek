@@ -286,7 +286,7 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(url: &str, headers: HashMap<String, String>) -> AppResult<Self> {
-        let client = build_http_client()?;
+        let client = super::http::client(super::http::PROTOCOL_TIMEOUT)?;
 
         Ok(Self {
             client,
@@ -295,29 +295,6 @@ impl HttpTransport {
             session_id: Mutex::new(None),
         })
     }
-}
-
-/// Shared timeout policy for `HttpTransport` and `SseTransport`.
-///
-/// Previously both used a flat 30s *total* timeout (connect + send + full
-/// response), which is a much tighter budget than stdio's 60s and hard-cuts
-/// any tool call — or SSE body — that legitimately runs long. This aligns
-/// the per-request budget with stdio's 60s while giving connection setup its
-/// own short 10s allowance, so a slow-to-connect server doesn't eat into the
-/// time budgeted for the actual call. `read_timeout` additionally caps the
-/// gap between individual reads of a streaming (SSE) body — a stalled
-/// stream with no bytes for 60s is treated the same as a stalled non-stream
-/// response, rather than being able to hang indefinitely past the request
-/// timeout by trickling bytes just often enough (reqwest supports both
-/// knobs directly on `ClientBuilder`, so there is no residual gap to
-/// document here).
-fn build_http_client() -> AppResult<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .cookie_store(true)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(60))
-        .read_timeout(std::time::Duration::from_secs(60))
-        .build()?)
 }
 
 /// Attach the sticky `MCP-Session-Id` (if one was captured from an earlier
@@ -458,7 +435,7 @@ pub struct SseTransport {
 
 impl SseTransport {
     pub fn new(url: &str, headers: HashMap<String, String>) -> AppResult<Self> {
-        let client = build_http_client()?;
+        let client = super::http::client(super::http::PROTOCOL_TIMEOUT)?;
 
         Ok(Self {
             client,

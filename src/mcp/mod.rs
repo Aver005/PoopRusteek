@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+mod http;
 pub mod jsonrpc;
 pub mod manager;
 pub mod oauth;
