@@ -6,11 +6,27 @@ use crate::app::conversation::ConversationId;
 use crate::debug_log;
 use serde_json::json;
 
+/// Всё, что трасса пишет про один результат инструмента. Семь позиционных
+/// аргументов из двух строк и трёх чисел путались местами.
+#[derive(Clone, Copy)]
+pub struct ToolResultTrace<'a> {
+    pub name: &'a str,
+    pub is_error: bool,
+    pub result: &'a str,
+    pub preview: &'a str,
+    /// Модели ушёл урезанный вывод (ступень 0 ладдера).
+    pub capped: bool,
+    pub chars_sent: usize,
+}
+
 /// Обёртка над `debug_log` для одного шага хода.
 pub struct StepTrace {
     conversation: ConversationId,
     step: usize,
     max_steps: usize,
+    /// Общий префикс всех строк шага. Собран один раз: поля не меняются,
+    /// а записей за шаг набирается около десятка.
+    head: String,
 }
 
 impl StepTrace {
@@ -19,15 +35,12 @@ impl StepTrace {
             conversation,
             step,
             max_steps,
+            head: format!("conversation={conversation} step={step}/{max_steps}"),
         }
     }
 
-    /// Общий префикс всех строк шага.
-    fn head(&self) -> String {
-        format!(
-            "conversation={} step={}/{}",
-            self.conversation, self.step, self.max_steps
-        )
+    fn head(&self) -> &str {
+        &self.head
     }
 
     pub fn start(&self, message_count: usize) {
@@ -67,21 +80,10 @@ impl StepTrace {
         );
     }
 
-    pub fn parsed(&self, got_stop: bool, visible: &str, calls: &[ParsedToolCall]) {
-        debug_log::log(
-            "agent.step.parsed",
-            format!(
-                "{} got_stop={got_stop} visible_chars={} tool_calls={}",
-                self.head(),
-                visible.chars().count(),
-                calls.len()
-            ),
-        );
-    }
-
-    /// Полная выкладка шага — это и есть трасса харнесса, поэтому здесь
-    /// лежит сырой ответ, а не только его размер.
-    pub fn parsed_payload(
+    /// Разбор шага: короткая строка и полная выкладка. Обе записи читает
+    /// харнесс, поэтому имена и поля прежние — метод один, чтобы сырой ответ
+    /// не пересчитывался дважды.
+    pub fn parsed(
         &self,
         got_stop: bool,
         provider_error: Option<&str>,
@@ -89,6 +91,15 @@ impl StepTrace {
         visible: &str,
         calls: &[ParsedToolCall],
     ) {
+        let visible_chars = visible.chars().count();
+        debug_log::log(
+            "agent.step.parsed",
+            format!(
+                "{} got_stop={got_stop} visible_chars={visible_chars} tool_calls={}",
+                self.head(),
+                calls.len()
+            ),
+        );
         debug_log::log_json(
             "agent.step.parsed.payload",
             &json!({
@@ -99,7 +110,7 @@ impl StepTrace {
                 "provider_error": provider_error,
                 "full_response_chars": raw.chars().count(),
                 "full_response": raw,
-                "visible_text_chars": visible.chars().count(),
+                "visible_text_chars": visible_chars,
                 "visible_text": visible,
                 "tool_calls": calls
                     .iter()
@@ -151,20 +162,12 @@ impl StepTrace {
         );
     }
 
-    pub fn tool_call(&self, index: usize, total: usize, name: &str) {
+    /// Вызов инструмента: строка и выкладка с аргументами.
+    pub fn tool_call(&self, index: usize, total: usize, name: &str, arguments: &serde_json::Value) {
         debug_log::log(
             "agent.tool.call",
             format!("{} index={index}/{total} name={name}", self.head()),
         );
-    }
-
-    pub fn tool_call_payload(
-        &self,
-        index: usize,
-        total: usize,
-        name: &str,
-        arguments: &serde_json::Value,
-    ) {
         debug_log::log_json(
             "agent.tool.call.payload",
             &json!({
@@ -186,28 +189,25 @@ impl StepTrace {
         );
     }
 
-    pub fn tool_result(&self, name: &str, is_error: bool, result: &str, preview: &str) {
+    /// Результат инструмента: строка и полная выкладка. Некапнутый результат
+    /// пишется целиком — трасса не должна врать о том, что инструмент выдал.
+    pub fn tool_result(&self, result: &ToolResultTrace<'_>) {
+        let ToolResultTrace {
+            name,
+            is_error,
+            result: text,
+            preview,
+            capped,
+            chars_sent,
+        } = *result;
+        let result_chars = text.chars().count();
         debug_log::log(
             "agent.tool.result",
             format!(
-                "{} name={name} is_error={is_error} result_chars={} preview={preview}",
-                self.head(),
-                result.chars().count()
+                "{} name={name} is_error={is_error} result_chars={result_chars} preview={preview}",
+                self.head()
             ),
         );
-    }
-
-    /// Некапнутый результат тоже пишем: трасса не должна врать о том, что
-    /// инструмент на самом деле выдал.
-    pub fn tool_result_payload(
-        &self,
-        name: &str,
-        is_error: bool,
-        result: &str,
-        preview: &str,
-        capped: bool,
-        chars_sent: usize,
-    ) {
         debug_log::log_json(
             "agent.tool.result.payload",
             &json!({
@@ -216,8 +216,8 @@ impl StepTrace {
                 "max_steps": self.max_steps,
                 "tool_name": name,
                 "is_error": is_error,
-                "result_chars": result.chars().count(),
-                "result": result,
+                "result_chars": result_chars,
+                "result": text,
                 "preview": preview,
                 "result_capped": capped,
                 "result_chars_sent": chars_sent,

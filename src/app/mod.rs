@@ -842,7 +842,7 @@ impl App {
             self.state.status_message = message;
         }
 
-        match reduce::turn_tail(end, focused, background) {
+        match reduce::turn_tail(end, reduce::TurnOwner::classify(focused, background)) {
             reduce::TurnTail::None => {}
             reduce::TurnTail::Background(error) => self.finish_background(target, error),
             reduce::TurnTail::Focused(end) => {

@@ -91,9 +91,8 @@ impl App {
         }
     }
 
-    /// Deny-and-drop every pending approval belonging to `conversation` — its
-    /// turn is being cancelled, so leaving them queued (or on screen) would
-    /// present approvals for a task that no longer exists.
+    /// Отклонить и выбросить все ожидания этой беседы: её ход отменяют, а
+    /// оставленный запрос спрашивал бы про задачу, которой уже нет.
     pub(crate) async fn purge_interactions_for(
         &mut self,
         conversation: conversation::ConversationId,

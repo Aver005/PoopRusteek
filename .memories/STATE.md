@@ -25,7 +25,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **671 passing** + 4 `#[ignore]`d (semantic evals + perf probe, need the model / a terminal) — 2026-08-27, было 635 до рефакторинга «упрощение» (фазы 1-2) (`cargo test --bin pooprusteek`) |
+| Tests | **675 passing** + 4 `#[ignore]`d (semantic evals + perf probe, need the model / a terminal) — 2026-08-27, было 635 до рефакторинга «упрощение» (фазы 1-3 плюс правки по ревью) (`cargo test --bin pooprusteek`) |
 | `cargo fmt` | Clean — whole `src/` reformatted 2026-07-06 (was never run before; 127/161 files had drift). No fmt step in `ci.yml` yet (only enforced locally via the pre-commit hook). |
 | CI | `.github/workflows/ci.yml` — single sequential pipeline: `test` (build+test, win+linux) + `lint` (fmt --check + clippy -D warnings, now blocking, no longer advisory) gate `release-build`/`publish` (only run for a `develop` push once both pass). Merged 2026-07-06 — was two separate parallel workflow files (`ci.yml` + `dev-release.yml`), which meant the dev-build release could publish even when tests failed; `dev-release.yml` deleted, its jobs folded in here. |
 | Dev-build release | Rolling `v<version>-dev` GitHub Release on qualifying `develop` pushes, now gated behind `test`+`lint` passing (see CI row above); `.gitlab-ci.yml` mirrors the same `check → build → release` stage order (unverified, no GitLab remote yet). Release notes rendered from `scripts/dev-release.template.md` via `scripts/render-release-notes.sh` (shared, 24 `{{VAR}}` placeholders — tag/commit/author/changelog-since-last-build/artifacts). |

@@ -598,45 +598,41 @@ async fn drive(
                         stopped = true;
                         break;
                     };
-                    // История меняется тем же редьюсером, что и в TUI, —
-                    // иначе харнесс мерил бы не то поведение, что видит человек.
-                    if let AppEvent::Agent {
-                        conversation,
-                        event: agent_event,
-                    } = &event
-                    {
-                        let end = if *conversation == root {
-                            reduce::apply(&mut history, agent_event)
-                        } else {
-                            reduce::turn_end(agent_event)
-                        };
-                        trace_agent_event(*conversation, agent_event);
-                        if let AgentEvent::ToolError { .. } = agent_event
-                            && let Some(last) = tools.last_mut()
-                        {
-                            last.ok = false;
-                        }
-                        match end {
-                            Some(reduce::TurnEnd::Done) => {
-                                if *conversation == root
-                                    && let AgentEvent::Done(result) = agent_event
-                                {
-                                    final_text = result.text.clone();
-                                }
-                                pending.remove(conversation);
-                            }
-                            Some(reduce::TurnEnd::Failed(message)) => {
-                                if error.is_none() {
-                                    error = Some(message);
-                                    status = RunStatus::Failed;
-                                }
-                                pending.remove(conversation);
-                            }
-                            None => {}
-                        }
-                        continue;
-                    }
                     match event {
+                        // История меняется тем же редьюсером, что и в TUI, —
+                        // иначе харнесс мерил бы не то поведение, что видит
+                        // человек.
+                        AppEvent::Agent { conversation, event: agent_event } => {
+                            let end = if conversation == root {
+                                reduce::apply(&mut history, &agent_event)
+                            } else {
+                                reduce::turn_end(&agent_event)
+                            };
+                            trace_agent_event(conversation, &agent_event);
+                            if let AgentEvent::ToolError { .. } = &agent_event
+                                && let Some(last) = tools.last_mut()
+                            {
+                                last.ok = false;
+                            }
+                            match end {
+                                Some(reduce::TurnEnd::Done) => {
+                                    if conversation == root
+                                        && let AgentEvent::Done(result) = agent_event
+                                    {
+                                        final_text = result.text;
+                                    }
+                                    pending.remove(&conversation);
+                                }
+                                Some(reduce::TurnEnd::Failed(message)) => {
+                                    if error.is_none() {
+                                        error = Some(message);
+                                        status = RunStatus::Failed;
+                                    }
+                                    pending.remove(&conversation);
+                                }
+                                None => {}
+                            }
+                        }
                         AppEvent::RequestToolApproval(request) => {
                             let approved = options.approve.decide(&request.tool_name, &whitelist);
                             record_approval(&request, approved);

@@ -147,8 +147,10 @@ pub struct ListWindow {
 
 impl ListWindow {
     fn new(start: usize, len: usize, visible: usize) -> Self {
+        // Не оставлять пустоту под концом списка: сохранённое смещение могло
+        // прийти от окна поменьше — терминал с тех пор растянули.
         // Окно нулевой высоты рисует пустоту, а не одну строку мимо области.
-        let start = start.min(len.saturating_sub(1));
+        let start = start.min(len.saturating_sub(visible.max(1)));
         let end = (start + visible).min(len);
         Self {
             start,
@@ -295,7 +297,22 @@ mod tests {
         cursor.clamp(3, 5);
         assert_eq!(cursor.selected, 2);
         let window = cursor.window(3, 5);
-        assert_eq!((window.start, window.end), (2, 3));
+        // Три строки в окне на пять показываются целиком.
+        assert_eq!((window.start, window.end), (0, 3));
+        assert!(!window.more_above && !window.more_below);
+    }
+
+    #[test]
+    fn a_grown_window_stops_showing_emptiness_under_the_list() {
+        // Смещение доехало на узком окне, потом терминал растянули: раньше
+        // окно на десять строк показывало три последних и пустоту под ними.
+        let mut cursor = ListCursor::default();
+        for _ in 0..8 {
+            cursor.apply(ListNav::Down, 10, 2);
+        }
+        let window = cursor.window(10, 10);
+        assert_eq!((window.start, window.end), (0, 10));
+        assert!(!window.more_above && !window.more_below);
     }
 
     #[test]

@@ -13,6 +13,30 @@ pub enum TurnEnd {
     Failed(String),
 }
 
+/// Чей это ход. Два `bool` подряд в сигнатуре переставлялись местами молча —
+/// здесь развилка названа и разобрана один раз.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOwner {
+    /// Чат на экране.
+    Focused,
+    /// Побочный чат (`/btw`, суб-агент).
+    Background,
+    /// Параллельный чат не на экране.
+    Parallel,
+}
+
+impl TurnOwner {
+    /// Побочный чат сворачивается в родителя независимо от того, смотрят на
+    /// него или нет, — поэтому он проверяется первым.
+    pub fn classify(focused: bool, background: bool) -> Self {
+        match (background, focused) {
+            (true, _) => Self::Background,
+            (false, true) => Self::Focused,
+            (false, false) => Self::Parallel,
+        }
+    }
+}
+
 /// Кому принадлежит хвост завершившегося хода. Три случая легко перепутать,
 /// поэтому развилка вынесена отдельно и покрыта тестами.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,13 +51,12 @@ pub enum TurnTail {
 }
 
 /// Разложить исход хода по тому, чей он.
-pub fn turn_tail(end: Option<TurnEnd>, focused: bool, background: bool) -> TurnTail {
-    match end {
-        None => TurnTail::None,
-        Some(TurnEnd::Done) if background => TurnTail::Background(None),
-        Some(TurnEnd::Failed(error)) if background => TurnTail::Background(Some(error)),
-        Some(_) if !focused => TurnTail::None,
-        Some(end) => TurnTail::Focused(end),
+pub fn turn_tail(end: Option<TurnEnd>, owner: TurnOwner) -> TurnTail {
+    match (end, owner) {
+        (None, _) | (Some(_), TurnOwner::Parallel) => TurnTail::None,
+        (Some(TurnEnd::Done), TurnOwner::Background) => TurnTail::Background(None),
+        (Some(TurnEnd::Failed(error)), TurnOwner::Background) => TurnTail::Background(Some(error)),
+        (Some(end), TurnOwner::Focused) => TurnTail::Focused(end),
     }
 }
 
@@ -231,26 +254,46 @@ mod tests {
     }
 
     #[test]
-    fn a_side_chat_folds_into_its_parent_whether_or_not_it_is_on_screen() {
+    fn a_side_chat_is_background_whether_or_not_it_is_on_screen() {
         for focused in [true, false] {
             assert_eq!(
-                turn_tail(Some(TurnEnd::Done), focused, true),
-                TurnTail::Background(None)
-            );
-            assert_eq!(
-                turn_tail(Some(TurnEnd::Failed("нет".to_string())), focused, true),
-                TurnTail::Background(Some("нет".to_string()))
+                TurnOwner::classify(focused, true),
+                TurnOwner::Background,
+                "focused={focused}"
             );
         }
+        assert_eq!(TurnOwner::classify(true, false), TurnOwner::Focused);
+        assert_eq!(TurnOwner::classify(false, false), TurnOwner::Parallel);
+    }
+
+    #[test]
+    fn a_side_chat_folds_into_its_parent() {
+        assert_eq!(
+            turn_tail(Some(TurnEnd::Done), TurnOwner::Background),
+            TurnTail::Background(None)
+        );
+        assert_eq!(
+            turn_tail(
+                Some(TurnEnd::Failed("нет".to_string())),
+                TurnOwner::Background
+            ),
+            TurnTail::Background(Some("нет".to_string()))
+        );
     }
 
     #[test]
     fn a_parallel_chat_off_screen_gets_no_tail() {
         // Статистика, автосохранение и GOAL относятся к тому, что на экране:
         // прогон соседнего чата не должен их дёргать.
-        assert_eq!(turn_tail(Some(TurnEnd::Done), false, false), TurnTail::None);
         assert_eq!(
-            turn_tail(Some(TurnEnd::Failed("нет".to_string())), false, false),
+            turn_tail(Some(TurnEnd::Done), TurnOwner::Parallel),
+            TurnTail::None
+        );
+        assert_eq!(
+            turn_tail(
+                Some(TurnEnd::Failed("нет".to_string())),
+                TurnOwner::Parallel
+            ),
             TurnTail::None
         );
     }
@@ -258,17 +301,19 @@ mod tests {
     #[test]
     fn the_chat_on_screen_keeps_its_own_tail() {
         assert_eq!(
-            turn_tail(Some(TurnEnd::Done), true, false),
+            turn_tail(Some(TurnEnd::Done), TurnOwner::Focused),
             TurnTail::Focused(TurnEnd::Done)
         );
     }
 
     #[test]
     fn a_turn_that_has_not_ended_has_no_tail() {
-        for focused in [true, false] {
-            for background in [true, false] {
-                assert_eq!(turn_tail(None, focused, background), TurnTail::None);
-            }
+        for owner in [
+            TurnOwner::Focused,
+            TurnOwner::Background,
+            TurnOwner::Parallel,
+        ] {
+            assert_eq!(turn_tail(None, owner), TurnTail::None, "{owner:?}");
         }
     }
 

@@ -100,8 +100,7 @@ pub async fn run_agent_loop(
 
         let (tool_calls, parse_errors) = parse_tool_calls_with_errors(&raw);
         let visible_text = strip_tool_calls(&raw);
-        trace.parsed(got_stop, &visible_text, &tool_calls);
-        trace.parsed_payload(
+        trace.parsed(
             got_stop,
             provider_error.as_deref(),
             &raw,
@@ -160,12 +159,9 @@ pub async fn run_agent_loop(
     }
 
     trace::turn_out_of_steps(conversation, max_steps, collected_tool_calls.len());
-    let _ = event_tx.send(AppEvent::Agent {
-        conversation,
-        event: AgentEvent::Failed(
-            "Reached max agent steps before producing a final answer".to_string(),
-        ),
-    });
+    ctx.emit(AgentEvent::Failed(
+        "Reached max agent steps before producing a final answer".to_string(),
+    ));
 }
 
 /// Пройти ступени компакции и вернуть заполненность окна для этого шага.
