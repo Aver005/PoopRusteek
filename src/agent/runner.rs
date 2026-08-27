@@ -1,20 +1,18 @@
-use crate::agent::stream::{StreamEnd, StreamOutcome, collect_stream};
+use crate::agent::retry::{MAX_EMPTY_RESPONSE_RETRIES, MAX_MALFORMED_TOOL_RETRIES, RetryBudget};
+use crate::agent::stream::{StreamEnd, StreamOutcome, StreamVerdict, collect_stream};
 use crate::agent::tool_parser::{
-    ParsedToolCall, StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
+    StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
 };
+use crate::agent::tools_step::{ToolExecContext, run_tool_calls};
+use crate::agent::trace::{self, StepTrace};
 use crate::app::conversation::ConversationId;
-use crate::app::events::{
-    AgentEvent, AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest,
-    ToolCallInfo,
-};
+use crate::app::events::{AgentEvent, AgentResult, AppEvent};
 use crate::app::runtime::TurnSpec;
 use crate::debug_log;
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::semantic::SemanticService;
 use crate::tools::registry::ToolRegistry;
-use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
-use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -46,8 +44,7 @@ pub async fn run_agent_loop(
         context,
     } = spec;
     let mut collected_tool_calls = Vec::new();
-    let mut malformed_retries: u32 = 0;
-    let mut empty_retries: u32 = 0;
+    let mut retries = RetryBudget::default();
     let mut compaction = CompactionState::default();
 
     inject_semantic_hint(conversation, &semantic, &mut messages).await;
@@ -77,414 +74,214 @@ pub async fn run_agent_loop(
     };
 
     for step in 0..max_steps {
-        let step_number = step + 1;
-        debug_log::log(
-            "agent.step.start",
-            format!(
-                "conversation={conversation} step={step_number}/{max_steps} message_count={}",
-                messages.len()
-            ),
-        );
-        // Measured here because this is the one place that sees exactly what
-        // goes on the wire. Runs on the agent task, never the event loop.
-        let mut used = context_used(&provider, &system_prompt, &messages);
-        // Every step, not just the turn boundary: one turn can run a dozen
-        // tool calls and never be checked again after the history grows.
-        if prune_tool_output(&compaction_ctx, used, &mut messages, &mut compaction).await {
-            used = context_used(&provider, &system_prompt, &messages);
-        }
-        // Rung 2, same checkpoint and a higher threshold: rung 1 is free, so it
-        // gets first refusal, and only what it leaves behind reaches this.
-        if reset_server_session(&compaction_ctx, used, &mut messages, &mut compaction).await {
-            used = context_used(&provider, &system_prompt, &messages);
-        }
+        let trace = StepTrace::new(conversation, step + 1, max_steps);
+        trace.start(messages.len());
 
-        let _ = event_tx.send(AppEvent::Agent {
-            conversation,
-            event: AgentEvent::BeginAssistantMessage,
-        });
+        let used = apply_ladder(&compaction_ctx, &mut messages, &mut compaction).await;
+
+        ctx.emit(AgentEvent::BeginAssistantMessage);
         let request =
             build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
-        let _ = event_tx.send(AppEvent::Agent {
-            conversation,
-            event: AgentEvent::ContextUsage(used),
-        });
+        ctx.emit(AgentEvent::ContextUsage(used));
 
         let outcome = stream_step(conversation, &provider, request, &event_tx).await;
-
-        let full_response = outcome.text;
-        let got_stop = outcome.got_stop;
-        if matches!(outcome.end, StreamEnd::IdleTimeout) {
-            debug_log::log(
-                "agent.step.error",
-                format!(
-                    "conversation={conversation} step={step_number}/{max_steps} reason=stream_timeout"
-                ),
-            );
-            let _ = event_tx.send(AppEvent::Agent {
-                conversation,
-                event: AgentEvent::Failed(
-                    "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
-                ),
-            });
-            return;
-        }
-        if !got_stop {
-            debug_log::log(
-                "agent.step.stream_closed",
-                format!(
-                    "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} collected_bytes={}",
-                    full_response.len()
-                ),
-            );
-        }
-
-        // A closed channel without a "stop" chunk means the provider bailed
-        // mid-stream — surface its error instead of treating it as end-of-turn.
-        let mut provider_error_message: Option<String> = None;
-        match outcome.end {
-            StreamEnd::IdleTimeout => unreachable!("handled above"),
-            StreamEnd::Completed => {
-                if !got_stop {
-                    let message = format!(
-                        "Stream ended without stop signal. conversation={conversation} step={step_number}/{max_steps} response_bytes={}",
-                        full_response.len()
-                    );
-                    debug_log::log("agent.step.error", &message);
-                    provider_error_message = Some(message);
-                } else {
-                    debug_log::log(
-                        "agent.step.provider_ok",
-                        format!(
-                            "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} response_bytes={}",
-                            full_response.len()
-                        ),
-                    );
-                }
-            }
-            StreamEnd::ProviderError(message) => {
-                debug_log::log(
-                    "agent.step.error",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} reason=provider_error error={message}"
-                    ),
-                );
-                if !got_stop {
-                    provider_error_message = Some(message);
-                }
-            }
-            StreamEnd::TaskFailed(join_error) => {
-                debug_log::log(
-                    "agent.step.error",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} reason=stream_task_join_error error={join_error}"
-                    ),
-                );
-                if !got_stop {
-                    provider_error_message = Some(format!("Stream task failed: {join_error}"));
-                }
-            }
-        }
-
-        let (tool_calls, parse_errors) = parse_tool_calls_with_errors(&full_response);
-        let visible_text = strip_tool_calls(&full_response);
-        debug_log::log(
-            "agent.step.parsed",
-            format!(
-                "conversation={conversation} step={step_number}/{max_steps} got_stop={got_stop} visible_chars={} tool_calls={}",
-                visible_text.chars().count(),
-                tool_calls.len()
-            ),
-        );
-        let tool_calls_for_log = tool_calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "name": call.name,
-                    "arguments": call.arguments,
-                })
-            })
-            .collect::<Vec<_>>();
-        debug_log::log_json(
-            "agent.step.parsed.payload",
-            &json!({
-                "conversation": conversation.0,
-                "step": step_number,
-                "max_steps": max_steps,
-                "got_stop": got_stop,
-                "provider_error": provider_error_message,
-                "full_response_chars": full_response.chars().count(),
-                "full_response": full_response,
-                "visible_text_chars": visible_text.chars().count(),
-                "visible_text": visible_text,
-                "tool_calls": tool_calls_for_log,
-            }),
-        );
-        if let Some(error) = provider_error_message.take() {
-            if !tool_calls.is_empty() {
-                debug_log::log(
-                    "agent.step.salvaged",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} reason=provider_error_with_complete_tool_call error={error} tool_calls={}",
-                        tool_calls.len()
-                    ),
-                );
-                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(
-                        "Warning: stream ended early, but a complete tool call was recovered. Continuing.",
-                    )) });
-            } else {
-                let _ = event_tx.send(AppEvent::Agent {
-                    conversation,
-                    event: AgentEvent::Failed(error),
-                });
+        let provider_error = match classify_stream(&outcome, &trace) {
+            Ok(error) => error,
+            Err(fatal) => {
+                ctx.emit(AgentEvent::Failed(fatal));
                 return;
             }
+        };
+        let StreamOutcome {
+            text: raw,
+            got_stop,
+            ..
+        } = outcome;
+
+        let (tool_calls, parse_errors) = parse_tool_calls_with_errors(&raw);
+        let visible_text = strip_tool_calls(&raw);
+        trace.parsed(got_stop, &visible_text, &tool_calls);
+        trace.parsed_payload(
+            got_stop,
+            provider_error.as_deref(),
+            &raw,
+            &visible_text,
+            &tool_calls,
+        );
+
+        // Оборванный стрим, из которого всё же вынулся целый вызов, — не
+        // повод терять ход: продолжаем и предупреждаем.
+        if let Some(error) = provider_error {
+            if tool_calls.is_empty() {
+                ctx.emit(AgentEvent::Failed(error));
+                return;
+            }
+            trace.salvaged(&error, tool_calls.len());
+            ctx.emit(AgentEvent::Message(ChatMessage::system(
+                "Warning: stream ended early, but a complete tool call was recovered. Continuing.",
+            )));
         }
 
         if tool_calls.is_empty() {
-            // A `<tool_use>` block that yielded zero parsed calls means the
-            // model emitted a malformed tool call (swapped tags, invalid JSON,
-            // …). Ending the turn silently here is exactly what made the agent
-            // look frozen — nothing shown, nothing run. Feed the parse errors
-            // back so it can re-issue the call, bounded so a model that can't
-            // recover can't loop. (A provider error with empty calls already
-            // returned above, so these errors are from a clean stream.)
-            if !parse_errors.is_empty() && malformed_retries < MAX_MALFORMED_TOOL_RETRIES {
-                malformed_retries += 1;
-                // Keep what the model actually emitted (raw, not stripped) so
-                // full-history providers see the mistake; DeepSeek already has
-                // it server-side and re-sends only the correction below.
-                messages.push(ChatMessage::assistant(&full_response));
-                messages.push(ChatMessage::user(&malformed_tool_feedback(&parse_errors)));
-                debug_log::log(
-                    "agent.step.malformed_tool_use",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} retry={malformed_retries}/{MAX_MALFORMED_TOOL_RETRIES} errors={}",
-                        parse_errors.join(" | ")
-                    ),
-                );
-                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(&format!(
-                        "⚠ Malformed tool call (attempt {malformed_retries}/{MAX_MALFORMED_TOOL_RETRIES}) — asking the model to retry"
-                    ))) });
-                continue;
-            }
-            if !parse_errors.is_empty() {
-                debug_log::log(
-                    "agent.step.malformed_tool_use_exhausted",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} errors={}",
-                        parse_errors.join(" | ")
-                    ),
-                );
-                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(
-                        "⚠ The model kept emitting malformed tool calls; stopping this turn. Try rephrasing your request.",
-                    )) });
-            }
-            if !visible_text.is_empty() {
-                messages.push(ChatMessage::assistant(&visible_text));
-            } else {
-                debug_log::log(
-                    "agent.step.empty_assistant",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} reason=empty_response_without_tool_calls"
-                    ),
-                );
-                let _ = event_tx.send(AppEvent::Agent {
-                    conversation,
-                    event: AgentEvent::DiscardEmptyAssistant,
-                });
-
-                // No text and no tool call means the turn did nothing at all.
-                // Reporting that as a success is how "build me a page" came
-                // back in 1.4s with an empty directory and no complaint.
-                // Nudge and retry, bounded, the way a malformed tool call is
-                // handled — and if it keeps happening, say so instead of
-                // pretending the work is done.
-                if empty_retries < MAX_EMPTY_RESPONSE_RETRIES {
-                    empty_retries += 1;
-                    messages.push(ChatMessage::user(EMPTY_RESPONSE_FEEDBACK));
-                    debug_log::log(
-                        "agent.step.empty_retry",
-                        format!(
-                            "conversation={conversation} step={step_number}/{max_steps} retry={empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES}"
-                        ),
-                    );
-                    let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(&format!(
-                            "⚠ Empty reply from the model (attempt {empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES}) — retrying"
-                        ))) });
-                    continue;
+            match finish_or_retry(
+                &ctx,
+                &trace,
+                &mut retries,
+                &mut messages,
+                &raw,
+                &visible_text,
+                &parse_errors,
+            ) {
+                StepEnd::Retry => continue,
+                StepEnd::Answer(text) => {
+                    trace.turn_done(&text, collected_tool_calls.len());
+                    ctx.emit(AgentEvent::Done(AgentResult {
+                        text,
+                        tool_calls: collected_tool_calls,
+                    }));
+                    return;
                 }
-                debug_log::log(
-                    "agent.turn.error",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} status=empty_response_exhausted"
-                    ),
-                );
-                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Failed("The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request.".to_string()) });
-                return;
+                StepEnd::GiveUp => return,
             }
-
-            debug_log::log(
-                "agent.turn.done",
-                format!(
-                    "conversation={conversation} step={step_number}/{max_steps} status=success text_chars={} tool_calls_total={}",
-                    visible_text.chars().count(),
-                    collected_tool_calls.len()
-                ),
-            );
-            let _ = event_tx.send(AppEvent::Agent {
-                conversation,
-                event: AgentEvent::Done(AgentResult {
-                    text: visible_text,
-                    tool_calls: collected_tool_calls,
-                }),
-            });
-            return;
         }
 
         messages.push(ChatMessage::assistant(&visible_text));
         if visible_text.is_empty() {
-            let _ = event_tx.send(AppEvent::Agent {
-                conversation,
-                event: AgentEvent::DiscardEmptyAssistant,
-            });
+            ctx.emit(AgentEvent::DiscardEmptyAssistant);
         }
-
-        let total_calls = tool_calls.len();
-        for (call_index, tool_call) in tool_calls.into_iter().enumerate() {
-            let tool_id = uuid::Uuid::new_v4().to_string();
-            let tool_name = tool_call.name.clone();
-            debug_log::log(
-                "agent.tool.call",
-                format!(
-                    "conversation={conversation} step={step_number}/{max_steps} index={}/{} name={}",
-                    call_index + 1,
-                    total_calls,
-                    tool_name
-                ),
-            );
-            debug_log::log_json(
-                "agent.tool.call.payload",
-                &json!({
-                    "conversation": conversation.0,
-                    "step": step_number,
-                    "max_steps": max_steps,
-                    "tool_name": tool_name,
-                    "call_index": call_index + 1,
-                    "total_calls": total_calls,
-                    "arguments": tool_call.arguments,
-                }),
-            );
-
-            // Calls beyond the per-step limit still get a tool_result — the
-            // model must learn they were skipped, not reason from phantom
-            // results it assumes came back.
-            if call_index >= max_tools_per_step {
-                let skipped = tool_skip_message(max_tools_per_step, total_calls);
-                let tool_message = ChatMessage::tool_with_display(
-                    &tool_id,
-                    &tool_call.name,
-                    &skipped,
-                    &summarize_tool_result(&skipped),
-                    true,
-                );
-                messages.push(tool_message.clone());
-                let _ = event_tx.send(AppEvent::Agent {
-                    conversation,
-                    event: AgentEvent::Message(tool_message),
-                });
-                debug_log::log(
-                    "agent.tool.skipped",
-                    format!(
-                        "conversation={conversation} step={step_number}/{max_steps} name={} reason=max_tools_per_step",
-                        tool_name
-                    ),
-                );
-                continue;
-            }
-
-            let (tool_result, is_error) = execute_tool_call(&tool_call, &ctx).await;
-
-            let preview = summarize_tool_result(&tool_result);
-            let display = preview.clone();
-            // What the model actually receives — capped at capture (rung 0 of
-            // the compaction ladder). The trace below still logs the uncapped
-            // `tool_result` so it never misleads about what the tool produced.
-            let content_for_model =
-                crate::context::cap_tool_output(&tool_result, tool_output_limit);
-            let result_capped =
-                tool_output_limit != 0 && tool_result.chars().count() > tool_output_limit;
-            debug_log::log(
-                "agent.tool.result",
-                format!(
-                    "conversation={conversation} step={step_number}/{max_steps} name={} is_error={} result_chars={} preview={}",
-                    tool_name,
-                    is_error,
-                    tool_result.chars().count(),
-                    preview
-                ),
-            );
-            debug_log::log_json(
-                "agent.tool.result.payload",
-                &json!({
-                    "conversation": conversation.0,
-                    "step": step_number,
-                    "max_steps": max_steps,
-                    "tool_name": tool_name,
-                    "is_error": is_error,
-                    "result_chars": tool_result.chars().count(),
-                    "result": tool_result,
-                    "preview": preview,
-                    "result_capped": result_capped,
-                    "result_chars_sent": content_for_model.chars().count(),
-                }),
-            );
-
-            let tool_message = ChatMessage::tool_with_display(
-                &tool_id,
-                &tool_name,
-                &content_for_model,
-                &display,
-                is_error,
-            );
-            messages.push(tool_message.clone());
-            collected_tool_calls.push(ToolCallInfo {
-                name: tool_name.clone(),
-                arguments: tool_call.arguments.clone(),
-                result: Some(tool_result.clone()),
-            });
-            let _ = event_tx.send(AppEvent::Agent {
-                conversation,
-                event: AgentEvent::Message(tool_message),
-            });
-
-            if is_error {
-                let _ = event_tx.send(AppEvent::Agent {
-                    conversation,
-                    event: AgentEvent::ToolError { error: preview },
-                });
-            } else {
-                let _ = event_tx.send(AppEvent::Agent {
-                    conversation,
-                    event: AgentEvent::ToolDone { result: preview },
-                });
-            }
-        }
+        run_tool_calls(
+            tool_calls,
+            &ctx,
+            &trace,
+            &mut messages,
+            &mut collected_tool_calls,
+        )
+        .await;
     }
 
-    debug_log::log(
-        "agent.turn.error",
-        format!(
-            "conversation={conversation} status=max_steps_exceeded max_steps={max_steps} tool_calls_total={}",
-            collected_tool_calls.len()
-        ),
-    );
+    trace::turn_out_of_steps(conversation, max_steps, collected_tool_calls.len());
     let _ = event_tx.send(AppEvent::Agent {
         conversation,
         event: AgentEvent::Failed(
             "Reached max agent steps before producing a final answer".to_string(),
         ),
     });
+}
+
+/// Пройти ступени компакции и вернуть заполненность окна для этого шага.
+///
+/// Зовётся на каждом шаге, а не на границе хода: один ход бывает в дюжину
+/// вызовов, и после роста истории её больше никто не проверит.
+async fn apply_ladder(
+    ctx: &CompactionCtx<'_>,
+    messages: &mut [ChatMessage],
+    compaction: &mut CompactionState,
+) -> u32 {
+    // Мерим здесь: только это место видит, что реально уходит на провод.
+    let mut used = context_used(ctx.provider, ctx.system_prompt, messages);
+    if prune_tool_output(ctx, used, messages, compaction).await {
+        used = context_used(ctx.provider, ctx.system_prompt, messages);
+    }
+    // Ступень 2 на том же чекпойнте и с порогом выше: ступень 1 бесплатна,
+    // поэтому право первого отказа у неё.
+    if reset_server_session(ctx, used, messages, compaction).await {
+        used = context_used(ctx.provider, ctx.system_prompt, messages);
+    }
+    used
+}
+
+/// Чем кончился шаг без вызовов инструментов.
+enum StepEnd {
+    /// Модель попросили переписать — идём на следующий шаг.
+    Retry,
+    /// Готовый ответ хода.
+    Answer(String),
+    /// Ход провален, событие уже отправлено.
+    GiveUp,
+}
+
+/// Разобрать конец стрима. `Ok(None)` — можно продолжать, `Ok(Some(e))` —
+/// провайдер сбежал, но, может, вызов ещё спасётся; `Err` — ход не спасти.
+fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> Result<Option<String>, String> {
+    let verdict = outcome.verdict();
+    // Таймаут — это своя строка; вторая про «закрылся без stop» удвоила бы
+    // его в отчёте `mine`, где каждая запись считается отдельно.
+    if !outcome.got_stop && verdict != StreamVerdict::IdleTimeout {
+        trace.stream_closed(outcome.text.len());
+    }
+    match &outcome.end {
+        StreamEnd::Completed if outcome.got_stop => trace.provider_ok(outcome.text.len()),
+        StreamEnd::ProviderError(error) => {
+            trace.error(&format!("reason=provider_error error={error}"))
+        }
+        StreamEnd::TaskFailed(error) => {
+            trace.error(&format!("reason=stream_task_join_error error={error}"))
+        }
+        StreamEnd::IdleTimeout | StreamEnd::Completed => {}
+    }
+    match verdict {
+        StreamVerdict::IdleTimeout => {
+            trace.error("reason=stream_timeout");
+            Err("Stream timed out (no data for 120s). Cancelling turn.".to_string())
+        }
+        StreamVerdict::Ok => Ok(None),
+        StreamVerdict::ClosedWithoutStop => Ok(Some(trace.closed_without_stop(outcome.text.len()))),
+        StreamVerdict::Failed(error) => Ok(Some(error)),
+    }
+}
+
+/// Шаг без вызовов инструментов: сломанный `<tool_use>`, пустой ответ или
+/// готовый текст. Границы повторов держит `RetryBudget`.
+fn finish_or_retry(
+    ctx: &ToolExecContext<'_>,
+    trace: &StepTrace,
+    retries: &mut RetryBudget,
+    messages: &mut Vec<ChatMessage>,
+    raw: &str,
+    visible: &str,
+    parse_errors: &[String],
+) -> StepEnd {
+    // Ноль разобранных вызовов при непустых ошибках — это сломанный блок, а
+    // не финальный ответ. Молча закончить ход здесь и значило «агент завис».
+    if !parse_errors.is_empty() {
+        if let Some(attempt) = retries.take_malformed() {
+            // Кладём сырое: провайдеру с полной историей нужно увидеть ошибку.
+            messages.push(ChatMessage::assistant(raw));
+            messages.push(ChatMessage::user(&malformed_tool_feedback(parse_errors)));
+            trace.malformed(attempt, MAX_MALFORMED_TOOL_RETRIES, parse_errors);
+            ctx.emit(AgentEvent::Message(ChatMessage::system(&format!(
+                "⚠ Malformed tool call (attempt {attempt}/{MAX_MALFORMED_TOOL_RETRIES}) — asking the model to retry"
+            ))));
+            return StepEnd::Retry;
+        }
+        trace.malformed_exhausted(parse_errors);
+        ctx.emit(AgentEvent::Message(ChatMessage::system(
+            "⚠ The model kept emitting malformed tool calls; stopping this turn. Try rephrasing your request.",
+        )));
+    }
+
+    if !visible.is_empty() {
+        messages.push(ChatMessage::assistant(visible));
+        return StepEnd::Answer(visible.to_string());
+    }
+
+    // Ни текста, ни вызова — ход не сделал ничего. Считать это успехом и
+    // значило вернуть «готово» над пустым каталогом.
+    trace.empty_assistant();
+    ctx.emit(AgentEvent::DiscardEmptyAssistant);
+    if let Some(attempt) = retries.take_empty() {
+        messages.push(ChatMessage::user(EMPTY_RESPONSE_FEEDBACK));
+        trace.empty_retry(attempt, MAX_EMPTY_RESPONSE_RETRIES);
+        ctx.emit(AgentEvent::Message(ChatMessage::system(&format!(
+            "⚠ Empty reply from the model (attempt {attempt}/{MAX_EMPTY_RESPONSE_RETRIES}) — retrying"
+        ))));
+        return StepEnd::Retry;
+    }
+    trace.turn_error("status=empty_response_exhausted");
+    ctx.emit(AgentEvent::Failed(
+        "The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request.".to_string(),
+    ));
+    StepEnd::GiveUp
 }
 
 /// How full the window is, from the one source that knows. A provider holding
@@ -881,157 +678,6 @@ async fn stream_step(
     .await
 }
 
-/// Everything one tool call's execution needs from the turn — bundled so
-/// [`execute_tool_call`] doesn't take a dozen positional arguments (the
-/// same disease `TurnSpec` cures one level up).
-struct ToolExecContext<'turn> {
-    conversation: ConversationId,
-    provider: &'turn Arc<dyn LLMProvider>,
-    tools: &'turn Arc<ToolRegistry>,
-    mcp: &'turn Arc<tokio::sync::Mutex<MCPManager>>,
-    system_prompt: &'turn str,
-    model: &'turn str,
-    temperature: f32,
-    max_tokens: u32,
-    max_steps: usize,
-    max_tools_per_step: usize,
-    auto_approve: bool,
-    tool_output_limit: usize,
-    event_tx: &'turn mpsc::UnboundedSender<AppEvent>,
-}
-
-/// Execute one parsed tool call: `question` (interactive prompt — declined
-/// on background turns), `task` (sub-agent spawn — foreground only, depth
-/// limit 1), or a generic builtin/MCP tool behind the approval gate.
-/// Returns `(result, is_error)`.
-async fn execute_tool_call(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> (String, bool) {
-    if call.name == QUESTION_TOOL_NAME {
-        // Background turns (auto_approve) have no user to answer.
-        if ctx.auto_approve {
-            return (
-                "Cannot ask the user from a background agent.".to_string(),
-                true,
-            );
-        }
-        let question_text = call.arguments["question"]
-            .as_str()
-            .unwrap_or("(no question)");
-        let options: Vec<String> = call.arguments["options"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let allow_custom = call.arguments["allow_custom"].as_bool().unwrap_or(false);
-
-        let qs = QuestionState::new(question_text.to_string(), options, allow_custom);
-        let request = QuestionRequest::new();
-        let _ = ctx
-            .event_tx
-            .send(AppEvent::RequestQuestion(request.clone(), qs));
-        let _ = ctx.event_tx.send(AppEvent::Agent {
-            conversation: ctx.conversation,
-            event: AgentEvent::ToolStarted {
-                name: call.name.clone(),
-            },
-        });
-        return match request.wait().await {
-            Some(answer) if !answer.is_empty() => (format!("User answered: {answer}"), false),
-            _ => ("User cancelled the question".to_string(), true),
-        };
-    }
-
-    if call.name == TASK_TOOL_NAME {
-        // Only the foreground (interactive) loop may spawn sub-agents;
-        // sidechats / sub-agents (auto_approve) cannot — depth limit 1.
-        if ctx.auto_approve {
-            return ("Nested sub-agents are not allowed.".to_string(), true);
-        }
-        let prompt = call.arguments["prompt"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let label = call.arguments["description"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("sub-agent task")
-            .to_string();
-        let background = call.arguments["background"].as_bool().unwrap_or(false);
-        if prompt.is_empty() {
-            return (
-                "The 'task' tool requires a non-empty 'prompt'.".to_string(),
-                true,
-            );
-        }
-        if background {
-            let _ = ctx.event_tx.send(AppEvent::SpawnSubAgent {
-                parent: ctx.conversation,
-                label: label.clone(),
-                prompt,
-            });
-            return (format!("Started background sub-agent: {label}"), false);
-        }
-        let _ = ctx.event_tx.send(AppEvent::Agent {
-            conversation: ctx.conversation,
-            event: AgentEvent::ToolStarted {
-                name: TASK_TOOL_NAME.to_string(),
-            },
-        });
-        let sub_provider = ctx.provider.fork();
-        let session_cleanup = Arc::clone(&sub_provider);
-        let outcome = match crate::agent::sub_agent::run_sub_agent(
-            sub_provider,
-            Arc::clone(ctx.tools),
-            Arc::clone(ctx.mcp),
-            ctx.system_prompt.to_string(),
-            prompt,
-            ctx.model.to_string(),
-            ctx.temperature,
-            ctx.max_tokens,
-            ctx.max_steps.min(8),
-            ctx.max_tools_per_step,
-            ctx.tool_output_limit,
-        )
-        .await
-        {
-            Ok(text) => (text, false),
-            Err(e) => (format!("Sub-agent failed: {e}"), true),
-        };
-        // The fork is one-shot — delete its server-side session so it
-        // doesn't linger on the account.
-        tokio::spawn(async move {
-            let _ = session_cleanup.discard_remote_session().await;
-        });
-        return outcome;
-    }
-
-    let approved = if ctx.auto_approve {
-        true
-    } else {
-        let arguments_preview = serde_json::to_string_pretty(&call.arguments)
-            .unwrap_or_else(|_| call.arguments.to_string());
-        let approval =
-            ToolApprovalRequest::new(ctx.conversation, call.name.clone(), arguments_preview);
-        let _ = ctx
-            .event_tx
-            .send(AppEvent::RequestToolApproval(approval.clone()));
-        approval.wait().await
-    };
-    if !approved {
-        return ("Execution denied by user.".to_string(), true);
-    }
-    let _ = ctx.event_tx.send(AppEvent::Agent {
-        conversation: ctx.conversation,
-        event: AgentEvent::ToolStarted {
-            name: call.name.clone(),
-        },
-    });
-    dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments.clone()).await
-}
-
 /// Build one step's completion request: system prompt first, then the
 /// running history. Shared by the main and sub-agent loops (the two copies
 /// had already been flagged as drift-prone).
@@ -1054,61 +700,6 @@ pub(crate) fn build_step_request(
     }
 }
 
-/// The explicit tool_result for a call dropped by the per-step limit — the
-/// model must learn it was skipped, not reason from phantom results it
-/// assumes came back. Was byte-identical in both loops before extraction.
-pub(crate) fn tool_skip_message(max_tools_per_step: usize, total_calls: usize) -> String {
-    format!(
-        "Skipped: per-step tool-call limit of {max_tools_per_step} reached \
-        ({total_calls} calls requested). Re-issue this call next step if still needed."
-    )
-}
-
-/// Execute a plain (non-meta) tool call. MCP tools resolve their client
-/// under a short-lived manager lock and call on the owned handle — holding
-/// the mutex across the network await froze the whole UI once (the event
-/// loop polls the same mutex for status counts); everything else goes to
-/// the builtin registry. Returns `(content, is_error)`; the sub-agent loop
-/// drops the flag and reports errors as plain result text.
-pub(crate) async fn dispatch_generic_tool(
-    tools: &ToolRegistry,
-    mcp: &tokio::sync::Mutex<MCPManager>,
-    name: &str,
-    arguments: serde_json::Value,
-) -> (String, bool) {
-    if name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
-        let client = { mcp.lock().await.client_for(name) };
-        match client {
-            Some((client, bare_name)) => match client.call_tool(&bare_name, arguments).await {
-                Ok(result) => (result.content, result.is_error),
-                Err(error) => (error.to_string(), true),
-            },
-            None => (
-                format!("MCP tool '{name}' is not available (server not connected)"),
-                true,
-            ),
-        }
-    } else {
-        let result = tools.execute(name, arguments).await;
-        (result.content, result.is_error)
-    }
-}
-
-/// How many times, within one turn, a malformed `<tool_use>` block may be
-/// handed back to the model for correction before the turn gives up. Bounds
-/// a weaker model that can't recover its own XML/JSON so it can't spin.
-/// Shared with the sub-agent loop, which applies the same recovery.
-pub(crate) const MAX_MALFORMED_TOOL_RETRIES: u32 = 2;
-
-/// How many times, within one turn, an entirely empty model reply (no text,
-/// no tool call) may be retried before the turn is reported as failed.
-///
-/// Found by the harness: DeepSeek occasionally closes a stream with
-/// `got_stop=true` and zero bytes, and the loop used to report that as
-/// `turn.done status=success`. A "build me a page" request then returned in
-/// 1.4s having created nothing, with no error shown to anyone.
-pub(crate) const MAX_EMPTY_RESPONSE_RETRIES: u32 = 2;
-
 /// Nudge sent back after an empty reply. Deliberately concrete about the two
 /// acceptable shapes of a turn, since the failure is the model producing
 /// neither.
@@ -1129,17 +720,6 @@ pub(crate) fn malformed_tool_feedback(errors: &[String]) -> String {
          (e.g. a Windows path: \"C:\\\\Users\\\\Aver\\\\file.png\").",
         errors.join("\n- ")
     )
-}
-
-fn summarize_tool_result(result: &str) -> String {
-    let trimmed = result.trim();
-    if trimmed.len() <= 200 {
-        trimmed.to_string()
-    } else {
-        // Find a safe char boundary at or before byte 200
-        let end = trimmed.floor_char_boundary(200);
-        format!("{}…", &trimmed[..end])
-    }
 }
 
 #[cfg(test)]
@@ -2372,44 +1952,5 @@ mod tests {
             Some(11_500),
             "what was reset is what the provider reported holding"
         );
-    }
-
-    #[test]
-    fn summarize_short_result() {
-        assert_eq!(summarize_tool_result("hello"), "hello");
-    }
-
-    #[test]
-    fn summarize_whitespace_trimmed() {
-        assert_eq!(summarize_tool_result("  hello  "), "hello");
-    }
-
-    #[test]
-    fn summarize_exactly_200_bytes() {
-        let input = "a".repeat(200);
-        assert_eq!(summarize_tool_result(&input), input);
-    }
-
-    #[test]
-    fn summarize_over_200_bytes() {
-        let input = "a".repeat(250);
-        let result = summarize_tool_result(&input);
-        // Result should be at most 200 chars + 3-byte ellipsis
-        assert!(result.len() <= 203);
-        assert!(result.ends_with('…'));
-    }
-
-    #[test]
-    fn summarize_multibyte_safe() {
-        // Each emoji is 4 bytes
-        let input = "😀".repeat(60); // 240 bytes
-        let result = summarize_tool_result(&input);
-        // Should not panic on char boundary; result <= 200 + 3 (ellipsis)
-        assert!(result.len() <= 203);
-    }
-
-    #[test]
-    fn summarize_empty() {
-        assert_eq!(summarize_tool_result(""), "");
     }
 }

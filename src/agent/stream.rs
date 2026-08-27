@@ -48,6 +48,37 @@ pub struct StreamOutcome {
     pub end: StreamEnd,
 }
 
+/// Как понимать конец стрима. Что с этим делать — дело цикла: главный считает
+/// обрыв без stop ошибкой (и пытается спасти вызов), суб-агент — нет.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamVerdict {
+    /// Закрылся штатно, со stop-сигналом.
+    Ok,
+    /// Данных не было [`STREAM_IDLE_TIMEOUT`].
+    IdleTimeout,
+    /// Закрылся чисто, но без stop — провайдер ушёл посреди ответа.
+    ClosedWithoutStop,
+    /// Провайдер или задача стрима отдали ошибку, и stop не пришёл.
+    Failed(String),
+}
+
+impl StreamOutcome {
+    /// Свести `end` и `got_stop` в один разбор. Оба цикла читали эти два
+    /// поля вручную и по-разному раскладывали одни и те же четыре случая.
+    pub fn verdict(&self) -> StreamVerdict {
+        match &self.end {
+            StreamEnd::IdleTimeout => StreamVerdict::IdleTimeout,
+            // stop пришёл — значит ответ целый, а ошибка догнала уже после.
+            _ if self.got_stop => StreamVerdict::Ok,
+            StreamEnd::Completed => StreamVerdict::ClosedWithoutStop,
+            StreamEnd::ProviderError(error) => StreamVerdict::Failed(error.clone()),
+            StreamEnd::TaskFailed(error) => {
+                StreamVerdict::Failed(format!("Stream task failed: {error}"))
+            }
+        }
+    }
+}
+
 /// Run `provider.complete_stream(request)` to completion, accumulating the
 /// streamed text. `on_progress` is invoked with the full accumulated text
 /// after every non-empty chunk — the main loop derives visible deltas from

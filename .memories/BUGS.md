@@ -5,6 +5,8 @@
 
 ## RESOLVED 2026-08-27
 
+- ✅ **Суб-агент отдавал пустой ответ как успешный.** `run_sub_agent` возвращал `Ok(visible)` даже при пустом `visible` — тот же дефект, что харнесс нашёл для главного цикла 2026-08-25 и где его закрыли; суб-агент защиту не унаследовал. Найдено ревью фазы 3 по неиспользованному `RetryBudget::take_empty`. `→ src/agent/sub_agent.rs`, 2 теста
+
 - ✅ **DeepSeek сообщал симптом вместо причины при протухшем токене.** Создание сессии отвечает HTTP 200 с ошибкой в теле (`{"code":40003,"msg":"Authorization Failed (invalid token)"}`), поэтому проверка статуса её пропускала, а пользователь видел `Invalid session payload: missing chat_session.id`. Тот же класс, что и rate-limit внутри стрима. `session_create_error` достаёт `code`/`msg` из конверта. `→ src/provider/deepseek/session.rs`
 - ✅ **Строгий гейт clippy был красным на `develop`** — два протухших `#[expect(dead_code)]` роняли `clippy -D warnings`, значит блокирующий `lint` в CI падал и dev-build не публиковался. `→ src/provider/types.rs`, `src/provider/deepseek/endpoints.rs`
 - ✅ **Список MCP не прокручивался за курсором**, `McpViewState.scroll_offset` служил двум разным целям, а у панели провайдеров прокрутки не было вовсе — всё три закрыты фазой 1. См. `JOURNAL/2026-08-27.md`

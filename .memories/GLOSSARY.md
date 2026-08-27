@@ -12,7 +12,7 @@
 | **`fork()`** | `LLMProvider::fork()` — returns a fresh-session sibling provider sharing config/token. Gives each conversation an isolated DeepSeek session (no `parent_message_id` cross-talk). poopseek's `provider.clone()` analog. |
 | **Sidechat (`/btw`)** | A one-shot background side-answer in its own ephemeral `Sidechat` conversation; streams in without disturbing the main turn. |
 | **Sub-agent** | An isolated agent run (`SubAgent` conversation) spawned by the model (`task` tool) or user (`/agent`); foreground returns only its conclusion into the turn, `background:true` detaches + notifies. `/agents` lists/stops. |
-| **`task` tool** | Model-driven sub-agent spawn; special-cased in `run_agent_loop` (like `question`), not a normal `Tool`. |
+| **`task` tool** | Model-driven sub-agent spawn; special-cased in `agent/tools_step.rs` (like `question`), not a normal `Tool`. |
 | **AgentRuntime / TurnSpec** | The controller (`app/runtime.rs`) that owns `tools`/`mcp`/`event_tx` and is the single launch point for every agent turn; `TurnSpec` describes one turn. |
 | **Controller** | A type that owns its *dependencies* and exposes a narrow API (`AgentRuntime`, `system_prompt::build`, `BackgroundCounters`), so behavior stops reaching into all of `App`. |
 | **`auto_approve`** | `TurnSpec` flag: background turns (sidechats/sub-agents) auto-approve tools so they never block on a modal nobody's watching; the focused user turn does not. |

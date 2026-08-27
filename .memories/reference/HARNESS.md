@@ -54,7 +54,7 @@ adding instrumentation upstream is always safe. `→ src/harness/trace.rs`
 
 `run_agent_loop` refuses sub-agents when `auto_approve` is on — depth limit 1,
 `"Nested sub-agents are not allowed."` (`→ src/agent/runner.rs`, the
-`TASK_TOOL_NAME` branch). A harness that took the easy path and set
+`TASK_TOOL_NAME` branch, now `agent/tools_step.rs::spawn_task`). A harness that took the easy path and set
 `auto_approve: true` would therefore be unable to test sub-agents at all, and
 would skip the approval machinery entirely.
 

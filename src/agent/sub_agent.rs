@@ -6,12 +6,11 @@
 //! (no user is watching), and `task`/`question` are refused so a sub-agent
 //! can't spawn sub-agents or block on a prompt (depth limit of 1).
 
-use crate::agent::runner::{
-    MAX_MALFORMED_TOOL_RETRIES, build_step_request, dispatch_generic_tool, malformed_tool_feedback,
-    tool_skip_message,
-};
-use crate::agent::stream::{StreamEnd, collect_stream};
+use crate::agent::retry::RetryBudget;
+use crate::agent::runner::{EMPTY_RESPONSE_FEEDBACK, build_step_request, malformed_tool_feedback};
+use crate::agent::stream::{StreamVerdict, collect_stream};
 use crate::agent::tool_parser::{parse_tool_calls_with_errors, strip_tool_calls};
+use crate::agent::tools_step::{dispatch_generic_tool, tool_skip_message};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::tools::registry::ToolRegistry;
@@ -35,25 +34,20 @@ pub async fn run_sub_agent(
     tool_output_limit: usize,
 ) -> Result<String, String> {
     let mut messages = vec![ChatMessage::user(&user_prompt)];
-    let mut malformed_retries: u32 = 0;
+    let mut retries = RetryBudget::default();
 
     for _step in 0..max_steps {
         let request =
             build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
 
-        // Headless: no progress callback — nothing streams to a UI.
+        // Безголово: колбэка прогресса нет, стримить некуда.
         let outcome = collect_stream(&provider, request, |_| {}).await;
-        // Unlike the main loop, a completed-but-stopless stream is not
-        // treated as an error here — the parent only cares about final text.
-        match outcome.end {
-            StreamEnd::IdleTimeout => return Err("sub-agent stream timed out".to_string()),
-            StreamEnd::Completed => {}
-            StreamEnd::ProviderError(error) if !outcome.got_stop => return Err(error),
-            StreamEnd::ProviderError(_) => {}
-            StreamEnd::TaskFailed(join_error) if !outcome.got_stop => {
-                return Err(format!("sub-agent stream task failed: {join_error}"));
-            }
-            StreamEnd::TaskFailed(_) => {}
+        match outcome.verdict() {
+            StreamVerdict::IdleTimeout => return Err("sub-agent stream timed out".to_string()),
+            StreamVerdict::Failed(error) => return Err(error),
+            // В отличие от главного цикла, обрыв без stop здесь не ошибка:
+            // родителю важен только финальный текст.
+            StreamVerdict::Ok | StreamVerdict::ClosedWithoutStop => {}
         }
         let full = outcome.text;
 
@@ -61,31 +55,37 @@ pub async fn run_sub_agent(
         let visible = strip_tool_calls(&full);
 
         if tool_calls.is_empty() {
-            // Same recovery as the main loop: zero parsed calls plus parse
-            // errors means a malformed `<tool_use>`, not a final answer —
-            // returning `visible` here silently swallowed the failure (the
-            // text before a broken block is usually empty).
-            if !parse_errors.is_empty() && malformed_retries < MAX_MALFORMED_TOOL_RETRIES {
-                malformed_retries += 1;
+            // Та же развилка, что и в главном цикле: ноль разобранных вызовов
+            // при непустых ошибках — это сломанный `<tool_use>`, а не ответ.
+            if !parse_errors.is_empty() {
+                let Some(_attempt) = retries.take_malformed() else {
+                    return Err(format!(
+                        "sub-agent kept emitting malformed tool calls: {}",
+                        parse_errors.join(" | ")
+                    ));
+                };
                 messages.push(ChatMessage::assistant(&full));
                 messages.push(ChatMessage::user(&malformed_tool_feedback(&parse_errors)));
                 continue;
             }
-            if !parse_errors.is_empty() {
-                return Err(format!(
-                    "sub-agent kept emitting malformed tool calls: {}",
-                    parse_errors.join(" | ")
-                ));
+            if !visible.is_empty() {
+                return Ok(visible);
             }
-            return Ok(visible);
+            // Ни текста, ни вызова. Главный цикл ловит это с 2026-08-25
+            // (харнесс нашёл: DeepSeek закрывает стрим со stop и нулём байт),
+            // а суб-агент отдавал пустоту родителю как успешный ответ.
+            let Some(_attempt) = retries.take_empty() else {
+                return Err("sub-agent returned an empty reply and did nothing".to_string());
+            };
+            messages.push(ChatMessage::user(EMPTY_RESPONSE_FEEDBACK));
+            continue;
         }
 
         messages.push(ChatMessage::assistant(&visible));
         let total_calls = tool_calls.len();
         for (call_index, tool_call) in tool_calls.into_iter().enumerate() {
             let tool_id = uuid::Uuid::new_v4().to_string();
-            // Same contract as the main loop: dropped calls get an explicit
-            // skipped tool_result instead of silently vanishing.
+            // Тот же контракт: пропущенный вызов получает явный tool_result.
             if call_index >= max_tools_per_step {
                 messages.push(ChatMessage::tool(
                     &tool_id,
@@ -97,9 +97,8 @@ pub async fn run_sub_agent(
             {
                 format!("'{}' is not available inside a sub-agent.", tool_call.name)
             } else {
-                // Shared with the main loop (same short-lock MCP discipline).
-                // A sub-agent reports errors as plain result text, so the
-                // error flag is dropped.
+                // Общее с главным циклом (та же дисциплина короткого лока).
+                // Суб-агент отдаёт ошибку обычным текстом, флаг не нужен.
                 dispatch_generic_tool(&tools, &mcp, &tool_call.name, tool_call.arguments.clone())
                     .await
                     .0
@@ -111,7 +110,7 @@ pub async fn run_sub_agent(
         }
     }
 
-    // Hit the step cap — return the best (last assistant) text we have.
+    // Шаги кончились — отдаём лучшее, что есть: последний текст ассистента.
     Ok(messages
         .iter()
         .rev()
@@ -178,6 +177,57 @@ mod tests {
         )
         .await;
 
+        assert_eq!(out.unwrap(), "Recovered");
+    }
+
+    /// Пустой ответ нельзя отдавать родителю как успешный: главный цикл ловит
+    /// это с 2026-08-25, а суб-агент раньше возвращал пустую строку.
+    #[tokio::test]
+    async fn an_empty_reply_is_retried_then_reported() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_responses(vec![
+            String::new(),
+            String::new(),
+            String::new(),
+        ]));
+        let out = run_sub_agent(
+            provider,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            "system".to_string(),
+            "do the thing".to_string(),
+            "fake".to_string(),
+            0.0,
+            128,
+            8,
+            4,
+            0,
+        )
+        .await;
+        assert!(out.is_err(), "пустой ответ не должен быть успехом: {out:?}");
+    }
+
+    /// Но пустой первый ответ ещё не приговор — после подсказки модель
+    /// отвечает, и ход засчитывается.
+    #[tokio::test]
+    async fn an_empty_reply_recovers_when_the_model_answers() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_responses(vec![
+            String::new(),
+            "Recovered".to_string(),
+        ]));
+        let out = run_sub_agent(
+            provider,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            "system".to_string(),
+            "do the thing".to_string(),
+            "fake".to_string(),
+            0.0,
+            128,
+            8,
+            4,
+            0,
+        )
+        .await;
         assert_eq!(out.unwrap(), "Recovered");
     }
 }

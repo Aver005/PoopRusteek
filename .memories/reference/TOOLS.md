@@ -46,7 +46,7 @@ The most intricate subsystem. Powers background + interactive shells.
 
 **Foreground** bash/powershell store their PID in a global so `Esc`/`Ctrl+C` can kill the child (`app/mod.rs:33` `kill_foreground_child`).
 
-## AGENT LOOP (`agent/runner.rs:9` `run_agent_loop`)
+## AGENT LOOP (`agent/runner.rs` `run_agent_loop` — шаги; `agent/tools_step.rs` — вызовы инструментов)
 
 ```
 for step in 0..max_steps:                       # default max_steps_per_turn = 256
@@ -75,8 +75,8 @@ for step in 0..max_steps:                       # default max_steps_per_turn = 2
 
 - Launched via `AgentRuntime::spawn(TurnSpec)` (`app/runtime.rs`); the handle lives on the owning `Conversation` (`state.focused().agent_task`). `Esc` aborts the focused conversation's task.
 - All emitted `AppEvent`s are tagged with the turn's `ConversationId` so background turns stream into the right buffer.
-- The `task` tool (sub-agents) is special-cased here, not a `Tool` impl; the headless runner is `agent/sub_agent.rs::run_sub_agent`.
-- `summarize_tool_result` (:219) truncates at `floor_char_boundary(200)` — UTF-8/emoji safe (tested).
+- The `task` tool (sub-agents) is special-cased in `agent/tools_step.rs::spawn_task`, not a `Tool` impl; the headless runner is `agent/sub_agent.rs::run_sub_agent`.
+- `summarize_tool_result` (`agent/tools_step.rs`) truncates at `floor_char_boundary(200)` — UTF-8/emoji safe (tested).
 
 ## TOOL-CALL PARSING (`agent/tool_parser.rs`)
 

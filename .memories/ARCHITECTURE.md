@@ -102,8 +102,8 @@ Every agent turn — normal, sidechat, or sub-agent — is described by a `TurnS
 
 ## SUB-AGENTS (`agent/sub_agent.rs`, `runner.rs`, `/agent` `/agents`)
 
-Reference: Claude Code. Spawned by **the model** (a `task` tool call, special-cased in `run_agent_loop` like `question`) and by **the user** (`/agent <prompt>`).
-- **Foreground (default)**: `run_agent_loop` forks the provider, awaits `run_sub_agent(...)` inline, and returns only its final text as the tool result — isolated context, just the conclusion crosses back.
+Reference: Claude Code. Spawned by **the model** (a `task` tool call, special-cased in `agent/tools_step.rs::execute_tool_call` like `question`) and by **the user** (`/agent <prompt>`).
+- **Foreground (default)**: `tools_step::spawn_task` forks the provider, awaits `run_sub_agent(...)` inline, and returns only its final text as the tool result — isolated context, just the conclusion crosses back.
 - **Background (`background:true`)**: emits `AppEvent::SpawnSubAgent { parent, label, prompt }`, returns immediately; `App` spawns it as a `SubAgent` conversation (`spawn_sub_agent`), notifies + delivers the result into the parent on completion.
 - Tracked/stoppable via `/agents` (picker) and the conversations store. Sub-agents auto-approve within their toolset and don't recursively spawn (depth-limited).
 
