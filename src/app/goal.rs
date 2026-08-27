@@ -605,10 +605,10 @@ impl App {
 }
 
 impl App {
-    /// GOAL-cycle transition run after every `AgentDone`: when agent 1 just
-    /// finished, hand its output to the evaluator — or retry an empty turn.
-    /// Lives here so the whole goal state machine reads in one file; the
-    /// `AgentDone` arm in `handle_event` only calls this.
+    /// GOAL-cycle transition run after every `AgentEvent::Done`: when agent 1
+    /// just finished, hand its output to the evaluator — or retry an empty
+    /// turn. Lives here so the whole goal state machine reads in one file;
+    /// `on_agent_event`'s `TurnTail::Focused` branch only calls this.
     pub(crate) async fn maybe_advance_goal_cycle(&mut self) {
         if !(self.state.goal.mode && self.state.goal.stage == GoalStage::RunAgent1) {
             return;

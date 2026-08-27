@@ -182,50 +182,6 @@ impl App {
     /// Apply an agent event that targets a non-focused conversation. Streaming
     /// events mutate that conversation; terminal events finalize sidechats /
     /// sub-agents (which flush their result) while parked sessions just stop.
-    pub(crate) fn handle_background_event(
-        &mut self,
-        target: conversation::ConversationId,
-        event: AppEvent,
-    ) {
-        enum Finish {
-            None,
-            Done,
-            Error(String),
-        }
-        let mut finish = Finish::None;
-
-        if let Some(conv) = self.state.conversations.get_mut(target) {
-            match event {
-                AppEvent::AgentStarted(_) => {
-                    conv.generation.begin(std::time::Instant::now());
-                }
-                AppEvent::BeginAssistantMessage(_) => conv.begin_assistant_message(),
-                AppEvent::AgentChunk(_, chunk) => conv.append_chunk(&chunk),
-                AppEvent::AddMessage(_, message) => conv.messages.push(message),
-                AppEvent::DiscardEmptyAssistantMessage(_) => conv.discard_empty_assistant(),
-                AppEvent::AgentDone(_, _) => {
-                    conv.finish_turn("FINISHED");
-                    if conv.is_background_kind() {
-                        finish = Finish::Done;
-                    }
-                }
-                AppEvent::AgentError(_, err) => {
-                    conv.finish_turn("ABORTED");
-                    if conv.is_background_kind() {
-                        finish = Finish::Error(err);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        match finish {
-            Finish::Done => self.finish_background(target, None),
-            Finish::Error(err) => self.finish_background(target, Some(err)),
-            Finish::None => {}
-        }
-    }
-
     /// Remove a finished sidechat / sub-agent and flush its result (answer or
     /// error) into the chat that spawned it (or the focused chat).
     pub(crate) fn finish_background(
@@ -521,6 +477,37 @@ impl App {
             // Kept so Ctrl+C / Esc can abort the run; that path clears the flag
             // itself, because an aborted task sends no `CompactFinished`.
             target.agent_task = Some(handle);
+        }
+    }
+}
+
+impl App {
+    /// `/compact` закончил. Итог вклеивается, а не отбрасывается: выжимка уже
+    /// оплачена, и дописать пришедшее следом ничего не теряет.
+    pub(crate) fn on_compact_finished(
+        &mut self,
+        conversation: conversation::ConversationId,
+        messages: Option<Vec<crate::provider::ChatMessage>>,
+        status: String,
+    ) {
+        let mut status = status;
+        if let Some(target) = self.state.conversations.get_mut(conversation) {
+            match (target.end_compaction(), messages) {
+                (Some(base), Some(rebuilt)) => match target.swap_compacted(base, rebuilt) {
+                    Some(0) => {}
+                    Some(extra) => status = format!("{status}; kept {extra} newer message(s)"),
+                    None => {
+                        status = "Compaction dropped: this chat's history changed while it ran."
+                            .to_string();
+                    }
+                },
+                (Some(_), None) => {}
+                // Флага нет — прогон отменили, его история заведомо устарела.
+                (None, _) => status = "Compaction dropped: it was cancelled.".to_string(),
+            }
+        }
+        if conversation == self.state.conversations.focused_id() {
+            self.state.status_message = status;
         }
     }
 }

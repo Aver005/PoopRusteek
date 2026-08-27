@@ -123,6 +123,26 @@ impl SearchViewState {
         )
     }
 
+    /// Поздний ответ на прошлый запрос отбрасывается — иначе он затёр бы
+    /// то, что человек спрашивает сейчас.
+    pub fn apply_results(&mut self, query: &str, matches: Vec<HistoryMatch>) {
+        if self.last_query != query {
+            return;
+        }
+        self.searching = false;
+        self.matches = matches;
+        self.reset_selection();
+        self.status = if self.matches.is_empty() {
+            "No matches — the index may still be building (see /rag)".to_string()
+        } else {
+            format!("{} matches", self.matches.len())
+        };
+        // Сразу поставить курсор на результаты, а не на строку запроса.
+        if !self.matches.is_empty() {
+            self.focus = SearchFocus::Results;
+        }
+    }
+
     /// Reset list position after anything that changes the visible set.
     pub fn reset_selection(&mut self) {
         self.selected = 0;

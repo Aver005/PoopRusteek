@@ -48,9 +48,15 @@ This is the "event-driven, no render races" design from the README: the agent ru
 
 ## `AppEvent` (`app/events.rs`)
 
-TUI: `Key, Resize, Tick`. Agent (now **tagged with `ConversationId`** so background turns stream into the right buffer): `AgentStarted(id), AgentChunk(id, String), AgentDone(id, AgentResult), AgentError(id, String), BeginAssistantMessage(id), DiscardEmptyAssistantMessage(id), AddMessage(id, …)`. Tools: `ToolStarted, ToolDone, ToolError, RequestToolApproval, RequestQuestion`. Goal: `GoalEvaluationDone(GoalEvalOutcome)` (the old unused `GoalCycleFinished` variant was removed). MCP: `McpOperationDone` (reload/toggle/reconnect results delivered off the event loop). Sub-agent: `SpawnSubAgent { parent, label, prompt }`.
+TUI: `Key, Resize { rows }, Tick`. Agent — **один вариант** `Agent { conversation, event: AgentEvent }` (2026-08-27; раньше здесь было 13 плоских вариантов). `AgentEvent`: `Started, BeginAssistantMessage, Chunk(String), Message(ChatMessage), DiscardEmptyAssistant, Done(AgentResult), Failed(String), ToolStarted, ToolDone, ToolError, ToolOutputCleared, SessionReset, ContextUsage(u32)`. Взаимодействие с человеком: `RequestToolApproval, RequestQuestion`. Goal: `GoalEvaluationDone(GoalEvalOutcome)` (the old unused `GoalCycleFinished` variant was removed). MCP: `McpOperationDone` (reload/toggle/reconnect results delivered off the event loop). Sub-agent: `SpawnSubAgent { parent, label, prompt }`.
 
-`handle_event` first calls `agent_event_target(&event)`; if the target id ≠ focused, it routes to `handle_background_event` (`app/multichat.rs`) which mutates that conversation's parked record instead of the focused chat via the same unified reducer methods the focused path uses (`begin_assistant_message`/`append_chunk`/`discard_empty_assistant`/`finish_turn` on `Conversation`, `app/conversation.rs`) — the two paths no longer duplicate/diverge in logic. Rendering only ever shows the focused conversation. A focused sidechat that's tabbed away from and back still finalizes correctly into its parent on completion (kind-based routing, not focus-based).
+`handle_event`'s `AppEvent::Agent` arm вызывает `on_agent_event` (`app/mod.rs`), и дальше путь один на всех:
+
+1. `reduce::apply(conversation, &event)` (`app/reduce.rs`) — **единственное место**, где агентское событие меняет историю беседы. Его же зовёт безголовый харнесс (`harness/driver.rs`), поэтому разойтись они не могут. До 2026-08-27 таких применений было три, и они успели разойтись.
+2. `status_for(&event)` — строка состояния, только для фокусного не-фонового чата.
+3. `reduce::turn_tail(end, focused, background)` — чей хвост у завершившегося хода: `Background` (свернуть в родителя), `Focused` (статистика, автосохранение, шаг GOAL) или `None` (параллельный чат не на экране — историю обновил, и всё).
+
+Маршрутизация по-прежнему по **виду** беседы, а не по фокусу, поэтому побочный чат сворачивается в родителя, даже если на него переключились. Rendering only ever shows the focused conversation.
 
 ## PRIMARY DATA FLOW (a normal turn)
 
@@ -61,12 +67,13 @@ key 'Enter' → handle_key (app/keys.rs)
               system_prompt::build(prompts, skills, tools, mcp, workspace)
               AgentRuntime::spawn(TurnSpec{ conversation: focused_id, provider, messages, … auto_approve:false })
                 run_agent_loop → provider.complete_stream → SSE → CompletionChunk
-                  → AppEvent::AgentChunk(id, delta) → handle_event → focused_mut().messages → render
+                  → AppEvent::Agent{id, AgentEvent::Chunk(delta)} → on_agent_event → reduce::apply → render
                 parse_tool_calls → per tool:
                   RequestToolApproval → modal → user Y/N → tools.execute()/mcp.call_tool()
-                  → AppEvent::AddMessage(id, tool result)
+                  → AppEvent::Agent{id, AgentEvent::Message(tool result)}
                   task tool → fork + run_sub_agent (fg) | SpawnSubAgent event (bg)
-                AppEvent::AgentDone(id, _) → record stats → auto_save_session()
+                AppEvent::Agent{id, AgentEvent::Done(_)} → reduce::apply(finish_turn)
+                  → turn_tail == Focused → record stats → auto_save_session() → GOAL
 ```
 
 ## TOOL APPROVAL / QUESTION HANDSHAKE

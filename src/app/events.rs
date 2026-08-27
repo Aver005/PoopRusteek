@@ -74,6 +74,59 @@ pub enum GoalEvalOutcome {
     Failed(String),
 }
 
+/// Что произошло внутри одного хода агента. Выделено из `AppEvent`: у этих
+/// событий три потребителя — фокусный чат, фоновый и безголовый харнесс.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// Ход начался.
+    Started,
+    /// Открыть пустое сообщение ассистента под стрим.
+    BeginAssistantMessage,
+    /// Кусок стрима в открытое сообщение.
+    Chunk(String),
+    /// Готовое сообщение в историю (результат инструмента, системная заметка).
+    Message(ChatMessage),
+    /// Сбросить хвостовое сообщение ассистента, в которое так и не пришло текста.
+    DiscardEmptyAssistant,
+    /// Ход завершён.
+    Done(AgentResult),
+    /// Ход оборвался.
+    Failed(String),
+    /// Пошёл вызов инструмента.
+    ToolStarted {
+        name: String,
+    },
+    ToolDone {
+        // Every receiver currently ignores this (matched out with `..`) — the
+        // status line shows a generic "Tool finished" rather than a preview.
+        #[expect(
+            dead_code,
+            reason = "tool-result preview not surfaced by any receiver yet"
+        )]
+        result: String,
+    },
+    ToolError {
+        error: String,
+    },
+    /// Ступень 1 очистила старые тела инструментов в копии хода.
+    /// Ту же правку применяет каждый потребитель.
+    ToolOutputCleared {
+        /// (id вызова, маркер) на каждый очищенный результат.
+        cleared: Vec<(String, String)>,
+        freed_tokens: u32,
+    },
+    /// Ступень 2 сбросила серверную сессию: следующий запрос засеет новую
+    /// уже очищенной историей.
+    SessionReset {
+        /// Сколько накопил сервер до сброса.
+        before_tokens: u32,
+        /// Чем засеется новая сессия.
+        after_tokens: u32,
+    },
+    /// Насколько было заполнено окно для только что отправленного запроса.
+    ContextUsage(u32),
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     // TUI events
@@ -92,15 +145,12 @@ pub enum AppEvent {
     },
     Tick,
 
-    // Agent events — each carries the conversation it belongs to so background
-    // (sidechat / sub-agent) turns stream into the right place.
-    AgentStarted(ConversationId),
-    AgentChunk(ConversationId, String),
-    AgentDone(ConversationId, AgentResult),
-    AgentError(ConversationId, String),
-    BeginAssistantMessage(ConversationId),
-    DiscardEmptyAssistantMessage(ConversationId),
-    AddMessage(ConversationId, ChatMessage),
+    /// Событие одного хода агента. Все трое потребителей — фокус, фон
+    /// и харнесс — применяют его через `app::reduce`.
+    Agent {
+        conversation: ConversationId,
+        event: AgentEvent,
+    },
     /// `/compact` finished. `messages` is `Some` only when the summary was
     /// accepted; on refusal the history is left exactly as it was and only the
     /// status line changes.
@@ -112,51 +162,7 @@ pub enum AppEvent {
     /// The active provider answered with its model's context window. Sent
     /// once at startup; absent whenever the provider cannot say.
     ContextWindowLearned(u32),
-    /// How full the window was for the request just sent. Measurement only —
-    /// nothing acts on it yet. See `.docs/context-compaction.md`.
-    ContextUsage {
-        conversation: ConversationId,
-        used: u32,
-    },
-    /// Rung 1 cleared old tool bodies in the turn's message copy. The app
-    /// applies the same edit to its own history so the change survives the
-    /// turn and shrinks the saved session.
-    ToolOutputCleared {
-        conversation: ConversationId,
-        /// (tool_call_id, marker) for each cleared result.
-        cleared: Vec<(String, String)>,
-        freed_tokens: u32,
-    },
-    /// Rung 2 dropped the provider's server-side session. The next request
-    /// re-seeds a fresh one with the cleared local history, so the branch the
-    /// server remembered is replaced by a smaller one.
-    SessionReset {
-        conversation: ConversationId,
-        /// What the server had accumulated before the reset.
-        before_tokens: u32,
-        /// What the fresh session will be re-seeded with.
-        after_tokens: u32,
-    },
 
-    // Tool events
-    ToolStarted {
-        conversation: ConversationId,
-        name: String,
-    },
-    ToolDone {
-        conversation: ConversationId,
-        // Every receiver currently ignores this (matched out with `..`) — the
-        // status line shows a generic "Tool finished" rather than a preview.
-        #[expect(
-            dead_code,
-            reason = "tool-result preview not surfaced by any receiver yet"
-        )]
-        result: String,
-    },
-    ToolError {
-        conversation: ConversationId,
-        error: String,
-    },
     RequestToolApproval(ToolApprovalRequest),
     RequestQuestion(QuestionRequest, QuestionState),
 
@@ -285,15 +291,15 @@ pub enum AppEvent {
     },
 }
 
-// Populated at the `AgentDone` send site but every current receiver
-// discards the payload (`AgentDone(_, _)`); goal-mode independently
+// Populated at the `AgentEvent::Done` send site but every current receiver
+// discards the payload (`AgentEvent::Done(_)`); goal-mode independently
 // re-derives the same text by scanning the message list instead of reading
 // this. Kept for future use rather than deleted in this pass. `allow`, not
 // `expect`: under `cargo test` the fields count as read (test-only paths),
 // so an `expect` is unfulfilled in that build.
 #[allow(
     dead_code,
-    reason = "AgentDone payload not read by any current receiver"
+    reason = "AgentEvent::Done payload not read by any current receiver"
 )]
 #[derive(Debug, Clone)]
 pub struct AgentResult {
@@ -303,7 +309,7 @@ pub struct AgentResult {
 
 #[expect(
     dead_code,
-    reason = "AgentDone payload not read by any current receiver"
+    reason = "AgentEvent::Done payload not read by any current receiver"
 )]
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {

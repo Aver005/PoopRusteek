@@ -21,7 +21,10 @@
 //! decisions it made and the run's verdict.
 
 use crate::app::conversation::{Conversation, ConversationId};
-use crate::app::events::{AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest};
+use crate::app::events::{
+    AgentEvent, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest,
+};
+use crate::app::reduce;
 use crate::app::runtime::{AgentRuntime, TurnSpec};
 use crate::config::Config;
 use crate::debug_log;
@@ -595,64 +598,45 @@ async fn drive(
                         stopped = true;
                         break;
                     };
+                    // История меняется тем же редьюсером, что и в TUI, —
+                    // иначе харнесс мерил бы не то поведение, что видит человек.
+                    if let AppEvent::Agent {
+                        conversation,
+                        event: agent_event,
+                    } = &event
+                    {
+                        let end = if *conversation == root {
+                            reduce::apply(&mut history, agent_event)
+                        } else {
+                            reduce::turn_end(agent_event)
+                        };
+                        trace_agent_event(*conversation, agent_event);
+                        if let AgentEvent::ToolError { .. } = agent_event
+                            && let Some(last) = tools.last_mut()
+                        {
+                            last.ok = false;
+                        }
+                        match end {
+                            Some(reduce::TurnEnd::Done) => {
+                                if *conversation == root
+                                    && let AgentEvent::Done(result) = agent_event
+                                {
+                                    final_text = result.text.clone();
+                                }
+                                pending.remove(conversation);
+                            }
+                            Some(reduce::TurnEnd::Failed(message)) => {
+                                if error.is_none() {
+                                    error = Some(message);
+                                    status = RunStatus::Failed;
+                                }
+                                pending.remove(conversation);
+                            }
+                            None => {}
+                        }
+                        continue;
+                    }
                     match event {
-                        AppEvent::AgentDone(conversation, result) => {
-                            if conversation == root {
-                                final_text = result.text.clone();
-                                history.discard_empty_assistant();
-                            }
-                            pending.remove(&conversation);
-                        }
-                        AppEvent::AgentError(conversation, message) => {
-                            if error.is_none() {
-                                error = Some(message.clone());
-                                status = RunStatus::Failed;
-                            }
-                            if conversation == root {
-                                history.discard_empty_assistant();
-                            }
-                            debug_log::log_json(
-                                action::MESSAGE,
-                                &serde_json::json!({
-                                    "conversation": conversation.0,
-                                    "role": "error",
-                                    "content": message,
-                                }),
-                            );
-                            pending.remove(&conversation);
-                        }
-                        AppEvent::AddMessage(conversation, message) => {
-                            if conversation == root {
-                                history.messages.push(message.clone());
-                            }
-                            debug_log::log_json(
-                                action::MESSAGE,
-                                &serde_json::json!({
-                                    "conversation": conversation.0,
-                                    "role": &message.role,
-                                    "content": message.content,
-                                    "tool_error": message.tool_error,
-                                }),
-                            );
-                        }
-                        // The three events the TUI builds assistant messages
-                        // from; without them the next turn loses what the
-                        // model said in this one.
-                        AppEvent::BeginAssistantMessage(conversation) => {
-                            if conversation == root {
-                                history.begin_assistant_message();
-                            }
-                        }
-                        AppEvent::AgentChunk(conversation, chunk) => {
-                            if conversation == root {
-                                history.append_chunk(&chunk);
-                            }
-                        }
-                        AppEvent::DiscardEmptyAssistantMessage(conversation) => {
-                            if conversation == root {
-                                history.discard_empty_assistant();
-                            }
-                        }
                         AppEvent::RequestToolApproval(request) => {
                             let approved = options.approve.decide(&request.tool_name, &whitelist);
                             record_approval(&request, approved);
@@ -675,15 +659,6 @@ async fn drive(
                                 }),
                             );
                             record_question(&request, answer);
-                        }
-                        AppEvent::ToolError { conversation: _, error: message } => {
-                            if let Some(last) = tools.last_mut() {
-                                last.ok = false;
-                            }
-                            debug_log::log_json(
-                                action::TOOL_RESULT,
-                                &serde_json::json!({ "ok": false, "error": message }),
-                            );
                         }
                         AppEvent::SpawnSubAgent { parent, label, prompt } => {
                             sub_agents += 1;
@@ -724,28 +699,6 @@ async fn drive(
                             debug_log::log_json(
                                 action::CONTEXT_WINDOW,
                                 &serde_json::json!({ "provider_window": window }),
-                            );
-                        }
-                        // Rung 1 rewrote the turn's copy of the history; the
-                        // app applies the same edit to its own, so the harness
-                        // must too — otherwise the next turn is driven from a
-                        // history the TUI would never have had, in exactly the
-                        // dimension compaction is about.
-                        AppEvent::ToolOutputCleared {
-                            conversation,
-                            cleared,
-                            freed_tokens,
-                        } => {
-                            if conversation == root {
-                                apply_cleared_tool_output(&mut history.messages, &cleared);
-                            }
-                            debug_log::log_json(
-                                action::TOOL_OUTPUT_CLEARED,
-                                &serde_json::json!({
-                                    "conversation": conversation.0,
-                                    "cleared": cleared.len(),
-                                    "freed_tokens": freed_tokens,
-                                }),
                             );
                         }
                         // Everything else is TUI chrome (status lines, server
@@ -790,24 +743,46 @@ async fn drive(
     }
 }
 
-/// Replace the bodies rung 1 cleared with their markers, the way
-/// `App::handle_event` does for the TUI's own history.
-///
-/// Matched by tool-call id, never by index: the agent loop works on a copy
-/// with the `ui_only` messages dropped, so the two lists never line up.
-fn apply_cleared_tool_output(messages: &mut [ChatMessage], cleared: &[(String, String)]) {
-    for (tool_call_id, marker) in cleared {
-        if let Some(message) = messages
-            .iter_mut()
-            .find(|m| m.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
-        {
-            message.content = marker.clone();
-        }
+/// Всё, что трасса знает об агентском событии. Отдельная функция, потому
+/// что редьюсер историю уже применил и возвращаться к разбору поздно.
+fn trace_agent_event(conversation: ConversationId, event: &AgentEvent) {
+    match event {
+        AgentEvent::Message(message) => debug_log::log_json(
+            action::MESSAGE,
+            &serde_json::json!({
+                "conversation": conversation.0,
+                "role": &message.role,
+                "content": message.content,
+                "tool_error": message.tool_error,
+            }),
+        ),
+        AgentEvent::Failed(message) => debug_log::log_json(
+            action::MESSAGE,
+            &serde_json::json!({
+                "conversation": conversation.0,
+                "role": "error",
+                "content": message,
+            }),
+        ),
+        AgentEvent::ToolError { error } => debug_log::log_json(
+            action::TOOL_RESULT,
+            &serde_json::json!({ "ok": false, "error": error }),
+        ),
+        AgentEvent::ToolOutputCleared {
+            cleared,
+            freed_tokens,
+        } => debug_log::log_json(
+            action::TOOL_OUTPUT_CLEARED,
+            &serde_json::json!({
+                "conversation": conversation.0,
+                "cleared": cleared.len(),
+                "freed_tokens": freed_tokens,
+            }),
+        ),
+        _ => {}
     }
 }
 
-/// Approvals and questions are resolved through an async `Notify`; the
-/// waiting agent task is parked, so resolving must not block this loop.
 fn record_approval(request: &ToolApprovalRequest, approved: bool) {
     debug_log::log_json(
         action::APPROVAL,
@@ -910,49 +885,6 @@ mod tests {
         let empty = QuestionState::new("q".into(), Vec::new(), false);
         options.answer = None;
         assert_eq!(answer_for(&options, &empty), "");
-    }
-
-    /// Rung 1 rewrites the turn's copy of the history and tells the app to do
-    /// the same. The harness ignoring that message is how a multi-turn run
-    /// diverges from the TUI in exactly the dimension compaction is about:
-    /// turn 2 would be driven from bodies the TUI no longer had.
-    #[test]
-    fn cleared_tool_output_is_applied_the_way_the_tui_applies_it() {
-        let mut messages = vec![
-            ChatMessage::user("read both files"),
-            // A UI-only message: present here, absent from the agent loop's
-            // copy, so any index-based edit would land on the wrong message.
-            ChatMessage {
-                ui_only: true,
-                ..ChatMessage::assistant("(status line)")
-            },
-            ChatMessage::assistant("reading"),
-            ChatMessage::tool("call-a", "a".repeat(4000).as_str()),
-            ChatMessage::tool("call-b", "b".repeat(4000).as_str()),
-        ];
-        apply_cleared_tool_output(
-            &mut messages,
-            &[(
-                "call-a".to_string(),
-                "[cleared: /spill/call-a.txt]".to_string(),
-            )],
-        );
-        assert_eq!(messages[3].content, "[cleared: /spill/call-a.txt]");
-        // Untouched: only what rung 1 actually spilled may be replaced.
-        assert_eq!(messages[4].content.len(), 4000);
-        assert_eq!(messages[1].content, "(status line)");
-    }
-
-    /// An id the harness's history does not carry is dropped, not applied to
-    /// whatever happened to be at that position.
-    #[test]
-    fn an_unknown_tool_call_id_clears_nothing() {
-        let mut messages = vec![ChatMessage::tool("call-a", "body")];
-        apply_cleared_tool_output(
-            &mut messages,
-            &[("call-z".to_string(), "[cleared]".to_string())],
-        );
-        assert_eq!(messages[0].content, "body");
     }
 
     #[test]

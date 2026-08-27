@@ -4,6 +4,7 @@ pub mod events;
 pub mod generation;
 mod goal;
 pub mod input;
+mod interaction;
 mod keys;
 pub mod list;
 pub mod mcp_add;
@@ -12,6 +13,7 @@ mod multichat;
 mod persist;
 mod pickers;
 pub mod providers;
+pub mod reduce;
 pub(crate) mod runtime;
 pub mod search;
 mod serve;
@@ -31,8 +33,8 @@ use crate::provider::{ChatMessage, LLMProvider, Role};
 use crate::skills::{SkillDefinition, discovery::discover_all_skills};
 use crate::tools::registry::ToolRegistry;
 use events::{
-    AppEvent, ConfirmAction, Modal, OnboardingState, PendingInteraction, QuestionRequest,
-    QuestionState, ToolApprovalRequest, View,
+    AgentEvent, AppEvent, ConfirmAction, Modal, OnboardingState, PendingInteraction,
+    QuestionRequest, ToolApprovalRequest, View,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -70,21 +72,35 @@ pub fn kill_foreground_child() {
     }
 }
 
-/// The conversation an agent event targets, if it is a per-conversation event.
-fn agent_event_target(event: &AppEvent) -> Option<conversation::ConversationId> {
-    match event {
-        AppEvent::AgentStarted(id)
-        | AppEvent::AgentChunk(id, _)
-        | AppEvent::AgentDone(id, _)
-        | AppEvent::AgentError(id, _)
-        | AppEvent::BeginAssistantMessage(id)
-        | AppEvent::DiscardEmptyAssistantMessage(id)
-        | AppEvent::AddMessage(id, _) => Some(*id),
-        AppEvent::ToolStarted { conversation, .. }
-        | AppEvent::ToolDone { conversation, .. }
-        | AppEvent::ToolError { conversation, .. } => Some(*conversation),
-        _ => None,
-    }
+/// Строка состояния для события — или `None`, если сказать нечего.
+/// Чистая: разница фокуса и фона лишь в том, зовут её или нет.
+fn status_for(event: &AgentEvent) -> Option<String> {
+    Some(match event {
+        AgentEvent::Started => "Thinking...".to_string(),
+        AgentEvent::Done(_) => "Ready".to_string(),
+        AgentEvent::Failed(error) => error.clone(),
+        AgentEvent::ToolStarted { name } => format!("Running {name}..."),
+        AgentEvent::ToolDone { .. } => "Tool finished".to_string(),
+        AgentEvent::ToolError { error } => format!("Tool error: {error}"),
+        AgentEvent::ToolOutputCleared {
+            cleared,
+            freed_tokens,
+        } => format!(
+            "Cleared {} old tool output(s), ~{freed_tokens} tokens freed",
+            cleared.len()
+        ),
+        AgentEvent::SessionReset {
+            before_tokens,
+            after_tokens,
+        } => format!(
+            "Started a fresh provider session, re-seeding ~{after_tokens} tokens instead of ~{before_tokens}"
+        ),
+        AgentEvent::BeginAssistantMessage
+        | AgentEvent::Chunk(_)
+        | AgentEvent::Message(_)
+        | AgentEvent::DiscardEmptyAssistant
+        | AgentEvent::ContextUsage(_) => return None,
+    })
 }
 
 /// Ask the active provider for its context window off the event loop
@@ -679,200 +695,32 @@ impl App {
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> AppResult<bool> {
-        // Agent events for a background conversation are applied to its parked
-        // record, not the focused chat. Sidechats/sub-agents route by KIND even
-        // while focused (Tab can land on one): their terminal events must
-        // finalize-and-flush into the parent, which the focused path never does.
-        if let Some(target) = agent_event_target(&event) {
-            let background_kind = self
-                .state
-                .conversations
-                .get(target)
-                .is_some_and(|c| c.is_background_kind());
-            if target != self.state.conversations.focused_id() || background_kind {
-                self.handle_background_event(target, event);
-                return Ok(false);
-            }
-        }
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::Resize { rows } => self.state.terminal_rows = rows,
             AppEvent::Paste(text) => self.handle_paste(text),
-            AppEvent::AgentStarted(_) => {
-                self.state
-                    .focused_mut()
-                    .generation
-                    .begin(std::time::Instant::now());
-                self.state.status_message = "Thinking...".to_string();
-            }
             AppEvent::CompactFinished {
                 conversation,
                 messages,
                 status,
-            } => {
-                let mut status = status;
-                if let Some(target) = self.state.conversations.get_mut(conversation) {
-                    match (target.end_compaction(), messages) {
-                        // Splice rather than refuse: the summary is already paid
-                        // for, and appending newcomers loses nothing either way.
-                        (Some(base), Some(rebuilt)) => {
-                            match target.swap_compacted(base, rebuilt) {
-                                Some(0) => {}
-                                Some(extra) => {
-                                    status = format!("{status}; kept {extra} newer message(s)");
-                                }
-                                None => {
-                                    status = "Compaction dropped: this chat's history changed while it ran.".to_string();
-                                }
-                            }
-                        }
-                        (Some(_), None) => {}
-                        // No flag: the run was cancelled, so its history is stale
-                        // by definition and the current one wins.
-                        (None, _) => {
-                            status = "Compaction dropped: it was cancelled.".to_string();
-                        }
-                    }
-                }
-                if conversation == self.state.conversations.focused_id() {
-                    self.state.status_message = status;
-                }
-            }
+            } => self.on_compact_finished(conversation, messages, status),
             AppEvent::ContextWindowLearned(window) => {
                 self.state.provider_context_window = window;
             }
-            AppEvent::ContextUsage { conversation, used } => {
-                if let Some(target) = self.state.conversations.get_mut(conversation) {
-                    target.context_used = used;
-                }
-            }
-            AppEvent::ToolOutputCleared {
+            AppEvent::Agent {
                 conversation,
-                cleared,
-                freed_tokens,
+                event,
             } => {
-                let count = cleared.len();
-                if let Some(target) = self.state.conversations.get_mut(conversation) {
-                    // Matched by tool-call id, never by index: the agent loop's
-                    // copy drops `ui_only` messages, so the two never line up.
-                    for (tool_call_id, marker) in cleared {
-                        if let Some(message) = target
-                            .messages
-                            .iter_mut()
-                            .find(|m| m.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
-                        {
-                            message.content = marker;
-                        }
-                    }
-                }
-                self.state.status_message =
-                    format!("Cleared {count} old tool output(s), ~{freed_tokens} tokens freed");
-            }
-            AppEvent::SessionReset {
-                conversation,
-                before_tokens,
-                after_tokens,
-            } => {
-                // Nothing to apply to the local history: the reset happened on
-                // the provider's side, and rung 1 already sent its own edit.
-                // A background turn's reset must not overwrite the status the
-                // user is reading for the chat in front of them.
-                if conversation == self.state.conversations.focused_id() {
-                    self.state.status_message = format!(
-                        "Started a fresh provider session, re-seeding ~{after_tokens} tokens instead of ~{before_tokens}"
-                    );
-                }
-            }
-            AppEvent::BeginAssistantMessage(_) => {
-                self.state.focused_mut().begin_assistant_message();
-            }
-            AppEvent::DiscardEmptyAssistantMessage(_) => {
-                self.state.focused_mut().discard_empty_assistant();
-            }
-            AppEvent::AgentChunk(_, chunk) => {
-                self.state.focused_mut().append_chunk(&chunk);
-            }
-            AppEvent::AgentDone(_, _result) => {
-                self.state.focused_mut().finish_turn("FINISHED");
-                self.state.status_message = "Ready".to_string();
-                self.record_gen_stats();
-                self.auto_save_session();
-                self.maybe_advance_goal_cycle().await;
-            }
-            AppEvent::AgentError(_, err) => {
-                self.state.status_message = err.clone();
-                self.state.focused_mut().finish_turn("ABORTED");
-                self.record_gen_stats();
-                self.auto_save_session();
-
-                // An error mid-cycle would otherwise leave goal mode stuck in a
-                // "running" stage with nothing actually running.
-                if self.state.goal.is_running() {
-                    self.cancel_goal_cycle(&format!(
-                        "⚠ Goal cycle stopped after an error: {err}. Use /goal to retry."
-                    ));
-                }
-            }
-            AppEvent::AddMessage(_, message) => {
-                self.state.focused_mut().messages.push(message);
-            }
-            AppEvent::ToolStarted { name, .. } => {
-                self.state.status_message = format!("Running {name}...");
-            }
-            AppEvent::ToolDone { .. } => {
-                self.state.status_message = "Tool finished".to_string();
-            }
-            AppEvent::ToolError { error, .. } => {
-                self.state.status_message = format!("Tool error: {error}");
+                self.on_agent_event(conversation, event).await;
             }
             AppEvent::RequestToolApproval(request) => {
-                if self.state.approved_tools.contains(&request.tool_name) {
-                    request.resolve(true).await;
-                    self.state.focused_mut().generation.active = true;
-                    self.state.status_message =
-                        format!("Running {} (auto-approved)", request.tool_name);
-                } else if self.state.modal.is_some()
-                    || self.state.pending_tool_approval.is_some()
-                    || self.state.pending_question.is_some()
-                {
-                    // Another interaction is on screen — park this one. An
-                    // overwrite would orphan the previous request's agent
-                    // task on a `Notify` nobody would ever fire.
-                    self.state
-                        .pending_interactions
-                        .push_back(PendingInteraction::Approval(request));
-                    self.state.status_message = format!(
-                        "{} interaction(s) queued",
-                        self.state.pending_interactions.len()
-                    );
-                } else {
-                    self.present_tool_approval(request);
-                }
+                self.on_tool_approval_requested(request).await;
             }
             AppEvent::RequestQuestion(request, state) => {
-                if self.state.modal.is_some()
-                    || self.state.pending_tool_approval.is_some()
-                    || self.state.pending_question.is_some()
-                {
-                    self.state
-                        .pending_interactions
-                        .push_back(PendingInteraction::Question(request, state));
-                } else {
-                    self.present_question(request, state);
-                }
+                self.on_question_requested(request, state);
             }
-            AppEvent::Tick => {
-                if self.tick_is_visual() {
-                    self.state.focused_mut().generation.animation_tick = self
-                        .state
-                        .focused_mut()
-                        .generation
-                        .animation_tick
-                        .wrapping_add(1);
-                }
-                self.maybe_refetch_provider_models();
-            }
+            AppEvent::Tick => self.on_tick(),
             AppEvent::GoalEvaluationDone(outcome) => {
                 self.handle_goal_evaluation_done(outcome).await;
             }
@@ -934,12 +782,10 @@ impl App {
                 self.state.status_message = message;
             }
             AppEvent::UpdateStatus { message, notable } => {
-                self.state.status_message = message.clone();
                 if notable {
-                    self.state
-                        .focused_mut()
-                        .messages
-                        .push(ChatMessage::ui_system(&message));
+                    self.announce(message);
+                } else {
+                    self.state.status_message = message;
                 }
             }
             AppEvent::ErrorLogged { message } => {
@@ -960,111 +806,60 @@ impl App {
                 // servers); nothing to show here.
             }
             AppEvent::ProviderModelsRefreshed { summary, failed } => {
-                self.state.status_message = summary.clone();
-                // Quiet on success (background bookkeeping); failures get a
-                // visible line so a dead endpoint doesn't fail silently.
-                if failed > 0 {
-                    self.state
-                        .focused_mut()
-                        .messages
-                        .push(ChatMessage::ui_system(&format!("⚠ {summary}")));
-                }
+                self.on_provider_models_refreshed(summary, failed);
             }
             AppEvent::HistorySearchDone { query, matches } => {
-                let search = &mut self.state.search;
-                // Only the reply to the latest query counts.
-                if search.last_query == query {
-                    search.searching = false;
-                    search.matches = matches;
-                    search.reset_selection();
-                    search.status = if search.matches.is_empty() {
-                        "No matches — the index may still be building (see /rag)".to_string()
-                    } else {
-                        format!("{} matches", search.matches.len())
-                    };
-                    // Land the user straight on the results.
-                    if !search.matches.is_empty() {
-                        search.focus = search::SearchFocus::Results;
-                    }
-                }
+                self.state.search.apply_results(&query, matches);
             }
         }
         Ok(false)
     }
 
-    /// Put a tool-approval request on screen (modal + current slot).
-    fn present_tool_approval(&mut self, request: ToolApprovalRequest) {
-        self.state.focused_mut().generation.active = false;
-        self.state.status_message = format!("Approve tool {}?", request.tool_name);
-        self.state.modal = Some(Modal::ToolApproval {
-            tool_name: request.tool_name.clone(),
-            arguments: request.arguments.clone(),
-            scroll_offset: 0,
-            always_allow: false,
-        });
-        self.state.pending_tool_approval = Some(request);
+    /// Такт анимации и периодическая дозагрузка моделей.
+    fn on_tick(&mut self) {
+        if self.tick_is_visual() {
+            let generation = &mut self.state.focused_mut().generation;
+            generation.animation_tick = generation.animation_tick.wrapping_add(1);
+        }
+        self.maybe_refetch_provider_models();
     }
 
-    /// Put a question request on screen (modal + current slot).
-    fn present_question(&mut self, request: QuestionRequest, state: QuestionState) {
-        self.state.pending_question = Some(request);
-        self.state.modal = Some(Modal::Question(state));
-        self.state.focused_mut().generation.active = false;
-        self.state.status_message = "Question pending...".to_string();
-    }
+    /// Единственный вход агентских событий: историю меняет `reduce`, здесь
+    /// остаётся хвост — фон и фокус расходятся ровно в нём.
+    async fn on_agent_event(&mut self, target: conversation::ConversationId, event: AgentEvent) {
+        let focused = self.state.conversations.focused_id() == target;
+        let Some(conversation) = self.state.conversations.get_mut(target) else {
+            return;
+        };
+        let background = conversation.is_background_kind();
+        let end = reduce::apply(conversation, &event);
 
-    /// After a modal resolves, surface the next parked interaction (if any).
-    /// Approvals whitelisted meanwhile resolve immediately instead of showing.
-    pub(crate) async fn present_next_interaction(&mut self) {
-        while let Some(next) = self.state.pending_interactions.pop_front() {
-            match next {
-                PendingInteraction::Approval(request) => {
-                    if self.state.approved_tools.contains(&request.tool_name) {
-                        request.resolve(true).await;
-                        continue;
+        // Фоновый ход не перебивает строку, которую читают для чата на экране.
+        if focused
+            && !background
+            && let Some(message) = status_for(&event)
+        {
+            self.state.status_message = message;
+        }
+
+        match reduce::turn_tail(end, focused, background) {
+            reduce::TurnTail::None => {}
+            reduce::TurnTail::Background(error) => self.finish_background(target, error),
+            reduce::TurnTail::Focused(end) => {
+                self.record_gen_stats();
+                self.auto_save_session();
+                match end {
+                    reduce::TurnEnd::Done => self.maybe_advance_goal_cycle().await,
+                    // Ошибка посреди цикла оставила бы GOAL в «выполняется»,
+                    // когда ничего уже не выполняется.
+                    reduce::TurnEnd::Failed(error) if self.state.goal.is_running() => {
+                        self.cancel_goal_cycle(&format!(
+                            "⚠ Goal cycle stopped after an error: {error}. Use /goal to retry."
+                        ));
                     }
-                    self.present_tool_approval(request);
-                    return;
-                }
-                PendingInteraction::Question(request, state) => {
-                    self.present_question(request, state);
-                    return;
+                    reduce::TurnEnd::Failed(_) => {}
                 }
             }
-        }
-    }
-
-    /// Deny-and-drop every pending approval belonging to `conversation` — its
-    /// turn is being cancelled, so leaving them queued (or on screen) would
-    /// present approvals for a task that no longer exists.
-    pub(crate) async fn purge_interactions_for(
-        &mut self,
-        conversation: conversation::ConversationId,
-    ) {
-        let mut kept = std::collections::VecDeque::new();
-        while let Some(item) = self.state.pending_interactions.pop_front() {
-            match item {
-                PendingInteraction::Approval(request) if request.conversation == conversation => {
-                    request.resolve(false).await;
-                }
-                other => kept.push_back(other),
-            }
-        }
-        self.state.pending_interactions = kept;
-
-        let current_is_target = self
-            .state
-            .pending_tool_approval
-            .as_ref()
-            .is_some_and(|r| r.conversation == conversation);
-        if current_is_target {
-            if let Some(request) = self.state.pending_tool_approval.take() {
-                request.resolve(false).await;
-            }
-            if matches!(self.state.modal, Some(Modal::ToolApproval { .. })) {
-                self.state.modal = None;
-            }
-            self.present_next_interaction().await;
         }
     }
 
@@ -1158,7 +953,10 @@ impl App {
             .with_output_cap(self.config.provider.max_tokens),
         };
 
-        let _ = self.event_tx.send(AppEvent::AgentStarted(conversation));
+        let _ = self.event_tx.send(AppEvent::Agent {
+            conversation,
+            event: AgentEvent::Started,
+        });
         let handle = self.runtime.spawn(spec);
         self.state.focused_mut().agent_task = Some(handle);
 

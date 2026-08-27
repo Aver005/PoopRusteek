@@ -156,7 +156,23 @@ impl Conversation {
         }
     }
 
-    /// Terminal-event bookkeeping shared by `AgentDone` / `AgentError`.
+    /// Заменить очищенные ступенью 1 тела инструментов их маркерами.
+    ///
+    /// Только по id вызова, никогда по индексу: цикл агента работает на копии
+    /// без `ui_only`-сообщений, так что списки не совпадают.
+    pub fn clear_tool_output(&mut self, cleared: &[(String, String)]) {
+        for (tool_call_id, marker) in cleared {
+            if let Some(message) = self
+                .messages
+                .iter_mut()
+                .find(|m| m.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
+            {
+                message.content = marker.clone();
+            }
+        }
+    }
+
+    /// Terminal-event bookkeeping shared by `AgentEvent::Done` / `Failed`.
     pub fn finish_turn(&mut self, status: &str) {
         self.generation.active = false;
         self.generation.last_status = Some(status.to_string());

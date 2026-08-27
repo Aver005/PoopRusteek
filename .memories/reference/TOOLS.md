@@ -59,7 +59,7 @@ for step in 0..max_steps:                       # default max_steps_per_turn = 2
       break on finish_reason == "stop"
   tool_calls = parse_tool_calls(full_response)
   visible   = strip_tool_calls(full_response)
-  if no tool_calls: push assistant msg, AgentDone, return
+  if no tool_calls: push assistant msg, AgentEvent::Done, return
   push assistant(visible)
   for call in tool_calls.take(max_tools_per_step):   # default 10
       if name == "question": RequestQuestion → wait()      # no approval, opens modal
@@ -69,8 +69,8 @@ for step in 0..max_steps:                       # default max_steps_per_turn = 2
               mcp__* → mcp.call_tool()
               else   → tools.execute()
           else: "Execution denied by user." (is_error)
-      summarize_tool_result() (≤200 bytes, char-boundary-safe) → tool msg + AddMessage + ToolDone/ToolError
-# loop exhausted → AgentError("Reached max agent steps…")
+      summarize_tool_result() (≤200 bytes, char-boundary-safe) → tool msg + AgentEvent::Message + AgentEvent::ToolDone/ToolError
+# loop exhausted → AgentEvent::Failed("Reached max agent steps…")
 ```
 
 - Launched via `AgentRuntime::spawn(TurnSpec)` (`app/runtime.rs`); the handle lives on the owning `Conversation` (`state.focused().agent_task`). `Esc` aborts the focused conversation's task.

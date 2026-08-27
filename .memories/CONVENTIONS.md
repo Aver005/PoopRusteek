@@ -21,7 +21,7 @@
 - Shared services are `Arc<Mutex<…>>` (`MCPManager`) or `Arc<…>` (`ToolRegistry`, provider).
 - Global singletons (background registry, foreground-PID slot) use `OnceLock`/atomics.
 - **Per-conversation state** lives in a `Conversation` (`app/conversation.rs`), never globally on `AppState`. Reach the active one via `state.focused()/focused_mut()`; touch others only through the `Conversations` store API. Each conversation has its **own forked provider** (`LLMProvider::fork()`).
-- **Agent events must carry a `ConversationId`** so background turns stream into the right buffer; route non-focused events through `handle_background_event`.
+- **Agent events must carry a `ConversationId`** so background turns stream into the right buffer. Один ход — это `AppEvent::Agent { conversation, event: AgentEvent }`; историю меняет только `app::reduce::apply` (его же зовёт харнесс), а `reduce::turn_tail` решает, чей хвост: фоновый сворачивается в родителя, фокусный пишет статистику и двигает GOAL, параллельный не на экране не получает ничего. Нового приложения событий не заводить.
 - **Launch every agent turn via `AgentRuntime::spawn(TurnSpec)`** — don't call `run_agent_loop` directly. Set `auto_approve:true` for background turns (sidechats/sub-agents).
 
 ## MODULE / DECOMPOSITION PATTERN (how the god-object was tamed — keep it this way)

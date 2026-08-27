@@ -4,7 +4,8 @@ use crate::agent::tool_parser::{
 };
 use crate::app::conversation::ConversationId;
 use crate::app::events::{
-    AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo,
+    AgentEvent, AgentResult, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest,
+    ToolCallInfo,
 };
 use crate::app::runtime::TurnSpec;
 use crate::debug_log;
@@ -98,10 +99,16 @@ pub async fn run_agent_loop(
             used = context_used(&provider, &system_prompt, &messages);
         }
 
-        let _ = event_tx.send(AppEvent::BeginAssistantMessage(conversation));
+        let _ = event_tx.send(AppEvent::Agent {
+            conversation,
+            event: AgentEvent::BeginAssistantMessage,
+        });
         let request =
             build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
-        let _ = event_tx.send(AppEvent::ContextUsage { conversation, used });
+        let _ = event_tx.send(AppEvent::Agent {
+            conversation,
+            event: AgentEvent::ContextUsage(used),
+        });
 
         let outcome = stream_step(conversation, &provider, request, &event_tx).await;
 
@@ -114,10 +121,12 @@ pub async fn run_agent_loop(
                     "conversation={conversation} step={step_number}/{max_steps} reason=stream_timeout"
                 ),
             );
-            let _ = event_tx.send(AppEvent::AgentError(
+            let _ = event_tx.send(AppEvent::Agent {
                 conversation,
-                "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
-            ));
+                event: AgentEvent::Failed(
+                    "Stream timed out (no data for 120s). Cancelling turn.".to_string(),
+                ),
+            });
             return;
         }
         if !got_stop {
@@ -220,14 +229,14 @@ pub async fn run_agent_loop(
                         tool_calls.len()
                     ),
                 );
-                let _ = event_tx.send(AppEvent::AddMessage(
-                    conversation,
-                    ChatMessage::system(
+                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(
                         "Warning: stream ended early, but a complete tool call was recovered. Continuing.",
-                    ),
-                ));
+                    )) });
             } else {
-                let _ = event_tx.send(AppEvent::AgentError(conversation, error));
+                let _ = event_tx.send(AppEvent::Agent {
+                    conversation,
+                    event: AgentEvent::Failed(error),
+                });
                 return;
             }
         }
@@ -254,12 +263,9 @@ pub async fn run_agent_loop(
                         parse_errors.join(" | ")
                     ),
                 );
-                let _ = event_tx.send(AppEvent::AddMessage(
-                    conversation,
-                    ChatMessage::system(&format!(
+                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(&format!(
                         "⚠ Malformed tool call (attempt {malformed_retries}/{MAX_MALFORMED_TOOL_RETRIES}) — asking the model to retry"
-                    )),
-                ));
+                    ))) });
                 continue;
             }
             if !parse_errors.is_empty() {
@@ -270,12 +276,9 @@ pub async fn run_agent_loop(
                         parse_errors.join(" | ")
                     ),
                 );
-                let _ = event_tx.send(AppEvent::AddMessage(
-                    conversation,
-                    ChatMessage::system(
+                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(
                         "⚠ The model kept emitting malformed tool calls; stopping this turn. Try rephrasing your request.",
-                    ),
-                ));
+                    )) });
             }
             if !visible_text.is_empty() {
                 messages.push(ChatMessage::assistant(&visible_text));
@@ -286,7 +289,10 @@ pub async fn run_agent_loop(
                         "conversation={conversation} step={step_number}/{max_steps} reason=empty_response_without_tool_calls"
                     ),
                 );
-                let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage(conversation));
+                let _ = event_tx.send(AppEvent::Agent {
+                    conversation,
+                    event: AgentEvent::DiscardEmptyAssistant,
+                });
 
                 // No text and no tool call means the turn did nothing at all.
                 // Reporting that as a success is how "build me a page" came
@@ -303,12 +309,9 @@ pub async fn run_agent_loop(
                             "conversation={conversation} step={step_number}/{max_steps} retry={empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES}"
                         ),
                     );
-                    let _ = event_tx.send(AppEvent::AddMessage(
-                        conversation,
-                        ChatMessage::system(&format!(
+                    let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Message(ChatMessage::system(&format!(
                             "⚠ Empty reply from the model (attempt {empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES}) — retrying"
-                        )),
-                    ));
+                        ))) });
                     continue;
                 }
                 debug_log::log(
@@ -317,10 +320,7 @@ pub async fn run_agent_loop(
                         "conversation={conversation} step={step_number}/{max_steps} status=empty_response_exhausted"
                     ),
                 );
-                let _ = event_tx.send(AppEvent::AgentError(
-                    conversation,
-                    "The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request.".to_string(),
-                ));
+                let _ = event_tx.send(AppEvent::Agent { conversation, event: AgentEvent::Failed("The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request.".to_string()) });
                 return;
             }
 
@@ -332,19 +332,22 @@ pub async fn run_agent_loop(
                     collected_tool_calls.len()
                 ),
             );
-            let _ = event_tx.send(AppEvent::AgentDone(
+            let _ = event_tx.send(AppEvent::Agent {
                 conversation,
-                AgentResult {
+                event: AgentEvent::Done(AgentResult {
                     text: visible_text,
                     tool_calls: collected_tool_calls,
-                },
-            ));
+                }),
+            });
             return;
         }
 
         messages.push(ChatMessage::assistant(&visible_text));
         if visible_text.is_empty() {
-            let _ = event_tx.send(AppEvent::DiscardEmptyAssistantMessage(conversation));
+            let _ = event_tx.send(AppEvent::Agent {
+                conversation,
+                event: AgentEvent::DiscardEmptyAssistant,
+            });
         }
 
         let total_calls = tool_calls.len();
@@ -386,7 +389,10 @@ pub async fn run_agent_loop(
                     true,
                 );
                 messages.push(tool_message.clone());
-                let _ = event_tx.send(AppEvent::AddMessage(conversation, tool_message));
+                let _ = event_tx.send(AppEvent::Agent {
+                    conversation,
+                    event: AgentEvent::Message(tool_message),
+                });
                 debug_log::log(
                     "agent.tool.skipped",
                     format!(
@@ -447,17 +453,20 @@ pub async fn run_agent_loop(
                 arguments: tool_call.arguments.clone(),
                 result: Some(tool_result.clone()),
             });
-            let _ = event_tx.send(AppEvent::AddMessage(conversation, tool_message));
+            let _ = event_tx.send(AppEvent::Agent {
+                conversation,
+                event: AgentEvent::Message(tool_message),
+            });
 
             if is_error {
-                let _ = event_tx.send(AppEvent::ToolError {
+                let _ = event_tx.send(AppEvent::Agent {
                     conversation,
-                    error: preview,
+                    event: AgentEvent::ToolError { error: preview },
                 });
             } else {
-                let _ = event_tx.send(AppEvent::ToolDone {
+                let _ = event_tx.send(AppEvent::Agent {
                     conversation,
-                    result: preview,
+                    event: AgentEvent::ToolDone { result: preview },
                 });
             }
         }
@@ -470,17 +479,19 @@ pub async fn run_agent_loop(
             collected_tool_calls.len()
         ),
     );
-    let _ = event_tx.send(AppEvent::AgentError(
+    let _ = event_tx.send(AppEvent::Agent {
         conversation,
-        "Reached max agent steps before producing a final answer".to_string(),
-    ));
+        event: AgentEvent::Failed(
+            "Reached max agent steps before producing a final answer".to_string(),
+        ),
+    });
 }
 
 /// How full the window is, from the one source that knows. A provider holding
 /// the history itself counts what it was actually sent since its session
 /// began; everyone else is measured by the local history we re-send each step.
 ///
-/// The single caller feeds all three consumers — `AppEvent::ContextUsage`,
+/// The single caller feeds all three consumers — `AgentEvent::ContextUsage`,
 /// rung 1 and rung 2 — from the same value, so the status bar can never
 /// disagree with what the ladder acted on.
 fn context_used(
@@ -655,10 +666,12 @@ async fn clear_tool_bodies(
     // Sent after the spill so the marker never points at a file that is not
     // there yet.
     if !cleared.is_empty() {
-        let _ = ctx.event_tx.send(AppEvent::ToolOutputCleared {
+        let _ = ctx.event_tx.send(AppEvent::Agent {
             conversation: ctx.conversation,
-            cleared,
-            freed_tokens: freed,
+            event: AgentEvent::ToolOutputCleared {
+                cleared,
+                freed_tokens: freed,
+            },
         });
     }
     rewrote > 0
@@ -771,10 +784,12 @@ async fn reset_server_session(
             snapshot.percent_used()
         ),
     );
-    let _ = ctx.event_tx.send(AppEvent::SessionReset {
+    let _ = ctx.event_tx.send(AppEvent::Agent {
         conversation,
-        before_tokens: used,
-        after_tokens: after,
+        event: AgentEvent::SessionReset {
+            before_tokens: used,
+            after_tokens: after,
+        },
     });
     true
 }
@@ -848,13 +863,18 @@ async fn stream_step(
         if next_visible.starts_with(&streamed_visible) {
             let delta = &next_visible[streamed_visible.len()..];
             if !delta.is_empty() {
-                let _ = progress_tx.send(AppEvent::AgentChunk(conversation, delta.to_string()));
+                let _ = progress_tx.send(AppEvent::Agent {
+                    conversation,
+                    event: AgentEvent::Chunk(delta.to_string()),
+                });
             }
         } else if !next_visible.is_empty() {
-            let _ = progress_tx.send(AppEvent::AddMessage(
+            let _ = progress_tx.send(AppEvent::Agent {
                 conversation,
-                ChatMessage::system("⚠ Streaming sync issue — agent will continue"),
-            ));
+                event: AgentEvent::Message(ChatMessage::system(
+                    "⚠ Streaming sync issue — agent will continue",
+                )),
+            });
         }
         streamed_visible = next_visible;
     })
@@ -911,9 +931,11 @@ async fn execute_tool_call(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> 
         let _ = ctx
             .event_tx
             .send(AppEvent::RequestQuestion(request.clone(), qs));
-        let _ = ctx.event_tx.send(AppEvent::ToolStarted {
+        let _ = ctx.event_tx.send(AppEvent::Agent {
             conversation: ctx.conversation,
-            name: call.name.clone(),
+            event: AgentEvent::ToolStarted {
+                name: call.name.clone(),
+            },
         });
         return match request.wait().await {
             Some(answer) if !answer.is_empty() => (format!("User answered: {answer}"), false),
@@ -952,9 +974,11 @@ async fn execute_tool_call(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> 
             });
             return (format!("Started background sub-agent: {label}"), false);
         }
-        let _ = ctx.event_tx.send(AppEvent::ToolStarted {
+        let _ = ctx.event_tx.send(AppEvent::Agent {
             conversation: ctx.conversation,
-            name: TASK_TOOL_NAME.to_string(),
+            event: AgentEvent::ToolStarted {
+                name: TASK_TOOL_NAME.to_string(),
+            },
         });
         let sub_provider = ctx.provider.fork();
         let session_cleanup = Arc::clone(&sub_provider);
@@ -999,9 +1023,11 @@ async fn execute_tool_call(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> 
     if !approved {
         return ("Execution denied by user.".to_string(), true);
     }
-    let _ = ctx.event_tx.send(AppEvent::ToolStarted {
+    let _ = ctx.event_tx.send(AppEvent::Agent {
         conversation: ctx.conversation,
-        name: call.name.clone(),
+        event: AgentEvent::ToolStarted {
+            name: call.name.clone(),
+        },
     });
     dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments.clone()).await
 }
@@ -1122,7 +1148,7 @@ mod tests {
     use crate::provider::fake::FakeProvider;
 
     /// The provider seam is substitutable: with a `FakeProvider` the agent loop
-    /// runs to completion — streaming visible text, then `AgentDone` — with no
+    /// runs to completion — streaming visible text, then `AgentEvent::Done` — with no
     /// network, no proof-of-work, and no DeepSeek token.
     #[tokio::test]
     async fn agent_loop_streams_plain_response_then_done() {
@@ -1161,26 +1187,34 @@ mod tests {
         }
 
         // First event opens the assistant message, tagged with our conversation.
-        assert!(matches!(events.first(), Some(AppEvent::BeginAssistantMessage(id)) if *id == cid));
+        assert!(
+            matches!(events.first(), Some(AppEvent::Agent { conversation: id, event: AgentEvent::BeginAssistantMessage }) if *id == cid)
+        );
 
         // The streamed deltas reassemble into the full visible response.
         let streamed: String = events
             .iter()
             .filter_map(|e| match e {
-                AppEvent::AgentChunk(_, s) => Some(s.as_str()),
+                AppEvent::Agent {
+                    conversation: _,
+                    event: AgentEvent::Chunk(s),
+                } => Some(s.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(streamed, "Hello, world!");
 
-        // The turn ends with AgentDone carrying the final text and no tool calls.
+        // The turn ends with AgentEvent::Done carrying the final text and no tool calls.
         let done = events
             .iter()
             .find_map(|e| match e {
-                AppEvent::AgentDone(_, result) => Some(result),
+                AppEvent::Agent {
+                    conversation: _,
+                    event: AgentEvent::Done(result),
+                } => Some(result),
                 _ => None,
             })
-            .expect("agent loop should finish with AgentDone");
+            .expect("agent loop should finish with AgentEvent::Done");
         assert_eq!(done.text, "Hello, world!");
         assert!(done.tool_calls.is_empty());
     }
@@ -1223,14 +1257,20 @@ mod tests {
         let mut saw_error = None;
         while let Ok(ev) = event_rx.try_recv() {
             match ev {
-                AppEvent::AgentDone(_, _) => saw_done = true,
-                AppEvent::AgentError(id, message) if id == cid => saw_error = Some(message),
+                AppEvent::Agent {
+                    conversation: _,
+                    event: AgentEvent::Done(_),
+                } => saw_done = true,
+                AppEvent::Agent {
+                    conversation: id,
+                    event: AgentEvent::Failed(message),
+                } if id == cid => saw_error = Some(message),
                 _ => {}
             }
         }
 
         assert!(!saw_done, "abrupt EOF must not look like a successful turn");
-        let error = saw_error.expect("abrupt EOF should surface as AgentError");
+        let error = saw_error.expect("abrupt EOF should surface as AgentEvent::Failed");
         assert!(error.contains("without stop"));
     }
 
@@ -1308,8 +1348,14 @@ mod tests {
         let (mut done, mut error) = (None, None);
         while let Ok(event) = event_rx.try_recv() {
             match event {
-                AppEvent::AgentDone(id, result) if id == cid => done = Some(result),
-                AppEvent::AgentError(id, message) if id == cid => error = Some(message),
+                AppEvent::Agent {
+                    conversation: id,
+                    event: AgentEvent::Done(result),
+                } if id == cid => done = Some(result),
+                AppEvent::Agent {
+                    conversation: id,
+                    event: AgentEvent::Failed(message),
+                } if id == cid => error = Some(message),
                 _ => {}
             }
         }
@@ -1359,8 +1405,14 @@ mod tests {
         let mut saw_error = None;
         while let Ok(ev) = event_rx.try_recv() {
             match ev {
-                AppEvent::AgentDone(id, result) if id == cid => saw_done = Some(result),
-                AppEvent::AgentError(id, message) if id == cid => saw_error = Some(message),
+                AppEvent::Agent {
+                    conversation: id,
+                    event: AgentEvent::Done(result),
+                } if id == cid => saw_done = Some(result),
+                AppEvent::Agent {
+                    conversation: id,
+                    event: AgentEvent::Failed(message),
+                } if id == cid => saw_error = Some(message),
                 _ => {}
             }
         }
@@ -1447,7 +1499,10 @@ mod tests {
         // The event stream is the user's and the harness's view: uncapped.
         let mut reported = None;
         while let Ok(ev) = event_rx.try_recv() {
-            if let AppEvent::AgentDone(id, result) = ev
+            if let AppEvent::Agent {
+                conversation: id,
+                event: AgentEvent::Done(result),
+            } = ev
                 && id == cid
             {
                 reported = result.tool_calls.first().and_then(|c| c.result.clone());
@@ -1624,7 +1679,13 @@ mod tests {
 
         let mut cleared_events = 0;
         while let Ok(ev) = event_rx.try_recv() {
-            if matches!(ev, AppEvent::ToolOutputCleared { .. }) {
+            if matches!(
+                ev,
+                AppEvent::Agent {
+                    event: AgentEvent::ToolOutputCleared { .. },
+                    ..
+                }
+            ) {
                 cleared_events += 1;
             }
         }
@@ -1696,7 +1757,13 @@ mod tests {
 
         while let Ok(ev) = event_rx.try_recv() {
             assert!(
-                !matches!(ev, AppEvent::ToolOutputCleared { .. }),
+                !matches!(
+                    ev,
+                    AppEvent::Agent {
+                        event: AgentEvent::ToolOutputCleared { .. },
+                        ..
+                    }
+                ),
                 "nothing was settled enough to clear"
             );
         }
@@ -1783,10 +1850,13 @@ mod tests {
         // The app needs the same edit applied to its own history.
         let mut cleared_event = None;
         while let Ok(ev) = event_rx.try_recv() {
-            if let AppEvent::ToolOutputCleared {
+            if let AppEvent::Agent {
                 conversation,
-                cleared,
-                freed_tokens,
+                event:
+                    AgentEvent::ToolOutputCleared {
+                        cleared,
+                        freed_tokens,
+                    },
             } = ev
             {
                 assert_eq!(conversation, cid);
@@ -1868,7 +1938,13 @@ mod tests {
         );
         while let Ok(ev) = event_rx.try_recv() {
             assert!(
-                !matches!(ev, AppEvent::ToolOutputCleared { .. }),
+                !matches!(
+                    ev,
+                    AppEvent::Agent {
+                        event: AgentEvent::ToolOutputCleared { .. },
+                        ..
+                    }
+                ),
                 "the app must not be told to clear what is only in memory"
             );
         }
@@ -1948,10 +2024,13 @@ mod tests {
 
         let mut reset_event = None;
         while let Ok(ev) = event_rx.try_recv() {
-            if let AppEvent::SessionReset {
+            if let AppEvent::Agent {
                 conversation,
-                before_tokens,
-                after_tokens,
+                event:
+                    AgentEvent::SessionReset {
+                        before_tokens,
+                        after_tokens,
+                    },
             } = ev
             {
                 assert_eq!(conversation, cid);
@@ -2029,7 +2108,11 @@ mod tests {
             assert!(
                 !matches!(
                     ev,
-                    AppEvent::SessionReset { .. } | AppEvent::ToolOutputCleared { .. }
+                    AppEvent::Agent {
+                        event: AgentEvent::SessionReset { .. }
+                            | AgentEvent::ToolOutputCleared { .. },
+                        ..
+                    }
                 ),
                 "nothing was reset or cleared, so nothing may be announced"
             );
@@ -2160,7 +2243,13 @@ mod tests {
 
         assert_eq!(fake.resets(), 0, "rung 2 is not for this provider");
         while let Ok(ev) = event_rx.try_recv() {
-            assert!(!matches!(ev, AppEvent::SessionReset { .. }));
+            assert!(!matches!(
+                ev,
+                AppEvent::Agent {
+                    event: AgentEvent::SessionReset { .. },
+                    ..
+                }
+            ));
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2212,7 +2301,11 @@ mod tests {
     fn reported_usage(event_rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> Option<u32> {
         let mut used_reported = None;
         while let Ok(ev) = event_rx.try_recv() {
-            if let AppEvent::ContextUsage { used, .. } = ev {
+            if let AppEvent::Agent {
+                event: AgentEvent::ContextUsage(used),
+                ..
+            } = ev
+            {
                 used_reported = Some(used);
             }
         }
@@ -2265,10 +2358,9 @@ mod tests {
         assert_eq!(fake.resets(), 1, "rung 2 acted on the provider's number");
         let mut reset_event = None;
         while let Ok(ev) = event_rx.try_recv() {
-            if let AppEvent::SessionReset {
+            if let AppEvent::Agent {
                 conversation,
-                before_tokens,
-                ..
+                event: AgentEvent::SessionReset { before_tokens, .. },
             } = ev
             {
                 assert_eq!(conversation, cid);

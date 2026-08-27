@@ -634,3 +634,19 @@ mod tests {
         assert!(entry.model.is_empty());
     }
 }
+
+impl crate::app::App {
+    /// Фоновая дозагрузка списков моделей. Тихо на успехе — это служебная
+    /// работа; отказ показываем строкой, иначе мёртвый эндпоинт молчит.
+    pub(crate) fn on_provider_models_refreshed(&mut self, summary: String, failed: usize) {
+        self.state.status_message = summary.clone();
+        if failed > 0 {
+            self.state
+                .focused_mut()
+                .messages
+                .push(crate::provider::ChatMessage::ui_system(&format!(
+                    "⚠ {summary}"
+                )));
+        }
+    }
+}

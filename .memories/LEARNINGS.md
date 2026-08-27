@@ -14,7 +14,8 @@
 
 - **`parent_message_id` desync = "evaporating messages".** DeepSeek's web session is a tree keyed by `parent_message_id`; a stale id silently forks onto an *invisible* branch — the UI shows the message but the web view (and the model's context) never sees it. An interrupted/errored stream was the trigger. Fix: incrementally persist `parent_message_id` and flush-on-error (`deepseek.rs`, commit `183712e`).
 - **Structural prevention**: give each `Conversation` its own forked provider (fresh `SessionState`). Concurrent turns then can't collide on shared `session_state`. `fork()` is the cornerstone that makes parallel sessions / sidechats / sub-agents safe.
-- **Event tagging is mandatory for concurrency**: agent events carry a `ConversationId`; `handle_event` routes non-focused ones to `handle_background_event`. Without the tag, a background turn's chunks would append to whatever's focused.
+- **Event tagging is mandatory for concurrency**: agent events carry a `ConversationId`; `handle_event` → `on_agent_event` → `app::reduce::apply` применяет их к нужной беседе. Without the tag, a background turn's chunks would append to whatever's focused.
+- **Одно и то же событие применялось в трёх местах** (фокус, фон, харнесс) и они успели разойтись; свели в `app/reduce.rs` 2026-08-27. Появится четвёртый потребитель — звать редьюсер, а не писать свой `match`.
 
 ## DEEPSEEK API  (full detail → `reference/PROVIDER.md`)
 

@@ -112,7 +112,7 @@ impl RunMetrics {
         }
 
         // Not every ending leaves an `agent.turn.*` marker: a provider error
-        // sends `AgentError` straight out without one, so a 429 or a dead
+        // sends `AgentEvent::Failed` straight out without one, so a 429 or a dead
         // endpoint would otherwise read as `unknown`. The driver's own
         // verdict fills the gap — no extra instrumentation in the agent loop,
         // which the harness is not allowed to touch.
