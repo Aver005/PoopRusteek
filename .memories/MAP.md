@@ -1,6 +1,6 @@
 # MAP
 > Codebase map — file → purpose. Navigation aid. (~15k LOC)
-> Last updated: 2026-08-25 (+ `src/harness/` and `sandbox/` — sizes approximate, anchor to names not lines)
+> Last updated: 2026-08-27 (+ `scripts/` и `.githooks/`; 2026-08-25 — `src/harness/` и `sandbox/`; размеры приблизительные, опираться на имена, не на строки)
 
 ## ENTRY / ROOT
 | File | Purpose | Lines |
@@ -176,6 +176,10 @@
 | `assets/prompts/` | base/tools/compact/goal-evaluator + persona & figma prompts |
 | `assets/sha3_wasm_bg.*.wasm` | DeepSeek PoW solver blob |
 | `.github/workflows/ci.yml` | CI: build+test on Windows and Linux, clippy advisory |
+| `.githooks/pre-commit` | Локальная проверка перед коммитом: `cargo fmt --check` + `clippy -D warnings` + тесты. Включается `git config core.hooksPath .githooks` |
+| `scripts/render-release-notes.sh` | Подстановка `{{VAR}}` в шаблон заметок к выпуску; общий для `.github/workflows/dev-release.yml` и `.gitlab-ci.yml`, чтобы оба конвейера давали одинаковый текст |
+| `scripts/dev-release.template.md` | Сам шаблон заметок катящегося `dev-build` |
+| `scripts/find-ai-marks.{sh,ps1}` | Поиск в последних N коммитах (по умолчанию 20) со-авторства и прочих следов ИИ-агентов: трейлеры `Co-authored-by`/`Generated-by`, адреса ИИ-сервисов, фразы о генерации, 🤖, ИИ-имена в `%an/%ae/%cn/%ce`. Две версии дают одинаковый вывод; коды возврата 0/1/2 (чисто / нашлось / ошибка запуска), так что годится и для проверки в конвейере |
 | `CLAUDE.md` | Repo-root bridge that points Claude Code at `.memories/INDEX.md` |
 | `.docs/` | Human docs (partly aspirational — trust code/`.memories` over it). `review-2026-08-26-rust.md`: full-codebase review, 20 findings, source of record for BUGS.md's open review items. `vision-local-image-understanding.md`: local image-understanding research/plan, Stage 0 done (see JOURNAL/2026-08-26.md). `context-compaction.md`: context-compaction research/plan (decided 2026-08-26; step 1/measurement shipped same day, rest not implemented), closes review #3/#4 — see `PLANS.md`/`BUGS.md` |
 
