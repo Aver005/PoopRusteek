@@ -211,9 +211,9 @@ fn with_args(args: &str, usage: &str, body: impl FnOnce(&str) -> CommandResult) 
 /// …) stay gated behind it; a failed write becomes the canonical
 /// "Failed to save config" error.
 fn save_config_then(config: &Config, then: impl FnOnce() -> CommandResult) -> CommandResult {
-    match crate::config::save(config) {
+    match crate::config::save_or_message(config) {
         Ok(()) => then(),
-        Err(e) => CommandResult::Error(format!("Failed to save config: {e}")),
+        Err(message) => CommandResult::Error(message),
     }
 }
 

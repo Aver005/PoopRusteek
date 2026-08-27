@@ -42,7 +42,7 @@ impl App {
                     return Ok(false);
                 }
                 self.config.active_provider = (!row.builtin).then(|| row.name.clone());
-                match crate::config::save(&self.config) {
+                match crate::config::save_or_message(&self.config) {
                     Ok(()) => {
                         self.rebuild_provider();
                         self.state.providers_view.status_message =
@@ -70,9 +70,8 @@ impl App {
                             self.request_models(None);
                         }
                     }
-                    Err(error) => {
-                        self.state.providers_view.status_message =
-                            format!("Failed to save config: {error}");
+                    Err(message) => {
+                        self.state.providers_view.status_message = message;
                     }
                 }
             }
@@ -91,7 +90,7 @@ impl App {
                 if was_active {
                     self.config.active_provider = None;
                 }
-                match crate::config::save(&self.config) {
+                match crate::config::save_or_message(&self.config) {
                     Ok(()) => {
                         if was_active {
                             self.rebuild_provider();
@@ -105,9 +104,8 @@ impl App {
                             },
                         );
                     }
-                    Err(error) => {
-                        self.state.providers_view.status_message =
-                            format!("Failed to save config: {error}");
+                    Err(message) => {
+                        self.state.providers_view.status_message = message;
                     }
                 }
                 let max = provider_rows(&self.config).len().saturating_sub(1);
@@ -210,7 +208,7 @@ impl App {
                         Ok(entry) => {
                             let name = entry.name.clone();
                             self.config.providers.push(entry.clone());
-                            match crate::config::save(&self.config) {
+                            match crate::config::save_or_message(&self.config) {
                                 Ok(()) => {
                                     // Pull its model list right away so the
                                     // API catalog knows the new backend.
@@ -225,9 +223,9 @@ impl App {
                                         format!("{name} added — Enter to activate");
                                     return Ok(false);
                                 }
-                                Err(error) => {
+                                Err(message) => {
                                     self.config.providers.pop();
-                                    wizard.error = Some(format!("Failed to save config: {error}"));
+                                    wizard.error = Some(message);
                                 }
                             }
                         }

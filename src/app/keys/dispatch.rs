@@ -169,7 +169,7 @@ impl App {
                         Ok(entry) => {
                             let name = entry.name.clone();
                             self.config.providers.push(entry.clone());
-                            match crate::config::save(&self.config) {
+                            match crate::config::save_or_message(&self.config) {
                                 Ok(()) => {
                                     // Pull its model list right away so the
                                     // API catalog knows the new backend.
@@ -178,10 +178,9 @@ impl App {
                                         "Provider '{name}' added. Open /providers and press Enter on it to activate."
                                     ));
                                 }
-                                Err(error) => {
+                                Err(message) => {
                                     self.config.providers.pop();
-                                    self.state
-                                        .push_system(&format!("Failed to save config: {error}"));
+                                    self.state.push_system(&message);
                                 }
                             }
                         }
@@ -272,9 +271,8 @@ impl App {
             }
             RagAction::SetEnabled(on) => {
                 self.config.semantic.enabled = on;
-                if let Err(e) = crate::config::save(&self.config) {
-                    self.state
-                        .push_system(&format!("Failed to save config: {e}"));
+                if let Err(message) = crate::config::save_or_message(&self.config) {
+                    self.state.push_system(&message);
                     return;
                 }
                 self.semantic.set_enabled(on);
@@ -322,9 +320,8 @@ impl App {
             }
             RagAction::SetLimit(limit) => {
                 self.config.semantic.rag_limit = limit;
-                if let Err(e) = crate::config::save(&self.config) {
-                    self.state
-                        .push_system(&format!("Failed to save config: {e}"));
+                if let Err(message) = crate::config::save_or_message(&self.config) {
+                    self.state.push_system(&message);
                     return;
                 }
                 let resolved = self.semantic.set_embed_batch(limit);
@@ -373,9 +370,8 @@ impl App {
             }
             UpdateAction::SetAuto(on) => {
                 self.config.update.auto = on;
-                if let Err(e) = crate::config::save(&self.config) {
-                    self.state
-                        .push_system(&format!("Failed to save config: {e}"));
+                if let Err(message) = crate::config::save_or_message(&self.config) {
+                    self.state.push_system(&message);
                     return;
                 }
                 self.state.push_system(if on {

@@ -110,10 +110,7 @@ impl DeepseekProvider {
     ) -> AppResult<(Response, String)> {
         let (system_prompt, non_system_messages) = prompt::split_system_prompt(&request.messages);
         let should_reset = {
-            let state = self
-                .session_state
-                .lock()
-                .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+            let state = self.session()?;
             state.system_sent_for_session
                 && prompt::is_first_conversational_send(&non_system_messages)
         };
@@ -207,20 +204,9 @@ impl DeepseekProvider {
             };
             if role == Role::User || role == Role::Assistant {
                 messages.push(ChatMessage {
-                    role,
-                    content,
-                    name: None,
-                    tool_call_id: None,
-                    display_content: None,
-                    tool_error: false,
-                    ui_only: false,
+                    // Метки времени в этом ответе нет — оставляем пустой.
                     created_at: String::new(),
-                    total_tokens: None,
-                    model: String::new(),
-                    status: None,
-                    think_elapsed_secs: 0.0,
-                    references_count: 0,
-                    search_triggered: false,
+                    ..ChatMessage::new(role, &content)
                 });
             }
         }

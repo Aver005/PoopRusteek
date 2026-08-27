@@ -103,6 +103,15 @@ fn decode_utf16(bytes: &[u8], encoding: Utf16) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// Байтовое смещение `char_pos`-го символа, или длина строки, если он за
+/// концом. Единственный способ получить индекс для вставки (инвариант 4).
+pub fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
 /// Truncate to `max_bytes` with an ellipsis suffix, char-boundary safe.
 pub fn truncate_with_ellipsis(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {

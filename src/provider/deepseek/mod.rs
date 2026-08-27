@@ -46,6 +46,14 @@ pub struct DeepseekProvider {
 }
 
 impl DeepseekProvider {
+    /// Взять состояние сессии под замок. Отравленный замок — ошибка
+    /// провайдера, а не паника: семь мест повторяли это дословно.
+    fn session(&self) -> AppResult<std::sync::MutexGuard<'_, SessionState>> {
+        self.session_state
+            .lock()
+            .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))
+    }
+
     pub fn new(
         config: &ProviderConfig,
         rate_limit_ms: u64,
@@ -366,10 +374,7 @@ impl LLMProvider for DeepseekProvider {
     }
 
     async fn reset(&self) -> AppResult<()> {
-        let mut state = self
-            .session_state
-            .lock()
-            .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+        let mut state = self.session()?;
         *state = SessionState::default();
         Ok(())
     }
@@ -378,10 +383,7 @@ impl LLMProvider for DeepseekProvider {
         // Take the id and clear local state first — even if the delete call
         // fails, this instance must not keep threading onto the old session.
         let session_id = {
-            let mut state = self
-                .session_state
-                .lock()
-                .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+            let mut state = self.session()?;
             let id = state.session_id.take();
             *state = SessionState::default();
             id
@@ -422,10 +424,7 @@ impl LLMProvider for DeepseekProvider {
         session_id: &str,
         parent_message_id: Option<i64>,
     ) -> AppResult<()> {
-        let mut state = self
-            .session_state
-            .lock()
-            .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+        let mut state = self.session()?;
         state.session_id = Some(session_id.to_string());
         state.parent_message_id = parent_message_id;
         // The remote thread already has the system prompt/history from

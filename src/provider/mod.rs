@@ -119,9 +119,11 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl ChatMessage {
-    pub fn system(content: &str) -> Self {
+    /// Основа для всех конструкторов: роль и текст, остальное — по умолчанию.
+    /// Поля, которые ставит только один вызывающий, добавляются через `..`.
+    pub fn new(role: Role, content: &str) -> Self {
         Self {
-            role: Role::System,
+            role,
             content: content.to_string(),
             name: None,
             tool_call_id: None,
@@ -136,62 +138,24 @@ impl ChatMessage {
             references_count: 0,
             search_triggered: false,
         }
+    }
+
+    pub fn system(content: &str) -> Self {
+        Self::new(Role::System, content)
     }
 
     pub fn user(content: &str) -> Self {
-        Self {
-            role: Role::User,
-            content: content.to_string(),
-            name: None,
-            tool_call_id: None,
-            display_content: None,
-            tool_error: false,
-            ui_only: false,
-            created_at: now_rfc3339(),
-            total_tokens: None,
-            model: String::new(),
-            status: None,
-            think_elapsed_secs: 0.0,
-            references_count: 0,
-            search_triggered: false,
-        }
+        Self::new(Role::User, content)
     }
 
     pub fn assistant(content: &str) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: content.to_string(),
-            name: None,
-            tool_call_id: None,
-            display_content: None,
-            tool_error: false,
-            ui_only: false,
-            created_at: now_rfc3339(),
-            total_tokens: None,
-            model: String::new(),
-            status: None,
-            think_elapsed_secs: 0.0,
-            references_count: 0,
-            search_triggered: false,
-        }
+        Self::new(Role::Assistant, content)
     }
 
     pub fn tool(tool_call_id: &str, content: &str) -> Self {
         Self {
-            role: Role::Tool,
-            content: content.to_string(),
-            name: None,
             tool_call_id: Some(tool_call_id.to_string()),
-            display_content: None,
-            tool_error: false,
-            ui_only: false,
-            created_at: now_rfc3339(),
-            total_tokens: None,
-            model: String::new(),
-            status: None,
-            think_elapsed_secs: 0.0,
-            references_count: 0,
-            search_triggered: false,
+            ..Self::new(Role::Tool, content)
         }
     }
 
@@ -203,20 +167,11 @@ impl ChatMessage {
         is_error: bool,
     ) -> Self {
         Self {
-            role: Role::Tool,
-            content: content.to_string(),
             name: Some(tool_name.to_string()),
             tool_call_id: Some(tool_call_id.to_string()),
             display_content: Some(display.to_string()),
             tool_error: is_error,
-            ui_only: false,
-            created_at: now_rfc3339(),
-            total_tokens: None,
-            model: String::new(),
-            status: None,
-            think_elapsed_secs: 0.0,
-            references_count: 0,
-            search_triggered: false,
+            ..Self::new(Role::Tool, content)
         }
     }
 

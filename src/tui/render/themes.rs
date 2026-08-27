@@ -5,7 +5,8 @@
 //! showcases the roles that don't appear in the surrounding chrome (message
 //! backgrounds, status colors, selection, the full swatch board).
 
-use super::popup::push_text_box_lines;
+use super::chrome::{panel_footer, panel_frame};
+use super::popup::{option_row, push_text_box_lines};
 use crate::app::list::{ListWindow, NAV_HINT, rows as list_rows};
 use crate::app::themes::{
     ThemeRowKind, ThemeWizardState, ThemeWizardStep, ThemesViewState, theme_rows,
@@ -13,7 +14,7 @@ use crate::app::themes::{
 use crate::config::Config;
 use crate::tui::theme::{PRESETS, ROLES, Theme};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -25,42 +26,19 @@ pub(super) fn render_themes_view(
     config: &Config,
     theme: &Theme,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    // Header
-    let header = Block::default()
-        .borders(Borders::ALL)
-        .title(" Themes ")
-        .border_style(Style::default().fg(theme.accent));
-    let header_inner = header.inner(chunks[0]);
-    frame.render_widget(header, chunks[0]);
     let subtitle = if view.wizard.is_some() {
         "Create your own theme — every keystroke restyles the whole app live"
     } else {
         "Pick a look — moving the cursor previews it live, Enter makes it stick"
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            subtitle,
-            Style::default().fg(theme.text_dim),
-        )))
-        .alignment(Alignment::Center),
-        header_inner,
-    );
+    let (body_area, footer_area) = panel_frame(frame, area, " Themes ", subtitle, theme);
 
     // Body: gallery / wizard on the left, preview pane on the right.
-    let left_w = 46u16.min(chunks[1].width / 2).max(24);
+    let left_w = 46u16.min(body_area.width / 2).max(24);
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_w), Constraint::Min(20)])
-        .split(chunks[1]);
+        .split(body_area);
 
     match &view.wizard {
         Some(wizard) => render_wizard_panel(frame, body[0], wizard, theme),
@@ -68,12 +46,6 @@ pub(super) fn render_themes_view(
     }
     render_preview_panel(frame, body[1], view, theme);
 
-    // Footer with keybindings.
-    let footer = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
-    let footer_inner = footer.inner(chunks[2]);
-    frame.render_widget(footer, chunks[2]);
     let hint = match &view.wizard {
         None => format!("  {NAV_HINT} preview  Enter apply  n new  e edit  d delete  Esc/q back  "),
         Some(wizard) => match wizard.step {
@@ -85,14 +57,7 @@ pub(super) fn render_themes_view(
             ThemeWizardStep::Name => "  Enter next  Esc cancel  ".to_string(),
         },
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme.text_dim),
-        )))
-        .alignment(Alignment::Center),
-        footer_inner,
-    );
+    panel_footer(frame, footer_area, hint, theme);
 }
 
 fn render_theme_list(
@@ -215,27 +180,7 @@ fn render_wizard_panel(frame: &mut Frame, area: Rect, wizard: &ThemeWizardState,
             )));
             lines.push(Line::from(""));
             for (i, preset) in PRESETS.iter().enumerate() {
-                let is_cursor = i == wizard.base_selected;
-                let indicator = if is_cursor { "▶ " } else { "  " };
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
-                        indicator,
-                        Style::default().fg(if is_cursor {
-                            theme.accent
-                        } else {
-                            theme.text_dim
-                        }),
-                    ),
-                    Span::styled(
-                        preset.label,
-                        if is_cursor {
-                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(theme.text_soft)
-                        },
-                    ),
-                ]));
+                lines.push(option_row(preset.label, i == wizard.base_selected, theme));
             }
         }
         ThemeWizardStep::Color(index) => {

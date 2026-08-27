@@ -101,10 +101,54 @@ pub fn is_notification_or_request(value: &Value) -> bool {
     value.get("method").is_some()
 }
 
+/// Снять из буфера первый целый SSE-кадр и склеить его строки `data:`.
+/// `None` — целого кадра ещё нет. Пустая строка — кадр без данных, вызывающий
+/// такой пропускает: `serde_json` на нём всё равно споткнётся.
+pub fn take_sse_frame(buffer: &mut String) -> Option<String> {
+    let event_end = buffer.find("\n\n")?;
+    let event = buffer[..event_end].to_string();
+    *buffer = buffer[event_end + 2..].to_string();
+
+    let mut data_lines: Vec<String> = Vec::new();
+    for line in event.lines() {
+        if let Some(d) = line.strip_prefix("data: ") {
+            data_lines.push(d.to_string());
+        } else if line.trim() == "data:" {
+            data_lines.push(String::new());
+        }
+    }
+    Some(data_lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn take_sse_frame_needs_a_blank_line_to_close_the_frame() {
+        let mut buffer = "data: {\"a\":1}".to_string();
+        assert_eq!(take_sse_frame(&mut buffer), None);
+        assert_eq!(buffer, "data: {\"a\":1}", "неполный кадр остаётся в буфере");
+    }
+
+    #[test]
+    fn take_sse_frame_joins_multiline_data_and_consumes_the_frame() {
+        let mut buffer = "event: message\ndata: {\"a\":1,\ndata: \"b\":2}\n\nrest".to_string();
+        assert_eq!(
+            take_sse_frame(&mut buffer).as_deref(),
+            Some("{\"a\":1,\n\"b\":2}"),
+            "строки data: склеиваются, прочие поля кадра отбрасываются"
+        );
+        assert_eq!(buffer, "rest");
+    }
+
+    #[test]
+    fn take_sse_frame_returns_empty_for_a_frame_without_data() {
+        let mut buffer = ": keep-alive\n\n".to_string();
+        assert_eq!(take_sse_frame(&mut buffer).as_deref(), Some(""));
+        assert_eq!(buffer, "");
+    }
 
     #[test]
     fn ids_match_numeric_equal() {

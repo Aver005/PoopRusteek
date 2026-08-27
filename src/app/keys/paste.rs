@@ -53,12 +53,8 @@ impl App {
                 }
                 Modal::Question(qs) if qs.is_custom_mode => {
                     let clean = sanitize(&text, false);
-                    let byte_pos = qs
-                        .custom_input
-                        .char_indices()
-                        .nth(qs.custom_cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(qs.custom_input.len());
+                    let byte_pos =
+                        crate::util::char_to_byte_pos(&qs.custom_input, qs.custom_cursor);
                     qs.custom_input.insert_str(byte_pos, &clean);
                     qs.custom_cursor += clean.chars().count();
                 }

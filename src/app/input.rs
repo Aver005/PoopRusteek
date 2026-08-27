@@ -8,6 +8,8 @@
 //! bug-prone parts (byte/char offset juggling, word boundaries, selection
 //! deletion) are testable in isolation.
 
+use crate::util::char_to_byte_pos;
+
 /// A multi-line paste collapsed to a compact placeholder chip in the buffer.
 /// The chip keeps the prompt readable; the real text is restored by
 /// [`InputState::expanded`] at submit time.
@@ -258,15 +260,6 @@ impl InputState {
         self.selection_anchor = None;
         self.pastes.clear();
     }
-}
-
-/// Byte offset of the `char_pos`-th character, or the string's length if
-/// `char_pos` is past the end.
-pub fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
-    s.char_indices()
-        .nth(char_pos)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
 }
 
 fn char_is_word(ch: char) -> bool {

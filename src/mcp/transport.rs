@@ -6,7 +6,9 @@
 //! response on the same stream (see `send_request` on `StdioTransport` and
 //! `parse_sse_stream`/`parse_sse_fallback` on `SseTransport`).
 
-use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse, ids_match, is_notification_or_request};
+use super::jsonrpc::{
+    JsonRpcRequest, JsonRpcResponse, ids_match, is_notification_or_request, take_sse_frame,
+};
 use crate::error::AppResult;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -479,25 +481,7 @@ impl SseTransport {
             let chunk = chunk?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            while let Some(event_end) = buffer.find("\n\n") {
-                let event_str = buffer[..event_end].to_string();
-                buffer = buffer[event_end + 2..].to_string();
-
-                let mut data_lines: Vec<String> = Vec::new();
-                for line in event_str.lines() {
-                    if let Some(d) = line.strip_prefix("data: ") {
-                        data_lines.push(d.to_string());
-                    } else if line.trim() == "data:" {
-                        data_lines.push(String::new());
-                    }
-                }
-
-                if data_lines.is_empty() {
-                    continue;
-                }
-
-                let json_str = data_lines.join("\n");
-
+            while let Some(json_str) = take_sse_frame(&mut buffer) {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
                     continue;
                 };
@@ -640,25 +624,7 @@ impl SseTransport {
     ) -> AppResult<JsonRpcResponse> {
         let mut buffer = body.to_string();
 
-        while let Some(event_end) = buffer.find("\n\n") {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
-
-            let mut data_lines: Vec<String> = Vec::new();
-            for line in event_str.lines() {
-                if let Some(d) = line.strip_prefix("data: ") {
-                    data_lines.push(d.to_string());
-                } else if line.trim() == "data:" {
-                    data_lines.push(String::new());
-                }
-            }
-
-            if data_lines.is_empty() {
-                continue;
-            }
-
-            let json_str = data_lines.join("\n");
-
+        while let Some(json_str) = take_sse_frame(&mut buffer) {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
                 continue;
             };

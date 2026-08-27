@@ -10,6 +10,7 @@
 //! new code may import from here directly.
 
 use crate::app::list::{ListCursor, ListNav};
+use crate::util::char_to_byte_pos;
 use std::collections::HashSet;
 
 /// Высота списка в модалке. Совпадает с тем, что рисует `render_picker` /
@@ -62,13 +63,8 @@ impl OnboardingState {
     /// Insert a char at the cursor position, advancing the cursor.
     pub fn insert(&mut self, ch: char) {
         self.error = None;
-        let byte_pos = self
-            .input
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len());
-        self.input.insert(byte_pos, ch);
+        self.input
+            .insert(char_to_byte_pos(&self.input, self.cursor), ch);
         self.cursor += 1;
     }
 
@@ -79,13 +75,8 @@ impl OnboardingState {
             return;
         }
         self.cursor -= 1;
-        let byte_pos = self
-            .input
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len());
-        self.input.remove(byte_pos);
+        self.input
+            .remove(char_to_byte_pos(&self.input, self.cursor));
     }
 
     /// Toggle the model selector between deepseek-chat and deepseek-reasoner.
@@ -792,23 +783,13 @@ pub fn handle_question_key(
                     crossterm::event::KeyCode::Backspace => {
                         if qs.custom_cursor > 0 {
                             qs.custom_cursor -= 1;
-                            let byte_pos = qs
-                                .custom_input
-                                .char_indices()
-                                .nth(qs.custom_cursor)
-                                .map(|(i, _)| i)
-                                .unwrap_or(qs.custom_input.len());
+                            let byte_pos = char_to_byte_pos(&qs.custom_input, qs.custom_cursor);
                             qs.custom_input.remove(byte_pos);
                         }
                         None
                     }
                     crossterm::event::KeyCode::Delete => {
-                        let byte_pos = qs
-                            .custom_input
-                            .char_indices()
-                            .nth(qs.custom_cursor)
-                            .map(|(i, _)| i)
-                            .unwrap_or(qs.custom_input.len());
+                        let byte_pos = char_to_byte_pos(&qs.custom_input, qs.custom_cursor);
                         if byte_pos < qs.custom_input.len() {
                             qs.custom_input.remove(byte_pos);
                         }
@@ -832,12 +813,7 @@ pub fn handle_question_key(
                         None
                     }
                     crossterm::event::KeyCode::Char(c) => {
-                        let byte_pos = qs
-                            .custom_input
-                            .char_indices()
-                            .nth(qs.custom_cursor)
-                            .map(|(i, _)| i)
-                            .unwrap_or(qs.custom_input.len());
+                        let byte_pos = char_to_byte_pos(&qs.custom_input, qs.custom_cursor);
                         qs.custom_input.insert(byte_pos, c);
                         qs.custom_cursor += 1;
                         None

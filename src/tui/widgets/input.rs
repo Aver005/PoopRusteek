@@ -1,6 +1,6 @@
 use crate::app::AppState;
-use crate::app::input::char_to_byte_pos;
 use crate::tui::theme::Theme;
+use crate::util::char_to_byte_pos;
 use ratatui::{
     Frame,
     layout::Rect,

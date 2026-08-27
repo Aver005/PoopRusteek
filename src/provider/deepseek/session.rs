@@ -82,10 +82,7 @@ impl DeepseekProvider {
 
     pub(super) async fn ensure_session(&self, should_reset: bool) -> AppResult<SessionSnapshot> {
         {
-            let state = self
-                .session_state
-                .lock()
-                .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+            let state = self.session()?;
 
             if !should_reset && let Some(session_id) = &state.session_id {
                 return Ok(SessionSnapshot {
@@ -97,10 +94,7 @@ impl DeepseekProvider {
         }
 
         let session_id = self.create_session().await?;
-        let mut state = self
-            .session_state
-            .lock()
-            .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+        let mut state = self.session()?;
         state.session_id = Some(session_id.clone());
         state.parent_message_id = None;
         state.system_sent_for_session = false;
@@ -142,10 +136,7 @@ impl DeepseekProvider {
         session_id: &str,
         parent_message_id: Option<i64>,
     ) -> AppResult<()> {
-        let mut state = self
-            .session_state
-            .lock()
-            .map_err(|_| AppError::Provider("Session state lock poisoned".to_string()))?;
+        let mut state = self.session()?;
 
         if state.session_id.as_deref() == Some(session_id) {
             state.system_sent_for_session = true;

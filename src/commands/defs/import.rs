@@ -100,20 +100,10 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
                     .clone()
                     .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
                 messages.push(ChatMessage {
-                    role,
-                    content: current_content.trim().to_string(),
                     name: current_name.take(),
                     tool_call_id: current_tool_call_id.take(),
-                    display_content: None,
-                    tool_error: false,
-                    ui_only: false,
                     created_at,
-                    total_tokens: None,
-                    model: String::new(),
-                    status: None,
-                    think_elapsed_secs: 0.0,
-                    references_count: 0,
-                    search_triggered: false,
+                    ..ChatMessage::new(role, current_content.trim())
                 });
                 current_content.clear();
                 current_created_at = None;
@@ -150,20 +140,10 @@ fn parse_markdown_export(content: &str) -> Result<Vec<ChatMessage>, String> {
     if let Some(role) = current_role {
         let created_at = current_created_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         messages.push(ChatMessage {
-            role,
-            content: current_content.trim().to_string(),
             name: current_name.take(),
             tool_call_id: current_tool_call_id.take(),
-            display_content: None,
-            tool_error: false,
-            ui_only: false,
             created_at,
-            total_tokens: None,
-            model: String::new(),
-            status: None,
-            think_elapsed_secs: 0.0,
-            references_count: 0,
-            search_triggered: false,
+            ..ChatMessage::new(role, current_content.trim())
         });
     }
 

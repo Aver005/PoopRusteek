@@ -65,6 +65,27 @@ impl AcpServer {
         Ok(())
     }
 
+    /// Успешный ответ на запрос `id`, либо внутренняя ошибка, если результат
+    /// не сериализуется. Два обработчика повторяли это дословно.
+    fn reply(id: Option<u64>, result: impl serde::Serialize) -> Option<AcpResponse> {
+        let (result, error) = match serde_json::to_value(result) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (
+                None,
+                Some(AcpError {
+                    code: -32603,
+                    message: format!("Internal error: {e}"),
+                }),
+            ),
+        };
+        Some(AcpResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result,
+            error,
+        })
+    }
+
     fn handle_request(&mut self, request: AcpRequest) -> Option<AcpResponse> {
         match request.method.as_str() {
             "initialize" => {
@@ -77,26 +98,7 @@ impl AcpServer {
                         "prompt": true,
                     }),
                 };
-                let result_value = match serde_json::to_value(result) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Some(AcpResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: None,
-                            error: Some(AcpError {
-                                code: -32603,
-                                message: format!("Internal error: {e}"),
-                            }),
-                        });
-                    }
-                };
-                Some(AcpResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: Some(result_value),
-                    error: None,
-                })
+                Self::reply(request.id, result)
             }
             "initialized" => None,
             "prompt" => {
@@ -115,33 +117,9 @@ impl AcpServer {
                     tokio::runtime::Handle::current().block_on(self.handle_prompt(&params))
                 });
 
-                let result_value = match serde_json::to_value(result) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Some(AcpResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: None,
-                            error: Some(AcpError {
-                                code: -32603,
-                                message: format!("Internal error: {e}"),
-                            }),
-                        });
-                    }
-                };
-                Some(AcpResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: Some(result_value),
-                    error: None,
-                })
+                Self::reply(request.id, result)
             }
-            "ping" => Some(AcpResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: Some(serde_json::json!({})),
-                error: None,
-            }),
+            "ping" => Self::reply(request.id, serde_json::json!({})),
             _ => Some(AcpResponse {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,

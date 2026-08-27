@@ -8,6 +8,7 @@
 //! - [`status`], [`landing`], [`onboarding`], [`mcp`], [`modals`] — the
 //!   actual views; [`render`] below only dispatches between them.
 
+mod chrome;
 mod landing;
 mod mcp;
 mod modals;

@@ -161,7 +161,7 @@
   ×7 in `handle_event` → one `announce()` helper.
 - `[DONE 2026-07-15 — shared `spawn_mcp_semantic_refresh`; the startup copy stays, it also signals `McpInitialized`]` mcp+semantic corpus-refresh spawn block ×3 (app/mod.rs ×2,
   keys/dispatch.rs RAG reload).
-- `[REPORTED]` config save-or-rollback ("mutate → save → on Err roll back +
+- `[DONE 2026-08-27 — `config::save_or_message`; grown to 16 sites by then, the message literal now lives once]` config save-or-rollback ("mutate → save → on Err roll back +
   format!(\"Failed to save config: {e}\")") ×10 across app/providers.rs,
   keys/themes.rs, keys/providers.rs, keys/dispatch.rs — the 2026-07-04
   `save_config_then` helper covered only `commands/defs/`.
@@ -186,10 +186,19 @@
 - `[FIXED 2026-07-15 — reuses `popup::push_text_box_lines`]` `render_question` custom-input mode hand-rolls single-line
   cursor rendering (and doesn't split `'\n'` — a paste renders glued) while
   `popup::push_text_box_lines` is already imported and used in the same file.
-- `[REPORTED]` "selectable option list" loop ×4 (modals ×2, themes, providers)
+- `[PARTLY DONE 2026-08-27]` "selectable option list" loop ×4 (modals ×2, themes, providers)
   → `popup::push_option_list`; `GoalStage`→label match ×3 (status.rs ×2,
   landing.rs) → one helper next to the enum; selected-row background drawn
   from 3 different theme roles across 7 list renderers (drift, not tiers).
+  Done: the no-background wizard-option family → `popup::option_row` + a
+  single `popup::CURSOR_MARK` (4 sites: mcp ×2, providers, themes — the count
+  above named modals ×2 instead, those are the *with-background* family). Also
+  done: the popup tail → `popup::draw_popup` (7 sites) and the full-screen
+  panel chrome → new `render/chrome.rs` (`panel_frame`/`panel_footer`, 3 sites).
+  Still open: the with-background row family (`render_delete_sessions`,
+  `render_picker`, `render_question`), the 3-theme-role background drift, the
+  `GoalStage` label match, and five remaining cursor-marker spellings in two
+  different glyphs. See `JOURNAL/2026-08-27-duplication.md`.
 - `[FIXED 2026-07-15 — truncate now measures display cells; the wider 4-helper consolidation remains open]` `render/util.rs::truncate` measures `.chars().count()` while
   its neighbor `fit_col` correctly measures display columns — emoji/CJK
   under-truncate and misalign fixed-width tables (Cyrillic is width-1, safe).
@@ -207,7 +216,7 @@
 - `[REPORTED]` `goal-evaluator.prompt.md` embedded twice: fixed evaluator
   prompt (prompts.rs, used by goal.rs) AND a user-toggleable builtin skill
   (discovery.rs) — the file's own exclusion rationale for base/tools applies.
-- `[REPORTED]` `session.rs::save_session` re-implements `save_local`'s body;
+- `[PARTLY DONE 2026-08-27 — import.rs: the duplicated 15-field `ChatMessage` literal is gone (`ChatMessage::new` + `..`); its surrounding flush logic is still ×2. Everything else here still open.]` `session.rs::save_session` re-implements `save_local`'s body;
   import.rs flush block ×2; tool_search/history_search identical
   limit-clamp consts; background kill-dispatch ×4 + capture-initial-output ×2
   (spawn.rs); shell.rs `capped_pipe_reader` vs spawn.rs `pipe_reader_loop` —

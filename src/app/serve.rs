@@ -26,10 +26,9 @@ impl App {
             ServeAction::SetPort(port) => {
                 let previous = self.config.server.port;
                 self.config.server.port = port;
-                if let Err(error) = crate::config::save(&self.config) {
+                if let Err(message) = crate::config::save_or_message(&self.config) {
                     self.config.server.port = previous;
-                    self.state
-                        .push_system(&format!("Failed to save config: {error}"));
+                    self.state.push_system(&message);
                     return;
                 }
                 if self.server.is_some() {
@@ -51,10 +50,9 @@ impl App {
                 }
                 let previous = self.config.server.api;
                 self.config.server.api = api;
-                if let Err(error) = crate::config::save(&self.config) {
+                if let Err(message) = crate::config::save_or_message(&self.config) {
                     self.config.server.api = previous;
-                    self.state
-                        .push_system(&format!("Failed to save config: {error}"));
+                    self.state.push_system(&message);
                     return;
                 }
                 if self.server.is_some() {

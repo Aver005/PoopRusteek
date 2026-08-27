@@ -1,66 +1,43 @@
 //! MCP-related screens: the full-screen server-management view
 //! (`View::Mcp`, list + details) and the `/mcp add` modal.
 
+use super::chrome::{panel_footer, panel_frame};
 use super::popup::{
-    center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
+    center_popup, draw_popup, fill_panel_space, modal_block, option_row, push_text_box_lines,
+    separator_line,
 };
 use crate::app::list::{ListWindow, NAV_HINT};
 use crate::mcp::types::McpViewState;
 use crate::tui::theme::Theme;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    // Header
-    let header = Block::default()
-        .borders(Borders::ALL)
-        .title(if mcp.auth_mode {
+    let (body_area, footer_area) = panel_frame(
+        frame,
+        area,
+        if mcp.auth_mode {
             " MCP Authorization "
         } else {
             " MCP Server Management "
-        })
-        .border_style(Style::default().fg(theme.accent));
-    let header_inner = header.inner(chunks[0]);
-    frame.render_widget(header, chunks[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            if mcp.auth_mode {
-                "Servers requiring authorization — Enter to authorize"
-            } else {
-                "Manage your MCP servers — toggle, reconnect, or remove"
-            },
-            Style::default().fg(theme.text_dim),
-        )))
-        .alignment(Alignment::Center),
-        header_inner,
+        },
+        if mcp.auth_mode {
+            "Servers requiring authorization — Enter to authorize"
+        } else {
+            "Manage your MCP servers — toggle, reconnect, or remove"
+        },
+        theme,
     );
 
-    // Body
-    let body_area = chunks[1];
     if let Some(detail_name) = &mcp.details_server {
         render_mcp_details(frame, body_area, mcp, detail_name, theme);
     } else {
         render_mcp_list(frame, body_area, mcp, theme);
     }
 
-    // Footer with keybindings. Block first, hints into its inner row — the
-    // old order painted the hint text onto the border row and the block's
-    // top border then overdrew it, leaving the legend invisible.
-    let footer = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
     let hints = if mcp.auth_mode {
         format!("  {NAV_HINT} navigate  Enter authorize  Esc/q back  ")
     } else if mcp.details_server.is_some() {
@@ -70,16 +47,7 @@ pub(super) fn render_mcp_view(frame: &mut Frame, area: Rect, mcp: &McpViewState,
             "  {NAV_HINT} navigate  Space toggle  r reconnect  d remove  Enter details  Esc/q back  "
         )
     };
-    let footer_inner = footer.inner(chunks[2]);
-    frame.render_widget(footer, chunks[2]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hints,
-            Style::default().fg(theme.text_dim),
-        )))
-        .alignment(Alignment::Center),
-        footer_inner,
-    );
+    panel_footer(frame, footer_area, hints, theme);
 }
 
 fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Theme) {
@@ -301,27 +269,7 @@ pub(super) fn render_mcp_add(
                 .iter()
                 .enumerate()
             {
-                let is_cursor = i == *selected;
-                let indicator = if is_cursor { "\u{25B6} " } else { "  " };
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default().fg(theme.fg)),
-                    Span::styled(
-                        indicator,
-                        Style::default().fg(if is_cursor {
-                            theme.accent
-                        } else {
-                            theme.text_dim
-                        }),
-                    ),
-                    Span::styled(
-                        opt.to_string(),
-                        if is_cursor {
-                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(theme.text_soft)
-                        },
-                    ),
-                ]));
+                lines.push(option_row(opt.to_string(), i == *selected, theme));
             }
             " \u{2191}\u{2193} navigate    Enter select    Esc cancel "
         }
@@ -383,27 +331,11 @@ pub(super) fn render_mcp_add(
                 ),
                 WizardStep::Transport => {
                     for (i, choice) in TransportChoice::ALL.iter().enumerate() {
-                        let is_cursor = i == wiz.transport_selected;
-                        let indicator = if is_cursor { "\u{25B6} " } else { "  " };
-                        lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default().fg(theme.fg)),
-                            Span::styled(
-                                indicator,
-                                Style::default().fg(if is_cursor {
-                                    theme.accent
-                                } else {
-                                    theme.text_dim
-                                }),
-                            ),
-                            Span::styled(
-                                choice.label(),
-                                if is_cursor {
-                                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(theme.text_soft)
-                                },
-                            ),
-                        ]));
+                        lines.push(option_row(
+                            choice.label(),
+                            i == wiz.transport_selected,
+                            theme,
+                        ));
                     }
                 }
                 WizardStep::Primary => push_text_box_lines(
@@ -470,10 +402,5 @@ pub(super) fn render_mcp_add(
         Style::default().fg(theme.text_dim),
     )));
 
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
-        inner,
-    );
+    draw_popup(frame, popup_area, inner, block, lines, theme);
 }

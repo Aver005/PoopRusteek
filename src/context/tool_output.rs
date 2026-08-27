@@ -1,3 +1,5 @@
+use crate::util::char_to_byte_pos;
+
 /// Share of the budget kept from the head. The tail carries the exit status,
 /// the error, the summary line — so it gets the rest. Roo's `truncateOutput`
 /// splits 20/80 for the same reason.
@@ -21,21 +23,13 @@ pub fn cap_tool_output(text: &str, limit_chars: usize) -> String {
     let tail_chars = limit_chars - head_chars;
     let dropped = total - limit_chars;
 
-    let head_end = char_offset(text, head_chars);
-    let tail_start = char_offset(text, total - tail_chars);
+    let head_end = char_to_byte_pos(text, head_chars);
+    let tail_start = char_to_byte_pos(text, total - tail_chars);
     format!(
         "{}\n[... {dropped} chars cut from the middle; the tool ran, only this text was trimmed ...]\n{}",
         &text[..head_end],
         &text[tail_start..]
     )
-}
-
-/// Byte offset of the `n`-th char. Never slices mid-character (invariant 4).
-fn char_offset(text: &str, n: usize) -> usize {
-    text.char_indices()
-        .nth(n)
-        .map(|(offset, _)| offset)
-        .unwrap_or(text.len())
 }
 
 #[cfg(test)]

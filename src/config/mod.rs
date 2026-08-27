@@ -883,6 +883,12 @@ pub fn load() -> AppResult<Config> {
     parse(&content).map_err(|e| AppError::Config(e.to_string()))
 }
 
+/// Сохранить настройки, а отказ вернуть готовым для показа текстом.
+/// Одна формулировка на все панели: копий было шестнадцать.
+pub fn save_or_message(config: &Config) -> Result<(), String> {
+    save(config).map_err(|error| format!("Failed to save config: {error}"))
+}
+
 pub fn save(config: &Config) -> AppResult<()> {
     let path = Config::path();
     if let Some(parent) = path.parent() {

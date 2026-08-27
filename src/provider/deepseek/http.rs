@@ -158,6 +158,17 @@ impl DeepseekProvider {
         Duration::from_millis(1000u64 << exp).min(Duration::from_secs(30))
     }
 
+    /// Отложить следующую попытку: счётчик вперёд, отступ от нового счётчика,
+    /// строка в журнал. Четыре ветки повтора делали это порознь, а порядок
+    /// «сначала счётчик, потом отступ» здесь важен.
+    async fn back_off(action: &str, attempt: &mut usize, max_attempts: usize, reason: &str) {
+        *attempt += 1;
+        let n = *attempt;
+        let capped = Self::retry_backoff(n);
+        tracing::warn!("{action} {reason}, retry {n}/{max_attempts} in {capped:?}");
+        sleep(capped).await;
+    }
+
     pub(super) async fn send_json_request(
         &self,
         action: &str,
@@ -199,12 +210,13 @@ impl DeepseekProvider {
                         return Ok(response);
                     }
 
-                    attempt += 1;
-                    let capped = Self::retry_backoff(attempt);
-                    tracing::warn!(
-                        "{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}"
-                    );
-                    sleep(capped).await;
+                    Self::back_off(
+                        action,
+                        &mut attempt,
+                        max_attempts,
+                        &format!("server error {status}"),
+                    )
+                    .await;
                 }
                 Err(error) => {
                     if attempt + 1 >= max_attempts {
@@ -214,12 +226,13 @@ impl DeepseekProvider {
                         );
                         return Err(AppError::Http(error));
                     }
-                    attempt += 1;
-                    let capped = Self::retry_backoff(attempt);
-                    tracing::warn!(
-                        "{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}"
-                    );
-                    sleep(capped).await;
+                    Self::back_off(
+                        action,
+                        &mut attempt,
+                        max_attempts,
+                        &format!("connection error: {error}"),
+                    )
+                    .await;
                 }
             }
         }
@@ -268,23 +281,25 @@ impl DeepseekProvider {
                         return Ok(response);
                     }
 
-                    attempt += 1;
-                    let capped = Self::retry_backoff(attempt);
-                    tracing::warn!(
-                        "{action} server error {status}, retry {attempt}/{max_attempts} in {capped:?}"
-                    );
-                    sleep(capped).await;
+                    Self::back_off(
+                        action,
+                        &mut attempt,
+                        max_attempts,
+                        &format!("server error {status}"),
+                    )
+                    .await;
                 }
                 Err(error) => {
                     if attempt + 1 >= max_attempts {
                         return Err(AppError::Http(error));
                     }
-                    attempt += 1;
-                    let capped = Self::retry_backoff(attempt);
-                    tracing::warn!(
-                        "{action} connection error: {error}, retry {attempt}/{max_attempts} in {capped:?}"
-                    );
-                    sleep(capped).await;
+                    Self::back_off(
+                        action,
+                        &mut attempt,
+                        max_attempts,
+                        &format!("connection error: {error}"),
+                    )
+                    .await;
                 }
             }
         }

@@ -4,7 +4,8 @@
 //! [`super::popup`].
 
 use super::popup::{
-    center_popup, fill_panel_space, modal_block, overflow_line, push_text_box_lines, separator_line,
+    center_popup, draw_popup, fill_panel_space, modal_block, overflow_line, push_text_box_lines,
+    separator_line,
 };
 use super::util::{highlight_json, truncate};
 use crate::app::AppState;
@@ -166,12 +167,7 @@ fn render_tool_approval(
         Span::styled(" scroll", Style::default().fg(theme.text_dim)),
     ]));
 
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-    frame.render_widget(
-        Paragraph::new(all_lines).style(Style::default().bg(theme.panel)),
-        inner,
-    );
+    draw_popup(frame, popup_area, inner, block, all_lines, theme);
 }
 
 fn render_delete_sessions(
@@ -220,12 +216,7 @@ fn render_delete_sessions(
             )),
         ];
 
-        frame.render_widget(Clear, popup_area);
-        frame.render_widget(block, popup_area);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(theme.panel)),
-            inner,
-        );
+        draw_popup(frame, popup_area, inner, block, lines, theme);
         return;
     }
 
@@ -355,12 +346,7 @@ fn render_delete_sessions(
         Style::default().fg(theme.text_dim).bg(theme.panel),
     )));
 
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
-        inner,
-    );
+    draw_popup(frame, popup_area, inner, block, lines, theme);
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, cs: &ConfirmState, theme: &Theme) {
@@ -403,12 +389,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, cs: &ConfirmState, theme: &Them
         Style::default().fg(theme.text_dim),
     )));
 
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
-        inner,
-    );
+    draw_popup(frame, popup_area, inner, block, lines, theme);
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Theme) {
@@ -541,12 +522,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         Span::styled(hints, Style::default().fg(theme.text_dim)),
     ]));
 
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
-        inner,
-    );
+    draw_popup(frame, popup_area, inner, block, lines, theme);
 }
 
 fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Theme) {
@@ -715,12 +691,7 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
         ]));
     }
 
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
-        inner,
-    );
+    draw_popup(frame, popup_area, inner, block, lines, theme);
 }
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;

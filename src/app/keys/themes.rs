@@ -98,7 +98,7 @@ impl App {
                 if was_active {
                     self.config.ui.theme = "default".to_string();
                 }
-                match crate::config::save(&self.config) {
+                match crate::config::save_or_message(&self.config) {
                     Ok(()) => {
                         self.state.themes.status_message = format!(
                             "{name} deleted{}",
@@ -109,9 +109,8 @@ impl App {
                             },
                         );
                     }
-                    Err(error) => {
-                        self.state.themes.status_message =
-                            format!("Failed to save config: {error}");
+                    Err(message) => {
+                        self.state.themes.status_message = message;
                     }
                 }
                 let max = theme_rows(&self.config).len().saturating_sub(1);
@@ -125,9 +124,9 @@ impl App {
     /// Persist `name` as the active theme; the next frame renders with it.
     pub(crate) fn apply_theme(&mut self, name: &str) {
         self.config.ui.theme = name.to_string();
-        self.state.themes.status_message = match crate::config::save(&self.config) {
+        self.state.themes.status_message = match crate::config::save_or_message(&self.config) {
             Ok(()) => format!("{name} is now active"),
-            Err(error) => format!("Failed to save config: {error}"),
+            Err(message) => message,
         };
     }
 
@@ -252,7 +251,7 @@ impl App {
         };
         self.config.ui.theme = name.clone();
 
-        if let Err(error) = crate::config::save(&self.config) {
+        if let Err(message) = crate::config::save_or_message(&self.config) {
             // Roll back so a failed write doesn't leave a phantom theme
             // active in memory.
             self.config.ui.theme = previous_active;
@@ -264,7 +263,7 @@ impl App {
                     .custom_themes
                     .retain(|theme| theme.name != name),
             }
-            return Err(format!("Failed to save config: {error}"));
+            return Err(message);
         }
 
         self.state.themes.wizard = None;

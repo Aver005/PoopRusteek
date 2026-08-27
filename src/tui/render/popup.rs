@@ -55,6 +55,56 @@ pub(super) fn overflow_line(up: bool, theme: &Theme) -> Line<'static> {
     ))
 }
 
+/// Маркер курсора в списках вариантов. Один на все мастера: знак был записан
+/// тремя способами, а в автодополнении оказался вообще другим (U+25B8).
+pub(super) const CURSOR_MARK: &str = "\u{25B6} ";
+
+/// Строка варианта в мастере: маркер курсора плюс подпись, без фона.
+/// Четыре мастера рисовали её порознь и уже разошлись в стиле отбивки.
+pub(super) fn option_row(
+    label: impl Into<String>,
+    is_cursor: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ", Style::default().fg(theme.fg)),
+        Span::styled(
+            if is_cursor { CURSOR_MARK } else { "  " },
+            Style::default().fg(if is_cursor {
+                theme.accent
+            } else {
+                theme.text_dim
+            }),
+        ),
+        Span::styled(
+            label.into(),
+            if is_cursor {
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_soft)
+            },
+        ),
+    ])
+}
+
+/// Отрисовать собранную модалку: затереть площадку, рамку, содержимое.
+/// Одинаковый хвост стоял в семи отрисовщиках.
+pub(super) fn draw_popup(
+    frame: &mut ratatui::Frame,
+    popup_area: Rect,
+    inner: Rect,
+    block: Block<'static>,
+    lines: Vec<Line<'static>>,
+    theme: &Theme,
+) {
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(lines).style(Style::default().bg(theme.panel)),
+        inner,
+    );
+}
+
 /// Pad `lines` with blanks until it is `target_rows` long, so the footer
 /// lands on the popup's bottom rows. The popup paragraph's own panel-bg
 /// style paints the padding.

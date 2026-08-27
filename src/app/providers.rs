@@ -373,10 +373,9 @@ impl crate::app::App {
             ProviderModelsAction::SetRefetch(ms) => {
                 let previous = self.config.provider_models.refetch_ms;
                 self.config.provider_models.refetch_ms = ms;
-                if let Err(error) = crate::config::save(&self.config) {
+                if let Err(message) = crate::config::save_or_message(&self.config) {
                     self.config.provider_models.refetch_ms = previous;
-                    self.state
-                        .push_system(&format!("Failed to save config: {error}"));
+                    self.state.push_system(&message);
                     return;
                 }
                 // New period counts from now, not from the last fire.
@@ -389,10 +388,9 @@ impl crate::app::App {
             ProviderModelsAction::SetCache(ms) => {
                 let previous = self.config.provider_models.cache_ms;
                 self.config.provider_models.cache_ms = ms;
-                if let Err(error) = crate::config::save(&self.config) {
+                if let Err(message) = crate::config::save_or_message(&self.config) {
                     self.config.provider_models.cache_ms = previous;
-                    self.state
-                        .push_system(&format!("Failed to save config: {error}"));
+                    self.state.push_system(&message);
                     return;
                 }
                 self.state.push_system(&match ms {
@@ -497,18 +495,17 @@ impl crate::app::App {
                 self.config.provider.model = model.to_string();
             }
         }
-        match crate::config::save(&self.config) {
+        match crate::config::save_or_message(&self.config) {
             Ok(()) => {
                 self.rebuild_provider();
                 self.state
                     .push_system(&format!("Model switched to {model}."));
             }
-            Err(error) => {
+            Err(message) => {
                 // The model changed in memory even though the save failed, so
                 // the window the old one reported no longer describes it.
                 self.invalidate_provider_context_window();
-                self.state
-                    .push_system(&format!("Failed to save config: {error}"));
+                self.state.push_system(&message);
             }
         }
     }

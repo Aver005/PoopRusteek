@@ -1,8 +1,10 @@
 //! The `/providers` management screen (list of the built-in DeepSeek
 //! provider + OpenAI-compatible entries) and the add-wizard modal.
 
+use super::chrome::{panel_footer, panel_frame};
 use super::popup::{
-    center_popup, fill_panel_space, modal_block, push_text_box_lines, separator_line,
+    center_popup, draw_popup, fill_panel_space, modal_block, option_row, push_text_box_lines,
+    separator_line,
 };
 use crate::app::list::{ListWindow, NAV_HINT};
 use crate::app::providers::{
@@ -11,10 +13,10 @@ use crate::app::providers::{
 use crate::config::Config;
 use crate::tui::theme::Theme;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 pub(super) fn render_providers_view(
     frame: &mut Frame,
@@ -23,34 +25,16 @@ pub(super) fn render_providers_view(
     config: &Config,
     theme: &Theme,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    // Header
-    let header = Block::default()
-        .borders(Borders::ALL)
-        .title(" Providers ")
-        .border_style(Style::default().fg(theme.accent));
-    let header_inner = header.inner(chunks[0]);
-    frame.render_widget(header, chunks[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "LLM backends — the built-in DeepSeek web client and OpenAI-compatible endpoints",
-            Style::default().fg(theme.text_dim),
-        )))
-        .alignment(Alignment::Center),
-        header_inner,
+    let (body, footer_area) = panel_frame(
+        frame,
+        area,
+        " Providers ",
+        "LLM backends — the built-in DeepSeek web client and OpenAI-compatible endpoints",
+        theme,
     );
 
     // Body: one row per provider.
     let rows = provider_rows(config);
-    let body = chunks[1];
     let window = ListWindow::anchored(view.selected, rows.len(), body.height as usize);
     for (slot, i) in window.range().enumerate() {
         let row = &rows[i];
@@ -108,21 +92,11 @@ pub(super) fn render_providers_view(
         );
     }
 
-    // Footer with keybindings. Block first, hints into its inner row — the
-    // other order paints the hint text onto the border row and the block's
-    // top border then overdraws it.
-    let footer = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
-    let footer_inner = footer.inner(chunks[2]);
-    frame.render_widget(footer, chunks[2]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {NAV_HINT} navigate  Enter/Space activate  a add  d remove  Esc/q back  "),
-            Style::default().fg(theme.text_dim),
-        )))
-        .alignment(Alignment::Center),
-        footer_inner,
+    panel_footer(
+        frame,
+        footer_area,
+        format!("  {NAV_HINT} navigate  Enter/Space activate  a add  d remove  Esc/q back  "),
+        theme,
     );
 }
 
@@ -165,27 +139,11 @@ pub(super) fn render_provider_add(
         ),
         ProviderWizardStep::Protocol => {
             for (i, protocol) in crate::app::providers::PROTOCOL_CHOICES.iter().enumerate() {
-                let is_cursor = i == wizard.protocol_selected;
-                let indicator = if is_cursor { "\u{25B6} " } else { "  " };
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default().fg(theme.fg)),
-                    Span::styled(
-                        indicator,
-                        Style::default().fg(if is_cursor {
-                            theme.accent
-                        } else {
-                            theme.text_dim
-                        }),
-                    ),
-                    Span::styled(
-                        crate::app::providers::protocol_choice_label(*protocol),
-                        if is_cursor {
-                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(theme.text_soft)
-                        },
-                    ),
-                ]));
+                lines.push(option_row(
+                    crate::app::providers::protocol_choice_label(*protocol),
+                    i == wizard.protocol_selected,
+                    theme,
+                ));
             }
         }
         ProviderWizardStep::BaseUrl => {
@@ -276,10 +234,5 @@ pub(super) fn render_provider_add(
         Style::default().fg(theme.text_dim),
     )));
 
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.panel)),
-        inner,
-    );
+    draw_popup(frame, popup_area, inner, block, lines, theme);
 }
