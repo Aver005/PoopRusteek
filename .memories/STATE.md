@@ -25,7 +25,7 @@
 |-------|--------|
 | `cargo build` | Passes |
 | `cargo clippy` | 0 warnings (was ~220 before the 2026-07-02 session) |
-| Tests | **675 passing** + 4 `#[ignore]`d (semantic evals + perf probe, need the model / a terminal) — 2026-08-27, было 635 до рефакторинга «упрощение» (фазы 1-3 плюс правки по ревью) (`cargo test --bin pooprusteek`) |
+| Tests | **676 passing** + 4 `#[ignore]`d (semantic evals + perf probe, need the model / a terminal) — 2026-08-27, было 635 до рефакторинга «упрощение» (фазы 1-3 плюс правки по ревью); +1 — тест на инвариант 11 в проходе по длинным функциям (`JOURNAL/2026-08-27-long-functions.md`) (`cargo test --bin pooprusteek`) |
 | `cargo fmt` | Clean — whole `src/` reformatted 2026-07-06 (was never run before; 127/161 files had drift). No fmt step in `ci.yml` yet (only enforced locally via the pre-commit hook). |
 | CI | `.github/workflows/ci.yml` — single sequential pipeline: `test` (build+test, win+linux) + `lint` (fmt --check + clippy -D warnings, now blocking, no longer advisory) gate `release-build`/`publish` (only run for a `develop` push once both pass). Merged 2026-07-06 — was two separate parallel workflow files (`ci.yml` + `dev-release.yml`), which meant the dev-build release could publish even when tests failed; `dev-release.yml` deleted, its jobs folded in here. |
 | Dev-build release | Rolling `v<version>-dev` GitHub Release on qualifying `develop` pushes, now gated behind `test`+`lint` passing (see CI row above); `.gitlab-ci.yml` mirrors the same `check → build → release` stage order (unverified, no GitLab remote yet). Release notes rendered from `scripts/dev-release.template.md` via `scripts/render-release-notes.sh` (shared, 24 `{{VAR}}` placeholders — tag/commit/author/changelog-since-last-build/artifacts). |
@@ -47,6 +47,8 @@
 
 ## KNOWN GAPS
 
+- **16 функций сверх 150 строк** (замер 2026-08-27, `scratchpad`-скрипт со снятием строковых литералов — наивный счёт скобок врёт втрое). Крупнейшие: `apply_command_result` 244 (`app/keys/dispatch.rs`), `drive` 225 (`harness/driver.rs`), `run_foreground` 199 (`tools/shell.rs`), плюс девять отрисовщиков TUI из открытого списка `JOURNAL/2026-07-15.md:229-234`. **Правило межфайловое** — отбирать по самым длинным файлам неверно, это уже привело к неверному плану (`JOURNAL/2026-08-27-long-functions.md`).
+- **`ShellTool::execute` / `run_foreground` не покрыты ни одним тестом** — функция убивает деревья процессов и трогает глобальный `FOREGROUND_CHILD_PID`. Дешёвые кандидаты перечислены в `JOURNAL/2026-08-27-long-functions.md`.
 - **`.memories/` is not auto-loaded** by the agent (verified: nothing in `src/` reads it). The "Integrate memories" commit only created the docs; `CLAUDE.md` at the repo root now bridges into it for Claude Code specifically.
 - ~~Single provider~~ FIXED 2026-07-05: `/providers` manages OpenAI-compatible endpoints (LM Studio, Ollama `/v1`, vLLM, …) — `OpenAiCompatProvider` (`provider/openai_client.rs`) + `provider::build_provider` factory + `Config.providers`/`active_provider`. The old `ProviderKind::Openai/Custom` enum variants are now purely decorative (selection goes through `/providers` entries, not `provider.kind`) — candidates for removal.
 - No schema validation on MCP tool arguments. `→ src/mcp/client.rs`

@@ -640,34 +640,8 @@ mod tests {
 
         let theme = Theme::default_dark();
         let mut state = AppState {
-            conversations: crate::app::conversation::Conversations::new(
-                crate::app::conversation::Conversation::fresh_main(None),
-            ),
-            input: crate::app::input::InputState::default(),
-            status_message: String::new(),
-            error_count: 0,
-            last_error: None,
-            scroll_offset: 0,
             terminal_rows: 40,
-            modal: None,
-            approved_tools: std::collections::HashSet::new(),
-            pending_tool_approval: None,
-            pending_question: None,
-            pending_interactions: std::collections::VecDeque::new(),
-            autocomplete: crate::app::AutocompleteState::default(),
-            view: crate::app::events::View::Chat,
-            onboarding: crate::app::events::OnboardingState::default(),
-            mcp_status: crate::app::mcp_status::McpStatus::default(),
-            providers_view: crate::app::providers::ProvidersViewState::default(),
-            search: crate::app::search::SearchViewState::default(),
-            themes: crate::app::themes::ThemesViewState::default(),
-            workspace_path: String::new(),
-            show_stats_panel: true,
-            attached_files: Vec::new(),
-            goal: Default::default(),
-            needs_terminal_restore: false,
-            background: crate::app::background_stats::BackgroundCounters::default(),
-            provider_context_window: 0,
+            ..AppState::new(crate::app::conversation::Conversation::fresh_main(None))
         };
 
         for i in 0..100 {

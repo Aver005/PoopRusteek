@@ -290,224 +290,220 @@ impl Tool for ShellTool {
             .await;
         }
 
-        let mut cmd = Command::new(self.shell.name);
-        cmd.args(&argv);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        // Without this, dropping `child` (e.g. this future being cancelled)
-        // would leave the process running with no supervisor left to kill
-        // it — the same leak class as the unbounded-hang bug this fix
-        // targets, just via a different path.
-        cmd.kill_on_drop(true);
+        run_foreground(&self.shell, argv, command).await
+    }
+}
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return ToolResult::error(&format!("Failed to execute command: {e}")),
-        };
-        let pid = child.id().unwrap_or(0);
-        debug_log::log_json(
-            "shell.foreground.spawned",
-            &json!({
-                "tool": self.shell.name,
-                "display": self.shell.display,
-                "command": command,
-                "argv": argv,
-                "pid": pid,
-                "creation_flags_detached_process": false,
-            }),
+/// Склеить потоки для ответа модели. Пустой поток разделителя не добавляет.
+fn combine_output(stdout: &str, stderr: &str) -> String {
+    let mut result = String::from(stdout);
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(stderr);
+    }
+    result
+}
+
+/// Передний план: запустить, дождаться в пределах таймаута, вернуть вывод.
+/// Ровный сосед `run_background` и `run_interactive`.
+async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> ToolResult {
+    let mut cmd = Command::new(shell.name);
+    cmd.args(&argv);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // Without this, dropping `child` (e.g. this future being cancelled)
+    // would leave the process running with no supervisor left to kill
+    // it — the same leak class as the unbounded-hang bug this fix
+    // targets, just via a different path.
+    cmd.kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(&format!("Failed to execute command: {e}")),
+    };
+    let pid = child.id().unwrap_or(0);
+    debug_log::log_json(
+        "shell.foreground.spawned",
+        &json!({
+            "tool": shell.name,
+            "display": shell.display,
+            "command": command,
+            "argv": argv,
+            "pid": pid,
+            "creation_flags_detached_process": false,
+        }),
+    );
+
+    // Track PID so Escape/Ctrl+C can kill the child process.
+    crate::app::FOREGROUND_CHILD_PID.store(pid, Ordering::SeqCst);
+
+    // Incremental, capped readers: a foreground call with no timeout/cap
+    // (the old `wait_with_output`) hangs the whole turn forever on a
+    // command the persistent-background heuristic doesn't catch (e.g.
+    // `npm run dev` invoked without background=true), and buffers
+    // unbounded output (`cat big.bin`) in memory. Both streams are read
+    // here (never left un-drained, or the child would block writing to
+    // a full pipe) but capped at a combined budget.
+    let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let budget = Arc::new(AtomicUsize::new(0));
+    let truncated = Arc::new(AtomicBool::new(false));
+
+    let stdout_task = child.stdout.take().map(|out| {
+        tokio::spawn(capped_pipe_reader(
+            out,
+            Arc::clone(&stdout_buf),
+            Arc::clone(&budget),
+            Arc::clone(&truncated),
+        ))
+    });
+    let stderr_task = child.stderr.take().map(|err| {
+        tokio::spawn(capped_pipe_reader(
+            err,
+            Arc::clone(&stderr_buf),
+            Arc::clone(&budget),
+            Arc::clone(&truncated),
+        ))
+    });
+
+    let timed_out = tokio::select! {
+        _ = child.wait() => false,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(FOREGROUND_TIMEOUT_SECS)) => true,
+    };
+
+    let exit_status = if timed_out {
+        debug_log::log(
+            "shell.foreground_timeout",
+            format!(
+                "{} pid={pid} exceeded {FOREGROUND_TIMEOUT_SECS}s, killing tree",
+                shell.name
+            ),
         );
-
-        // Track PID so Escape/Ctrl+C can kill the child process.
-        crate::app::FOREGROUND_CHILD_PID.store(pid, Ordering::SeqCst);
-
-        // Incremental, capped readers: a foreground call with no timeout/cap
-        // (the old `wait_with_output`) hangs the whole turn forever on a
-        // command the persistent-background heuristic doesn't catch (e.g.
-        // `npm run dev` invoked without background=true), and buffers
-        // unbounded output (`cat big.bin`) in memory. Both streams are read
-        // here (never left un-drained, or the child would block writing to
-        // a full pipe) but capped at a combined budget.
-        let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let budget = Arc::new(AtomicUsize::new(0));
-        let truncated = Arc::new(AtomicBool::new(false));
-
-        let stdout_task = child.stdout.take().map(|out| {
-            tokio::spawn(capped_pipe_reader(
-                out,
-                Arc::clone(&stdout_buf),
-                Arc::clone(&budget),
-                Arc::clone(&truncated),
-            ))
-        });
-        let stderr_task = child.stderr.take().map(|err| {
-            tokio::spawn(capped_pipe_reader(
-                err,
-                Arc::clone(&stderr_buf),
-                Arc::clone(&budget),
-                Arc::clone(&truncated),
-            ))
-        });
-
-        let timed_out = tokio::select! {
-            _ = child.wait() => false,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(FOREGROUND_TIMEOUT_SECS)) => true,
-        };
-
-        let exit_status = if timed_out {
-            debug_log::log(
-                "shell.foreground_timeout",
-                format!(
-                    "{} pid={pid} exceeded {FOREGROUND_TIMEOUT_SECS}s, killing tree",
-                    self.shell.name
-                ),
-            );
-            tracing::warn!(
-                "{} command timed out after {FOREGROUND_TIMEOUT_SECS}s (pid={pid}), killing process tree",
-                self.shell.name
-            );
-            if pid != 0
-                && let Err(e) = background::force_kill_pid(pid).await
-            {
-                tracing::warn!(
-                    "Failed to kill timed-out {} pid={pid}: {e}",
-                    self.shell.name
-                );
-            }
-            None
-        } else {
-            child.wait().await.ok()
-        };
-
-        // Let the readers observe EOF (the pipes close once the process
-        // exits or is killed) so the captured output is complete rather
-        // than a mid-flight snapshot.
-        if let Some(task) = stdout_task {
-            let _ = task.await;
-        }
-        if let Some(task) = stderr_task {
-            let _ = task.await;
-        }
-
-        crate::app::FOREGROUND_CHILD_PID.store(0, Ordering::SeqCst);
-
-        // One decode per stream, on the complete buffer: this is the only
-        // place that can tell UTF-16 child output from UTF-8.
-        let mut stdout =
-            crate::util::decode_process_output(&stdout_buf.lock().unwrap()).into_owned();
-        let stderr = crate::util::decode_process_output(&stderr_buf.lock().unwrap()).into_owned();
-        if truncated.load(Ordering::Relaxed) {
-            // Appended to `stdout` specifically (not `stderr`) because the
-            // success path below returns stdout only — a marker attached to
-            // stderr would be invisible on success, silently hiding the
-            // fact that output was dropped.
-            stdout.push_str(FOREGROUND_TRUNCATION_MARKER);
-        }
-        debug_log::log_json(
-            "shell.foreground.output",
-            &json!({
-                "tool": self.shell.name,
-                "display": self.shell.display,
-                "command": command,
-                "pid": pid,
-                "timed_out": timed_out,
-                "exit_status": exit_status.as_ref().map(|status| status.code()),
-                "exit_success": exit_status.as_ref().map(|status| status.success()),
-                "stdout_chars": stdout.chars().count(),
-                "stderr_chars": stderr.chars().count(),
-                "stdout": stdout,
-                "stderr": stderr,
-                "truncated": truncated.load(Ordering::Relaxed),
-            }),
+        tracing::warn!(
+            "{} command timed out after {FOREGROUND_TIMEOUT_SECS}s (pid={pid}), killing process tree",
+            shell.name
         );
-
-        if timed_out {
-            let mut result = String::new();
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(&stderr);
-            }
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&format!(
-                "[command timed out after {FOREGROUND_TIMEOUT_SECS}s and was killed]"
-            ));
-            return ToolResult::error(&result);
+        if pid != 0
+            && let Err(e) = background::force_kill_pid(pid).await
+        {
+            tracing::warn!("Failed to kill timed-out {} pid={pid}: {e}", shell.name);
         }
+        None
+    } else {
+        child.wait().await.ok()
+    };
 
-        match exit_status {
-            Some(status) => {
-                if status.success() {
-                    if stdout.trim().is_empty() && stderr.trim().is_empty() {
-                        debug_log::log_json(
-                            "shell.foreground.empty_success",
-                            &json!({
-                                "tool": self.shell.name,
-                                "display": self.shell.display,
-                                "command": command,
-                                "argv": argv,
-                                "pid": pid,
-                                "exit_code": status.code(),
-                                "note": "command exited successfully but produced no stdout/stderr",
-                            }),
-                        );
-                        if self.shell.name == "powershell" {
-                            // Genuinely empty output (e.g. a filter that matched
-                            // nothing) is common and not a failure — flagging it
-                            // as `ToolResult::error` used to make the agent treat
-                            // a normal zero-result command as broken.
-                            return ToolResult::success(
-                                "(command completed successfully with no output)",
-                            );
-                        }
-                    }
-                    ToolResult::success(&stdout)
-                } else {
-                    let mut result = String::new();
-                    if !stdout.is_empty() {
-                        result.push_str(&stdout);
-                    }
-                    if !stderr.is_empty() {
-                        if !result.is_empty() {
-                            result.push('\n');
-                        }
-                        result.push_str(&stderr);
-                    }
+    // Let the readers observe EOF (the pipes close once the process
+    // exits or is killed) so the captured output is complete rather
+    // than a mid-flight snapshot.
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+
+    crate::app::FOREGROUND_CHILD_PID.store(0, Ordering::SeqCst);
+
+    // One decode per stream, on the complete buffer: this is the only
+    // place that can tell UTF-16 child output from UTF-8.
+    let mut stdout = crate::util::decode_process_output(&stdout_buf.lock().unwrap()).into_owned();
+    let stderr = crate::util::decode_process_output(&stderr_buf.lock().unwrap()).into_owned();
+    if truncated.load(Ordering::Relaxed) {
+        // Appended to `stdout` specifically (not `stderr`) because the
+        // success path below returns stdout only — a marker attached to
+        // stderr would be invisible on success, silently hiding the
+        // fact that output was dropped.
+        stdout.push_str(FOREGROUND_TRUNCATION_MARKER);
+    }
+    debug_log::log_json(
+        "shell.foreground.output",
+        &json!({
+            "tool": shell.name,
+            "display": shell.display,
+            "command": command,
+            "pid": pid,
+            "timed_out": timed_out,
+            "exit_status": exit_status.as_ref().map(|status| status.code()),
+            "exit_success": exit_status.as_ref().map(|status| status.success()),
+            "stdout_chars": stdout.chars().count(),
+            "stderr_chars": stderr.chars().count(),
+            "stdout": stdout,
+            "stderr": stderr,
+            "truncated": truncated.load(Ordering::Relaxed),
+        }),
+    );
+
+    if timed_out {
+        let mut result = combine_output(&stdout, &stderr);
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&format!(
+            "[command timed out after {FOREGROUND_TIMEOUT_SECS}s and was killed]"
+        ));
+        return ToolResult::error(&result);
+    }
+
+    match exit_status {
+        Some(status) => {
+            if status.success() {
+                if stdout.trim().is_empty() && stderr.trim().is_empty() {
                     debug_log::log_json(
-                        "shell.foreground.nonzero_exit",
+                        "shell.foreground.empty_success",
                         &json!({
-                            "tool": self.shell.name,
-                            "display": self.shell.display,
+                            "tool": shell.name,
+                            "display": shell.display,
                             "command": command,
                             "argv": argv,
                             "pid": pid,
                             "exit_code": status.code(),
-                            "result_chars": result.chars().count(),
-                            "result": result,
+                            "note": "command exited successfully but produced no stdout/stderr",
                         }),
                     );
-                    ToolResult::error(&result)
+                    if shell.name == "powershell" {
+                        // Genuinely empty output (e.g. a filter that matched
+                        // nothing) is common and not a failure — flagging it
+                        // as `ToolResult::error` used to make the agent treat
+                        // a normal zero-result command as broken.
+                        return ToolResult::success(
+                            "(command completed successfully with no output)",
+                        );
+                    }
                 }
-            }
-            None => {
+                ToolResult::success(&stdout)
+            } else {
+                let result = combine_output(&stdout, &stderr);
                 debug_log::log_json(
-                    "shell.foreground.missing_exit_status",
+                    "shell.foreground.nonzero_exit",
                     &json!({
-                        "tool": self.shell.name,
-                        "display": self.shell.display,
+                        "tool": shell.name,
+                        "display": shell.display,
                         "command": command,
                         "argv": argv,
                         "pid": pid,
+                        "exit_code": status.code(),
+                        "result_chars": result.chars().count(),
+                        "result": result,
                     }),
                 );
-                ToolResult::error("Failed to execute command: could not determine exit status")
+                ToolResult::error(&result)
             }
+        }
+        None => {
+            debug_log::log_json(
+                "shell.foreground.missing_exit_status",
+                &json!({
+                    "tool": shell.name,
+                    "display": shell.display,
+                    "command": command,
+                    "argv": argv,
+                    "pid": pid,
+                }),
+            );
+            ToolResult::error("Failed to execute command: could not determine exit status")
         }
     }
 }

@@ -270,6 +270,39 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Состояние с одним разговором и значениями по умолчанию. Поля, которые
+    /// зависят от диска и от наличия провайдера, выставляет вызывающий.
+    pub fn new(main: conversation::Conversation) -> Self {
+        Self {
+            conversations: conversation::Conversations::new(main),
+            input: input::InputState::default(),
+            status_message: String::new(),
+            error_count: 0,
+            last_error: None,
+            scroll_offset: 0,
+            terminal_rows: 0,
+            modal: None,
+            approved_tools: std::collections::HashSet::new(),
+            pending_tool_approval: None,
+            pending_question: None,
+            pending_interactions: std::collections::VecDeque::new(),
+            autocomplete: AutocompleteState::default(),
+            view: View::Chat,
+            onboarding: OnboardingState::default(),
+            mcp_status: mcp_status::McpStatus::default(),
+            providers_view: providers::ProvidersViewState::default(),
+            search: search::SearchViewState::default(),
+            themes: themes::ThemesViewState::default(),
+            workspace_path: String::new(),
+            show_stats_panel: true,
+            attached_files: Vec::new(),
+            goal: goal::GoalState::default(),
+            needs_terminal_restore: false,
+            background: background_stats::BackgroundCounters::default(),
+            provider_context_window: 0,
+        }
+    }
+
     /// The focused conversation (whose messages/generation/session are shown).
     pub fn focused(&self) -> &conversation::Conversation {
         self.conversations.focused()
@@ -345,49 +378,20 @@ impl App {
         );
         let main_conversation = conversation::Conversation::fresh_main(provider);
 
-        let mut state = AppState {
-            conversations: conversation::Conversations::new(main_conversation),
-            input: input::InputState {
-                history: crate::session::load_history(),
-                ..Default::default()
-            },
-            status_message: if has_provider {
-                "Ready"
-            } else {
-                "No token configured"
-            }
-            .to_string(),
-            error_count: 0,
-            last_error: None,
-            scroll_offset: 0,
-            terminal_rows: 0,
-            modal: None,
-            approved_tools: crate::whitelist::load(),
-            pending_tool_approval: None,
-            pending_question: None,
-            pending_interactions: std::collections::VecDeque::new(),
-            autocomplete: AutocompleteState::default(),
-            view: if has_provider {
-                View::Chat
-            } else {
-                View::Onboarding
-            },
-            onboarding: OnboardingState::default(),
-            mcp_status: mcp_status::McpStatus::default(),
-            providers_view: providers::ProvidersViewState::default(),
-            search: search::SearchViewState::default(),
-            themes: themes::ThemesViewState::default(),
-            show_stats_panel: true,
-            workspace_path: std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            attached_files: Vec::new(),
-
-            goal: goal::GoalState::default(),
-            needs_terminal_restore: false,
-            background: background_stats::BackgroundCounters::default(),
-            provider_context_window: 0,
-        };
+        // Всё остальное — значения по умолчанию из `AppState::new`; здесь
+        // только то, что читается с диска и что решает наличие провайдера.
+        let mut state = AppState::new(main_conversation);
+        state.input.history = crate::session::load_history();
+        state.approved_tools = crate::whitelist::load();
+        state.workspace_path = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if has_provider {
+            state.status_message = "Ready".to_string();
+        } else {
+            state.status_message = "No token configured".to_string();
+            state.view = View::Onboarding;
+        }
 
         // A setting that changed section was applied from its old place — say
         // so, so the change is never silent (`config::apply_migrations`). Goes
@@ -1205,34 +1209,8 @@ mod window_tests {
 
     fn test_state() -> AppState {
         AppState {
-            conversations: conversation::Conversations::new(
-                conversation::Conversation::fresh_main(None),
-            ),
-            input: input::InputState::default(),
-            status_message: String::new(),
-            error_count: 0,
-            last_error: None,
-            scroll_offset: 0,
-            terminal_rows: 0,
-            modal: None,
-            approved_tools: std::collections::HashSet::new(),
-            pending_tool_approval: None,
-            pending_question: None,
-            pending_interactions: std::collections::VecDeque::new(),
-            autocomplete: AutocompleteState::default(),
-            view: View::Chat,
-            onboarding: OnboardingState::default(),
-            mcp_status: mcp_status::McpStatus::default(),
-            providers_view: providers::ProvidersViewState::default(),
-            search: search::SearchViewState::default(),
-            themes: themes::ThemesViewState::default(),
-            workspace_path: String::new(),
-            show_stats_panel: true,
-            attached_files: Vec::new(),
-            goal: goal::GoalState::default(),
-            needs_terminal_restore: false,
-            background: background_stats::BackgroundCounters::default(),
             provider_context_window: 1_000_000,
+            ..AppState::new(conversation::Conversation::fresh_main(None))
         }
     }
 

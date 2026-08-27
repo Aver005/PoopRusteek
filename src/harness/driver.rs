@@ -1009,6 +1009,40 @@ mod tests {
         assert!(fake.request(1).is_none(), "a second turn was sent");
     }
 
+    /// Инвариант 11: корневой ход идёт с `auto_approve: false`. При `true`
+    /// инструмент `task` отвечает отказом, и суб-агенты нечем проверить.
+    /// Фоновый вызов — потому что только он идёт через `SpawnSubAgent`.
+    #[tokio::test]
+    async fn the_root_turn_can_still_spawn_a_sub_agent() {
+        let call = r#"<tool_use><name>task</name><arguments>{"description":"probe","prompt":"go","background":true}</arguments></tool_use>"#;
+        let fake = Arc::new(crate::provider::fake::FakeProvider::with_responses(vec![
+            call.to_string(),
+            "done".to_string(),
+        ]));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let harness = probe_harness(Arc::clone(&fake) as Arc<dyn LLMProvider>, event_tx.clone());
+        let options = ExecOptions {
+            prompts: vec!["spawn one".to_string()],
+            timeout: Duration::from_secs(30),
+            ..probe_options()
+        };
+
+        let outcome = drive(
+            &probe_config(),
+            &options,
+            &harness,
+            event_tx,
+            event_rx,
+            Instant::now(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.sub_agents, 1,
+            "the root turn must keep auto_approve false, or `task` is refused"
+        );
+    }
+
     fn probe_config() -> Config {
         let mut config = Config::default();
         config.semantic.enabled = false;
