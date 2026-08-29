@@ -75,13 +75,12 @@ fn parse_arg(args: &Value, key: &str) -> Option<i64> {
 /// streaming reader and fine at the sizes this tool is meant for; it stops
 /// being fine only for files far larger than what a model should page through.
 fn read_file_blocking(path_str: &str, offset: usize, limit: usize) -> Result<String, String> {
-    let path = std::path::Path::new(path_str);
-    let metadata = std::fs::metadata(path).map_err(|e| classify_io_error(path_str, &e))?;
-    if metadata.is_dir() {
-        return Err(format!("{path_str} is a directory, not a file"));
-    }
+    // Разворачиваем `~` так же, как `edit`/`write`: иначе один и тот же путь
+    // читается с ошибкой, а пишется успешно.
+    let path = crate::util::expand_tilde(path_str);
+    ensure_regular_file(&path, path_str)?;
 
-    let bytes = std::fs::read(path).map_err(|e| classify_io_error(path_str, &e))?;
+    let bytes = std::fs::read(&path).map_err(|e| classify_io_error(path_str, &e))?;
     let text = crate::util::decode_process_output(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
@@ -101,14 +100,6 @@ fn read_file_blocking(path_str: &str, offset: usize, limit: usize) -> Result<Str
         format!("{path_str} (lines {}-{} of {total})\n", start + 1, end)
     };
     Ok(format!("{header}{slice}"))
-}
-
-fn classify_io_error(path_str: &str, e: &std::io::Error) -> String {
-    match e.kind() {
-        std::io::ErrorKind::NotFound => format!("File not found: {path_str}"),
-        std::io::ErrorKind::PermissionDenied => format!("Permission denied: {path_str}"),
-        _ => format!("Failed to read {path_str}: {e}"),
-    }
 }
 
 #[cfg(test)]

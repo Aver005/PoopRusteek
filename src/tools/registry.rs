@@ -38,6 +38,8 @@ impl ToolRegistry {
         self.register(Arc::new(shell_control::ShellListTool));
         self.register(Arc::new(shell_control::ShellInputTool));
         self.register(Arc::new(read_file::ReadFileTool));
+        self.register(Arc::new(edit::EditTool));
+        self.register(Arc::new(edit::WriteTool));
         self.register(Arc::new(timer::TimerTool));
     }
 
@@ -116,6 +118,15 @@ mod tests {
         // not be registered (there's no interpreter on PATH to run it).
         let registry = ToolRegistry::new();
         assert_eq!(registry.get("powershell").is_some(), cfg!(windows));
+    }
+
+    #[test]
+    fn the_file_editing_tools_are_registered() {
+        // Инвариант 7: новый инструмент виден модели только через реестр.
+        let registry = ToolRegistry::new();
+        assert!(registry.get("edit").is_some());
+        assert!(registry.get("write").is_some());
+        assert!(registry.get("read_file").is_some());
     }
 
     /// Prompt-bloat budget for the formatted builtin definitions — they are

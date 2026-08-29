@@ -1,0 +1,49 @@
+# The `edit` and `write` tools, end to end through the real agent loop:
+# parse → approval → registry dispatch → filesystem → tool result.
+#
+# `workspace_template` and not `workspace`: this scenario writes, so every
+# repeat needs its own fresh copy. The assertions are on the filesystem
+# rather than on the answer text — the model can claim it edited a file
+# while nothing was written, and that is exactly the failure worth catching.
+#
+# Needs the mock service:
+#   ./sandbox.ps1 mock edits-and-writes-files
+# or, on the host:
+#   pooprusteek mock-provider --port 811 \
+#     --script sandbox/mock-scripts/edits-and-writes-files.toml
+name = "edits-and-writes-files"
+description = "edit replaces text by anchor and write creates a file with its parents"
+prompt = "Change the greeting to say goodbye, then write a notes file."
+workspace_template = "edit-workspace"
+provider = "mock"
+timeout = 60
+max_steps = 6
+
+[expect]
+status = "completed"
+tools_used = ["edit", "write"]
+# A `write` that silently fell back to a shell heredoc would still leave the
+# file behind, so forbid the shells outright.
+tools_forbidden = ["bash", "powershell"]
+files_exist = ["notes/summary.md"]
+min_pass_rate = 1.0
+
+[[expect.file_matches]]
+path = "greeting.txt"
+pattern = 'goodbye world'
+
+# The replaced text must be gone, not merely joined by the new text — the
+# difference between a real replacement and an append.
+[[expect.file_matches]]
+path = "greeting.txt"
+pattern = 'hello world'
+absent = true
+
+# Lines the anchor did not name must survive untouched.
+[[expect.file_matches]]
+path = "greeting.txt"
+pattern = 'third line'
+
+[[expect.file_matches]]
+path = "notes/summary.md"
+pattern = 'Created by the write tool'

@@ -330,8 +330,9 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
     let approved = if ctx.auto_approve {
         true
     } else {
-        let arguments_preview = serde_json::to_string_pretty(&call.arguments)
-            .unwrap_or_else(|_| call.arguments.to_string());
+        // Не сырой JSON: он экранирует переводы строк, и содержимое файла в
+        // модалке становится одной нечитаемой строкой.
+        let arguments_preview = crate::tools::approval_preview(&call.name, &call.arguments);
         let approval =
             ToolApprovalRequest::new(ctx.conversation, call.name.clone(), arguments_preview);
         let _ = ctx

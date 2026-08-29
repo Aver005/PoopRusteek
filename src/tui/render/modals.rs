@@ -131,7 +131,7 @@ fn render_tool_approval(
     // Always allow checkbox
     let check = if always_allow { "\u{2611}" } else { "\u{2610}" };
     all_lines.push(Line::from(vec![Span::styled(
-        format!("  {} Always allow for this session", check),
+        format!("  {} Always allow (saved, survives restart)", check),
         if always_allow {
             Style::default().fg(theme.success)
         } else {

@@ -9,8 +9,8 @@
 - **`ToolResult`** (`tools/mod.rs:19`): `content: String, is_error: bool`. Helpers `::success()`, `::error()`.
 - **`ToolRegistry`** (`tools/registry.rs:6`): `Mutex<HashMap<String, Arc<dyn Tool>>>` + optional skill tool. API: `register`, `get`, `definitions()`, `execute(name,args)` (returns "Unknown tool" error if missing), `update_skills()`.
 
-### Built-in tools (9 default + `skill` dynamic) — `registry.rs:register_default_tools`
-`bash` · `powershell` · `question` · `task` · `timer` · `shell_output` · `shell_kill` · `shell_list` · `shell_input` · `read_file` (+ `skill` via `update_skills`, `tool_search`/`history_search` via `register_semantic_tools`).
+### Built-in tools (12 default + `skill` dynamic) — `registry.rs:register_default_tools`
+`bash` · `powershell` · `question` · `task` · `timer` · `shell_output` · `shell_kill` · `shell_list` · `shell_input` · `read_file` · `edit` · `write` (+ `skill` via `update_skills`, `tool_search`/`history_search` via `register_semantic_tools`).
 
 | Tool | Args | Returns | Notes |
 |------|------|---------|-------|
@@ -23,6 +23,10 @@
 | `shell_input` | `id`(req), `text`, `keys[]` | confirmation | interactive jobs only; `keys` → escape seqs (up/down/enter/esc/tab/ctrl+c…) |
 | `skill` | `action`(list\|load), `name` | list or `# Skill: {name}\n{content}` | backed by `Arc<RwLock<Vec<SkillDefinition>>>` |
 | `timer` | `action`(set\|list\|cancel, def `set`), `after`("20m") **or** `at`("18:30"), `note`(req for set), `wake`, `id`(cancel) | `Timer set — #3 — 2026-08-29 18:30 (in 3h 12m), wake: …` | special-cased in the agent loop (needs the conversation id); no approval prompt; refused when `auto_approve`. See DEFERRED TASKS below |
+| `read_file` | `path`(req), `offset`(1-based line, def 1), `limit`(def 400) | `{path} (lines a-b of N)
+{slice}` | expands `~`; escape hatch for the compaction ladder's file-path markers |
+| `edit` | `path`(req), `old_string`(req), `new_string`(req), `replace_all` | `Edited {path} (N replacements)` + a `-`/`+` diff of the changed region | anchor is a **literal substring**, must be unique unless `replace_all`; strict UTF-8 (binary refused); follows symlinks and preserves permissions; aborts if the file changed since it was read; `replace_all` with >1 hit omits the diff body so a short anchor cannot dump the file into context |
+| `write` | `path`(req), `content`(req) | `Created`/`Overwrote {path} (…lines, …bytes)` | creates parent dirs; cannot append; refuses this agent's own config dir and any MCP config file |
 
 **Auto-detection heuristics** (`tools/mod.rs:41`):
 - `looks_interactive_command()` → forces `interactive=true` for `bun/npm create`, `npm init`, `gh auth`.
@@ -129,3 +133,8 @@ Three formats parsed from raw LLM text (DeepSeek web API has NO native function-
 
 - `bash`/`powershell` run **arbitrary** commands — no sandbox, no command allow/deny list. Trust boundary = the **tool-approval modal** + the `/whitelist` of auto-approved tools (`approved_tools` set).
 - Approval currently **blocks the event loop** until the user answers (known limitation).
+- **The whitelist keys on the tool NAME only** — no arguments, no paths, no expiry, and `whitelist::persist_approval` writes it to disk, so it survives restarts. Whitelisting `edit`/`write` therefore grants unlimited, permanent writes to any path the process can reach; it removes the only screen on which the human ever sees `path`. Granular, pattern-based permissions are an open gap (see the competitor comparison in `PLANS.md`).
+- **`edit`/`write` get no approval at all under `auto_approve`** — background sub-agents (`multichat.rs`) and `sub_agent.rs` (which calls `dispatch_generic_tool` directly). The policy is inherited from `bash` and is not new, but the blast radius grew: `write` is far easier for a model to reach for than a quoted heredoc. Deliberately left as-is; restricting it would break legitimate sub-agent refactors.
+- `edit`/`write` **do** hard-refuse two path classes regardless of approval (`tools/edit.rs:refuse_protected_path`): this agent's own `Config::data_dir()`/config directory, and any `mcp.config.json`/`mcp.json`. The second is not cosmetic — an MCP config is executed as a child process on the next start, so an approved "write a json file" would otherwise have been arbitrary deferred code execution.
+- There is **no workspace jail**. Writes outside the working directory are allowed but flagged in the approval modal (`⚠ OUTSIDE WORKSPACE`, `tools/mod.rs:outside_workspace_note`).
+- The approval modal renders `tools::approval_preview`, **not** raw pretty-JSON: `serde_json` escapes newlines, which collapsed a 500-line `write` into one unreadable line the popup could neither grow to fit nor scroll.

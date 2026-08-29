@@ -34,7 +34,7 @@
 
 **Инструмент не рифмуется:**
 ```json
-{"tool": "file.read", "args": {"path": "config.ts"}}
+{"tool": "read_file", "args": {"path": "config.ts"}}
 ```
 
 **После инструмента — снова рифма:**

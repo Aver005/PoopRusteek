@@ -1,0 +1,34 @@
+# Drives the `edit` and `write` tools through the real agent loop.
+#
+# Mock and not live, for the usual reason: the point is that the *tools*
+# behave, not that a model picks them. Scripted replies make the sequence
+# deterministic, so a regression in the tools is the only thing that can turn
+# this scenario red.
+
+# Reply 1: a point edit by anchor. The anchor spans two lines on purpose —
+# multi-line anchors are where line endings and indentation actually bite.
+[[reply]]
+content = """
+I'll fix the greeting.
+<tool_use>
+<name>edit</name>
+<arguments>
+{"path": "greeting.txt", "old_string": "hello world\\nsecond line", "new_string": "goodbye world\\nsecond line"}
+</arguments>
+</tool_use>
+"""
+
+# Reply 2: create a new file, parents included, through `write`.
+[[reply]]
+content = """
+<tool_use>
+<name>write</name>
+<arguments>
+{"path": "notes/summary.md", "content": "# Notes\\n\\nCreated by the write tool.\\n"}
+</arguments>
+</tool_use>
+"""
+
+# Reply 3+: both tools reported success, so finish the turn.
+[[reply]]
+content = "Done — greeting.txt now says goodbye world, and notes/summary.md is written."
