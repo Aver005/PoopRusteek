@@ -23,6 +23,13 @@ pub enum JobCommandAction {
     Prune,
 }
 
+/// `/timers` — отложенные задачи агента. Взводит их инструмент `timer`,
+/// человеку остаётся посмотреть список и снять лишнее.
+pub enum TimerCommandAction {
+    List,
+    Cancel(u64),
+}
+
 /// `/rag` subcommand intents — interpreted in `apply_command_result`,
 /// which has the `App`-level access (semantic service, mutable config)
 /// these effects need.
@@ -103,6 +110,7 @@ pub enum CommandResult {
     OpenMcpAdd(Option<String>),
     ShowTools,
     Jobs(JobCommandAction),
+    Timers(TimerCommandAction),
     OpenWhitelist,
     ShowSkills,
     ToggleSkill(String, bool),
@@ -255,6 +263,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::import::ImportCommand));
         self.register(Box::new(defs::ps::PsCommand));
         self.register(Box::new(defs::jobs::JobsCommand));
+        self.register(Box::new(defs::timers::TimersCommand));
         self.register(Box::new(defs::btw::BtwCommand));
         self.register(Box::new(defs::chats::NewChatCommand));
         self.register(Box::new(defs::chats::ChatsCommand));

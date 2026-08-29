@@ -9,8 +9,8 @@
 - **`ToolResult`** (`tools/mod.rs:19`): `content: String, is_error: bool`. Helpers `::success()`, `::error()`.
 - **`ToolRegistry`** (`tools/registry.rs:6`): `Mutex<HashMap<String, Arc<dyn Tool>>>` + optional skill tool. API: `register`, `get`, `definitions()`, `execute(name,args)` (returns "Unknown tool" error if missing), `update_skills()`.
 
-### Built-in tools (7 default + `skill` dynamic) — `registry.rs:21`
-`bash` · `powershell` · `question` · `shell_output` · `shell_kill` · `shell_list` · `shell_input` (+ `skill` registered via `update_skills`).
+### Built-in tools (9 default + `skill` dynamic) — `registry.rs:register_default_tools`
+`bash` · `powershell` · `question` · `task` · `timer` · `shell_output` · `shell_kill` · `shell_list` · `shell_input` · `read_file` (+ `skill` via `update_skills`, `tool_search`/`history_search` via `register_semantic_tools`).
 
 | Tool | Args | Returns | Notes |
 |------|------|---------|-------|
@@ -22,6 +22,7 @@
 | `shell_list` | — | formatted job table | prunes finished first; shows pid, kind, persist, age, idle, ttl |
 | `shell_input` | `id`(req), `text`, `keys[]` | confirmation | interactive jobs only; `keys` → escape seqs (up/down/enter/esc/tab/ctrl+c…) |
 | `skill` | `action`(list\|load), `name` | list or `# Skill: {name}\n{content}` | backed by `Arc<RwLock<Vec<SkillDefinition>>>` |
+| `timer` | `action`(set\|list\|cancel, def `set`), `after`("20m") **or** `at`("18:30"), `note`(req for set), `wake`, `id`(cancel) | `Timer set — #3 — 2026-08-29 18:30 (in 3h 12m), wake: …` | special-cased in the agent loop (needs the conversation id); no approval prompt; refused when `auto_approve`. See DEFERRED TASKS below |
 
 **Auto-detection heuristics** (`tools/mod.rs:41`):
 - `looks_interactive_command()` → forces `interactive=true` for `bun/npm create`, `npm init`, `gh auth`.
@@ -45,6 +46,37 @@ The most intricate subsystem. Powers background + interactive shells.
 `read_output` (:542) · `kill_process` (:600) · `write_input` (:578) · `list_processes` (:608) · `process_snapshots` (:619) · `prune_finished_processes` (:552) · `expire_persistent_idle_processes` (:660, idle > ttl) · `prune_jobs` (:693) · `shutdown_nonpersistent` (:699, on each user turn) · `shutdown_all` (:729, on app exit) · `force_kill_pid` (:110, Windows `taskkill /F /T`, POSIX `kill -9`).
 
 **Foreground** bash/powershell store their PID in a global so `Esc`/`Ctrl+C` can kill the child (`app/mod.rs:33` `kill_foreground_child`).
+
+## DEFERRED TASKS — `timer` (`tools/timer.rs`, `app/timers.rs`)
+
+Отложенная задача = запись в `TimerStore`, которым владеет `ToolRegistry`
+(`registry.timers()`); тот же хэндл читает `App`. Взвод — четвёртая ветка
+`tools_step::execute_tool_call` → `manage_timer` (инструменту нужна беседа,
+через реестр её не получить). Срабатывание — `App::fire_due_timers` на тике
+(120 мс): `take_due(now)` изымает созревшие, чистая
+`app::timers::route(timer, owner_alive, owner_busy)` решает исход.
+
+| Исход | Когда | Что делает |
+|---|---|---|
+| `Orphan` | беседы-владельца нет | `ui_system` в фокусный чат, беседа не воскрешается |
+| `Notify` | `wake=false`, либо бюджет побудок исчерпан, либо чат занят > 5 мин | `ui_system` в беседу-владельца (+ короткая строка в фокусный, если человек смотрит в другую) — до модели **не** доходит |
+| `Defer` | `wake=true`, в беседе идёт ход | таймер возвращается на +5 с, до 60 раз |
+| `Wake` | `wake=true`, беседа свободна | `user_with_display` («⏰ Timer #N fired — automatic, not a message from the user») + `App::send_turn(owner, …)` |
+
+Роль побудки — `User`, не `System`: `provider/prompt.rs:format_tail_message`
+рендерит system-хвост как `### NOTE`, что для «сделай сейчас» слабо.
+
+**Предохранители:** фоновый ход (`auto_approve`) таймеры ставить не может;
+10 s ≤ задержка ≤ 24 h; ≤ 8 таймеров на беседу; заметка ≤ 400 байт;
+≤ 3 побудок подряд без реплики человека (`take_wake_slot` / `reset_wakes`,
+сброс — в `keys/chat.rs` на отправке сообщения). Таймеры снимаются в
+`stop_background` / `finish_background`.
+
+**Границы:** персистентности нет — перезапуск стирает всё (сознательно, см.
+`JOURNAL/2026-08-29-timers.md`). Тик есть только у TUI, поэтому в
+`pooprusteek exec` таймер взводится, но никогда не стреляет; `--acp` и
+`/serve` цикл агента не гоняют вовсе. Человеку — `/timers`, `/timers cancel <id>`
+и счётчик `⏰:N` в статус-баре.
 
 ## AGENT LOOP (`agent/runner.rs` `run_agent_loop` — шаги; `agent/tools_step.rs` — вызовы инструментов)
 

@@ -11,7 +11,8 @@ use crate::app::events::{
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, LLMProvider};
 use crate::tools::registry::ToolRegistry;
-use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME};
+use crate::tools::timer::{Timer, resolve_due};
+use crate::tools::{QUESTION_TOOL_NAME, TASK_TOOL_NAME, TIMER_TOOL_NAME};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -139,14 +140,103 @@ impl ToolExecContext<'_> {
     }
 }
 
-/// Развилка по имени вызова. Три ветки живут по своим причинам: вопрос —
-/// это UX, `task` — запуск суб-агента, остальное — аппрув и диспетчер.
+/// Развилка по имени вызова. Четыре ветки живут по своим причинам: вопрос —
+/// это UX, `task` — запуск суб-агента, `timer` — состояние беседы, а
+/// остальное — аппрув и диспетчер.
 async fn execute_tool_call(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
     match call.name.as_str() {
         QUESTION_TOOL_NAME => ask_the_user(&call, ctx).await,
         TASK_TOOL_NAME => spawn_task(&call, ctx).await,
+        TIMER_TOOL_NAME => {
+            ctx.emit_tool_started(TIMER_TOOL_NAME);
+            manage_timer(&call, ctx)
+        }
         _ => run_generic_tool(call, ctx).await,
     }
+}
+
+/// `timer`: отложенная задача этой беседы. Фоновому ходу отказ — беседа
+/// суб-агента исчезает вместе с его ответом, её таймер осиротеет.
+fn manage_timer(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
+    if ctx.auto_approve {
+        return ToolOutcome::failed("Timers are not available to background agents.");
+    }
+    let timers = ctx.tools.timers();
+    let owner = ctx.conversation.0;
+    let now = chrono::Local::now();
+
+    match call.arguments["action"].as_str().unwrap_or("set") {
+        "list" => {
+            let pending = timers.list(Some(owner));
+            if pending.is_empty() {
+                return ToolOutcome::ok("No timers pending in this chat.");
+            }
+            let now = now.with_timezone(&chrono::Utc);
+            ToolOutcome::ok(
+                pending
+                    .iter()
+                    .map(|t| t.describe(now))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+        "cancel" => match read_timer_id(call) {
+            Some(id) => match timers.cancel(id, Some(owner)) {
+                Some(timer) => ToolOutcome::ok(format!("Cancelled timer #{}: {}", id, timer.note)),
+                None => ToolOutcome::failed(format!("No timer #{id} in this chat.")),
+            },
+            None => ToolOutcome::failed("Cancelling a timer needs its numeric 'id'."),
+        },
+        "set" => set_timer(call, &timers, owner, now),
+        other => ToolOutcome::failed(format!(
+            "Unknown timer action '{other}'. Use 'set', 'list', or 'cancel'."
+        )),
+    }
+}
+
+/// Взвести таймер и рассказать модели, когда он сработает: текущего времени
+/// в промпте нет, так что абсолютную дату она узнаёт только отсюда.
+fn set_timer(
+    call: &ParsedToolCall,
+    timers: &crate::tools::timer::TimerStore,
+    owner: u64,
+    now: chrono::DateTime<chrono::Local>,
+) -> ToolOutcome {
+    let note = call.arguments["note"].as_str().unwrap_or_default();
+    let wake = call.arguments["wake"].as_bool().unwrap_or(false);
+    let due = match resolve_due(
+        now,
+        call.arguments["after"].as_str(),
+        call.arguments["at"].as_str(),
+    ) {
+        Ok(due) => due,
+        Err(error) => return ToolOutcome::failed(error),
+    };
+    match timers.set(owner, due, note, wake) {
+        Ok(timer) => ToolOutcome::ok(timer_set_message(&timer, now.with_timezone(&chrono::Utc))),
+        Err(error) => ToolOutcome::failed(error),
+    }
+}
+
+/// Ответ на взведённый таймер. Отдельно от `set_timer`, чтобы формулировку
+/// проверял тест, а не глаз.
+pub(crate) fn timer_set_message(timer: &Timer, now: chrono::DateTime<chrono::Utc>) -> String {
+    let tail = if timer.wake {
+        "It will start a turn here and hand you the note."
+    } else {
+        "It will show the note here; you are not resumed."
+    };
+    format!(
+        "Timer set — {}\n{tail} Timers are lost if the app exits.",
+        timer.describe(now)
+    )
+}
+
+/// Модели свойственно слать число строкой — читаем оба вида.
+fn read_timer_id(call: &ParsedToolCall) -> Option<u64> {
+    let id = &call.arguments["id"];
+    id.as_u64()
+        .or_else(|| id.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 /// `question`: спросить человека. В фоновом ходе отвечать некому.

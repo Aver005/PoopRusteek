@@ -7,18 +7,20 @@ pub mod shell;
 pub mod shell_control;
 pub mod skill;
 pub mod task;
+pub mod timer;
 pub mod tool_search;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 /// Tool names the agent loops special-case *before* registry dispatch (the
-/// `question`/`task` tools are declared like any other tool so the model
-/// sees them, but are never executed through `ToolRegistry::execute`).
+/// `question`/`task`/`timer` tools are declared like any other tool so the
+/// model sees them, but are never executed through `ToolRegistry::execute`).
 /// Dispatch sites must compare against these constants, not string
 /// literals, so a rename can't silently break the special-casing.
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const TASK_TOOL_NAME: &str = "task";
+pub const TIMER_TOOL_NAME: &str = "timer";
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {

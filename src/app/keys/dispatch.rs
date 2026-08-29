@@ -109,6 +109,13 @@ impl App {
                 };
                 self.state.push_system(&jobs_text);
             }
+            CommandResult::Timers(action) => {
+                let text = match action {
+                    crate::commands::TimerCommandAction::List => self.build_timers_display(),
+                    crate::commands::TimerCommandAction::Cancel(id) => self.cancel_timer_by_id(id),
+                };
+                self.state.push_system(&text);
+            }
             CommandResult::ShowSkills => {
                 self.open_skill_picker().await;
             }

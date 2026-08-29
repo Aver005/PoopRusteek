@@ -1949,4 +1949,73 @@ mod tests {
             "what was reset is what the provider reported holding"
         );
     }
+
+    /// Взвод таймера — сквозной путь: разбор вызова, ветка `timer`, запись
+    /// в хранилище того самого реестра, который держит и приложение.
+    #[tokio::test]
+    async fn a_timer_call_lands_in_the_registry_store() {
+        let call = r#"<tool_use><name>timer</name><arguments>{"action":"set","after":"10m","note":"check the build","wake":true}</arguments></tool_use>"#;
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_responses(vec![
+            call.to_string(),
+            "Timer is set.".to_string(),
+        ]));
+        let tools = Arc::new(ToolRegistry::new());
+        let cid = ConversationId::next();
+
+        run_timer_turn(provider, Arc::clone(&tools), cid, false).await;
+
+        let pending = tools.timers().list(Some(cid.0));
+        assert_eq!(pending.len(), 1, "the call must leave one armed timer");
+        assert_eq!(pending[0].note, "check the build");
+        assert!(pending[0].wake, "wake=true must survive the round trip");
+    }
+
+    /// Фоновому ходу таймеры недоступны: его беседа исчезает вместе с
+    /// ответом, и таймер осиротел бы по построению.
+    #[tokio::test]
+    async fn a_background_turn_cannot_arm_a_timer() {
+        let call = r#"<tool_use><name>timer</name><arguments>{"action":"set","after":"10m","note":"later"}</arguments></tool_use>"#;
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_responses(vec![
+            call.to_string(),
+            "Cannot.".to_string(),
+        ]));
+        let tools = Arc::new(ToolRegistry::new());
+        let cid = ConversationId::next();
+
+        run_timer_turn(provider, Arc::clone(&tools), cid, true).await;
+
+        assert!(tools.timers().list(None).is_empty());
+    }
+
+    /// Один ход поверх переданного реестра — хранилище таймеров живёт
+    /// именно в нём, поэтому реестр должен пережить прогон.
+    async fn run_timer_turn(
+        provider: Arc<dyn LLMProvider>,
+        tools: Arc<ToolRegistry>,
+        conversation: ConversationId,
+        auto_approve: bool,
+    ) {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        run_agent_loop(
+            TurnSpec {
+                conversation,
+                provider,
+                messages: vec![ChatMessage::user("remind me")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
+            },
+            tools,
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+    }
 }

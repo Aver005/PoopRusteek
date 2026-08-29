@@ -20,6 +20,7 @@ mod serve;
 mod sessions;
 pub mod system_prompt;
 pub mod themes;
+mod timers;
 pub mod view_state;
 
 use crate::commands::CommandRegistry;
@@ -264,6 +265,9 @@ pub struct AppState {
 
     pub needs_terminal_restore: bool,
     pub background: background_stats::BackgroundCounters,
+    /// Сколько таймеров взведено — для строки состояния. Обновляется тем же
+    /// тиком, что их и будит (`app::timers`).
+    pub timers_pending: usize,
     /// Context window the provider reported, 0 while unknown. Config wins over
     /// it — see `context::ContextBudget::learn_provider_window`.
     pub provider_context_window: u32,
@@ -297,6 +301,7 @@ impl AppState {
             show_stats_panel: true,
             attached_files: Vec::new(),
             goal: goal::GoalState::default(),
+            timers_pending: 0,
             needs_terminal_restore: false,
             background: background_stats::BackgroundCounters::default(),
             provider_context_window: 0,
@@ -724,7 +729,10 @@ impl App {
             AppEvent::RequestQuestion(request, state) => {
                 self.on_question_requested(request, state);
             }
-            AppEvent::Tick => self.on_tick(),
+            AppEvent::Tick => {
+                self.on_tick();
+                self.fire_due_timers().await?;
+            }
             AppEvent::GoalEvaluationDone(outcome) => {
                 self.handle_goal_evaluation_done(outcome).await;
             }
@@ -900,7 +908,21 @@ impl App {
     /// this replaces an older `send_to_agent(input)` whose argument was
     /// silently discarded. The provider sees every non-`ui_only` message.
     async fn send_focused_turn(&mut self, user_message: Option<ChatMessage>) -> AppResult<()> {
-        let provider = match &self.state.focused().provider {
+        self.send_turn(self.state.conversations.focused_id(), user_message)
+            .await
+    }
+
+    /// Тот же ход, но в названной беседе: её может не быть на экране —
+    /// так сработавший таймер будит свой чат, а не тот, куда ушёл человек.
+    pub(crate) async fn send_turn(
+        &mut self,
+        conversation: conversation::ConversationId,
+        user_message: Option<ChatMessage>,
+    ) -> AppResult<()> {
+        let Some(target) = self.state.conversations.get(conversation) else {
+            return Ok(());
+        };
+        let provider = match &target.provider {
             Some(p) => Arc::clone(p),
             None => {
                 self.state
@@ -913,14 +935,17 @@ impl App {
             }
         };
 
-        if let Some(message) = user_message {
-            self.state.focused_mut().messages.push(message);
+        if let Some(message) = user_message
+            && let Some(target) = self.state.conversations.get_mut(conversation)
+        {
+            target.messages.push(message);
         }
 
-        let conversation = self.state.conversations.focused_id();
-        let messages: Vec<ChatMessage> = self
-            .state
-            .focused()
+        let Some(target) = self.state.conversations.get(conversation) else {
+            return Ok(());
+        };
+        let session_id = target.session_id.clone();
+        let messages: Vec<ChatMessage> = target
             .messages
             .iter()
             .filter(|m| !m.ui_only)
@@ -947,12 +972,12 @@ impl App {
             max_tokens: self.config.provider.max_tokens,
             max_steps: self.config.agent.max_steps_per_turn.max(1),
             max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
-            auto_approve: false, // focused turn: interactive approval
+            auto_approve: false, // turn with a human behind it: interactive approval
             tool_output_limit: self.config.context.tool_output_limit as usize,
             context: crate::context::ContextSpec::new(
                 &self.config.context,
                 self.state.provider_context_window,
-                &self.state.focused().session_id,
+                &session_id,
             )
             .with_output_cap(self.config.provider.max_tokens),
         };
@@ -962,7 +987,9 @@ impl App {
             event: AgentEvent::Started,
         });
         let handle = self.runtime.spawn(spec);
-        self.state.focused_mut().agent_task = Some(handle);
+        if let Some(target) = self.state.conversations.get_mut(conversation) {
+            target.agent_task = Some(handle);
+        }
 
         Ok(())
     }

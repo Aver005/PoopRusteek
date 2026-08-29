@@ -95,6 +95,12 @@ pub(super) fn render_mini_status(
         }
     };
 
+    let timers_status = if state.timers_pending > 0 {
+        format!(" ⏰:{}", state.timers_pending)
+    } else {
+        String::new()
+    };
+
     let model_tag = if !state.focused().generation.last_model.is_empty() {
         format!(" · {}", state.focused().generation.last_model)
     } else {
@@ -115,8 +121,16 @@ pub(super) fn render_mini_status(
         String::new()
     };
     let left = format!(
-        " {}{} · {}{}{}{}{}{} ",
-        goal_tag, provider_name, model, model_tag, mcp_status, bg_status, btw_status, chats_status
+        " {}{} · {}{}{}{}{}{}{} ",
+        goal_tag,
+        provider_name,
+        model,
+        model_tag,
+        mcp_status,
+        bg_status,
+        btw_status,
+        chats_status,
+        timers_status
     );
 
     let status_tag = state

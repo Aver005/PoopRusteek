@@ -163,6 +163,7 @@ impl App {
     /// Stop a running background conversation (sidechat / sub-agent) by id.
     pub(crate) fn stop_background(&mut self, target: conversation::ConversationId) {
         if let Some(mut conv) = self.state.conversations.remove(target) {
+            self.drop_timers_of(target);
             if let Some(handle) = conv.agent_task.take() {
                 handle.abort();
             }
@@ -192,6 +193,7 @@ impl App {
         let Some(conv) = self.state.conversations.remove(target) else {
             return;
         };
+        self.drop_timers_of(target);
         discard_remote_session_of(&conv);
         let label = match conv.kind {
             conversation::ConversationKind::SubAgent => "🤖 sub-agent",

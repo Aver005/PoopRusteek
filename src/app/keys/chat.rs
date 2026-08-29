@@ -278,6 +278,8 @@ impl App {
                 &format!("{}\n📎 attached: {}", input, attached_names.join(", ")),
             )
         };
+        // Человек написал сам — цепочка автоматических побудок оборвана.
+        self.reset_timer_wakes(self.state.conversations.focused_id());
         self.send_focused_turn(Some(message)).await?;
         Ok(SubmitOutcome::Continue)
     }

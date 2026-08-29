@@ -6,6 +6,9 @@ use std::sync::{Arc, Mutex};
 pub struct ToolRegistry {
     tools: Mutex<HashMap<String, Arc<dyn Tool>>>,
     pub skill_tool: Mutex<Option<Arc<skill::SkillTool>>>,
+    /// Отложенные задачи процесса. Живут здесь, потому что взводит их
+    /// вызов инструмента, а будит `App` — общий владелец только один.
+    timers: Arc<timer::TimerStore>,
 }
 
 impl ToolRegistry {
@@ -13,6 +16,7 @@ impl ToolRegistry {
         let registry = Self {
             tools: Mutex::new(HashMap::new()),
             skill_tool: Mutex::new(None),
+            timers: Arc::new(timer::TimerStore::default()),
         };
         registry.register_default_tools();
         registry
@@ -34,6 +38,13 @@ impl ToolRegistry {
         self.register(Arc::new(shell_control::ShellListTool));
         self.register(Arc::new(shell_control::ShellInputTool));
         self.register(Arc::new(read_file::ReadFileTool));
+        self.register(Arc::new(timer::TimerTool));
+    }
+
+    /// Общий хэндл на хранилище таймеров: его читает и тик приложения,
+    /// и ветка вызова `timer` в цикле агента.
+    pub fn timers(&self) -> Arc<timer::TimerStore> {
+        Arc::clone(&self.timers)
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {

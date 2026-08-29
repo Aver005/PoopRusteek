@@ -34,6 +34,7 @@ pub mod session_info;
 pub mod session_list;
 pub mod skills;
 pub mod themes;
+pub mod timers;
 pub mod tools;
 pub mod update;
 pub mod version;

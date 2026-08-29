@@ -35,6 +35,7 @@
 | `/goal` | — | — | Toggle GOAL mode (iterative goal-driven loop) | `defs/goal.rs` |
 | `/jobs` | — | `[list\|kill <id>\|prune]` | Manage background jobs (default `list`) | `defs/jobs.rs` |
 | `/ps` | — | — | Alias for `/jobs list` | `defs/ps.rs` |
+| `/timers` | — | `[list\|cancel <id>]` | Pending agent timers (default `list`); the agent arms them with the `timer` tool | `defs/timers.rs` |
 | `/mcp` | — | `[ttl <secs>\|reload]` | Open MCP view; set cache TTL (1–86400); reload servers | `defs/mcp.rs` |
 | `/tools` | — | — | Show all available tools (built-in + MCP) | `defs/tools.rs` |
 | `/skills` | — | `[list\|enable <name>\|disable <name>]` | Manage skills; no-arg opens picker | `defs/skills.rs` |
