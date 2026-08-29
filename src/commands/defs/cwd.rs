@@ -2,16 +2,6 @@ use crate::app::AppState;
 use crate::commands::{Command, CommandResult, with_args};
 use crate::config::Config;
 
-fn strip_verbatim(path: &str) -> String {
-    // On Windows, std::env::current_dir() may return \\?\C:\... prefix.
-    // Strip it for cleaner display.
-    if let Some(rest) = path.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        path.to_string()
-    }
-}
-
 pub struct CwdCommand {
     pub name: &'static str,
 }
@@ -39,7 +29,11 @@ impl Command for CwdCommand {
             match std::env::set_current_dir(&absolute) {
                 Ok(()) => {
                     let cwd = std::env::current_dir()
-                        .map(|p| strip_verbatim(&p.to_string_lossy()))
+                        .map(|p| {
+                            crate::util::strip_verbatim(&p)
+                                .to_string_lossy()
+                                .into_owned()
+                        })
                         .unwrap_or_else(|_| absolute.to_string_lossy().to_string());
                     state.push_system(&format!("Changed directory to {cwd}"));
                     state.workspace_path = cwd;

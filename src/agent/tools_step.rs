@@ -333,8 +333,12 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
         // Не сырой JSON: он экранирует переводы строк, и содержимое файла в
         // модалке становится одной нечитаемой строкой.
         let arguments_preview = crate::tools::approval_preview(&call.name, &call.arguments);
-        let approval =
-            ToolApprovalRequest::new(ctx.conversation, call.name.clone(), arguments_preview);
+        let approval = ToolApprovalRequest::new(
+            ctx.conversation,
+            call.name.clone(),
+            arguments_preview,
+            crate::tools::approval_scope(&call.name, &call.arguments),
+        );
         let _ = ctx
             .event_tx
             .send(AppEvent::RequestToolApproval(approval.clone()));

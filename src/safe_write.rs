@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 /// пока нет (а именно такие модель и создаёт).
 pub fn resolve_for_compare(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
-        return canonical;
+        return crate::util::strip_verbatim(&canonical);
     }
     // Канонизируем ближайшего существующего предка и приклеиваем остаток —
     // так `..` сворачивается, а префикс совпадает с охраняемой стороной.
@@ -23,7 +23,7 @@ pub fn resolve_for_compare(path: &Path) -> PathBuf {
     let mut cursor = path;
     loop {
         if let Ok(canonical) = cursor.canonicalize() {
-            let mut out = canonical;
+            let mut out = crate::util::strip_verbatim(&canonical);
             for part in tail.iter().rev() {
                 out.push(part);
             }

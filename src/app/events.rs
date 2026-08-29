@@ -328,16 +328,24 @@ pub struct ToolApprovalRequest {
     pub conversation: ConversationId,
     pub tool_name: String,
     pub arguments: String,
+    /// Что именно можно разрешить «всегда» — см. `tools::approval_scope`.
+    pub scope: Option<crate::whitelist::Scope>,
     decision: Arc<Mutex<Option<bool>>>,
     notify: Arc<Notify>,
 }
 
 impl ToolApprovalRequest {
-    pub fn new(conversation: ConversationId, tool_name: String, arguments: String) -> Self {
+    pub fn new(
+        conversation: ConversationId,
+        tool_name: String,
+        arguments: String,
+        scope: Option<crate::whitelist::Scope>,
+    ) -> Self {
         Self {
             conversation,
             tool_name,
             arguments,
+            scope,
             decision: Arc::new(Mutex::new(None)),
             notify: Arc::new(Notify::new()),
         }

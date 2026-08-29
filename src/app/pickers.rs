@@ -8,45 +8,47 @@ use crate::util::format_duration_secs;
 use std::collections::HashSet;
 
 impl App {
+    /// `/whitelist` — что разрешено без вопроса.
+    ///
+    /// Список — это **правила**, а не инструменты: у правила есть область
+    /// (`bash · cargo test`), и снять с него галочку значит отозвать именно
+    /// его. Строка `· anything` показывается для каждого инструмента всегда —
+    /// иначе о самом широком варианте нельзя ни узнать, ни отказаться.
     pub(super) async fn open_whitelist_picker(&mut self) {
         use crate::app::events::{PickerItem, PickerKind, PickerMode, PickerState};
+        // Из состояния, а не с диска: после неудачной записи они расходятся, и
+        // сохранение пикера затёрло бы то, что действует в этой сессии.
+        let existing = self.state.approved_tools.clone();
         let mut items: Vec<PickerItem> = Vec::new();
         let mut checked: Vec<usize> = Vec::new();
-        let whitelist: HashSet<String> = crate::whitelist::load();
 
-        // Built-in tools
-        for def in self.tools.definitions() {
-            let in_list = whitelist.contains(&def.name);
-            items.push(PickerItem::new(
-                format!(
-                    "{}  {}",
-                    if in_list { "\u{2611}" } else { "\u{2610}" },
-                    def.name
-                ),
-                def.name.clone(),
-            ));
-            if in_list {
-                checked.push(items.len() - 1);
-            }
+        // Ключ — JSON самого правила: у области есть тип, и склеивать её с
+        // именем инструмента через разделитель было бы хрупко.
+        let key = |rule: &crate::whitelist::Rule| serde_json::to_string(rule).unwrap_or_default();
+
+        for rule in existing.rules() {
+            items.push(PickerItem::new(rule.describe(), key(rule)));
+            checked.push(items.len() - 1);
         }
 
-        // MCP tools
-        let mcp = self.mcp.lock().await;
-        for full in mcp.get_all_tools() {
-            let in_list = whitelist.contains(&full.full_name);
-            items.push(PickerItem::new(
-                format!(
-                    "{}  {}",
-                    if in_list { "\u{2611}" } else { "\u{2610}" },
-                    full.full_name
-                ),
-                full.full_name.clone(),
-            ));
-            if in_list {
-                checked.push(items.len() - 1);
-            }
+        let mut names: Vec<String> = self
+            .tools
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        {
+            let mcp = self.mcp.lock().await;
+            names.extend(mcp.get_all_tools().into_iter().map(|t| t.full_name));
         }
-        drop(mcp);
+        for name in names {
+            let wide = crate::whitelist::Rule::tool(&name);
+            // Уже отмеченное правило «целиком» второй раз не показываем.
+            if existing.rules().contains(&wide) {
+                continue;
+            }
+            items.push(PickerItem::new(wide.describe(), key(&wide)));
+        }
 
         if items.is_empty() {
             self.state
@@ -59,13 +61,13 @@ impl App {
         }
 
         let mut picker = PickerState::new_with_kind(
-            " Tool Whitelist (Space to toggle, Enter to save)",
+            " Auto-approved — Space toggles; ANYTHING means no limits",
             items,
             PickerMode::Multi,
             PickerKind::Whitelist,
         );
         picker.checked = checked;
-        picker.persistent_checked = whitelist.into_iter().collect();
+        picker.persistent_checked = existing.rules().iter().map(key).collect();
         self.state.modal = Some(crate::app::events::Modal::Picker(picker));
     }
 

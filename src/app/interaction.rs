@@ -10,10 +10,17 @@ impl App {
     /// Запрос на подтверждение инструмента: разрешить сразу, поставить в
     /// очередь или показать.
     pub(super) async fn on_tool_approval_requested(&mut self, request: ToolApprovalRequest) {
-        if self.state.approved_tools.contains(&request.tool_name) {
+        // Называем правило, а не просто «auto-approved»: с областями человеку
+        // важно видеть, какое именно разрешение сработало.
+        if let Some(rule) = self
+            .state
+            .approved_tools
+            .matching(&request.tool_name, request.scope.as_ref())
+        {
+            let shown = rule.describe();
             request.resolve(true).await;
             self.state.focused_mut().generation.active = true;
-            self.state.status_message = format!("Running {} (auto-approved)", request.tool_name);
+            self.state.status_message = format!("Running {shown} (auto-approved)");
             return;
         }
         if self.slot_is_busy() {
@@ -57,7 +64,8 @@ impl App {
             tool_name: request.tool_name.clone(),
             arguments: request.arguments.clone(),
             scroll_offset: 0,
-            always_allow: false,
+            grant: super::events::Grant::default(),
+            scope: request.scope.clone(),
         });
         self.state.pending_tool_approval = Some(request);
     }
@@ -76,7 +84,11 @@ impl App {
         while let Some(next) = self.state.pending_interactions.pop_front() {
             match next {
                 PendingInteraction::Approval(request) => {
-                    if self.state.approved_tools.contains(&request.tool_name) {
+                    if self
+                        .state
+                        .approved_tools
+                        .allows(&request.tool_name, request.scope.as_ref())
+                    {
                         request.resolve(true).await;
                         continue;
                     }

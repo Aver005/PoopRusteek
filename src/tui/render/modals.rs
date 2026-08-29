@@ -24,14 +24,18 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
             tool_name,
             arguments,
             scroll_offset,
-            always_allow,
+            grant,
+            scope,
         } => render_tool_approval(
             frame,
             area,
-            tool_name,
-            arguments,
-            *scroll_offset,
-            *always_allow,
+            ToolApprovalView {
+                tool_name,
+                arguments,
+                scroll_offset: *scroll_offset,
+                grant: *grant,
+                scope: scope.as_ref(),
+            },
             theme,
         ),
         Modal::Picker(picker) => render_picker(frame, area, picker, theme),
@@ -45,15 +49,24 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
     }
 }
 
-fn render_tool_approval(
-    frame: &mut Frame,
-    area: Rect,
-    tool_name: &str,
-    arguments: &str,
+/// Состояние модалки одним аргументом: восемь позиционных упирались в
+/// блокирующий гейт clippy, а список только рос.
+struct ToolApprovalView<'a> {
+    tool_name: &'a str,
+    arguments: &'a str,
     scroll_offset: usize,
-    always_allow: bool,
-    theme: &Theme,
-) {
+    grant: crate::app::view_state::Grant,
+    scope: Option<&'a crate::whitelist::Scope>,
+}
+
+fn render_tool_approval(frame: &mut Frame, area: Rect, view: ToolApprovalView<'_>, theme: &Theme) {
+    let ToolApprovalView {
+        tool_name,
+        arguments,
+        scroll_offset,
+        grant,
+        scope,
+    } = view;
     let popup_width = area.width.clamp(50, 72);
     let max_height = area.height.saturating_sub(4);
     let content_height = arguments
@@ -61,7 +74,10 @@ fn render_tool_approval(
         .count()
         .max(4)
         .min(max_height.saturating_sub(6) as usize);
-    let popup_height = (content_height + 8).min(max_height as usize) as u16;
+    // Плюс строка на каждый вариант разрешения — их два или три, и обрезать
+    // их снизу нельзя: именно там человек видит, что именно он разрешает.
+    let grants = crate::app::view_state::Grant::all(scope.is_some()).len();
+    let popup_height = (content_height + 7 + grants).min(max_height as usize) as u16;
     let popup_area = center_popup(area, popup_width, popup_height);
 
     let block = modal_block(" \u{26A0} Tool Call ", theme.warning, theme);
@@ -128,16 +144,29 @@ fn render_tool_approval(
     fill_panel_space(&mut all_lines, inner_h.saturating_sub(3));
     all_lines.push(separator_line(inner_w, theme));
 
-    // Always allow checkbox
-    let check = if always_allow { "\u{2611}" } else { "\u{2610}" };
-    all_lines.push(Line::from(vec![Span::styled(
-        format!("  {} Always allow (saved, survives restart)", check),
-        if always_allow {
-            Style::default().fg(theme.success)
-        } else {
-            Style::default().fg(theme.text_dim)
-        },
-    )]));
+    // Все варианты списком, а не только текущий: человек, видящий одну
+    // строку «just this once», не знает, что там есть что-то ещё.
+    use crate::app::view_state::Grant;
+    for option in Grant::all(scope.is_some()) {
+        let current = option == grant;
+        let style = match (current, option) {
+            (false, _) => Style::default().fg(theme.text_dim),
+            (true, Grant::Tool) => Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+            (true, _) => Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::BOLD),
+        };
+        all_lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  {} {}",
+                if current { "\u{25CF}" } else { "\u{25CB}" },
+                option.label(tool_name, scope)
+            ),
+            style,
+        )]));
+    }
 
     // Key bindings
     all_lines.push(Line::from(vec![
@@ -162,7 +191,7 @@ fn render_tool_approval(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" toggle  ", Style::default().fg(theme.text_dim)),
+        Span::styled(" change  ", Style::default().fg(theme.text_dim)),
         Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
         Span::styled(" scroll", Style::default().fg(theme.text_dim)),
     ]));

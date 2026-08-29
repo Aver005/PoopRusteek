@@ -21,7 +21,7 @@
 | **Agent loop** | `run_agent_loop` in `agent/runner.rs` — the multi-step LLM↔tool conversation driver. |
 | **Tool** | A capability the agent can invoke (`bash`, `powershell`, `question`, `shell_*`, `skill`, or any `mcp__*`). |
 | **Tool call** | Parsed from raw LLM text (XML `<tool_use>`, `[TOOL:…]`, or JSON). No native function-calling. |
-| **Tool approval** | Modal asking the user to allow a tool call. `/whitelist` auto-approves chosen tools (`approved_tools`). |
+| **Tool approval** | Modal asking the user to allow a tool call, with three grants: once, this scope, or the whole tool. `/whitelist` lists the saved rules (`approved_tools`: tool + optional `Scope::Command`/`Scope::Path`). |
 | **MCP** | Model Context Protocol. External servers exposing tools/resources, namespaced `mcp__{server}__{tool}`. |
 | **ACP** | Agent Client Protocol. `--acp` runs Pooprusteek as a JSON-RPC-over-stdio server for an external client (e.g. IDE). |
 | **Skill** | A reusable markdown instruction set (`SKILL.md` or `*.prompt.md`) injected into the system prompt when enabled. |

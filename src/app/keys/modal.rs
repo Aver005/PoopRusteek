@@ -9,7 +9,6 @@ use crate::app::events::{self, Modal};
 use crate::app::{App, conversation};
 use crate::error::AppResult;
 use crossterm::event::{KeyCode, KeyModifiers};
-use std::collections::HashSet;
 
 /// How many argument lines the tool-approval modal shows at once. The
 /// keyboard scroll clamp here and the mouse-wheel clamp in `keys::mouse`
@@ -64,13 +63,28 @@ impl App {
                 tool_name,
                 arguments,
                 scroll_offset,
-                always_allow,
+                grant,
+                scope,
             } => {
                 match approval_key(key.code) {
                     Some(ApprovalKey::Approve) => {
-                        if always_allow {
-                            self.state.approved_tools.insert(tool_name.clone());
-                            crate::whitelist::persist_approval(&tool_name);
+                        // Правило записывается ровно то, что подписано на
+                        // экране: узкое по умолчанию, широкое — только если
+                        // человек сам до него дощёлкал.
+                        let rule = match grant {
+                            events::Grant::Once => None,
+                            events::Grant::Scope => scope
+                                .clone()
+                                .map(|s| crate::whitelist::Rule::scoped(&tool_name, s)),
+                            events::Grant::Tool => Some(crate::whitelist::Rule::tool(&tool_name)),
+                        };
+                        // Состояние обновляем только если запись удалась:
+                        // иначе разрешение живёт до перезапуска и исчезает.
+                        if let Some(rule) = rule {
+                            match crate::whitelist::persist(rule.clone()) {
+                                Ok(()) => self.state.approved_tools.add(rule),
+                                Err(error) => self.state.push_ui_system(&error),
+                            }
                         }
                         if let Some(request) = self.state.pending_tool_approval.take() {
                             request.resolve(true).await;
@@ -92,7 +106,8 @@ impl App {
                             tool_name,
                             arguments,
                             scroll_offset,
-                            always_allow: !always_allow,
+                            grant: grant.next(scope.is_some()),
+                            scope,
                         });
                     }
                     Some(ApprovalKey::ScrollUp) => {
@@ -100,7 +115,8 @@ impl App {
                             tool_name,
                             arguments,
                             scroll_offset: scroll_offset.saturating_sub(3),
-                            always_allow,
+                            grant,
+                            scope,
                         });
                     }
                     Some(ApprovalKey::ScrollDown) => {
@@ -112,7 +128,8 @@ impl App {
                             tool_name,
                             arguments,
                             scroll_offset: (scroll_offset + 3).min(max_scroll),
-                            always_allow,
+                            grant,
+                            scope,
                         });
                     }
                     None => {
@@ -120,7 +137,8 @@ impl App {
                             tool_name,
                             arguments,
                             scroll_offset,
-                            always_allow,
+                            grant,
+                            scope,
                         });
                     }
                 }
@@ -231,15 +249,16 @@ impl App {
     ) -> AppResult<()> {
         match kind {
             events::PickerKind::Whitelist => {
-                let selected_names: HashSet<String> = indices
+                let rules = indices
                     .iter()
                     .filter_map(|&i| picker.items.get(i))
-                    .map(|item| item.value.clone())
+                    .filter_map(|item| serde_json::from_str(&item.value).ok())
                     .collect();
-                if let Err(e) = crate::whitelist::save(&selected_names) {
+                let list = crate::whitelist::Whitelist::from_rules(rules);
+                if let Err(e) = crate::whitelist::save(&list) {
                     tracing::warn!("Failed to save whitelist: {e}");
                 }
-                self.state.approved_tools = selected_names;
+                self.state.approved_tools = list;
             }
             events::PickerKind::Skills => {
                 let enabled: Vec<String> = indices

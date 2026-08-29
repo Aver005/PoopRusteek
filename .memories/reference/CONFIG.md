@@ -13,9 +13,28 @@ Paths come from the `dirs` crate, so they are **platform-specific**:
 | Sessions | `{data}/sessions/{id}.json` | … | … | … |
 | History | `{data}/history.json` | … | … | … |
 | MCP own config | `{data}/mcp.json` | … | … | … |
+| Approval rules | `{data}/whitelist.json` | … | … | … |
+| Undo journal | `{data}/checkpoints.jsonl` + `{data}/checkpoints/` | … | … | … |
 | Debug log | `.dev/debug.log` (relative to CWD; enabled by `--debug_log` at startup or toggled at runtime via `/debug`) | — | — | — |
 
 > On this machine (Windows), config + data both resolve under `%APPDATA%\Roaming\pooprusteek\`.
+
+**`whitelist.json`** — auto-approval rules, one object per rule:
+
+```json
+[
+  { "tool": "read_file" },
+  { "tool": "bash",  "scope": { "command": ["cargo", "test"] } },
+  { "tool": "edit",  "scope": { "path": "E:\Projects\Me\pooprusteek\src" } }
+]
+```
+
+A rule without `scope` means the whole tool. The **old format** — a bare array
+of tool names, `["bash","edit"]` — is still read and imported as tool-wide
+rules, with a one-time notice: that approval was given when no narrower option
+existed, so it should be reviewed rather than silently kept. An unparseable
+file is moved aside to `whitelist.json.bad` instead of being overwritten by the
+next write.
 
 ## CONFIG SCHEMA (`config/mod.rs:5`, TOML)
 

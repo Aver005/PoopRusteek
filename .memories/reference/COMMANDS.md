@@ -41,7 +41,7 @@
 | `/mcp` | — | `[ttl <secs>\|reload]` | Open MCP view; set cache TTL (1–86400); reload servers | `defs/mcp.rs` |
 | `/tools` | — | — | Show all available tools (built-in + MCP) | `defs/tools.rs` |
 | `/skills` | — | `[list\|enable <name>\|disable <name>]` | Manage skills; no-arg opens picker | `defs/skills.rs` |
-| `/whitelist` | — | — | Open tool auto-approval whitelist manager | `defs/whitelist.rs` |
+| `/whitelist` | — | — | Manage auto-approval **rules** (`tool` + optional scope). Existing rules are listed checked — unchecking revokes that rule; every tool also appears as `tool · anything` (unchecked) so the widest grant is visible and can be given or refused deliberately. Narrow rules are created from the approval modal, not here | `defs/whitelist.rs` |
 | `/rate` | — | `[<ms>\|<N>/min\|<N>rpm\|off]` | Set min delay between requests (`rate_limit_ms`) and/or max requests per rolling 60s window (`rate_limit_per_minute`) — independent gates, both may be active; `off` zeroes both. No args → prints current settings (`AgentConfig::rate_limit_display`) instead of just a usage error; every change pushes a confirmation system message | `defs/rate.rs` |
 | `/retry` | — | `<N\|on\|off\|-1>` | Set max retries on API failure → `config.agent.max_retries` (-1/on = infinite, 0/off = none) | `defs/retry.rs` |
 | `/btw` | — | `<question>` | One-shot side-question answered in the background (ephemeral `Sidechat` conversation, forked provider) — doesn't disturb the main turn | `defs/btw.rs` |

@@ -164,6 +164,17 @@ pub fn atomic_write(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
     Ok(())
 }
 
+/// Снять windows-префикс `\\?\` с канонизированного пути. `canonicalize`
+/// возвращает именно такой, а показывать его человеку и сравнивать с обычным
+/// `current_dir()` нельзя — префиксы не совпадут.
+pub fn strip_verbatim(path: &std::path::Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
+}
+
 /// Expand a leading `~` or `~/` to the user's home directory. Plain `~foo`
 /// (other-user syntax) is returned unchanged. The single shared impl — do not
 /// hand-roll tilde handling at call sites (two past copies were both wrong).

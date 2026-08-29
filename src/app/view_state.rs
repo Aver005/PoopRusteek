@@ -393,6 +393,54 @@ pub enum ConfirmAction {
     Undo,
 }
 
+/// Насколько широкое разрешение даёт «да» в модалке подтверждения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Grant {
+    /// Только этот вызов. Умолчание: узкое разрешение безопаснее широкого.
+    #[default]
+    Once,
+    /// Все вызовы этого инструмента в этой области (`bash · cargo test`).
+    Scope,
+    /// Инструмент целиком, без ограничений. Прежнее поведение «always allow».
+    Tool,
+}
+
+impl Grant {
+    /// Следующий вариант по кругу. Область пропускается, если её нет: у
+    /// MCP-инструмента сузить нечего.
+    pub fn next(self, has_scope: bool) -> Self {
+        match self {
+            Grant::Once if has_scope => Grant::Scope,
+            Grant::Once => Grant::Tool,
+            Grant::Scope => Grant::Tool,
+            Grant::Tool => Grant::Once,
+        }
+    }
+
+    /// Подпись в модалке. Именно та, что будет записана в правило: широкое
+    /// разрешение раньше пряталось за одним словом «always».
+    pub fn label(self, tool: &str, scope: Option<&crate::whitelist::Scope>) -> String {
+        match self {
+            Grant::Once => "Just this once".to_string(),
+            Grant::Scope => match scope {
+                Some(scope) => format!("Always: {tool} · {}", scope.describe()),
+                None => format!("Always: {tool}"),
+            },
+            Grant::Tool => format!("\u{26A0} Always: {tool} · ANYTHING"),
+        }
+    }
+
+    /// Все варианты по порядку — модалка показывает их списком, иначе
+    /// человек, видя только «just this once», не знает про остальные.
+    pub fn all(has_scope: bool) -> Vec<Grant> {
+        if has_scope {
+            vec![Grant::Once, Grant::Scope, Grant::Tool]
+        } else {
+            vec![Grant::Once, Grant::Tool]
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfirmLineKind {
     Normal,
@@ -518,7 +566,11 @@ pub enum Modal {
         tool_name: String,
         arguments: String,
         scroll_offset: usize,
-        always_allow: bool,
+        /// Что человек разрешает, если жмёт «да»: только этот вызов, эту
+        /// область или инструмент целиком.
+        grant: Grant,
+        /// Область вызова, если её удалось вывести (`tools::approval_scope`).
+        scope: Option<crate::whitelist::Scope>,
     },
     Picker(PickerState),
     Question(QuestionState),
@@ -1129,5 +1181,43 @@ mod picker_tests {
         picker.update_search("alpha".to_string());
         assert_eq!(picker.items.len(), 1);
         assert_eq!(picker.cursor.selected, 0);
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+
+    /// Без области `Scope` пропускается — иначе на MCP-инструменте цикл
+    /// предлагал бы разрешение, которое некуда записать.
+    #[test]
+    fn the_grant_cycle_skips_scope_when_there_is_none() {
+        assert_eq!(Grant::default(), Grant::Once);
+        assert_eq!(Grant::Once.next(false), Grant::Tool);
+        assert_eq!(Grant::Tool.next(false), Grant::Once);
+        assert_eq!(Grant::all(false), vec![Grant::Once, Grant::Tool]);
+    }
+
+    #[test]
+    fn the_grant_cycle_visits_every_option_when_a_scope_exists() {
+        assert_eq!(Grant::Once.next(true), Grant::Scope);
+        assert_eq!(Grant::Scope.next(true), Grant::Tool);
+        assert_eq!(Grant::Tool.next(true), Grant::Once);
+        assert_eq!(
+            Grant::all(true),
+            vec![Grant::Once, Grant::Scope, Grant::Tool]
+        );
+    }
+
+    /// Самое широкое разрешение должно быть подписано так, чтобы его нельзя
+    /// было принять за узкое: раньше всё пряталось за словом «always».
+    #[test]
+    fn the_widest_grant_is_labelled_as_unlimited() {
+        let scope = crate::whitelist::Scope::Command(vec!["cargo".into(), "test".into()]);
+        let narrow = Grant::Scope.label("bash", Some(&scope));
+        assert!(narrow.contains("cargo test"), "{narrow}");
+        let widest = Grant::Tool.label("bash", Some(&scope));
+        assert!(widest.contains("ANYTHING"), "{widest}");
+        assert!(!widest.contains("cargo test"), "{widest}");
     }
 }

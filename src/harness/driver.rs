@@ -92,11 +92,16 @@ impl FromStr for ApprovePolicy {
 }
 
 impl ApprovePolicy {
-    fn decide(&self, tool: &str, whitelist: &HashSet<String>) -> bool {
+    fn decide(
+        &self,
+        tool: &str,
+        scope: Option<&crate::whitelist::Scope>,
+        whitelist: &crate::whitelist::Whitelist,
+    ) -> bool {
         match self {
             Self::All => true,
             Self::None => false,
-            Self::Whitelist => whitelist.contains(tool),
+            Self::Whitelist => whitelist.allows(tool, scope),
             Self::Except(denied) => !denied.iter().any(|name| name == tool),
         }
     }
@@ -530,7 +535,7 @@ async fn drive(
     mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
     started: Instant,
 ) -> RunOutcome {
-    let whitelist = crate::whitelist::load();
+    let whitelist = crate::whitelist::load().whitelist;
     let root = ConversationId::next();
     // History is accumulated through the app's own reducer, so turn two sees
     // exactly what turn two in the TUI would see.
@@ -643,7 +648,10 @@ async fn drive(
                             }
                         }
                         AppEvent::RequestToolApproval(request) => {
-                            let approved = options.approve.decide(&request.tool_name, &whitelist);
+                            let approved =
+                            options
+                                .approve
+                                .decide(&request.tool_name, request.scope.as_ref(), &whitelist);
                             record_approval(&request, approved);
                             tools.push(ToolInvocation {
                                 name: request.tool_name.clone(),
@@ -858,14 +866,30 @@ mod tests {
 
     #[test]
     fn policies_decide_per_tool() {
-        let whitelist = HashSet::from(["bash".to_string()]);
-        assert!(ApprovePolicy::All.decide("write", &whitelist));
-        assert!(!ApprovePolicy::None.decide("bash", &whitelist));
-        assert!(ApprovePolicy::Whitelist.decide("bash", &whitelist));
-        assert!(!ApprovePolicy::Whitelist.decide("write", &whitelist));
+        use crate::whitelist::{Rule, Whitelist};
+        let whitelist = Whitelist::from_rules(vec![Rule::tool("bash")]);
+        assert!(ApprovePolicy::All.decide("write", None, &whitelist));
+        assert!(!ApprovePolicy::None.decide("bash", None, &whitelist));
+        assert!(ApprovePolicy::Whitelist.decide("bash", None, &whitelist));
+        assert!(!ApprovePolicy::Whitelist.decide("write", None, &whitelist));
         let except = ApprovePolicy::Except(vec!["bash".to_string()]);
-        assert!(!except.decide("bash", &whitelist));
-        assert!(except.decide("powershell", &whitelist));
+        assert!(!except.decide("bash", None, &whitelist));
+        assert!(except.decide("powershell", None, &whitelist));
+    }
+
+    /// Политика `whitelist` в сценариях должна уважать область правила, иначе
+    /// харнесс проверял бы не ту модель разрешений, что живёт в TUI.
+    #[test]
+    fn the_whitelist_policy_respects_a_rule_scope() {
+        use crate::whitelist::{Rule, Whitelist};
+        let whitelist = Whitelist::from_rules(vec![Rule::scoped(
+            "bash",
+            crate::whitelist::Scope::Command(vec!["cargo".into(), "test".into()]),
+        )]);
+        let allowed = crate::whitelist::Scope::Command(vec!["cargo".into(), "test".into()]);
+        assert!(ApprovePolicy::Whitelist.decide("bash", Some(&allowed), &whitelist));
+        let other = crate::whitelist::Scope::Command(vec!["rm".into(), "-rf".into()]);
+        assert!(!ApprovePolicy::Whitelist.decide("bash", Some(&other), &whitelist));
     }
 
     #[test]

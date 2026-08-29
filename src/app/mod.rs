@@ -243,7 +243,9 @@ pub struct AppState {
     /// отрисовки, а шаг `PageUp`/`PageDown` должен совпадать с экраном.
     pub terminal_rows: u16,
     pub modal: Option<Modal>,
-    pub approved_tools: std::collections::HashSet<String>,
+    /// Правила авто-одобрения. С областью, а не только с именем
+    /// инструмента: см. `crate::whitelist`.
+    pub approved_tools: crate::whitelist::Whitelist,
     /// The interaction currently on screen (tool approval / question)…
     pub pending_tool_approval: Option<ToolApprovalRequest>,
     pub pending_question: Option<QuestionRequest>,
@@ -315,7 +317,7 @@ impl AppState {
             scroll_offset: 0,
             terminal_rows: 0,
             modal: None,
-            approved_tools: std::collections::HashSet::new(),
+            approved_tools: crate::whitelist::Whitelist::default(),
             pending_tool_approval: None,
             pending_question: None,
             pending_interactions: std::collections::VecDeque::new(),
@@ -425,7 +427,11 @@ impl App {
         // только то, что читается с диска и что решает наличие провайдера.
         let mut state = AppState::new(main_conversation);
         state.input.history = crate::session::load_history();
-        state.approved_tools = crate::whitelist::load();
+        let whitelist = crate::whitelist::load();
+        state.approved_tools = whitelist.whitelist;
+        // Перенос старого формата и битый файл — не молча: в первом случае
+        // разрешение стало шире, чем человек выбирал, во втором пропало.
+        let whitelist_notice = whitelist.notice;
         state.workspace_path = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -433,9 +439,11 @@ impl App {
         // непустым и подменило домашний экран на каждом запуске.
         let instructions_notice = reload_instructions(&mut state, &config);
         if has_provider {
-            // Правила проекта важнее «Ready»: их подхватили молча, и это
-            // единственное место, где человек об этом узнаёт.
-            state.status_message = instructions_notice.unwrap_or_else(|| "Ready".to_string());
+            // Правила проекта и перенос whitelist важнее «Ready»: и то, и
+            // другое произошло молча, а знать об этом человеку надо.
+            state.status_message = whitelist_notice
+                .or(instructions_notice)
+                .unwrap_or_else(|| "Ready".to_string());
         } else {
             state.status_message = "No token configured".to_string();
             state.view = View::Onboarding;
@@ -1109,7 +1117,7 @@ impl App {
             }
         }
         self.config = crate::config::Config::default();
-        self.state.approved_tools.clear();
+        self.state.approved_tools = crate::whitelist::Whitelist::default();
         self.state.input.history.clear();
         if errors.is_empty() {
             self.reset_to_onboarding("All local data wiped".to_string());
