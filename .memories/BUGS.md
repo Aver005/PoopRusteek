@@ -3,6 +3,29 @@
 > Last updated: 2026-08-26 (**five-agent review of the day's context-compaction work**, **42** findings filed below under the prefix `compaction-review-2026-08-26 #N`. Now: **17 closed the same day** (the five data-loss fixes, then **#1, #2, #3, #16, #17**, then the evening batch **#4, #5, #6, #7, #8, #11, #26** — see the RESOLVED entries), **24 open** (#9, #10, #12-#15, #18-#25, #27-#36, spread HIGH 2 / MEDIUM 15 / LOW 7) and **1 accepted** (#37, `chars / 3`, owner decision). **#25 is two thirds closed** and stays open with its scope narrowed to the one third that remains (a verbatim `<template>` echo still validates). The evening batch closed the measurement-and-summary group: the context window is re-polled on every provider/model switch and goes to *unknown* — ladder off — the moment one starts, an old `[agent] auto_compact = false` is migrated instead of silently reversed, the prior summary reaches the summariser once instead of twice, mode 2 folds its chunk summaries into one form mechanically and gives each chunk its own upstream session, the harness driver applies `ToolOutputCleared` the way the TUI does, and mode 1 no longer drops what sits ahead of the first user message. Before, same day: the harness group is closed: the ladder is now reachable from a scenario (`[context]` table + provider-window discovery in the driver), a scenario can assert a rung actually fired (`[[expect.trace]]`), a run that produced nothing to judge is a failure, and the reserve no longer switches the ladder off on windows ≤ 20k. First scenario that exercises rung 1 end to end: `sandbox/scenarios/mock/rung-one-clears-tool-output.toml` (2/2; fails with exit 4 and `0 'context.prune' record(s)` once the window is taken away). `.docs/context-compaction.md` corrected in the same pass and given a «Известные расхождения» section. Before, same day: **context compaction steps 5-6**: rung 3 + `/compact` shipped, closing findings **#3** and **#4**. Tally re-counted against the entries below, because the two header lines had drifted apart: of the review's 20 findings, **9 are closed** (1, 2, 3, 4, 5, 11, 12, 15, 16), **1 refuted** (17), **10 open** (6, 7, 8, 9, 10, 13, 14, 18, 19, 20). Two new HIGH entries opened by the same work, both found by reading rather than by running: `/compact` is a no-op on DeepSeek and pollutes its server-side branch, and a stale doc comment in `src/context/summary.rs`. Before, same day: full-codebase review `.docs/review-2026-08-26-rust.md`, 20 findings — same-day fix batch closed 6 (1,2,5,11,12,16), see RESOLVED and `JOURNAL/2026-08-26.md`; the other 14 added below by severity, source of record is the review doc. Before, same day: the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
 > Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure), `.docs/review-2026-08-26-rust.md` (2026-08-26 full-codebase review, 20 numbered findings — 9 closed, 1 refuted, 10 open as of the evening of 2026-08-26; referenced by number below)
 
+## RESOLVED 2026-08-29 — OpenAI-формат и история вызовов
+
+- ✅ **HIGH — исходящий `role:"tool"` без `tool_calls` ломал любой строгий
+  эндпоинт.** `request_to_openai` отправлял результат инструмента как
+  `{role:"tool", tool_call_id}`, но у предшествующего ассистентского
+  сообщения никаких `tool_calls` не было и быть не могло: протокол вызовов
+  промптовый, XML вырезается `strip_tool_calls` до попадания в историю.
+  api.openai.com и строгие шлюзы отвечают на это 400 («messages with role
+  'tool' must be a response to a preceeding message with 'tool_calls'»), то
+  есть **любой ход с инструментом падал**. Не замечали, потому что локальные
+  серверы (LM Studio, Ollama) это прощают, а мок ничего не проверяет.
+  Anthropic и Gemini не задело: `merge_alternating_turns` давно
+  переклеивает результаты в пользовательский текст. Теперь так же делает и
+  OpenAI-путь. `→  src/provider/openai_compat.rs::request_to_openai`
+- ✅ **MEDIUM — свой же сервер отвергал `"content": null`.** `MessageContent`
+  был untagged-перечислением из двух вариантов, `Text` и `Parts`; `null` не
+  совпадал ни с одним, разбор **всего тела** падал, и `POST
+  /v1/chat/completions` отвечал «400 invalid request body». Между тем
+  `"content": null` — это ровно то, что OpenAI-клиент шлёт в ассистентском
+  сообщении с одними `tool_calls`, то есть любой клиент, проигрывающий свою
+  историю вызовов, получал отказ на входе. Добавлен вариант `Null` и
+  `#[serde(default)]` на поле. `→  src/provider/openai_compat.rs::MessageContent`
+
 ## RESOLVED 2026-08-29 — стрим и терминальные причины
 
 - ✅ **HIGH — обрезанный ответ выдавался за ошибку провайдера.** `collect_stream`

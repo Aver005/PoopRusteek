@@ -23,6 +23,13 @@
 //! rather than silently ignore; multimodal content parts are flattened to
 //! their text parts.
 //!
+//! Not translating tool-calling still has to mean *tolerating* it on the
+//! wire, in both directions. Inbound: an assistant message whose whole point
+//! is its `tool_calls` carries `"content": null`, which must parse rather
+//! than 400 the request. Outbound: a `Role::Tool` message goes out as user
+//! text, because our assistant messages carry no `tool_calls` for it to
+//! answer and a lone `role:"tool"` is rejected by strict endpoints.
+//!
 //! Everything here is pure data mapping — no I/O, no `App`, no network.
 
 use crate::provider::{
@@ -56,6 +63,9 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionMessage {
     pub role: String,
+    /// Отсутствующее поле читается как `null`: у ассистентского сообщения с
+    /// одними вызовами инструментов текста нет вовсе.
+    #[serde(default)]
     pub content: MessageContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -71,11 +81,17 @@ pub struct ChatCompletionMessage {
 /// OpenAI message content: a plain string, or an array of typed parts
 /// (multimodal). Non-text parts are dropped at conversion — text-only
 /// backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+    /// `"content": null` — что OpenAI шлёт в ассистентском сообщении, чей
+    /// смысл целиком в `tool_calls`. Без этого варианта разбор всего тела
+    /// падал, и клиент, проигрывающий свою же историю вызовов, получал от
+    /// нашего сервера 400 ещё на входе.
+    #[default]
+    Null,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +113,7 @@ impl MessageContent {
                 .filter_map(|part| part.text)
                 .collect::<Vec<_>>()
                 .join("\n"),
+            MessageContent::Null => String::new(),
         }
     }
 }
@@ -311,17 +328,26 @@ pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
         .iter()
         .filter(|message| !message.ui_only)
         .map(|message| {
+            // Результат инструмента уходит текстом от пользователя — ровно
+            // как в anthropic_compat и gemini_compat. Протокол вызовов у нас
+            // промптовый, у ассистента нет `tool_calls`, а `role:"tool"` без
+            // них строгие эндпоинты (api.openai.com и шлюзы) отвергают с 400:
+            // «messages with role 'tool' must be a response to a preceeding
+            // message with 'tool_calls'». Локальные серверы это прощали,
+            // поэтому баг дожил досюда.
+            if message.role == Role::Tool {
+                let body = match &message.name {
+                    Some(name) => format!("[tool result: {name}]\n{}", message.content),
+                    None => format!("[tool result]\n{}", message.content),
+                };
+                return serde_json::json!({ "role": "user", "content": body });
+            }
             let mut object = serde_json::json!({
                 "role": role_to_openai(&message.role),
                 "content": message.content,
             });
             if let Some(name) = &message.name {
                 object["name"] = serde_json::json!(name);
-            }
-            if message.role == Role::Tool
-                && let Some(id) = &message.tool_call_id
-            {
-                object["tool_call_id"] = serde_json::json!(id);
             }
             object
         })
@@ -797,8 +823,19 @@ mod tests {
         let wire = request_to_openai(&internal);
         // ui_only chrome must not survive the conversion.
         assert_eq!(wire["messages"].as_array().unwrap().len(), 3);
-        assert_eq!(wire["messages"][2]["role"], "tool");
-        assert_eq!(wire["messages"][2]["tool_call_id"], "call_1");
+        // Результат инструмента — пользовательский текст, а не `role:"tool"`:
+        // см. комментарий в `request_to_openai`.
+        assert_eq!(wire["messages"][2]["role"], "user");
+        assert!(
+            wire["messages"][2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("result")
+        );
+        assert!(
+            wire["messages"][2].get("tool_call_id").is_none(),
+            "an orphan tool_call_id is exactly what strict endpoints reject"
+        );
 
         // And the wire shape parses back through the inbound path.
         let raw = serde_json::json!({
@@ -811,10 +848,69 @@ mod tests {
         let back = to_internal_request(reparsed, &defaults()).unwrap();
         assert_eq!(back.messages.len(), 3);
         assert_eq!(back.messages[0].role, Role::System);
-        assert_eq!(back.messages[2].role, Role::Tool);
-        assert_eq!(back.messages[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(back.temperature, 0.3);
         assert_eq!(back.max_tokens, 512);
+    }
+
+    /// Ровно то тело, которое шлёт любой OpenAI-клиент, проигрывающий свою
+    /// историю вызовов: у ассистента `"content": null`, весь смысл в
+    /// `tool_calls`. Раньше это не совпадало ни с одним вариантом
+    /// `MessageContent`, разбор тела падал целиком, и сервер отвечал
+    /// «400 invalid request body» ещё до всякой обработки.
+    #[test]
+    fn an_assistant_message_with_null_content_is_accepted() {
+        let raw = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "what is the weather"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "52F"},
+            ],
+        });
+        let parsed: ChatCompletionRequest =
+            serde_json::from_value(raw).expect("a null assistant content must parse");
+        let internal = to_internal_request(parsed, &defaults()).unwrap();
+        assert_eq!(internal.messages.len(), 3);
+        assert_eq!(internal.messages[1].role, Role::Assistant);
+        assert_eq!(internal.messages[1].content, "");
+    }
+
+    /// Отсутствующее поле `content` — то же самое, что `null`.
+    #[test]
+    fn a_missing_content_field_is_accepted() {
+        let raw = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "assistant"}],
+        });
+        let parsed: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        let internal = to_internal_request(parsed, &defaults()).unwrap();
+        assert_eq!(internal.messages[0].content, "");
+    }
+
+    /// Входящее направление не трогаем: наш собственный сервер обязан
+    /// принимать `role:"tool"` от клиентов, это законная часть протокола.
+    /// Ломается только исходящее — там у ассистента нет `tool_calls`.
+    #[test]
+    fn an_inbound_tool_message_is_still_accepted() {
+        let raw = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+            ],
+        });
+        let parsed: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        let internal = to_internal_request(parsed, &defaults()).unwrap();
+        assert_eq!(internal.messages[1].role, Role::Tool);
+        assert_eq!(internal.messages[1].tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[test]
