@@ -203,6 +203,7 @@ impl App {
                 }
             },
             CommandResult::Rag(action) => self.apply_rag_action(action),
+            CommandResult::Instructions(enabled) => self.apply_instructions_action(enabled),
             CommandResult::OpenThemes => {
                 self.state.view = View::Themes;
                 self.state.themes = crate::app::themes::ThemesViewState::open(&self.config);
@@ -269,6 +270,23 @@ impl App {
     /// `/rag` effects: status display, persisted on/off switch, full
     /// reload. Everything heavy (model load, embedding) happens inside the
     /// service on blocking threads — these arms only flip flags and spawn.
+    /// `/instructions on|off`: сохранить выбор и сразу перечитать кэш, чтобы
+    /// следующий же ход шёл с новым промптом, а не после перезапуска.
+    fn apply_instructions_action(&mut self, enabled: bool) {
+        self.config.instructions.enabled = enabled;
+        let saved = crate::config::save_or_message(&self.config).err();
+        let notice = crate::app::reload_instructions(&mut self.state, &self.config);
+        let summary = match (enabled, notice) {
+            (true, Some(found)) => found,
+            (true, None) => "Project instructions ON — nothing found in this folder.".to_string(),
+            (false, _) => "Project instructions OFF — not sent to the model.".to_string(),
+        };
+        self.state.push_ui_system(&summary);
+        if let Some(problem) = saved {
+            self.state.push_ui_system(&problem);
+        }
+    }
+
     fn apply_rag_action(&mut self, action: crate::commands::RagAction) {
         use crate::commands::RagAction;
         match action {

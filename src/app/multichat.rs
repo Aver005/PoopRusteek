@@ -63,16 +63,7 @@ impl App {
         let id = conversation::ConversationId::next();
         let session_id = crate::session::create_session_id();
         let messages = vec![ChatMessage::user(&prompt)];
-        let system_prompt = super::system_prompt::build(
-            &self.prompts,
-            &self.skills,
-            self.config.skills.injection,
-            &self.tools,
-            &self.mcp,
-            self.config.effective_mcp_schema_mode(),
-            &self.state.workspace_path,
-        )
-        .await;
+        let system_prompt = super::system_prompt::build(self.prompt_inputs()).await;
 
         let mut generation = generation::GenerationState::default();
         generation.begin(std::time::Instant::now());

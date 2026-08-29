@@ -29,7 +29,7 @@ impl Command for CwdCommand {
         "/cwd <path>"
     }
 
-    fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
+    fn execute(&self, args: &str, state: &mut AppState, config: &Config) -> CommandResult {
         with_args(args, "/cwd <path>", |path| {
             let target = crate::util::expand_tilde(path);
 
@@ -43,6 +43,11 @@ impl Command for CwdCommand {
                         .unwrap_or_else(|_| absolute.to_string_lossy().to_string());
                     state.push_system(&format!("Changed directory to {cwd}"));
                     state.workspace_path = cwd;
+                    // Новая папка — новый AGENTS.md. Перечитываем здесь, а не
+                    // на каждом ходу: сборка промпта идёт на цикле событий.
+                    if let Some(notice) = crate::app::reload_instructions(state, config) {
+                        state.push_ui_system(&notice);
+                    }
                     CommandResult::Handled
                 }
                 Err(e) => {

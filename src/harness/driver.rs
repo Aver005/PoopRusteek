@@ -452,16 +452,25 @@ async fn assemble(
         &serde_json::json!({ "ready": semantic_ready, "enabled": semantic.is_enabled() }),
     );
 
-    let mut system_prompt = crate::app::system_prompt::build(
-        &crate::prompts::load_prompt_files(),
-        &skills,
-        config.skills.injection,
-        &tools,
-        &mcp,
-        config.effective_mcp_schema_mode(),
-        workspace,
-    )
-    .await;
+    let instructions = if config.instructions.enabled {
+        crate::instructions::load(workspace, config.instructions.max_bytes).section
+    } else {
+        String::new()
+    };
+    let mut system_prompt =
+        crate::app::system_prompt::build(crate::app::system_prompt::PromptInputs {
+            prompts: &crate::prompts::load_prompt_files(),
+            skills: &skills,
+            skills_injection: config.skills.injection,
+            tools: &tools,
+            mcp: &mcp,
+            mcp_schema_mode: config.effective_mcp_schema_mode(),
+            workspace,
+            // Сценарий гоняется в чужой рабочей папке, и её AGENTS.md — часть
+            // условий задачи ровно так же, как в TUI.
+            project_instructions: &instructions,
+        })
+        .await;
 
     // A prompt variant is appended rather than substituted: the comparison
     // worth making is "does this instruction change behaviour", and replacing

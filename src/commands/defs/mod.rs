@@ -13,6 +13,7 @@ pub mod goal;
 pub mod help;
 pub mod home;
 pub mod import;
+pub mod instructions;
 pub mod jobs;
 pub mod last;
 pub mod load;

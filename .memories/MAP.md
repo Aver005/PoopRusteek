@@ -8,6 +8,7 @@
 | `src/main.rs` | CLI (`--acp`, `--debug_log`), init order, launch TUI or ACP | 85 |
 | `src/error.rs` | `AppError` enum, `AppResult<T>` | — |
 | `src/prompts.rs` | `PromptFiles`, asset resolution for prompts | 67 |
+| `src/instructions.rs` | Project rule files (`AGENTS.md`/`CLAUDE.md`/`GEMINI.md`/`POOPRUSTEEK.md`): directory-chain discovery to the repo root, symlink refusal, nonce envelope, whole-section byte budget. Cached in `AppState::instructions_section` via `app::reload_instructions`. | ~520 |
 | `src/session.rs` | `Session`, save/load/list, tags, history file | 191 |
 | `src/debug_log.rs` | Optional `.dev/debug.log` logger | 68 |
 

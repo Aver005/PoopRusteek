@@ -8,6 +8,7 @@ mod context;
 mod debug_log;
 mod error;
 mod harness;
+mod instructions;
 mod logging;
 mod mcp;
 mod prompts;

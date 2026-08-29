@@ -152,6 +152,10 @@ pub enum CommandResult {
     SwitchModel(String),
     /// `/rag [on|off|reload]` — semantic-matching control.
     Rag(RagAction),
+    /// `/instructions on|off` — включить или выключить вклейку правил из
+    /// `AGENTS.md`. Эффект применяет `apply_instructions_action`: пишет
+    /// конфиг и перечитывает кэш секции.
+    Instructions(bool),
     /// `/search <query>` — history search; results flush back as a
     /// UI-only message once the off-loop lookup completes.
     SearchHistory(String),
@@ -256,6 +260,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::providers::ProvidersCommand));
         self.register(Box::new(defs::models::ModelsCommand));
         self.register(Box::new(defs::tools::ToolsCommand));
+        self.register(Box::new(defs::instructions::InstructionsCommand));
         self.register(Box::new(defs::whitelist::WhitelistCommand));
         self.register(Box::new(defs::skills::SkillsCommand));
         self.register(Box::new(defs::export::ExportCommand));

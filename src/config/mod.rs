@@ -17,6 +17,9 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// `AGENTS.md` рабочей папки — см. `crate::instructions`.
+    #[serde(default)]
+    pub instructions: InstructionsConfig,
     /// Semantic (embedding-based) skill matching — see `crate::semantic`.
     #[serde(default)]
     pub semantic: SemanticConfig,
@@ -513,6 +516,38 @@ impl Default for McpConfig {
             cache_ttl: default_mcp_cache_ttl(),
         }
     }
+}
+
+/// `[instructions]` — проектные правила из `AGENTS.md` и родни.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionsConfig {
+    /// Выключатель. Секция едет в каждый запрос и приходит из чужого
+    /// репозитория, так что отключаемость — требование, а не удобство.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Потолок на ВСЮ секцию, а не на файл: цепочка каталогов складывается,
+    /// и платится этот вес каждым запросом и каждым суб-агентом.
+    #[serde(default = "default_instructions_max_bytes")]
+    pub max_bytes: usize,
+}
+
+impl Default for InstructionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: default_instructions_max_bytes(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Вдвое больше скилл-бюджета (8 KiB) и вдвое меньше кодексовых 32 KiB:
+/// правила проекта важнее одного скилла, но не важнее всего промпта.
+fn default_instructions_max_bytes() -> usize {
+    16 * 1024
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

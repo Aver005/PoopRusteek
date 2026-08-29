@@ -24,7 +24,8 @@
 | `/quit` | — | — | Exit application | `defs/quit.rs` |
 | `/compact` | — | — | Summarize history to shrink context (uses `compact.prompt.md`) | `defs/compact.rs` |
 | `/reset` | — | — | Reset session completely (new session + provider reset) | `defs/reset.rs` |
-| `/cwd` | `/cd`, `/move` | `<path>` | Change working directory (expands `~`) | `defs/cwd.rs` |
+| `/cwd` | `/cd`, `/move` | `<path>` | Change working directory (expands `~`); also re-reads the project instruction chain for the new folder and reports it as a UI-only message | `defs/cwd.rs` |
+| `/instructions` | — | `[reload\|on\|off]` | Project rule files (`AGENTS.md` and kin). Bare = status: on/off, section size, budget, and where it looked. `reload` re-reads after you edit a file — the section is cached, not read per turn. `on`/`off` persists `[instructions] enabled` and refreshes the cache immediately. Intent: `CommandResult::Instructions(bool)` → `apply_instructions_action` | `defs/instructions.rs` |
 | `/attach` | — | `<path1> [path2]…` | Attach files to the NEXT message (supports quoted paths) | `defs/attach.rs` |
 | `/export` | — | `[path]` | Export chat to Markdown (default `{data}/exports/{session_id}.md`) | `defs/export.rs` |
 | `/import` | — | `<path.md>` | Import chat from Markdown; session tagged `Imported` | `defs/import.rs` |

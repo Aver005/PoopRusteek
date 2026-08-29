@@ -53,6 +53,13 @@ injection = "auto"         # auto | full | summary — how enabled skills reach 
                            # full = inline content (old behavior); summary = compact `slug — description` list, model loads on demand via the
                            # `skill` tool (per-turn semantic hint suggests the match); auto = full while combined content ≤ 8 KB (AUTO_FULL_BUDGET_BYTES), summary beyond
 
+[instructions]             # project rule files — AGENTS.md and kin (src/instructions.rs, /instructions)
+enabled = true             # off stops sending them entirely; the text comes from whatever repo was cloned, so this is a
+                           # safety switch, not a preference
+max_bytes = 16384          # cap on the WHOLE section (global rules + the whole directory chain), not per file. Twice the
+                           # skills budget, half of Codex's 32 KiB. The envelope (untrusted-source notice + nonce markers +
+                           # the re-assertion of the absolute rules) costs ~1830 B on top, and only when files were found.
+
 [server]                   # API gateway (src/server/) — /serve, /server <port>, --serve, --proxy
 host = "127.0.0.1"         # loopback by default; widen deliberately
 port = 7667                # persisted by /server <port> ("poop" on T9)

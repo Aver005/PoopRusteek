@@ -1,0 +1,30 @@
+# AGENTS.md рабочей папки попадает в системный промпт.
+#
+# Единственная улика — телеметрия сборки промпта: `system_prompt.assembled`
+# печатает размер каждой секции, и `instructions=N` больше нуля только если
+# файл действительно найден и вклеен. `workspace`, а не `workspace_template`:
+# сценарий ничего не пишет.
+#
+#   ./sandbox.ps1 mock reads-project-instructions
+name = "reads-project-instructions"
+description = "AGENTS.md in the workspace reaches the system prompt"
+prompt = "What is the magic word for this project?"
+workspace = "instructions-workspace"
+provider = "mock"
+timeout = 60
+max_steps = 3
+
+[expect]
+status = "completed"
+min_pass_rate = 1.0
+
+# Улика — счётчик источников, а не размер секции. Сценарий живёт внутри этого
+# репозитория и без своего `AGENTS.md` подъём дошёл бы до корня и подхватил его
+# `CLAUDE.md`, то есть секция была бы непустой и размерная проверка ничего бы
+# не значила. Ровно два файла — корневой и свой — бывает только когда свой на
+# месте; без него остаётся один, и обе границы обязательны, чтобы это поймать.
+[[expect.trace]]
+action = "instructions.loaded"
+field = "files"
+min_total = 2
+max_total = 2

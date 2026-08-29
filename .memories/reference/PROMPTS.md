@@ -15,14 +15,40 @@ Three prompts loaded at startup via `load_prompt_files()` (:11), searching exe-d
 base_prompt   (placeholders {{user}}, {{folder}}, {{os}} substituted)
 + tools_prompt ({{builtin_tools}} ← tools.definitions(); {{mcp_tools}} ← MCP tools+resources)
 + enabled skills content (full or summary — see `[skills] injection` below)
++ project instructions (AGENTS.md and kin — see below; LAST on purpose)
 ```
-> Does NOT read `.memories/`. To onboard an agent on this project you must point it at `.memories/INDEX.md` explicitly (or wire auto-loading — see PLANS).
+> Still does NOT read `.memories/` itself. It **does** now read the repo's root `CLAUDE.md` as a project instruction file (see below), which is a partial answer to the PLANS item — the curated `.memories/` read order is still opt-in.
+
+### Project instructions (`src/instructions.rs`, `[instructions]`)
+
+`instructions::load(workspace, max_bytes)` collects a **chain** of rule files —
+`POOPRUSTEEK.md` → `AGENTS.md` → `CLAUDE.md` → `GEMINI.md`, first match per
+directory — walking up from the workspace and stopping at the repository root
+(`.git`, file or directory) or the home directory. Nearest file goes **last**.
+`~/.pooprusteek/` supplies global user rules, prepended. Result is cached in
+`AppState::instructions_section` and refreshed by `app::reload_instructions`
+(startup, `/cwd`, `/instructions reload`) — never per turn, because assembly
+runs on the event loop (invariant 1).
+
+**This is untrusted text in the most privileged part of the prompt** — it comes
+from whatever repository the user cloned. Three defences, none removable
+without thought:
+- files are read with `symlink_metadata` and **symlinks are refused** — an
+  `AGENTS.md -> ~/.ssh/id_rsa` would otherwise be shipped to the provider;
+- the content sits inside an envelope marked with a per-process nonce, and any
+  occurrence of that nonce is stripped from the content, so a file cannot forge
+  the closing marker and continue as "system" text;
+- the absolute rules are **re-asserted after** the envelope, so the last word in
+  the prompt belongs to the system, not to the file.
+
+`[instructions] enabled` (default true) turns the whole thing off;
+`max_bytes` (default 16 KiB) caps the **whole section**, not each file.
 
 Context-budget behaviors (2026-07-13):
 - **Skills injection** (`SkillInjectionMode`, `[skills] injection = auto|full|summary`, default auto): full content while combined enabled-skill bytes ≤ 8 KB (`AUTO_FULL_BUDGET_BYTES`), otherwise a compact `slug — description` list + an instruction to `skill load` on demand (the per-turn semantic hint names the matching skill). `discovery.rs::load_enabled_skills_content(skills, injection)`.
 - **MCP resources** itemization sits behind the same deferred gate as tool schemas: when deferred, only a count line is emitted.
-- **Size telemetry**: every assembly logs `system_prompt.assembled` (per-section bytes: base/tools/builtin_defs/mcp/skills/total) to the debug log.
-- **Byte budgets enforced by tests**: `prompts.rs` (base < 5000 B, tools < 4500 B), `tools/registry.rs` (formatted builtin defs < 10000 B). Grow them only deliberately, in the same commit as the justification.
+- **Size telemetry**: every assembly logs `system_prompt.assembled` (per-section bytes: base/tools/builtin_defs/mcp/skills/instructions/total) to the debug log; `instructions::load` logs `instructions.loaded` (`files=` / `bytes=` / `truncated=`) — the file **count** is what the harness asserts on, because byte size drifts with whatever repository the scenario runs in.
+- **Byte budgets enforced by tests**: `prompts.rs` (base < 5000 B, tools < 4500 B), `tools/registry.rs` (formatted builtin defs < 10000 B), `instructions.rs` (section ≤ `max_bytes` + a ~1830 B envelope). Grow them only deliberately, in the same commit as the justification.
 
 ## assets/prompts/ catalog
 

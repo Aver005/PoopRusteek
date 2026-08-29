@@ -14,15 +14,31 @@ use crate::prompts::PromptFiles;
 use crate::skills::SkillDefinition;
 use crate::tools::registry::ToolRegistry;
 
-pub async fn build(
-    prompts: &PromptFiles,
-    skills: &[SkillDefinition],
-    skills_injection: SkillInjectionMode,
-    tools: &ToolRegistry,
-    mcp: &tokio::sync::Mutex<MCPManager>,
-    mcp_schema_mode: McpSchemaMode,
-    workspace: &str,
-) -> String {
+/// Входы сборки промпта. Восемь позиционных аргументов на месте вызова уже не
+/// читаются — та же болезнь, что `TurnSpec` лечит уровнем выше.
+pub struct PromptInputs<'a> {
+    pub prompts: &'a PromptFiles,
+    pub skills: &'a [SkillDefinition],
+    pub skills_injection: SkillInjectionMode,
+    pub tools: &'a ToolRegistry,
+    pub mcp: &'a tokio::sync::Mutex<MCPManager>,
+    pub mcp_schema_mode: McpSchemaMode,
+    pub workspace: &'a str,
+    /// Секция из `AGENTS.md` рабочей папки; пустая строка, если её нет.
+    pub project_instructions: &'a str,
+}
+
+pub async fn build(input: PromptInputs<'_>) -> String {
+    let PromptInputs {
+        prompts,
+        skills,
+        skills_injection,
+        tools,
+        mcp,
+        mcp_schema_mode,
+        workspace,
+        project_instructions,
+    } = input;
     let user = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "user".to_string());
@@ -56,23 +72,27 @@ pub async fn build(
     let skills_section =
         crate::skills::discovery::load_enabled_skills_content(skills, skills_injection);
 
+    // Инструкции проекта идут последними: recency работает на правила проекта,
+    // а абсолютные правила пере-заякорены внутри самой секции.
     let assembled = format!(
-        "{}\n\n{}{}",
+        "{}\n\n{}{}{}",
         base_prompt.trim(),
         tools_prompt.trim(),
-        skills_section
+        skills_section,
+        project_instructions
     );
     // Prompt-size telemetry: every DeepSeek session pays this up front as
     // flat text, so section growth is worth noticing before users do.
     crate::debug_log::log(
         "system_prompt.assembled",
         format!(
-            "bytes: base={} tools={} builtin_defs={} mcp={} skills={} total={}",
+            "bytes: base={} tools={} builtin_defs={} mcp={} skills={} instructions={} total={}",
             base_prompt.len(),
             tools_prompt.len(),
             builtin_section.len(),
             mcp_section.len(),
             skills_section.len(),
+            project_instructions.len(),
             assembled.len()
         ),
     );

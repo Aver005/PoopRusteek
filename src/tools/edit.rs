@@ -166,7 +166,14 @@ fn refuse_protected_path(target: &Path, path_str: &str) -> Result<(), String> {
     // проводят запись мимо проверки.
     let canonical = target.canonicalize();
     let resolved = canonical.as_deref().unwrap_or(target);
-    for guarded in [crate::config::Config::data_dir(), owned_config_dir()] {
+    // Домашняя папка правил — третья дверь в системный промпт: записав туда
+    // файл, модель выдала бы себе инструкции на все будущие сессии.
+    let guarded_dirs = [
+        Some(crate::config::Config::data_dir()),
+        Some(owned_config_dir()),
+        crate::instructions::global_dir(),
+    ];
+    for guarded in guarded_dirs.into_iter().flatten() {
         let guarded = guarded.canonicalize().unwrap_or(guarded);
         if resolved.starts_with(&guarded) {
             return Err(format!(

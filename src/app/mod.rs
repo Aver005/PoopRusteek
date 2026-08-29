@@ -257,6 +257,10 @@ pub struct AppState {
     pub search: search::SearchViewState,
     pub themes: themes::ThemesViewState,
     pub workspace_path: String,
+    /// Секция системного промпта из `AGENTS.md` рабочей папки и глобальных
+    /// правил. Кэш: собирается при старте, на `/cwd` и по `/instructions
+    /// reload`, а не на каждый ход (инвариант 1).
+    pub instructions_section: String,
     pub show_stats_panel: bool,
     pub attached_files: Vec<crate::provider::AttachedFile>,
 
@@ -271,6 +275,31 @@ pub struct AppState {
     /// Context window the provider reported, 0 while unknown. Config wins over
     /// it — see `context::ContextBudget::learn_provider_window`.
     pub provider_context_window: u32,
+}
+
+/// Перечитать правила проекта в кэш состояния и вернуть строку для человека.
+/// Одна точка на три вызова (старт, `/cwd`, `/instructions reload`) — раньше
+/// блок был скопирован дословно и читал файлы дважды.
+pub fn reload_instructions(state: &mut AppState, config: &Config) -> Option<String> {
+    if !config.instructions.enabled {
+        state.instructions_section.clear();
+        return None;
+    }
+    let loaded = crate::instructions::load(&state.workspace_path, config.instructions.max_bytes);
+    state.instructions_section = loaded.section;
+    let names: Vec<String> = loaded
+        .sources
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Project instructions loaded from {}{}",
+        names.join(", "),
+        if loaded.truncated { " (truncated)" } else { "" }
+    ))
 }
 
 impl AppState {
@@ -298,6 +327,7 @@ impl AppState {
             search: search::SearchViewState::default(),
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
+            instructions_section: String::new(),
             show_stats_panel: true,
             attached_files: Vec::new(),
             goal: goal::GoalState::default(),
@@ -328,6 +358,14 @@ impl AppState {
         self.focused_mut()
             .messages
             .push(ChatMessage::system(content));
+    }
+
+    /// Сообщение только для человека. Не путать с `push_system`: тот уезжает
+    /// модели в каждом последующем запросе, а такие заметки ей не нужны.
+    pub fn push_ui_system(&mut self, content: &str) {
+        self.focused_mut()
+            .messages
+            .push(ChatMessage::ui_system(content));
     }
 
     /// Reset the focused conversation's chat view: wipe its messages and
@@ -391,8 +429,13 @@ impl App {
         state.workspace_path = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
+        // В статус-строку, а не в чат: сообщение в буфере оставило бы его
+        // непустым и подменило домашний экран на каждом запуске.
+        let instructions_notice = reload_instructions(&mut state, &config);
         if has_provider {
-            state.status_message = "Ready".to_string();
+            // Правила проекта важнее «Ready»: их подхватили молча, и это
+            // единственное место, где человек об этом узнаёт.
+            state.status_message = instructions_notice.unwrap_or_else(|| "Ready".to_string());
         } else {
             state.status_message = "No token configured".to_string();
             state.view = View::Onboarding;
@@ -951,16 +994,7 @@ impl App {
             .filter(|m| !m.ui_only)
             .cloned()
             .collect();
-        let system_prompt = system_prompt::build(
-            &self.prompts,
-            &self.skills,
-            self.config.skills.injection,
-            &self.tools,
-            &self.mcp,
-            self.config.effective_mcp_schema_mode(),
-            &self.state.workspace_path,
-        )
-        .await;
+        let system_prompt = system_prompt::build(self.prompt_inputs()).await;
 
         let spec = runtime::TurnSpec {
             conversation,
@@ -1066,6 +1100,21 @@ impl App {
     }
 
     /// Drop provider, swap to a single fresh empty conversation, land on onboarding.
+    /// Входы сборки промпта из текущего состояния. Три места собирали этот
+    /// литерал побайтово одинаково.
+    fn prompt_inputs(&self) -> system_prompt::PromptInputs<'_> {
+        system_prompt::PromptInputs {
+            prompts: &self.prompts,
+            skills: &self.skills,
+            skills_injection: self.config.skills.injection,
+            tools: &self.tools,
+            mcp: &self.mcp,
+            mcp_schema_mode: self.config.effective_mcp_schema_mode(),
+            workspace: &self.state.workspace_path,
+            project_instructions: &self.state.instructions_section,
+        }
+    }
+
     fn reset_to_onboarding(&mut self, status: String) {
         self.state.conversations =
             conversation::Conversations::new(conversation::Conversation::fresh_main(None));
@@ -1073,6 +1122,9 @@ impl App {
         self.state.modal = None;
         self.state.view = View::Onboarding;
         self.state.status_message = status;
+        // `/wipe` сносит и папку глобальных правил, так что кэш секции после
+        // него описывает уже несуществующие файлы.
+        self.state.instructions_section.clear();
         self.state.scroll_offset = 0;
         self.state.input.buffer.clear();
         self.state.input.cursor = 0;
