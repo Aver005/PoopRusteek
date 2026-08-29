@@ -42,9 +42,14 @@ pub enum StreamEnd {
 pub struct StreamOutcome {
     /// Everything accumulated from the stream, tool-call syntax included.
     pub text: String,
-    /// Whether any chunk carried `finish_reason == "stop"` — the provider's
-    /// explicit end-of-turn marker, as opposed to the channel just closing.
+    /// Whether any chunk carried a `finish_reason` — the provider's explicit
+    /// end-of-turn marker, as opposed to the channel just closing. Any reason
+    /// counts: `length` and `content_filter` end the turn just as definitely
+    /// as `stop`, they just end it with something to say about it.
     pub got_stop: bool,
+    /// Терминальная причина, как её назвал провайдер. `None` — стрим закрылся
+    /// сам, без неё.
+    pub stop_reason: Option<String>,
     pub end: StreamEnd,
 }
 
@@ -54,6 +59,9 @@ pub struct StreamOutcome {
 pub enum StreamVerdict {
     /// Закрылся штатно, со stop-сигналом.
     Ok,
+    /// Закрылся штатно, но не по своей воле: кончились токены (`length`),
+    /// сработал фильтр. Ответ есть и он годен — просто неполный.
+    Finished(String),
     /// Данных не было [`STREAM_IDLE_TIMEOUT`].
     IdleTimeout,
     /// Закрылся чисто, но без stop — провайдер ушёл посреди ответа.
@@ -68,8 +76,13 @@ impl StreamOutcome {
     pub fn verdict(&self) -> StreamVerdict {
         match &self.end {
             StreamEnd::IdleTimeout => StreamVerdict::IdleTimeout,
-            // stop пришёл — значит ответ целый, а ошибка догнала уже после.
-            _ if self.got_stop => StreamVerdict::Ok,
+            // Терминальная причина пришла — значит ответ дописан, а ошибка
+            // догнала уже после. `stop` — целый ответ, остальное — обрыв по
+            // лимиту или фильтру: текст сохраняем, но говорим о нём.
+            _ if self.got_stop => match self.stop_reason.as_deref() {
+                Some("stop") | None => StreamVerdict::Ok,
+                Some(other) => StreamVerdict::Finished(other.to_string()),
+            },
             StreamEnd::Completed => StreamVerdict::ClosedWithoutStop,
             StreamEnd::ProviderError(error) => StreamVerdict::Failed(error.clone()),
             StreamEnd::TaskFailed(error) => {
@@ -95,6 +108,7 @@ pub async fn collect_stream(
 
     let mut text = String::new();
     let mut got_stop = false;
+    let mut stop_reason: Option<String> = None;
     loop {
         match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
             Err(_) => {
@@ -102,6 +116,7 @@ pub async fn collect_stream(
                 return StreamOutcome {
                     text,
                     got_stop,
+                    stop_reason,
                     end: StreamEnd::IdleTimeout,
                 };
             }
@@ -114,6 +129,7 @@ pub async fn collect_stream(
                         return StreamOutcome {
                             text,
                             got_stop,
+                            stop_reason,
                             end: StreamEnd::ProviderError(format!(
                                 "stream exceeded {} MiB without finishing — aborted",
                                 MAX_STREAM_BYTES / (1024 * 1024)
@@ -122,8 +138,12 @@ pub async fn collect_stream(
                     }
                     on_progress(&text);
                 }
-                if matches!(chunk.finish_reason.as_deref(), Some("stop")) {
+                // Любая причина завершает ход: `length` и `content_filter`
+                // — такой же конец, как `stop`, и терять из-за них уже
+                // полученный текст незачем.
+                if let Some(reason) = chunk.finish_reason {
                     got_stop = true;
+                    stop_reason = Some(reason);
                     break;
                 }
             }
@@ -140,6 +160,7 @@ pub async fn collect_stream(
     StreamOutcome {
         text,
         got_stop,
+        stop_reason,
         end,
     }
 }

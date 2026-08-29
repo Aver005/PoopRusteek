@@ -85,13 +85,17 @@ pub async fn run_agent_loop(
         ctx.emit(AgentEvent::ContextUsage(used));
 
         let outcome = stream_step(conversation, &provider, request, &event_tx).await;
-        let provider_error = match classify_stream(&outcome, &trace) {
-            Ok(error) => error,
+        let notes = match classify_stream(&outcome, &trace) {
+            Ok(notes) => notes,
             Err(fatal) => {
                 ctx.emit(AgentEvent::Failed(fatal));
                 return;
             }
         };
+        if let Some(notice) = notes.truncated {
+            ctx.emit(AgentEvent::Message(ChatMessage::system(&notice)));
+        }
+        let provider_error = notes.provider_error;
         let StreamOutcome {
             text: raw,
             got_stop,
@@ -198,7 +202,15 @@ enum StepEnd {
 
 /// Разобрать конец стрима. `Ok(None)` — можно продолжать, `Ok(Some(e))` —
 /// провайдер сбежал, но, может, вызов ещё спасётся; `Err` — ход не спасти.
-fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> Result<Option<String>, String> {
+/// Что цикл узнал о закончившемся стриме: жалоба провайдера (её ещё можно
+/// пережить, если из текста вынулся вызов) и пометка об обрыве по лимиту.
+#[derive(Default)]
+struct StreamNotes {
+    provider_error: Option<String>,
+    truncated: Option<String>,
+}
+
+fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> Result<StreamNotes, String> {
     let verdict = outcome.verdict();
     // Таймаут — это своя строка; вторая про «закрылся без stop» удвоила бы
     // его в отчёте `mine`, где каждая запись считается отдельно.
@@ -220,9 +232,21 @@ fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> Result<Option<
             trace.error("reason=stream_timeout");
             Err("Stream timed out (no data for 120s). Cancelling turn.".to_string())
         }
-        StreamVerdict::Ok => Ok(None),
-        StreamVerdict::ClosedWithoutStop => Ok(Some(trace.closed_without_stop(outcome.text.len()))),
-        StreamVerdict::Failed(error) => Ok(Some(error)),
+        StreamVerdict::Ok => Ok(StreamNotes::default()),
+        // Ответ дописан, но обрезан. Раньше это был `ClosedWithoutStop`, то
+        // есть ошибка, и готовый текст выбрасывался.
+        StreamVerdict::Finished(reason) => Ok(StreamNotes {
+            truncated: Some(trace.truncated(&reason, outcome.text.len())),
+            ..StreamNotes::default()
+        }),
+        StreamVerdict::ClosedWithoutStop => Ok(StreamNotes {
+            provider_error: Some(trace.closed_without_stop(outcome.text.len())),
+            ..StreamNotes::default()
+        }),
+        StreamVerdict::Failed(error) => Ok(StreamNotes {
+            provider_error: Some(error),
+            ..StreamNotes::default()
+        }),
     }
 }
 
@@ -936,6 +960,111 @@ mod tests {
             }
         }
         (done, error)
+    }
+
+    /// Ответ, обрезанный по лимиту токенов, — это ответ. Провайдер сказал
+    /// `length`, а цикл считал stop-сигналом только `stop`, поэтому целый
+    /// (пусть неполный) текст уходил в ошибку «stream ended without stop»
+    /// и до человека не доходил вовсе.
+    #[tokio::test]
+    async fn a_reply_cut_off_by_the_token_limit_is_delivered_not_failed() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response("Half an ans").finish_reason("length"));
+        let (done, error) = drive_turn(provider, 4).await;
+
+        assert!(error.is_none(), "a truncated reply must not fail the turn");
+        assert_eq!(done.expect("turn must finish").text, "Half an ans");
+    }
+
+    /// …и человеку говорят, что ответ обрезан, иначе «Half an ans» выглядит
+    /// как всё, что модель хотела сказать.
+    #[tokio::test]
+    async fn a_truncated_reply_is_announced() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_response("Half an ans").finish_reason("length"));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("hi")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let mut notices = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AppEvent::Agent {
+                event: AgentEvent::Message(message),
+                ..
+            } = event
+            {
+                notices.push(message.content);
+            }
+        }
+        assert!(
+            notices.iter().any(|n| n.contains("reason=length")
+                || (n.contains("length") && n.contains("incomplete"))),
+            "the truncation must be surfaced, got: {notices:?}"
+        );
+    }
+
+    /// Обычный `stop` ничего лишнего не печатает — иначе пометка об обрезке
+    /// висела бы на каждом ходу.
+    #[tokio::test]
+    async fn a_normal_reply_carries_no_truncation_notice() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(FakeProvider::with_response("All done."));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("hi")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        while let Ok(event) = event_rx.try_recv() {
+            if let AppEvent::Agent {
+                event: AgentEvent::Message(message),
+                ..
+            } = event
+            {
+                assert!(
+                    !message.content.contains("incomplete"),
+                    "unexpected truncation notice: {}",
+                    message.content
+                );
+            }
+        }
     }
 
     #[tokio::test]

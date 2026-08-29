@@ -37,6 +37,9 @@ pub struct FakeProvider {
     seen_requests: Mutex<Vec<Vec<ChatMessage>>>,
     /// How many times the loop asked for a fresh session (rung 2).
     resets: Mutex<usize>,
+    /// Терминальная причина в последнем чанке. По умолчанию `stop`; тест
+    /// ставит `length`, чтобы проверить обрезанный ответ.
+    finish_reason: String,
 }
 
 impl FakeProvider {
@@ -56,7 +59,15 @@ impl FakeProvider {
             session_tokens: None,
             seen_requests: Mutex::new(Vec::new()),
             resets: Mutex::new(0),
+            finish_reason: "stop".to_string(),
         }
+    }
+
+    /// Завершить стрим не `stop`, а другой причиной (`length`,
+    /// `content_filter`) — так провайдер сообщает, что ответ обрезан.
+    pub fn finish_reason(mut self, reason: &str) -> Self {
+        self.finish_reason = reason.to_string();
+        self
     }
 
     /// Split each streamed body into `n` chunks instead of one.
@@ -152,7 +163,7 @@ impl LLMProvider for FakeProvider {
         // Terminal chunk carries the stop signal, mirroring the real provider.
         let _ = tx.send(CompletionChunk {
             content: String::new(),
-            finish_reason: Some("stop".to_string()),
+            finish_reason: Some(self.finish_reason.clone()),
         });
         Ok(())
     }

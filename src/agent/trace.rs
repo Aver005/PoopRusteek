@@ -73,6 +73,21 @@ impl StepTrace {
         message
     }
 
+    /// Ход дописан, но обрезан провайдером: `length`, `content_filter`.
+    /// Текст годен, поэтому это не ошибка — но `mine` должен уметь их
+    /// сосчитать, отсюда своя запись.
+    pub fn truncated(&self, reason: &str, bytes: usize) -> String {
+        let message = format!(
+            "Stream finished early: the provider stopped the reply (reason={reason}). \
+             The answer below may be incomplete."
+        );
+        debug_log::log(
+            "agent.step.truncated",
+            format!("{} reason={reason} response_bytes={bytes}", self.head()),
+        );
+        message
+    }
+
     pub fn provider_ok(&self, bytes: usize) {
         debug_log::log(
             "agent.step.provider_ok",

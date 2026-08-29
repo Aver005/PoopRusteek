@@ -62,8 +62,9 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
             StreamVerdict::IdleTimeout => return Err("sub-agent stream timed out".to_string()),
             StreamVerdict::Failed(error) => return Err(error),
             // В отличие от главного цикла, обрыв без stop здесь не ошибка:
-            // родителю важен только финальный текст.
-            StreamVerdict::Ok | StreamVerdict::ClosedWithoutStop => {}
+            // родителю важен только финальный текст. Обрезанный по лимиту —
+            // тоже текст, и он лучше, чем ничего.
+            StreamVerdict::Ok | StreamVerdict::Finished(_) | StreamVerdict::ClosedWithoutStop => {}
         }
         let full = outcome.text;
 
