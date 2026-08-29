@@ -4,7 +4,7 @@
 use super::*;
 use serde_json::json;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Сколько строк каждой стороны диффа показываем модели. Дальше — счётчик.
 const MAX_DIFF_LINES: usize = 20;
@@ -150,67 +150,6 @@ fn read_text(path: &Path, path_str: &str) -> Result<String, String> {
     })
 }
 
-/// Собственные файлы агента правит человек через команды, не модель: запись в
-/// MCP-конфиг — это чужая команда, запускаемая при следующем старте.
-fn refuse_protected_path(target: &Path, path_str: &str) -> Result<(), String> {
-    const MCP_CONFIG_NAMES: &[&str] = &["mcp.config.json", "mcp.json"];
-
-    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if MCP_CONFIG_NAMES.contains(&name) {
-        return Err(format!(
-            "Refusing to write {path_str}: an MCP config runs its servers as child processes on the next start. Ask the user to change it with /mcp."
-        ));
-    }
-
-    // Канонизируем оба конца: иначе символическая ссылка или `..` в пути
-    // проводят запись мимо проверки.
-    let canonical = target.canonicalize();
-    let resolved = canonical.as_deref().unwrap_or(target);
-    // Домашняя папка правил — третья дверь в системный промпт: записав туда
-    // файл, модель выдала бы себе инструкции на все будущие сессии.
-    let guarded_dirs = [
-        Some(crate::config::Config::data_dir()),
-        Some(owned_config_dir()),
-        crate::instructions::global_dir(),
-    ];
-    for guarded in guarded_dirs.into_iter().flatten() {
-        let guarded = guarded.canonicalize().unwrap_or(guarded);
-        if resolved.starts_with(&guarded) {
-            return Err(format!(
-                "Refusing to write {path_str}: it belongs to this agent's own configuration. Use the slash commands (/mcp, /providers, /whitelist) instead."
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn owned_config_dir() -> PathBuf {
-    crate::config::Config::path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
-}
-
-/// Запись поверх существующего файла. `atomic_write` рассчитан на файлы,
-/// которые приложение создаёт само, и на чужих теряет две вещи — их и
-/// возвращаем: цель символической ссылки и права доступа.
-fn write_back(path: &Path, path_str: &str, contents: &str) -> Result<(), String> {
-    // Без канонизации `rename` кладёт обычный файл ПОВЕРХ самой ссылки:
-    // ссылка исчезает, а целевой файл остаётся старым.
-    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    refuse_protected_path(&target, path_str)?;
-
-    let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
-    crate::util::atomic_write(&target, contents.as_bytes())
-        .map_err(|e| format!("Failed to write {path_str}: {e}"))?;
-    // Новый инод получает права по umask, а не исходные: без этого правка
-    // `deploy.sh` снимает с него бит исполнения.
-    if let Some(permissions) = permissions {
-        let _ = std::fs::set_permissions(&target, permissions);
-    }
-    Ok(())
-}
-
 /// Размер и время правки на момент чтения. Проект штатно гоняет параллельные
 /// ходы, а потерянное обновление обе стороны рапортуют как успех.
 fn change_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
@@ -270,10 +209,16 @@ fn edit_blocking(
             "{path_str} changed on disk while this edit was being prepared — nothing was written. Read it again and redo the edit."
         ));
     }
-    write_back(&path, path_str, &updated)?;
+    crate::safe_write::write_preserving(&path, path_str, updated.as_bytes())?;
+    // Снимок ПОСЛЕ записи: до неё отказанная правка защищённого файла всё
+    // равно оставляла запись в журнале и копировала его содержимое наружу.
+    let note = crate::checkpoints::record(&path, "edit", Some(original.as_bytes()));
 
     let plural = if hits == 1 { "" } else { "s" };
-    let header = format!("Edited {path_str} ({hits} replacement{plural})");
+    let header = format!(
+        "Edited {path_str} ({hits} replacement{plural}){}",
+        note.map(|n| format!(" {n}")).unwrap_or_default()
+    );
     // Массовая замена по короткому якорю делает «удалённым» весь файл, и дифф
     // вываливает его содержимое в контекст. Для переименования он и не нужен.
     if replace_all && hits > 1 {
@@ -293,32 +238,41 @@ fn write_blocking(path_str: &str, content: &str) -> Result<String, String> {
     // Существование берём из метаданных, а не из успеха чтения: бинарный или
     // недоступный файл иначе выглядел бы как создание нового.
     let previous = std::fs::metadata(&path).ok().filter(|m| m.is_file());
-    let previous_text = previous
+    // Один раз и байтами: перезаписать можно и бинарник, и откат обязан
+    // вернуть его побайтово. Текст для отчёта достаём из тех же байт.
+    let previous_bytes = previous
         .is_some()
-        .then(|| std::fs::read_to_string(&path).ok())
+        .then(|| std::fs::read(&path).ok())
         .flatten();
+    let previous_text = previous_bytes
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_string);
 
     match &previous {
-        Some(_) => write_back(&path, path_str, content)?,
+        Some(_) => crate::safe_write::write_preserving(&path, path_str, content.as_bytes())?,
         None => {
-            refuse_protected_path(&path, path_str)?;
+            crate::safe_write::refuse_protected(&path, path_str)?;
             crate::util::atomic_write(&path, content.as_bytes())
                 .map_err(|e| format!("Failed to write {path_str}: {e}"))?;
         }
     }
+    let note = crate::checkpoints::record(&path, "write", previous_bytes.as_deref())
+        .map(|n| format!(" {n}"))
+        .unwrap_or_default();
 
     let lines = line_count(content);
     let bytes = content.len();
     Ok(match (previous, previous_text) {
-        (None, _) => format!("Created {path_str} ({lines} lines, {bytes} bytes)"),
+        (None, _) => format!("Created {path_str} ({lines} lines, {bytes} bytes){note}"),
         (Some(_), Some(old)) => format!(
-            "Overwrote {path_str} ({} lines → {lines} lines, {bytes} bytes)",
+            "Overwrote {path_str} ({} lines → {lines} lines, {bytes} bytes){note}",
             line_count(&old)
         ),
         // Файл был, но текстом не читается — сказать «создан» значит соврать
         // о потере данных.
         (Some(meta), None) => format!(
-            "Overwrote {path_str} ({} bytes of non-text content → {lines} lines, {bytes} bytes)",
+            "Overwrote {path_str} ({} bytes of non-text content → {lines} lines, {bytes} bytes){note}",
             meta.len()
         ),
     })
@@ -410,9 +364,17 @@ fn push_diff_side(out: &mut String, lines: &[&str], marker: char) {
     }
 }
 
+/// Точка входа для сквозного теста чекпоинтов: ему нужен настоящий путь
+/// записи инструмента, а не повтор его логики.
+#[cfg(test)]
+pub fn edit_for_test(path: &str, old: &str, new: &str) -> Result<String, String> {
+    edit_blocking(path, old, new, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Каталог, который сам за собой убирает: без `Drop` каждый прогон
     /// оставлял по десятку папок в `%TEMP%`.

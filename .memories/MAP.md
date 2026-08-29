@@ -9,6 +9,8 @@
 | `src/error.rs` | `AppError` enum, `AppResult<T>` | — |
 | `src/prompts.rs` | `PromptFiles`, asset resolution for prompts | 67 |
 | `src/instructions.rs` | Project rule files (`AGENTS.md`/`CLAUDE.md`/`GEMINI.md`/`POOPRUSTEEK.md`): directory-chain discovery to the repo root, symlink refusal, nonce envelope, whole-section byte budget. Cached in `AppState::instructions_section` via `app::reload_instructions`. | ~520 |
+| `src/safe_write.rs` | Writing on the model's behalf: `refuse_protected` (agent's own config dirs + MCP configs, comparing resolved paths component-wise so a file that does not exist yet is still covered) and `write_preserving` (follows symlinks, keeps permissions, handles read-only). Both write paths — `tools::edit` and the undo — go through it. | ~200 |
+| `src/checkpoints.rs` | Append-only snapshot journal behind `/undo`: `checkpoints.jsonl` + per-process-unique blobs, `Before::{Absent,Blob,Skipped}`, `after_len` guard against clobbering someone else's later change, secrets and oversized files never copied. Root set once by `Store::init` from `main`. | ~520 |
 | `src/session.rs` | `Session`, save/load/list, tags, history file | 191 |
 | `src/debug_log.rs` | Optional `.dev/debug.log` logger | 68 |
 

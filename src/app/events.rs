@@ -285,6 +285,9 @@ pub enum AppEvent {
     /// finished — see `crate::update`. With `notable: false` (startup check
     /// found nothing to do) only the status line changes; otherwise the
     /// message also lands in the focused chat.
+    /// Результат отката: работа шла на `spawn_blocking`, потому что чтение
+    /// копии и запись файла блокирующие, а `handle_event` — цикл событий.
+    UndoFinished(Result<String, String>),
     UpdateStatus {
         message: String,
         notable: bool,

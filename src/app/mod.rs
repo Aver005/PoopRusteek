@@ -836,6 +836,16 @@ impl App {
             AppEvent::SemanticStatus(message) => {
                 self.state.status_message = message;
             }
+            AppEvent::UndoFinished(outcome) => match outcome {
+                Ok(report) => {
+                    self.state.push_ui_system(&report);
+                    self.state.status_message = "Undone".to_string();
+                }
+                Err(error) => {
+                    self.state.push_ui_system(&error);
+                    self.state.status_message = "Undo failed".to_string();
+                }
+            },
             AppEvent::UpdateStatus { message, notable } => {
                 if notable {
                     self.announce(message);
@@ -1028,6 +1038,17 @@ impl App {
         Ok(())
     }
 
+    /// Откат вне цикла событий: копия может быть в мегабайты, а
+    /// `atomic_write` внутри делает `sync_all` (инвариант 1).
+    pub(crate) fn spawn_undo(&mut self) {
+        let event_tx = self.event_tx.clone();
+        self.state.status_message = "Undoing the last file change...".to_string();
+        tokio::task::spawn_blocking(move || {
+            let outcome = crate::checkpoints::Store::shared().undo_last();
+            let _ = event_tx.send(AppEvent::UndoFinished(outcome));
+        });
+    }
+
     /// Open the generic confirm modal for `/logout` or `/wipe`.
     pub(crate) fn open_confirm(&mut self, action: ConfirmAction) {
         use events::ConfirmState;
@@ -1035,6 +1056,9 @@ impl App {
             ConfirmAction::Logout => ConfirmState::logout(),
             ConfirmAction::Wipe => ConfirmState::wipe(),
             ConfirmAction::Update => ConfirmState::update_dev(),
+            // Цель отката знает только журнал, поэтому этот экран открывает
+            // диспетчер команды, а не общий путь.
+            ConfirmAction::Undo => return,
         };
         self.state.modal = Some(Modal::Confirm(cs));
     }

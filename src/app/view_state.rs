@@ -388,6 +388,9 @@ pub enum ConfirmAction {
     /// `/update` invoked from a debug/`cargo run` build — confirm before
     /// replacing the running dev binary with the released one.
     Update,
+    /// `/undo` — overwrites a file of the user's, or deletes one the agent
+    /// created. Same class of action as `/wipe`, so the same guard.
+    Undo,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +469,27 @@ impl ConfirmState {
                 ConfirmLine::danger("Are you sure you want to update?"),
             ],
             action: ConfirmAction::Update,
+        }
+    }
+
+    /// Подтверждение отката. Текст цели приходит готовым: только журнал
+    /// знает, файл восстанавливают или удаляют.
+    pub fn undo(target: &str, destructive: bool) -> Self {
+        let mut lines = vec![ConfirmLine::normal("Undo the agent's last file change:")];
+        lines.push(ConfirmLine::soft(format!("  {target}")));
+        if destructive {
+            lines.push(ConfirmLine::danger(
+                "The file will be DELETED — it did not exist before the edit.",
+            ));
+        } else {
+            lines.push(ConfirmLine::dim(
+                "Its content is replaced with the snapshot taken before the edit.",
+            ));
+        }
+        Self {
+            title: "Undo file change".to_string(),
+            lines,
+            action: ConfirmAction::Undo,
         }
     }
 

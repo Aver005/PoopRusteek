@@ -152,6 +152,12 @@ pub enum CommandResult {
     SwitchModel(String),
     /// `/rag [on|off|reload]` — semantic-matching control.
     Rag(RagAction),
+    /// `/undo` — показать подтверждение отката последней правки. Сама работа
+    /// идёт off-loop после «да»: чтение копии и запись файла блокирующие.
+    ConfirmUndo {
+        target: String,
+        destructive: bool,
+    },
     /// `/instructions on|off` — включить или выключить вклейку правил из
     /// `AGENTS.md`. Эффект применяет `apply_instructions_action`: пишет
     /// конфиг и перечитывает кэш секции.
@@ -261,6 +267,7 @@ impl CommandRegistry {
         self.register(Box::new(defs::models::ModelsCommand));
         self.register(Box::new(defs::tools::ToolsCommand));
         self.register(Box::new(defs::instructions::InstructionsCommand));
+        self.register(Box::new(defs::undo::UndoCommand));
         self.register(Box::new(defs::whitelist::WhitelistCommand));
         self.register(Box::new(defs::skills::SkillsCommand));
         self.register(Box::new(defs::export::ExportCommand));

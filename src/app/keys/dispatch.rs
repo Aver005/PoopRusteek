@@ -204,6 +204,14 @@ impl App {
             },
             CommandResult::Rag(action) => self.apply_rag_action(action),
             CommandResult::Instructions(enabled) => self.apply_instructions_action(enabled),
+            CommandResult::ConfirmUndo {
+                target,
+                destructive,
+            } => {
+                self.state.modal = Some(Modal::Confirm(
+                    crate::app::view_state::ConfirmState::undo(&target, destructive),
+                ));
+            }
             CommandResult::OpenThemes => {
                 self.state.view = View::Themes;
                 self.state.themes = crate::app::themes::ThemesViewState::open(&self.config);

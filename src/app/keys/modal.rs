@@ -208,6 +208,7 @@ impl App {
                         events::ConfirmAction::Logout => self.execute_logout().await,
                         events::ConfirmAction::Wipe => self.execute_wipe().await,
                         events::ConfirmAction::Update => self.start_manual_update(),
+                        events::ConfirmAction::Undo => self.spawn_undo(),
                     },
                     Some(false) => {}
                     None => {

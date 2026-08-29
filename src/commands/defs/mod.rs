@@ -37,6 +37,7 @@ pub mod skills;
 pub mod themes;
 pub mod timers;
 pub mod tools;
+pub mod undo;
 pub mod update;
 pub mod version;
 pub mod whitelist;

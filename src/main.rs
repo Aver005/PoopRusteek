@@ -1,6 +1,7 @@
 mod acp;
 mod agent;
 mod app;
+mod checkpoints;
 mod cli;
 mod commands;
 mod config;
@@ -13,6 +14,7 @@ mod logging;
 mod mcp;
 mod prompts;
 mod provider;
+mod safe_write;
 mod semantic;
 mod server;
 mod session;
@@ -106,6 +108,10 @@ fn main() -> Result<()> {
             Config::default()
         }
     };
+
+    // До развилки по режимам: инструменты правки пишут журнал откатов в любом
+    // из них, и папка у всех должна быть одна.
+    checkpoints::Store::init(Config::data_dir());
 
     // A manual runtime instead of `#[tokio::main]` for one reason: bounded
     // shutdown. `spawn_blocking` work cannot be aborted, and the semantic
