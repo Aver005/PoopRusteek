@@ -65,7 +65,9 @@ fn utf16_encoding(bytes: &[u8]) -> Option<Utf16> {
     let pairs = sample.len() / 2;
     // UTF-16LE puts the high half second in each pair, UTF-16BE first.
     let (mut second, mut first) = (0usize, 0usize);
-    for pair in sample[..pairs * 2].chunks_exact(2) {
+    // `as_chunks` сам отбрасывает нечётный хвост — обрезать срез вручную
+    // было незачем.
+    for pair in sample.as_chunks::<2>().0 {
         if implausible_in_text(pair[1]) {
             second += 1;
         }
@@ -94,7 +96,9 @@ fn decode_utf16(bytes: &[u8], encoding: Utf16) -> String {
     // A trailing odd byte is a truncated code unit (a capped or still-streaming
     // read) — drop it rather than losing the whole decode to it.
     let units: Vec<u16> = body
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| match encoding {
             Utf16::Little => u16::from_le_bytes([pair[0], pair[1]]),
             Utf16::Big => u16::from_be_bytes([pair[0], pair[1]]),

@@ -2,6 +2,28 @@
 > Hard-won technical knowledge. Gotchas. Patterns. (Deep detail lives in `reference/`.)
 > Last updated: 2026-06-30 (added refactor + conversation/fork learnings)
 
+## CI И ЛОКАЛЬНЫЕ ПРОВЕРКИ
+
+- **Локальный pre-commit не равен CI, даже когда команда буквально та же.** Хук и
+  CI оба зовут `cargo clippy --bin pooprusteek -- -D warnings`, и всё равно CI
+  падал восемь коммитов подряд, а хук был зелёным. Две причины, обе про среду,
+  не про команду:
+  1. **Версия тулчейна.** CI берёт `dtolnay/rust-toolchain@stable`, то есть
+     *свежайший* stable. Локально стоял 1.96.0, в CI приезжал 1.98.0 — два
+     релиза новых линтов, которых локальный clippy просто не знает. Так и
+     всплыли `chunks_exact_to_as_chunks` и `result_large_err`.
+  2. **Платформа.** Джоба `lint` крутится только на `ubuntu-latest`, а
+     разработка идёт на Windows. Код под `#[cfg(unix)]` линтуется лишь в CI,
+     код под `#[cfg(windows)]` — лишь локально. Дыра в обе стороны.
+- **Проверять — установкой той же версии, а не рассуждением.**
+  `rustup toolchain install <ver> --component clippy --profile minimal` и
+  `cargo +<ver> clippy` воспроизводят падение CI за минуту, не трогая дефолтный
+  тулчейн. `rustup check` показывает разрыв между локальным stable и свежим.
+- **Логи упавшей джобы через API не скачать без прав админа** (`403`), а вот
+  список прогонов и статусы шагов — открыты:
+  `/repos/<o>/<r>/actions/runs` и `/actions/runs/<id>/jobs`. Их хватает, чтобы
+  понять *какой* шаг и *с каких пор* красный.
+
 ## ARCHITECTURE & REFACTORING  (→ `ARCHITECTURE.md`)
 
 - **Organizational ≠ architectural.** Splitting a god-file into more files is not a clean refactor by itself. The wins here came from (a) grouping data clumps into cohesive structs and (b) extracting **controllers** that own *dependencies* and expose narrow APIs — so methods stop taking `&mut self` (all of `App`) just to touch three fields.

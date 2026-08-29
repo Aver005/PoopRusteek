@@ -53,18 +53,18 @@ pub(super) async fn route(
 }
 
 /// Read and size-cap a request body, or the ready-to-return error response.
-async fn read_body(request: Request<Incoming>) -> Result<Bytes, Response<ApiBody>> {
+async fn read_body(request: Request<Incoming>) -> Result<Bytes, Box<Response<ApiBody>>> {
     http_body_util::Limited::new(request.into_body(), MAX_BODY_BYTES)
         .collect()
         .await
         .map(|collected| collected.to_bytes())
         .map_err(|_| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &ErrorResponse::invalid_request(format!(
                     "request body unreadable or larger than {MAX_BODY_BYTES} bytes"
                 )),
-            )
+            ))
         })
 }
 
@@ -134,7 +134,7 @@ async fn chat_completions(
 ) -> Response<ApiBody> {
     let body = match read_body(request).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let wire: ChatCompletionRequest = match serde_json::from_slice(&body) {
@@ -203,7 +203,7 @@ async fn blocking_completion(
         .collect();
     let response = match run_blocking_completion(&provider, is_deepseek, request).await {
         Ok(response) => response,
-        Err(error_response) => return error_response,
+        Err(error_response) => return *error_response,
     };
     let prompt_refs: Vec<&str> = prompt_texts.iter().map(String::as_str).collect();
     let fallback = openai_compat::estimated_usage(&prompt_refs, &response.content);
@@ -221,14 +221,14 @@ async fn run_blocking_completion(
     provider: &Arc<dyn LLMProvider>,
     is_deepseek: bool,
     request: CompletionRequest,
-) -> Result<CompletionResponse, Response<ApiBody>> {
+) -> Result<CompletionResponse, Box<Response<ApiBody>>> {
     let result = provider.complete(request).await;
     discard_deepseek_session(is_deepseek, provider).await;
     result.map_err(|error| {
-        json_response(
+        Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &ErrorResponse::server_error(error.to_string()),
-        )
+        ))
     })
 }
 
@@ -461,7 +461,7 @@ async fn legacy_completions(
 ) -> Response<ApiBody> {
     let body = match read_body(request).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let wire: LegacyCompletionRequest = match serde_json::from_slice(&body) {
         Ok(parsed) => parsed,
@@ -522,7 +522,7 @@ async fn legacy_blocking(
 ) -> Response<ApiBody> {
     let response = match run_blocking_completion(&provider, is_deepseek, request).await {
         Ok(response) => response,
-        Err(error_response) => return error_response,
+        Err(error_response) => return *error_response,
     };
     let (_reasoning, text) = openai_compat::split_reasoning(&response.content);
     let usage = response
@@ -605,7 +605,7 @@ async fn passthrough(
 ) -> Response<ApiBody> {
     let body = match read_body(request).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
