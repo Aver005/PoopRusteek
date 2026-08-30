@@ -72,9 +72,13 @@ mod tests {
             "base.prompt.md grew to {} bytes (budget 5000)",
             EMBEDDED_BASE_PROMPT.len()
         );
+        // Поднято 4500 → 5500 вместе с секцией «План работы» (`todo`):
+        // дисциплина обновления плана — это и есть сам инструмент, коротким
+        // абзацем она не задаётся. Дальше — только за счёт урезания другого.
         assert!(
-            EMBEDDED_TOOLS_PROMPT.len() < 4_500,
-            "tools.prompt.md grew to {} bytes (budget 4500)",
+            EMBEDDED_TOOLS_PROMPT.len() < 5_500,
+            "tools.prompt.md grew to {} bytes (budget 5500). Trim something \
+             else rather than raising this number.",
             EMBEDDED_TOOLS_PROMPT.len()
         );
     }

@@ -73,7 +73,18 @@ pub(super) async fn run_tool_calls(
         }
 
         let ToolOutcome { text, is_error } = execute_tool_call(call, ctx).await;
-        let preview = summarize_tool_result(&text);
+        // Для большинства инструментов в ленту идёт выжимка: вывод бывает
+        // огромным. Но у некоторых результат сам адресован человеку, и
+        // обрезка съела бы всё, что в нём есть.
+        let whole = ctx
+            .tools
+            .get(&name)
+            .is_some_and(|tool| tool.result_is_its_own_summary());
+        let preview = if whole {
+            text.clone()
+        } else {
+            summarize_tool_result(&text)
+        };
         // Модель получает урезанный вывод (ступень 0 ладдера), трасса — целый.
         let for_model = crate::context::cap_tool_output(&text, ctx.tool_output_limit);
         let capped = ctx.tool_output_limit != 0 && text.chars().count() > ctx.tool_output_limit;
@@ -327,7 +338,14 @@ async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOut
 
 /// Обычный инструмент: аппрув, затем диспетчер (builtin или MCP).
 async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
-    let approved = if ctx.auto_approve {
+    // Незнакомое имя (в том числе любой MCP-инструмент) подтверждаем всегда:
+    // отказаться от модалки может только тот, кто сам объявил, что ему нечего
+    // подтверждать.
+    let needs_approval = ctx
+        .tools
+        .get(&call.name)
+        .is_none_or(|tool| tool.requires_approval());
+    let approved = if ctx.auto_approve || !needs_approval {
         true
     } else {
         // Не сырой JSON: он экранирует переводы строк, и содержимое файла в

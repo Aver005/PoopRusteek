@@ -9,8 +9,8 @@
 - **`ToolResult`** (`tools/mod.rs:19`): `content: String, is_error: bool`. Helpers `::success()`, `::error()`.
 - **`ToolRegistry`** (`tools/registry.rs:6`): `Mutex<HashMap<String, Arc<dyn Tool>>>` + optional skill tool. API: `register`, `get`, `definitions()`, `execute(name,args)` (returns "Unknown tool" error if missing), `update_skills()`.
 
-### Built-in tools (12 default + `skill` dynamic) — `registry.rs:register_default_tools`
-`bash` · `powershell` · `question` · `task` · `timer` · `shell_output` · `shell_kill` · `shell_list` · `shell_input` · `read_file` · `edit` · `write` (+ `skill` via `update_skills`, `tool_search`/`history_search` via `register_semantic_tools`).
+### Built-in tools (13 default + `skill` dynamic) — `registry.rs:register_default_tools`
+`bash` · `powershell` · `question` · `task` · `timer` · `shell_output` · `shell_kill` · `shell_list` · `shell_input` · `read_file` · `edit` · `write` · `todo` (+ `skill` via `update_skills`, `tool_search`/`history_search` via `register_semantic_tools`).
 
 | Tool | Args | Returns | Notes |
 |------|------|---------|-------|
@@ -26,6 +26,7 @@
 | `read_file` | `path`(req), `offset`(1-based line, def 1), `limit`(def 400) | `{path} (lines a-b of N)
 {slice}` | expands `~`; escape hatch for the compaction ladder's file-path markers |
 | `edit` | `path`(req), `old_string`(req), `new_string`(req), `replace_all` | `Edited {path} (N replacements)` + a `-`/`+` diff of the changed region | anchor is a **literal substring**, must be unique unless `replace_all`; strict UTF-8 (binary refused); follows symlinks and preserves permissions; aborts if the file changed since it was read; `replace_all` with >1 hit omits the diff body so a short anchor cannot dump the file into context |
+| `todo` | `todos`(req): array of `{content, status}`, status one of `pending`/`in_progress`/`done` | `Plan (N done, N in progress, N pending, N total)` + a `[x]`/`[>]`/`[ ]` row per item | **stateless** — the plan lives in the history as the tool result, so parallel conversations and sub-agents never share one. No approval prompt (`requires_approval() == false`) and shown whole in the chat (`result_is_its_own_summary() == true`). Caps: 30 items, 200 bytes per `content`; whitespace runs (newlines included) collapse so an item cannot forge a checklist row. Status matching is case/dash tolerant. At most one `in_progress`; an empty list is refused |
 | `write` | `path`(req), `content`(req) | `Created`/`Overwrote {path} (…lines, …bytes)` | creates parent dirs; cannot append; refuses this agent's own config dir and any MCP config file |
 
 **Auto-detection heuristics** (`tools/mod.rs:41`):
@@ -135,7 +136,8 @@ Three formats parsed from raw LLM text (DeepSeek web API has NO native function-
 - Approval currently **blocks the event loop** until the user answers (known limitation).
 - **Whitelist rules carry a scope** (`src/whitelist.rs`): `Rule { tool, scope: Option<Scope> }`, where `Scope` is either `Command(["cargo","test"])` or `Path(<absolute dir>)`. A rule with no scope means the whole tool. Commands compare word-by-word, paths component-by-component (case-insensitively on Windows); the two kinds never match each other. Rules are persisted (`whitelist::persist`) and survive restarts; there is no expiry.
 - **A compound command gets no scope at all.** `approval_scope` returns `None` the moment the command contains `; & | 
-  ` $ ( ) { } < >` — `git status && rm -rf /` starts with `git status` and does something else entirely, and `$(...)` runs *before* the "allowed" command. The only permanent approval available for such a call is tool-wide, shown as `⚠ … · ANYTHING`. Proper sub-command parsing (Claude Code splits on `&&`/`||`/`;`/`|`, strips `timeout`/`env` wrappers and treats redirect targets as file writes) is the right answer and is an open item in `BUGS.md`.
+ 
+ ` $ ( ) { } < >` — `git status && rm -rf /` starts with `git status` and does something else entirely, and `$(...)` runs *before* the "allowed" command. The only permanent approval available for such a call is tool-wide, shown as `⚠ … · ANYTHING`. Proper sub-command parsing (Claude Code splits on `&&`/`||`/`;`/`|`, strips `timeout`/`env` wrappers and treats redirect targets as file writes) is the right answer and is an open item in `BUGS.md`.
 - **File scopes are absolute and normalised** through `safe_write::resolve_for_compare`; a raw `src/app/../../../etc/passwd` used to pass a rule scoped to `src/app`. A volume root is never a scope (one click would hand over the whole drive), and a file in the workspace root scopes to the workspace.
 - **There is no deny list**, no project-level rules, and no sandbox. With no sandbox, a rule is a convenience, **not a security boundary** — it decides when to ask, not what is possible. Codex separates those two axes; this does not.
 - **`edit`/`write` get no approval at all under `auto_approve`** — background sub-agents (`multichat.rs`) and `sub_agent.rs` (which calls `dispatch_generic_tool` directly). The policy is inherited from `bash` and is not new, but the blast radius grew: `write` is far easier for a model to reach for than a quoted heredoc. Deliberately left as-is; restricting it would break legitimate sub-agent refactors.

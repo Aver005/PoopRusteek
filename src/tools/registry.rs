@@ -41,6 +41,7 @@ impl ToolRegistry {
         self.register(Arc::new(edit::EditTool));
         self.register(Arc::new(edit::WriteTool));
         self.register(Arc::new(timer::TimerTool));
+        self.register(Arc::new(todo::TodoTool));
     }
 
     /// Общий хэндл на хранилище таймеров: его читает и тик приложения,

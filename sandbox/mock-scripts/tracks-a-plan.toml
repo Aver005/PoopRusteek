@@ -1,0 +1,53 @@
+# Drives the `todo` tool through the real agent loop: a plan is written, one
+# item is closed against a real tool result, then the plan is re-sent whole.
+#
+# Mock and not live: the point is that the tool validates and renders a plan,
+# not that a model chooses to plan. Scripted replies make the sequence the
+# only thing a regression can break.
+
+# Reply 1: the whole plan up front, first item in progress.
+[[reply]]
+content = """
+Here is the plan.
+<tool_use>
+<name>todo</name>
+<arguments>
+{"todos": [
+  {"content": "Read the manifest", "status": "in_progress"},
+  {"content": "Report the version", "status": "pending"}
+]}
+</arguments>
+</tool_use>
+"""
+
+# Reply 2: do the first item for real. `read_file` and not a shell: the shell
+# tools depend on the host having a working bash/WSL, and a scenario about
+# `todo` must not go red because of that.
+[[reply]]
+content = """
+<tool_use>
+<name>read_file</name>
+<arguments>
+{"path": "Cargo.toml"}
+</arguments>
+</tool_use>
+"""
+
+# Reply 3: re-send the plan IN FULL with the statuses moved on — the tool
+# replaces the previous list rather than patching it.
+[[reply]]
+content = """
+<tool_use>
+<name>todo</name>
+<arguments>
+{"todos": [
+  {"content": "Read the manifest", "status": "done"},
+  {"content": "Report the version", "status": "in_progress"}
+]}
+</arguments>
+</tool_use>
+"""
+
+# Reply 4+: finish.
+[[reply]]
+content = "The package version is 0.4.2."

@@ -9,6 +9,7 @@ pub mod shell_control;
 pub mod skill;
 pub mod task;
 pub mod timer;
+pub mod todo;
 pub mod tool_search;
 
 use async_trait::async_trait;
@@ -256,6 +257,20 @@ pub fn ensure_regular_file(path: &std::path::Path, path_str: &str) -> Result<(),
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+
+    /// Спрашивать ли человека перед вызовом. `false` — только для
+    /// инструментов без побочных эффектов: подтверждать там нечего, а модалка
+    /// на каждый шаг отучает модель ими пользоваться.
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    /// Показывать ли результат в ленте целиком. По умолчанию туда идёт
+    /// выжимка в 200 байт — вывод инструмента бывает огромным. `true` — когда
+    /// результат сам по себе короткий и адресован человеку.
+    fn result_is_its_own_summary(&self) -> bool {
+        false
+    }
     async fn execute(&self, args: Value) -> ToolResult;
 }
 

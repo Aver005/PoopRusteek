@@ -1,0 +1,25 @@
+# The `todo` tool end to end through the real agent loop: parse → dispatch →
+# validation → rendered result → back into the history.
+#
+# Needs the mock service:
+#   ./sandbox.ps1 mock tracks-a-plan
+# or, on the host:
+#   pooprusteek mock-provider --port 811 \
+#     --script sandbox/mock-scripts/tracks-a-plan.toml
+name = "tracks-a-plan"
+description = "todo records a plan, then accepts the whole list again with moved statuses"
+prompt = "Find the package version, keeping track of your plan."
+workspace = "../../fixtures/tiny-repo"
+provider = "mock"
+timeout = 60
+max_steps = 8
+
+[expect]
+status = "completed"
+tools_used = ["todo", "read_file"]
+final_matches = ['0\.4\.2']
+# Без этого сценарий зеленел бы, даже если бы `todo` отвечал ошибкой на
+# каждый вызов: `tools_used` считает диспетчеризацию, а не успех.
+max_tool_errors = 0
+max_tool_calls = 3
+no_malformed = true

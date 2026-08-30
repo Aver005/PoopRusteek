@@ -115,6 +115,10 @@ pub struct Expect {
     /// across every turn, not per turn.
     pub max_steps: Option<usize>,
     pub max_tool_calls: Option<usize>,
+    /// Upper bound on tool calls that came back an error. `0` asserts every
+    /// tool did its job — without it a scenario stays green while every call
+    /// fails, because `tools_used` counts dispatch, not success.
+    pub max_tool_errors: Option<usize>,
     /// No malformed `<tool_use>` blocks at all.
     #[serde(default)]
     pub no_malformed: bool,
@@ -264,6 +268,14 @@ impl Expect {
             failures.push(format!(
                 "made {} tool calls, limit {limit}",
                 metrics.tool_calls
+            ));
+        }
+        if let Some(limit) = self.max_tool_errors
+            && metrics.tool_errors > limit
+        {
+            failures.push(format!(
+                "{} tool call(s) came back an error, limit {limit}",
+                metrics.tool_errors
             ));
         }
         if self.no_malformed && metrics.malformed_tool_calls > 0 {
