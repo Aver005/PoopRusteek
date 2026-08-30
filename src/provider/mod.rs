@@ -77,10 +77,29 @@ pub enum Role {
     Tool,
 }
 
+/// Один вызов инструмента так, как его назвал провайдер.
+///
+/// `id` — идентификатор провайдера (`call_…` у OpenAI, `toolu_…` у
+/// Anthropic): результат обязан сослаться на него дословно, иначе строгий
+/// эндпоинт отвечает 400. У Gemini своих идентификаторов нет, там он
+/// синтезируется локально и на провод не уходит.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Вызовы инструментов, объявленные этим сообщением ассистента.
+    /// Пусто на промптовом пути: там вызовы приходят текстом. Сохраняется в
+    /// файл сессии — иначе восстановленная история отдала бы результаты без
+    /// объявивших их вызовов.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +144,7 @@ impl ChatMessage {
         Self {
             role,
             content: content.to_string(),
+            tool_calls: Vec::new(),
             name: None,
             tool_call_id: None,
             display_content: None,
@@ -221,6 +241,9 @@ pub fn estimate_tokens(text: &str) -> u32 {
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub messages: Vec<ChatMessage>,
+    /// Инструменты, объявляемые провайдеру нативно. Пусто на промптовом
+    /// пути — там они описаны текстом в системном промпте.
+    pub tools: Vec<crate::tools::ToolDefinition>,
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
@@ -233,6 +256,9 @@ pub struct CompletionRequest {
 #[derive(Debug, Clone)]
 pub struct CompletionChunk {
     pub content: String,
+    /// Вызовы, собранные протоколом из фрагментов стрима. Приходят только
+    /// целиком: частичный JSON наверх не поднимается.
+    pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
 }
 
@@ -367,5 +393,42 @@ pub trait LLMProvider: Send + Sync {
         _parent_message_id: Option<i64>,
     ) -> crate::error::AppResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Файл сессии, записанный до появления `tool_calls`, обязан читаться:
+    /// поле необязательное. Иначе обновление обнулило бы всю историю.
+    #[test]
+    fn a_session_message_without_tool_calls_still_loads() {
+        let old = r#"{"role":"assistant","content":"hi","created_at":"2026-01-01T00:00:00Z"}"#;
+        let message: ChatMessage = serde_json::from_str(old).expect("old shape must load");
+        assert!(message.tool_calls.is_empty());
+    }
+
+    /// …и пустой список не пишется в файл, иначе каждая старая сессия
+    /// распухла бы на ровном месте при первом же пересохранении.
+    #[test]
+    fn an_empty_tool_call_list_is_not_serialized() {
+        let json = serde_json::to_string(&ChatMessage::assistant("hi")).unwrap();
+        assert!(!json.contains("tool_calls"), "{json}");
+    }
+
+    /// А непустой — пишется и читается обратно дословно: результат обязан
+    /// сослаться на тот же `id`, что объявил вызов.
+    #[test]
+    fn tool_calls_round_trip_through_a_session_file() {
+        let mut message = ChatMessage::assistant("");
+        message.tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "Cargo.toml"}),
+        }];
+        let json = serde_json::to_string(&message).unwrap();
+        let back: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tool_calls, message.tool_calls);
     }
 }

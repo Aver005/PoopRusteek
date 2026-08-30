@@ -96,6 +96,7 @@ pub async fn compact(
                     ChatMessage::system(&request.system_prompt),
                     ChatMessage::user(&request.user_prompt),
                 ],
+                tools: Vec::new(),
                 model: model.to_string(),
                 temperature: 0.2,
                 max_tokens: SUMMARY_MAX_TOKENS,

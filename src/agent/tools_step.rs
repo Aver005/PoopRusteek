@@ -50,7 +50,14 @@ pub(super) async fn run_tool_calls(
 ) {
     let total = calls.len();
     for (index, call) in calls.into_iter().enumerate() {
-        let tool_id = uuid::Uuid::new_v4().to_string();
+        // Идентификатор провайдера, если вызов пришёл родным протоколом:
+        // результат обязан сослаться на тот же, иначе строгий эндпоинт
+        // отвергнет следующий запрос. Свой придумываем только на промптовом
+        // пути, где его нет вовсе.
+        let tool_id = call
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let name = call.name.clone();
         // Единственная копия аргументов: одна уходит в исполнение, другая — в
         // запись хода. Раньше их было две, обе с полным телом вызова.

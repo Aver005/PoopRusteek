@@ -303,6 +303,26 @@ pub struct ProviderEntry {
     pub model: String,
     #[serde(default)]
     pub protocol: ProviderProtocol,
+    /// Промптовый протокол вызовов или родной. По умолчанию промптовый —
+    /// см. `ToolProtocol`.
+    #[serde(default)]
+    pub tools: ToolProtocol,
+}
+
+/// Как этой записи объявлять инструменты.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolProtocol {
+    /// Инструменты описаны текстом в системном промпте, вызовы приходят
+    /// блоками `<tool_use>`. Умолчание для **всех** протоколов: единственный
+    /// вариант, который работает на любом эндпоинте и не меняет поведение
+    /// уже существующих записей.
+    #[default]
+    Prompt,
+    /// Родное function-calling эндпоинта. Включается только вручную: эндпоинт,
+    /// молча игнорирующий `tools`, оставил бы модель вообще без инструментов,
+    /// и ход при этом завершался бы «успешно», просто прозой.
+    Native,
 }
 
 /// The reserved name of the built-in DeepSeek web provider in `/providers`
@@ -1217,6 +1237,7 @@ mod tests {
             api_key: None,
             model: "qwen".to_string(),
             protocol: ProviderProtocol::default(),
+            tools: Default::default(),
         });
         assert_eq!(config.active_model(), "deepseek-chat");
         config.active_provider = Some("lmstudio".to_string());
@@ -1395,5 +1416,35 @@ mod tests {
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(!text.contains("migration_notices"));
         assert!(parse(&text).unwrap().migration_notices.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tool_protocol_tests {
+    use super::*;
+
+    /// Запись, написанная до появления поля, остаётся промптовой. Умолчание
+    /// здесь не косметика: `config::save` гоняет всю структуру через
+    /// `to_string_pretty`, поэтому родной протокол по умолчанию был бы
+    /// **вписан в файл пользователя** при первом же сохранении.
+    #[test]
+    fn an_entry_without_the_field_stays_on_the_prompt_protocol() {
+        let entry: ProviderEntry = toml::from_str(
+            "name = \"x\"\nbase_url = \"http://localhost:1234/v1\"\nmodel = \"m\"\n",
+        )
+        .expect("old entry shape must load");
+        assert_eq!(entry.tools, ToolProtocol::Prompt);
+    }
+
+    /// Родной протокол — только явным выбором, и он переживает запись-чтение.
+    #[test]
+    fn native_is_explicit_and_round_trips() {
+        let entry: ProviderEntry = toml::from_str(
+            "name = \"x\"\nbase_url = \"http://h/v1\"\nmodel = \"m\"\ntools = \"native\"\n",
+        )
+        .unwrap();
+        assert_eq!(entry.tools, ToolProtocol::Native);
+        let text = toml::to_string(&entry).unwrap();
+        assert!(text.contains("tools = \"native\""), "{text}");
     }
 }

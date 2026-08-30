@@ -210,6 +210,9 @@ impl ProviderAddState {
             api_key: (!api_key.is_empty()).then(|| api_key.to_string()),
             model,
             protocol: self.protocol(),
+            // Мастер родной протокол пока не предлагает: включается правкой
+            // конфига, пока нет экрана выбора.
+            tools: crate::config::ToolProtocol::default(),
         })
     }
 }
@@ -283,6 +286,7 @@ pub fn parse_quick_add(raw: &str, config: &Config) -> Result<ProviderEntry, Stri
         api_key: api_key.map(str::to_string),
         model: model.to_string(),
         protocol,
+        tools: crate::config::ToolProtocol::default(),
     })
 }
 
@@ -529,6 +533,7 @@ mod tests {
             api_key: None,
             model: "default".to_string(),
             protocol: ProviderProtocol::default(),
+            tools: Default::default(),
         }
     }
 

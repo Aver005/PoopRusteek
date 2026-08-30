@@ -459,6 +459,7 @@ impl App {
 
         let request = crate::provider::CompletionRequest {
             messages: eval_messages.clone(),
+            tools: Vec::new(),
             model: self.config.provider.model.clone(),
             temperature: self.config.provider.temperature.min(0.5),
             max_tokens: self.config.provider.max_tokens,

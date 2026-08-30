@@ -145,6 +145,7 @@ impl LLMProvider for FakeProvider {
         for piece in chars.chunks(per) {
             let _ = tx.send(CompletionChunk {
                 content: piece.iter().collect(),
+                tool_calls: Vec::new(),
                 finish_reason: None,
             });
         }
@@ -163,6 +164,7 @@ impl LLMProvider for FakeProvider {
         // Terminal chunk carries the stop signal, mirroring the real provider.
         let _ = tx.send(CompletionChunk {
             content: String::new(),
+            tool_calls: Vec::new(),
             finish_reason: Some(self.finish_reason.clone()),
         });
         Ok(())

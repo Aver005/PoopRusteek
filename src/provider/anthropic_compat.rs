@@ -211,6 +211,7 @@ mod tests {
                 ChatMessage::tool("call_1", "42"),
                 ChatMessage::assistant("ok"),
             ],
+            tools: Vec::new(),
             model: "claude-x".to_string(),
             temperature: 0.5,
             max_tokens: 256,
@@ -233,6 +234,7 @@ mod tests {
     fn assistant_first_conversation_gets_a_user_opener() {
         let request = CompletionRequest {
             messages: vec![ChatMessage::assistant("previous answer")],
+            tools: Vec::new(),
             model: "m".to_string(),
             temperature: 0.0,
             max_tokens: 16,
@@ -250,6 +252,7 @@ mod tests {
         chrome.ui_only = true;
         let request = CompletionRequest {
             messages: vec![chrome, ChatMessage::user("real")],
+            tools: Vec::new(),
             model: "m".to_string(),
             temperature: 0.0,
             max_tokens: 16,

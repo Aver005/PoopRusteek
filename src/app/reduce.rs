@@ -72,7 +72,7 @@ pub fn turn_end(event: &AgentEvent) -> Option<TurnEnd> {
         | AgentEvent::BeginAssistantMessage
         | AgentEvent::Chunk(_)
         | AgentEvent::Message(_)
-        | AgentEvent::DiscardEmptyAssistant
+        | AgentEvent::EndAssistantMessage { .. }
         | AgentEvent::ToolStarted { .. }
         | AgentEvent::ToolDone { .. }
         | AgentEvent::ToolError { .. }
@@ -102,8 +102,8 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
             conversation.messages.push(message.clone());
             None
         }
-        AgentEvent::DiscardEmptyAssistant => {
-            conversation.discard_empty_assistant();
+        AgentEvent::EndAssistantMessage { tool_calls } => {
+            conversation.end_assistant_message(tool_calls);
             None
         }
         AgentEvent::ContextUsage(used) => {
@@ -156,7 +156,12 @@ mod tests {
     fn an_assistant_message_that_never_got_text_is_dropped() {
         let mut conv = conversation();
         apply(&mut conv, &AgentEvent::BeginAssistantMessage);
-        apply(&mut conv, &AgentEvent::DiscardEmptyAssistant);
+        apply(
+            &mut conv,
+            &AgentEvent::EndAssistantMessage {
+                tool_calls: Vec::new(),
+            },
+        );
         assert!(conv.messages.is_empty());
     }
 

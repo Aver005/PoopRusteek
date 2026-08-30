@@ -481,6 +481,7 @@ async fn legacy_completions(
     let prompt = wire.prompt.map(LegacyPrompt::into_text).unwrap_or_default();
     let internal = CompletionRequest {
         messages: vec![ChatMessage::user(&prompt)],
+        tools: Vec::new(),
         model: resolved.internal_model().to_string(),
         temperature: wire.temperature.unwrap_or(context.defaults.temperature),
         max_tokens: wire.max_tokens.unwrap_or(context.defaults.max_tokens),
@@ -802,6 +803,7 @@ mod tests {
                 api_key: None,
                 model: "m".to_string(),
                 protocol: ProviderProtocol::Openai,
+                tools: Default::default(),
             }],
             request_log: false,
         }

@@ -1,7 +1,7 @@
 use crate::agent::retry::{MAX_EMPTY_RESPONSE_RETRIES, MAX_MALFORMED_TOOL_RETRIES, RetryBudget};
 use crate::agent::stream::{StreamEnd, StreamOutcome, StreamVerdict, collect_stream};
 use crate::agent::tool_parser::{
-    StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
+    ParsedToolCall, StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
 };
 use crate::agent::tools_step::{ToolExecContext, run_tool_calls};
 use crate::agent::trace::{self, StepTrace};
@@ -99,10 +99,26 @@ pub async fn run_agent_loop(
         let StreamOutcome {
             text: raw,
             got_stop,
+            tool_calls: native_calls,
             ..
         } = outcome;
 
-        let (tool_calls, parse_errors) = parse_tool_calls_with_errors(&raw);
+        // Родные вызовы главнее: разбор текста в этом режиме — подстраховка
+        // на случай, когда эндпоинт молча проглотил `tools`, а не второй
+        // источник. Сложив их, мы выполнили бы один и тот же вызов дважды.
+        let (parsed_calls, parse_errors) = parse_tool_calls_with_errors(&raw);
+        let tool_calls: Vec<_> = if native_calls.is_empty() {
+            parsed_calls
+        } else {
+            native_calls.iter().map(ParsedToolCall::from).collect()
+        };
+        // Ошибки разбора текста при родных вызовах ни при чём: текст в этом
+        // случае — просто проза рядом с вызовом.
+        let parse_errors = if native_calls.is_empty() {
+            parse_errors
+        } else {
+            Vec::new()
+        };
         let visible_text = strip_tool_calls(&raw);
         trace.parsed(
             got_stop,
@@ -148,10 +164,15 @@ pub async fn run_agent_loop(
             }
         }
 
-        messages.push(ChatMessage::assistant(&visible_text));
-        if visible_text.is_empty() {
-            ctx.emit(AgentEvent::DiscardEmptyAssistant);
-        }
+        let mut assistant = ChatMessage::assistant(&visible_text);
+        assistant.tool_calls = native_calls.clone();
+        messages.push(assistant);
+        // Закрываем сообщение всегда: событие и прикрепляет вызовы к копии
+        // приложения, и решает, пустышка ли это. Раньше здесь был сброс,
+        // который в родном протоколе стирал бы шаг целиком.
+        ctx.emit(AgentEvent::EndAssistantMessage {
+            tool_calls: native_calls,
+        });
         run_tool_calls(
             tool_calls,
             &ctx,
@@ -288,7 +309,11 @@ fn finish_or_retry(
     // Ни текста, ни вызова — ход не сделал ничего. Считать это успехом и
     // значило вернуть «готово» над пустым каталогом.
     trace.empty_assistant();
-    ctx.emit(AgentEvent::DiscardEmptyAssistant);
+    // Ни текста, ни вызовов — закрываем пустым списком, и сообщение
+    // сбрасывается, как и раньше.
+    ctx.emit(AgentEvent::EndAssistantMessage {
+        tool_calls: Vec::new(),
+    });
     if let Some(attempt) = retries.take_empty() {
         messages.push(ChatMessage::user(EMPTY_RESPONSE_FEEDBACK));
         trace.empty_retry(attempt, MAX_EMPTY_RESPONSE_RETRIES);
@@ -713,6 +738,7 @@ pub(crate) fn build_step_request(
     request_messages.extend(messages.iter().cloned());
     CompletionRequest {
         messages: request_messages,
+        tools: Vec::new(),
         model: model.to_string(),
         temperature,
         max_tokens,

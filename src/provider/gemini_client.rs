@@ -64,12 +64,14 @@ impl CompatProtocol for GeminiProtocol {
         if !text.is_empty() {
             emit(CompletionChunk {
                 content: text,
+                tool_calls: Vec::new(),
                 finish_reason: None,
             });
         }
         if let Some(reason) = finish {
             emit(CompletionChunk {
                 content: String::new(),
+                tool_calls: Vec::new(),
                 finish_reason: Some(reason),
             });
             return SseFlow::Done;

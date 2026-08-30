@@ -25,8 +25,21 @@ static STRIP_LEGACY_RE: LazyLock<Regex> =
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
+    /// Идентификатор от провайдера, если вызов пришёл родным протоколом.
+    /// `None` — промптовый путь, там идентификатор придумывает сам цикл.
+    pub id: Option<String>,
     pub name: String,
     pub arguments: Value,
+}
+
+impl From<&crate::provider::ToolCall> for ParsedToolCall {
+    fn from(call: &crate::provider::ToolCall) -> Self {
+        Self {
+            id: Some(call.id.clone()),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        }
+    }
 }
 
 /// Test-only convenience wrapper over [`parse_tool_calls_with_errors`] that
@@ -69,7 +82,11 @@ pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<Str
             let name = name_cap[1].trim().to_string();
             match extract_arguments(body) {
                 Some(args_str) => match serde_json::from_str::<Value>(args_str.trim()) {
-                    Ok(arguments) => calls.push(ParsedToolCall { name, arguments }),
+                    Ok(arguments) => calls.push(ParsedToolCall {
+                        id: None,
+                        name,
+                        arguments,
+                    }),
                     Err(error) => errors.push(format!(
                         "tool `{name}`: <arguments> is not valid JSON ({error}). Re-send \
                          with a valid JSON object and escape every backslash (\\\\) and \
@@ -98,7 +115,11 @@ pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<Str
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
                 match name {
-                    Some(name) => calls.push(ParsedToolCall { name, arguments }),
+                    Some(name) => calls.push(ParsedToolCall {
+                        id: None,
+                        name,
+                        arguments,
+                    }),
                     None => errors.push(
                         "a <tool_use> block had no <name> tag and no \"tool\"/\"name\" \
                          field in its JSON."
@@ -120,6 +141,7 @@ pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<Str
         match serde_json::from_str::<Value>(args_str) {
             Ok(args) => {
                 calls.push(ParsedToolCall {
+                    id: None,
                     name,
                     arguments: args,
                 });

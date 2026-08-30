@@ -11,7 +11,7 @@
 //! stopless stream as a provider error (with a tool-call salvage path),
 //! while a sub-agent deliberately does not.
 
-use crate::provider::{CompletionRequest, LLMProvider};
+use crate::provider::{CompletionRequest, LLMProvider, ToolCall};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -47,6 +47,9 @@ pub struct StreamOutcome {
     /// counts: `length` and `content_filter` end the turn just as definitely
     /// as `stop`, they just end it with something to say about it.
     pub got_stop: bool,
+    /// Вызовы, пришедшие родным протоколом. Собирает их протокол — сюда они
+    /// попадают только целыми.
+    pub tool_calls: Vec<ToolCall>,
     /// Терминальная причина, как её назвал провайдер. `None` — стрим закрылся
     /// сам, без неё.
     pub stop_reason: Option<String>,
@@ -109,6 +112,10 @@ pub async fn collect_stream(
     let mut text = String::new();
     let mut got_stop = false;
     let mut stop_reason: Option<String> = None;
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    // Аргументы вызовов считаются в тот же потолок, что и текст: иначе
+    // сломанный эндпоинт мог бы лить их без границы.
+    let mut tool_call_bytes = 0usize;
     loop {
         match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
             Err(_) => {
@@ -116,6 +123,7 @@ pub async fn collect_stream(
                 return StreamOutcome {
                     text,
                     got_stop,
+                    tool_calls,
                     stop_reason,
                     end: StreamEnd::IdleTimeout,
                 };
@@ -129,6 +137,7 @@ pub async fn collect_stream(
                         return StreamOutcome {
                             text,
                             got_stop,
+                            tool_calls,
                             stop_reason,
                             end: StreamEnd::ProviderError(format!(
                                 "stream exceeded {} MiB without finishing — aborted",
@@ -137,6 +146,27 @@ pub async fn collect_stream(
                         };
                     }
                     on_progress(&text);
+                }
+                if !chunk.tool_calls.is_empty() {
+                    tool_call_bytes += chunk
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.arguments.to_string().len())
+                        .sum::<usize>();
+                    tool_calls.extend(chunk.tool_calls);
+                    if tool_call_bytes > MAX_STREAM_BYTES {
+                        stream_task.abort();
+                        return StreamOutcome {
+                            text,
+                            got_stop,
+                            tool_calls,
+                            stop_reason,
+                            end: StreamEnd::ProviderError(format!(
+                                "tool-call arguments exceeded {} MiB — aborted",
+                                MAX_STREAM_BYTES / (1024 * 1024)
+                            )),
+                        };
+                    }
                 }
                 // Любая причина завершает ход: `length` и `content_filter`
                 // — такой же конец, как `stop`, и терять из-за них уже
@@ -160,6 +190,7 @@ pub async fn collect_stream(
     StreamOutcome {
         text,
         got_stop,
+        tool_calls,
         stop_reason,
         end,
     }
@@ -173,6 +204,7 @@ mod tests {
     fn request() -> CompletionRequest {
         CompletionRequest {
             messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
             model: "fake".to_string(),
             temperature: 0.0,
             max_tokens: 128,

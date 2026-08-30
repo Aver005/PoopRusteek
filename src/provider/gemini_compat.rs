@@ -164,6 +164,7 @@ mod tests {
                 ChatMessage::tool("call_1", "42"),
                 ChatMessage::assistant("ok"),
             ],
+            tools: Vec::new(),
             model: "gemini-2.5-flash".to_string(),
             temperature: 0.4,
             max_tokens: 512,
@@ -190,6 +191,7 @@ mod tests {
     fn model_first_history_gets_user_opener() {
         let request = CompletionRequest {
             messages: vec![ChatMessage::assistant("earlier answer")],
+            tools: Vec::new(),
             model: "m".to_string(),
             temperature: 0.0,
             max_tokens: 16,

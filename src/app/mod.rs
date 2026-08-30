@@ -99,7 +99,7 @@ fn status_for(event: &AgentEvent) -> Option<String> {
         AgentEvent::BeginAssistantMessage
         | AgentEvent::Chunk(_)
         | AgentEvent::Message(_)
-        | AgentEvent::DiscardEmptyAssistant
+        | AgentEvent::EndAssistantMessage { .. }
         | AgentEvent::ContextUsage(_) => return None,
     })
 }

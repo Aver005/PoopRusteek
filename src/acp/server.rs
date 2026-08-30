@@ -142,6 +142,8 @@ impl AcpServer {
 
         let request = CompletionRequest {
             messages,
+            // ACP — голый ретранслятор промпта, цикл агента здесь не крутится.
+            tools: Vec::new(),
             model: self.provider.model().to_string(),
             temperature: 0.7,
             max_tokens: 4096,

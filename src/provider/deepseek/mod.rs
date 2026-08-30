@@ -338,6 +338,7 @@ impl LLMProvider for DeepseekProvider {
         self.drive_completion(&request, "stream", |text| {
             let _ = tx.send(CompletionChunk {
                 content: text,
+                tool_calls: Vec::new(),
                 finish_reason: None,
             });
         })
@@ -347,6 +348,7 @@ impl LLMProvider for DeepseekProvider {
         // treats as a failed turn — same contract as before the extraction.
         let _ = tx.send(CompletionChunk {
             content: String::new(),
+            tool_calls: Vec::new(),
             finish_reason: Some("stop".to_string()),
         });
         Ok(())

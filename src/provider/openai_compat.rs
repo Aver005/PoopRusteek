@@ -293,6 +293,9 @@ pub fn to_internal_request(
     }
     Ok(CompletionRequest {
         messages,
+        // Входящие `tools` наш сервер не транслирует (см. шапку модуля):
+        // он их фиксирует и предупреждает, а не пробрасывает дальше.
+        tools: Vec::new(),
         model: request.model,
         temperature: request.temperature.unwrap_or(defaults.temperature),
         max_tokens: request
@@ -352,13 +355,35 @@ pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
             object
         })
         .collect();
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": request.model,
         "messages": messages,
         "temperature": request.temperature,
         "max_tokens": request.max_tokens,
         "stream": request.stream,
-    })
+    });
+    // Объявляем инструменты только когда их дали: на промптовом пути список
+    // пуст, и поля в теле не появляется вовсе — эндпоинты, не знающие
+    // `tools`, не должны видеть его ради пустого массива.
+    if !request.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    body
 }
 
 // ── Outbound: internal result → OpenAI response / chunks ───────────────
@@ -485,6 +510,7 @@ pub fn chunk_from_openai(chunk: ChatCompletionChunk) -> CompletionChunk {
         .unwrap_or_default();
     CompletionChunk {
         content,
+        tool_calls: Vec::new(),
         finish_reason,
     }
 }
@@ -814,6 +840,7 @@ mod tests {
                 ChatMessage::user("question"),
                 ChatMessage::tool("call_1", "result"),
             ],
+            tools: Vec::new(),
             model: "deepseek-chat".to_string(),
             temperature: 0.3,
             max_tokens: 512,
@@ -1040,5 +1067,40 @@ mod tests {
         let (r3, c3) = splitter.finish();
         assert!(r2.is_empty() && r3.is_empty());
         assert_eq!(format!("{c}{c2}{c3}"), "Hello, world!");
+    }
+
+    /// Промптовый путь не должен даже упоминать `tools`: эндпоинты, которые
+    /// его не знают, спотыкаются и о пустой массив.
+    #[test]
+    fn no_tools_field_appears_when_none_are_declared() {
+        let wire = request_to_openai(&CompletionRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+        });
+        assert!(wire.get("tools").is_none(), "{wire}");
+    }
+
+    /// А объявленные — уходят в форме, которую ждёт OpenAI.
+    #[test]
+    fn declared_tools_are_sent_in_the_function_envelope() {
+        let wire = request_to_openai(&CompletionRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![crate::tools::ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+        });
+        assert_eq!(wire["tools"][0]["type"], "function");
+        assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(wire["tools"][0]["function"]["parameters"]["type"], "object");
     }
 }

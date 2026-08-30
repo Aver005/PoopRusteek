@@ -192,6 +192,7 @@ mod tests {
             api_key: None,
             model: model.to_string(),
             protocol: ProviderProtocol::Openai,
+            tools: Default::default(),
         }
     }
 

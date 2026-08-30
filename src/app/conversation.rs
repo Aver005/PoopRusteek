@@ -127,10 +127,11 @@ impl Conversation {
     /// `BeginAssistantMessage`: open an empty assistant message unless one is
     /// already open.
     pub fn begin_assistant_message(&mut self) {
-        let needs_push = self
-            .messages
-            .last()
-            .is_none_or(|m| m.role != crate::provider::Role::Assistant || !m.content.is_empty());
+        let needs_push = self.messages.last().is_none_or(|m| {
+            m.role != crate::provider::Role::Assistant
+                || !m.content.is_empty()
+                || !m.tool_calls.is_empty()
+        });
         if needs_push {
             self.messages.push(ChatMessage::assistant(""));
         }
@@ -145,13 +146,31 @@ impl Conversation {
         }
     }
 
-    /// Drop a trailing assistant message that never received content.
-    pub fn discard_empty_assistant(&mut self) {
-        if self
-            .messages
-            .last()
-            .is_some_and(|m| m.role == crate::provider::Role::Assistant && m.content.is_empty())
+    /// Закрыть сообщение ассистента: прикрепить его вызовы и сбросить
+    /// только пустышку.
+    ///
+    /// Сообщение с вызовами пустым не считается, даже когда текста в нём
+    /// нет — а в родном протоколе это обычный вид шага. Сбросив его, мы
+    /// оставили бы результаты инструментов без объявившего их вызова, и
+    /// следующий ход провайдер отверг бы с 400.
+    pub fn end_assistant_message(&mut self, tool_calls: &[crate::provider::ToolCall]) {
+        if let Some(last) = self.messages.last_mut()
+            && last.role == crate::provider::Role::Assistant
+            && last.tool_calls.is_empty()
         {
+            last.tool_calls = tool_calls.to_vec();
+        }
+        self.discard_empty_assistant();
+    }
+
+    /// Сбросить хвостовое сообщение ассистента, в которое не пришло ни
+    /// текста, ни вызовов.
+    pub fn discard_empty_assistant(&mut self) {
+        if self.messages.last().is_some_and(|m| {
+            m.role == crate::provider::Role::Assistant
+                && m.content.is_empty()
+                && m.tool_calls.is_empty()
+        }) {
             self.messages.pop();
         }
     }
@@ -421,5 +440,53 @@ mod tests {
             crate::context::conversation_tokens("", &conv.messages)
         );
         assert!(conv.context_used < 9_999);
+    }
+
+    /// Шаг, состоящий из одних вызовов, текста не даёт — и именно такое
+    /// сообщение раньше сбрасывалось. Результаты инструментов остались бы
+    /// тогда без объявившего их вызова, а это 400 на следующем ходу.
+    #[test]
+    fn an_assistant_message_with_only_tool_calls_survives() {
+        let mut conv = Conversation::fresh_main(None);
+        conv.begin_assistant_message();
+        conv.end_assistant_message(&[crate::provider::ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "x"}),
+        }]);
+
+        assert_eq!(conv.messages.len(), 1, "{:?}", conv.messages);
+        assert_eq!(conv.messages[0].tool_calls.len(), 1);
+        assert_eq!(conv.messages[0].tool_calls[0].id, "call_1");
+    }
+
+    /// А настоящая пустышка — ни текста, ни вызовов — сбрасывается, как и до
+    /// сих пор.
+    #[test]
+    fn an_assistant_message_with_neither_text_nor_calls_is_dropped() {
+        let mut conv = Conversation::fresh_main(None);
+        conv.begin_assistant_message();
+        conv.end_assistant_message(&[]);
+        assert!(conv.messages.is_empty());
+    }
+
+    /// Следующий шаг открывает новое сообщение, а не дописывает текст в то,
+    /// что уже объявило вызовы.
+    #[test]
+    fn a_new_assistant_message_opens_after_one_that_carried_calls() {
+        let mut conv = Conversation::fresh_main(None);
+        conv.begin_assistant_message();
+        conv.end_assistant_message(&[crate::provider::ToolCall {
+            id: "call_1".to_string(),
+            name: "t".to_string(),
+            arguments: serde_json::json!({}),
+        }]);
+        conv.begin_assistant_message();
+        conv.append_chunk("the answer");
+
+        assert_eq!(conv.messages.len(), 2);
+        assert!(conv.messages[0].content.is_empty());
+        assert_eq!(conv.messages[1].content, "the answer");
+        assert!(conv.messages[1].tool_calls.is_empty());
     }
 }

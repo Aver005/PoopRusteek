@@ -66,6 +66,7 @@ impl CompatProtocol for AnthropicProtocol {
             StreamEvent::Text(text) => {
                 emit(CompletionChunk {
                     content: text,
+                    tool_calls: Vec::new(),
                     finish_reason: None,
                 });
                 SseFlow::Continue
@@ -73,6 +74,7 @@ impl CompatProtocol for AnthropicProtocol {
             StreamEvent::Done => {
                 emit(CompletionChunk {
                     content: String::new(),
+                    tool_calls: Vec::new(),
                     finish_reason: Some("stop".to_string()),
                 });
                 SseFlow::Done
