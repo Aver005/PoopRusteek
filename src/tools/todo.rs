@@ -156,8 +156,13 @@ fn parse(args: &Value) -> Result<Vec<Item>, String> {
         if content.is_empty() {
             return Err(format!("todos[{index}] has an empty 'content'."));
         }
-        // Инвариант 4: режем по границе символа, а не по байтам.
-        let content = crate::util::truncate_at_char_boundary(&content, MAX_CONTENT_BYTES);
+        // Инвариант 4: режем по границе символа, а не по байтам. Об обрезке
+        // говорим многоточием — молча укоротить «удалить только если
+        // подтвердил» до «удалить только если» значит подменить пункт плана.
+        let content = match crate::util::truncate_at_char_boundary(&content, MAX_CONTENT_BYTES) {
+            cut if cut.len() < content.len() => format!("{cut}…"),
+            whole => whole.to_string(),
+        };
 
         let raw_status = match entry.get("status") {
             Some(Value::String(text)) => text.as_str(),
@@ -165,12 +170,15 @@ fn parse(args: &Value) -> Result<Vec<Item>, String> {
             None => return Err(format!("todos[{index}] has no 'status'.")),
         };
         let Some((status, mark)) = canonical_status(raw_status) else {
+            // Обрезаем: строка приходит от модели и ничем не ограничена, а
+            // отсюда она уходит в ленту и в строку состояния.
+            let shown = crate::util::truncate_at_char_boundary(raw_status, 40);
             return Err(format!(
-                "todos[{index}] has status {raw_status:?}; use \"pending\", \"in_progress\" or \"done\"."
+                "todos[{index}] has status {shown:?}; use \"pending\", \"in_progress\" or \"done\"."
             ));
         };
         items.push(Item {
-            content: content.to_string(),
+            content,
             status,
             mark,
         });
@@ -357,13 +365,25 @@ mod tests {
         assert!(text.contains("Read the loader [x] Delete the backups (approved)"));
     }
 
-    /// Инвариант 4: обрезка по границе символа, а не по байтам.
+    /// Инвариант 4: обрезка по границе символа, а не по байтам. И обрезка
+    /// видна: без многоточия укороченный пункт читается моделью как её
+    /// собственная формулировка целиком.
     #[test]
-    fn long_multibyte_content_is_cut_on_a_char_boundary() {
+    fn long_multibyte_content_is_cut_on_a_char_boundary_and_marked() {
         let long = "Починить всё 🎉 ".repeat(40);
         let items = call(json!([item(&long, "pending")])).unwrap();
-        assert!(items[0].content.len() <= MAX_CONTENT_BYTES);
-        assert!(long.starts_with(&items[0].content));
+        let cut = &items[0].content;
+        assert!(cut.ends_with('…'), "{cut}");
+        let body = cut.trim_end_matches('…');
+        assert!(body.len() <= MAX_CONTENT_BYTES);
+        assert!(long.starts_with(body));
+    }
+
+    /// Короткий пункт многоточия не получает.
+    #[test]
+    fn short_content_is_left_alone() {
+        let items = call(json!([item("Починить разбор", "pending")])).unwrap();
+        assert_eq!(items[0].content, "Починить разбор");
     }
 
     #[tokio::test]

@@ -958,7 +958,14 @@ impl App {
             "Cancelled".to_string()
         };
         self.state.needs_terminal_restore = true;
-        self.state.focused_mut().discard_empty_assistant();
+        {
+            let focused = self.state.focused_mut();
+            focused.discard_empty_assistant();
+            // Esc на модалке подтверждения обрывает ход ровно между вызовом
+            // и его результатом: без этого история осталась бы с вызовом,
+            // на который никто не ответил.
+            focused.settle_unanswered_tool_calls();
+        }
         if self.state.goal.is_running() {
             self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
         }

@@ -83,10 +83,14 @@ pub(super) async fn run_tool_calls(
         // Для большинства инструментов в ленту идёт выжимка: вывод бывает
         // огромным. Но у некоторых результат сам адресован человеку, и
         // обрезка съела бы всё, что в нём есть.
-        let whole = ctx
-            .tools
-            .get(&name)
-            .is_some_and(|tool| tool.result_is_its_own_summary());
+        // Только для успешного результата: текст ошибки собирается из
+        // аргументов модели и ничем не ограничен, а он уходит и в строку
+        // состояния, и в постоянное сообщение истории.
+        let whole = !is_error
+            && ctx
+                .tools
+                .get(&name)
+                .is_some_and(|tool| tool.result_is_its_own_summary());
         let preview = if whole {
             text.clone()
         } else {

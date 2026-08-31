@@ -9,7 +9,9 @@
 use crate::agent::retry::RetryBudget;
 use crate::agent::runner::{EMPTY_RESPONSE_FEEDBACK, build_step_request, malformed_tool_feedback};
 use crate::agent::stream::{StreamVerdict, collect_stream};
-use crate::agent::tool_parser::{parse_tool_calls_with_errors, strip_tool_calls};
+use crate::agent::tool_parser::{
+    ParsedToolCall, parse_tool_calls_with_errors, strip_thinking_only, strip_tool_calls,
+};
 use crate::agent::tools_step::{dispatch_generic_tool, tool_skip_message};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, LLMProvider, Role};
@@ -67,9 +69,28 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
             StreamVerdict::Ok | StreamVerdict::Finished(_) | StreamVerdict::ClosedWithoutStop => {}
         }
         let full = outcome.text;
+        let native_calls = outcome.tool_calls;
 
-        let (tool_calls, parse_errors) = parse_tool_calls_with_errors(&full);
-        let visible = strip_tool_calls(&full);
+        // Та же очерёдность, что в главном цикле: родные вызовы главнее, а
+        // разбор текста — подстраховка. Без этого шаг с родным вызовом и
+        // вводной фразой возвращался бы родителю как готовый ответ, не
+        // выполнив ничего.
+        let (parsed_calls, parse_errors) = parse_tool_calls_with_errors(&full);
+        let tool_calls: Vec<_> = if native_calls.is_empty() {
+            parsed_calls
+        } else {
+            native_calls.iter().map(ParsedToolCall::from).collect()
+        };
+        let parse_errors = if native_calls.is_empty() {
+            parse_errors
+        } else {
+            Vec::new()
+        };
+        let visible = if native_calls.is_empty() {
+            strip_tool_calls(&full)
+        } else {
+            strip_thinking_only(&full)
+        };
 
         if tool_calls.is_empty() {
             // Та же развилка, что и в главном цикле: ноль разобранных вызовов
@@ -98,10 +119,17 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
             continue;
         }
 
-        messages.push(ChatMessage::assistant(&visible));
+        let mut assistant = ChatMessage::assistant(&visible);
+        assistant.tool_calls = native_calls;
+        messages.push(assistant);
         let total_calls = tool_calls.len();
         for (call_index, tool_call) in tool_calls.into_iter().enumerate() {
-            let tool_id = uuid::Uuid::new_v4().to_string();
+            // Идентификатор от провайдера, если он есть: результат обязан
+            // сослаться на тот же, что и объявивший его вызов.
+            let tool_id = tool_call
+                .id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             // Тот же контракт: пропущенный вызов получает явный tool_result.
             if call_index >= max_tools_per_step {
                 messages.push(ChatMessage::tool(

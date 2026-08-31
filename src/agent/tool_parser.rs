@@ -190,6 +190,13 @@ fn extract_arguments(body: &str) -> Option<String> {
     Some(after_name[start..].trim().to_string())
 }
 
+/// Убрать только рассуждения. На родном протоколе вызовов в тексте нет, и
+/// вырезание `<tool_use>`/`[TOOL:…]` там — чистая потеря: модель, которую
+/// спросили «как выглядит вызов в этом репозитории», лишилась бы ответа.
+pub fn strip_thinking_only(text: &str) -> String {
+    STRIP_THINKING_RE.replace_all(text, "").trim().to_string()
+}
+
 pub fn strip_tool_calls(text: &str) -> String {
     let without_xml = STRIP_TOOL_XML_RE.replace_all(text, "");
     let without_thinking = STRIP_THINKING_RE.replace_all(&without_xml, "");

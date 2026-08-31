@@ -32,6 +32,14 @@ pub fn conversation_tokens(system_prompt: &str, messages: &[ChatMessage]) -> u32
         if let Some(name) = &message.name {
             total = total.saturating_add(budget_tokens(name));
         }
+        // Аргументы родного вызова уезжают на провод целиком, а в `content`
+        // их нет: шаг, записывающий файл, стоил бы по этой мерке четыре
+        // токена, и ладдер не сработал бы никогда.
+        for call in &message.tool_calls {
+            total = total
+                .saturating_add(budget_tokens(&call.name))
+                .saturating_add(budget_tokens(&call.arguments.to_string()));
+        }
     }
     total
 }

@@ -1,7 +1,8 @@
 use crate::agent::retry::{MAX_EMPTY_RESPONSE_RETRIES, MAX_MALFORMED_TOOL_RETRIES, RetryBudget};
 use crate::agent::stream::{StreamEnd, StreamOutcome, StreamVerdict, collect_stream};
 use crate::agent::tool_parser::{
-    ParsedToolCall, StreamTextTracker, parse_tool_calls_with_errors, strip_tool_calls,
+    ParsedToolCall, StreamTextTracker, parse_tool_calls_with_errors, strip_thinking_only,
+    strip_tool_calls,
 };
 use crate::agent::tools_step::{ToolExecContext, run_tool_calls};
 use crate::agent::trace::{self, StepTrace};
@@ -119,7 +120,13 @@ pub async fn run_agent_loop(
         } else {
             Vec::new()
         };
-        let visible_text = strip_tool_calls(&raw);
+        // На родном протоколе текст — это текст: вырезать из него разметку
+        // вызовов незачем, а навредить она может.
+        let visible_text = if native_calls.is_empty() {
+            strip_tool_calls(&raw)
+        } else {
+            strip_thinking_only(&raw)
+        };
         trace.parsed(
             got_stop,
             provider_error.as_deref(),
@@ -1093,6 +1100,82 @@ mod tests {
         }
     }
 
+    /// Ход с родным вызовом инструмента. Провайдер заканчивает его причиной
+    /// `tool_calls` — это штатный конец, а не обрыв: пометки «ответ неполный»
+    /// быть не должно. Пока `tool_calls` считался обрезкой, такая заметка
+    /// вставлялась в историю **на каждом** родном шаге и уезжала обратно
+    /// модели, сообщая ей, что её же вызов оборвался.
+    #[tokio::test]
+    async fn a_native_tool_call_is_a_normal_end_of_step_not_a_truncation() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(
+            FakeProvider::with_responses(vec![String::new(), "All done.".to_string()])
+                .with_tool_calls(vec![crate::provider::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "Cargo.toml"}),
+                }]),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let cid = ConversationId::next();
+        run_agent_loop(
+            TurnSpec {
+                conversation: cid,
+                provider,
+                messages: vec![ChatMessage::user("read the manifest")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
+            },
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let mut notices = Vec::new();
+        let mut ended_with = Vec::new();
+        let mut ran_tools = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AppEvent::Agent {
+                    event: AgentEvent::Message(message),
+                    ..
+                } => notices.push(message.content),
+                AppEvent::Agent {
+                    event: AgentEvent::EndAssistantMessage { tool_calls },
+                    ..
+                } => ended_with.push(tool_calls),
+                AppEvent::Agent {
+                    event: AgentEvent::ToolStarted { name },
+                    ..
+                } => ran_tools.push(name),
+                _ => {}
+            }
+        }
+
+        assert!(
+            !notices.iter().any(|n| n.contains("incomplete")),
+            "a native tool call must not be reported as a truncated reply: {notices:?}"
+        );
+        assert!(
+            ran_tools.contains(&"read_file".to_string()),
+            "the declared tool must actually run, got {ran_tools:?}"
+        );
+        assert!(
+            ended_with.iter().any(|calls| calls
+                .iter()
+                .any(|call| call.id == "call_1" && call.name == "read_file")),
+            "the assistant message must carry its calls, got {ended_with:?}"
+        );
+    }
+
     #[tokio::test]
     async fn agent_loop_salvages_complete_tool_call_when_stream_ends_early() {
         let response = r#"<tool_use><name>question</name><arguments>{"question":"q","options":[],"allow_custom":false}</arguments></tool_use>"#;
@@ -1567,13 +1650,15 @@ mod tests {
             "the protected tail is untouched"
         );
 
-        // Named after the sanitised tool-call id, not the message index.
-        let spilled = dir.join("call_old__9.txt");
+        // Имя — из очищенного id вызова плюс индекс сообщения: id провайдера
+        // между шагами повторяются, и без индекса два вывода легли бы в один
+        // файл.
+        let spilled = dir.join("call_old__9-2.txt");
         let on_disk = std::fs::read_to_string(&spilled)
             .unwrap_or_else(|e| panic!("spill at {}: {e}", spilled.display()));
         assert_eq!(on_disk, old_body);
         assert!(
-            tool_messages[0].content.contains("call_old__9.txt"),
+            tool_messages[0].content.contains("call_old__9-2.txt"),
             "the marker names the spill path, got {}",
             tool_messages[0].content
         );

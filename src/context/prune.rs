@@ -40,10 +40,14 @@ pub fn spill_file_name(tool_call_id: Option<&str>, index: usize) -> String {
         })
         .collect();
     let stem = safe.trim_matches('_');
+    // Индекс в имени всегда: идентификаторы провайдера уникальны только
+    // внутри одного ответа (`call_0`, `call_1`), так что на втором шаге они
+    // повторяются, и два разных вывода легли бы в один файл — маркер первого
+    // указывал бы на чужой текст.
     if stem.is_empty() {
         format!("{index}.txt")
     } else {
-        format!("{stem}.txt")
+        format!("{stem}-{index}.txt")
     }
 }
 
@@ -237,15 +241,26 @@ mod tests {
 
     #[test]
     fn a_spill_name_never_escapes_the_spill_directory() {
-        assert_eq!(spill_file_name(Some("call_ab-1"), 7), "call_ab-1.txt");
+        assert_eq!(spill_file_name(Some("call_ab-1"), 7), "call_ab-1-7.txt");
         assert_eq!(spill_file_name(Some(".."), 7), "7.txt");
         assert_eq!(
             spill_file_name(Some("../../etc/passwd"), 7),
-            "etc_passwd.txt"
+            "etc_passwd-7.txt"
         );
-        assert_eq!(spill_file_name(Some("a:b?c*d"), 7), "a_b_c_d.txt");
+        assert_eq!(spill_file_name(Some("a:b?c*d"), 7), "a_b_c_d-7.txt");
         assert_eq!(spill_file_name(None, 7), "7.txt");
         assert_eq!(spill_file_name(Some(""), 7), "7.txt");
-        assert!(spill_file_name(Some(&"x".repeat(500)), 7).len() <= 68);
+        assert!(spill_file_name(Some(&"x".repeat(500)), 7).len() <= 72);
+    }
+
+    /// Идентификатор провайдера повторяется между шагами (`call_0` в каждом
+    /// ответе), а имя файла повторяться не должно: иначе второй вывод затрёт
+    /// первый, и его маркер будет указывать на чужой текст.
+    #[test]
+    fn the_same_provider_id_on_two_steps_spills_to_two_files() {
+        assert_ne!(
+            spill_file_name(Some("call_0"), 3),
+            spill_file_name(Some("call_0"), 9)
+        );
     }
 }

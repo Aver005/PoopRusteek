@@ -40,6 +40,10 @@ pub struct FakeProvider {
     /// Терминальная причина в последнем чанке. По умолчанию `stop`; тест
     /// ставит `length`, чтобы проверить обрезанный ответ.
     finish_reason: String,
+    /// Родные вызовы первого ответа: уезжают в том же чанке, что и
+    /// терминальная причина, — ровно так, как это делает настоящий протокол.
+    /// Отдаются один раз, иначе ход не смог бы закончиться.
+    tool_calls: Mutex<Vec<crate::provider::ToolCall>>,
 }
 
 impl FakeProvider {
@@ -60,7 +64,15 @@ impl FakeProvider {
             seen_requests: Mutex::new(Vec::new()),
             resets: Mutex::new(0),
             finish_reason: "stop".to_string(),
+            tool_calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Ответить родными вызовами инструментов: они приходят вместе с
+    /// терминальной причиной `tool_calls`, как у OpenAI.
+    pub fn with_tool_calls(mut self, calls: Vec<crate::provider::ToolCall>) -> Self {
+        self.tool_calls = Mutex::new(calls);
+        self
     }
 
     /// Завершить стрим не `stop`, а другой причиной (`length`,
@@ -162,10 +174,18 @@ impl LLMProvider for FakeProvider {
             return Ok(());
         }
         // Terminal chunk carries the stop signal, mirroring the real provider.
+        // Вызовы отдаются один раз и вместе с `tool_calls` как причиной —
+        // так заканчивает ход с инструментом настоящий OpenAI.
+        let calls = std::mem::take(&mut *self.tool_calls.lock().unwrap());
+        let reason = if calls.is_empty() {
+            self.finish_reason.clone()
+        } else {
+            "tool_calls".to_string()
+        };
         let _ = tx.send(CompletionChunk {
             content: String::new(),
-            tool_calls: Vec::new(),
-            finish_reason: Some(self.finish_reason.clone()),
+            tool_calls: calls,
+            finish_reason: Some(reason),
         });
         Ok(())
     }

@@ -80,10 +80,12 @@ impl StreamOutcome {
         match &self.end {
             StreamEnd::IdleTimeout => StreamVerdict::IdleTimeout,
             // Терминальная причина пришла — значит ответ дописан, а ошибка
-            // догнала уже после. `stop` — целый ответ, остальное — обрыв по
-            // лимиту или фильтру: текст сохраняем, но говорим о нём.
+            // догнала уже после. `tool_calls`/`tool_use` — такой же штатный
+            // конец, как `stop`: так OpenAI и Anthropic заканчивают ход с
+            // вызовом инструмента. Обрыв — только `length` и фильтры: текст
+            // сохраняем, но говорим о нём.
             _ if self.got_stop => match self.stop_reason.as_deref() {
-                Some("stop") | None => StreamVerdict::Ok,
+                Some("stop" | "tool_calls" | "tool_use") | None => StreamVerdict::Ok,
                 Some(other) => StreamVerdict::Finished(other.to_string()),
             },
             StreamEnd::Completed => StreamVerdict::ClosedWithoutStop,
@@ -156,10 +158,13 @@ pub async fn collect_stream(
                     tool_calls.extend(chunk.tool_calls);
                     if tool_call_bytes > MAX_STREAM_BYTES {
                         stream_task.abort();
+                        // Вызовы выбрасываем: иначе ветка спасения в цикле
+                        // взяла бы ровно тот аргумент, который мы только что
+                        // признали безразмерным, и исполнила бы его.
                         return StreamOutcome {
                             text,
                             got_stop,
-                            tool_calls,
+                            tool_calls: Vec::new(),
                             stop_reason,
                             end: StreamEnd::ProviderError(format!(
                                 "tool-call arguments exceeded {} MiB — aborted",

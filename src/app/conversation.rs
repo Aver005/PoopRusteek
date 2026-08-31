@@ -154,13 +154,56 @@ impl Conversation {
     /// оставили бы результаты инструментов без объявившего их вызова, и
     /// следующий ход провайдер отверг бы с 400.
     pub fn end_assistant_message(&mut self, tool_calls: &[crate::provider::ToolCall]) {
-        if let Some(last) = self.messages.last_mut()
-            && last.role == crate::provider::Role::Assistant
-            && last.tool_calls.is_empty()
+        // Ищем последнее сообщение ассистента, а не просто последнее: между
+        // ним и этим событием цикл успевает вставить системную заметку
+        // (обрезка, спасение вызова), и тогда вызовы прикрепились бы к ней —
+        // то есть пропали бы вовсе.
+        if let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == crate::provider::Role::Assistant)
+            && self.messages[index].tool_calls.is_empty()
         {
-            last.tool_calls = tool_calls.to_vec();
+            self.messages[index].tool_calls = tool_calls.to_vec();
         }
         self.discard_empty_assistant();
+    }
+
+    /// Закрыть вызовы, на которые не успели прийти результаты.
+    ///
+    /// Ход обрывают между объявлением вызовов и их исполнением — например,
+    /// Esc на модалке подтверждения. Раньше такое сообщение было пустым и
+    /// просто сбрасывалось; теперь оно несёт вызовы и остаётся, а вызов без
+    /// результата провайдер отвергает. Дописываем явный результат вместо
+    /// того, чтобы стирать сам факт попытки.
+    pub fn settle_unanswered_tool_calls(&mut self) {
+        let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == crate::provider::Role::Assistant && !m.tool_calls.is_empty())
+        else {
+            return;
+        };
+        let answered: std::collections::HashSet<String> = self.messages[index + 1..]
+            .iter()
+            .filter(|m| m.role == crate::provider::Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        let missing: Vec<(String, String)> = self.messages[index]
+            .tool_calls
+            .iter()
+            .filter(|call| !answered.contains(&call.id))
+            .map(|call| (call.id.clone(), call.name.clone()))
+            .collect();
+        for (id, name) in missing {
+            self.messages.push(ChatMessage::tool_with_display(
+                &id,
+                &name,
+                "(the turn was interrupted before this tool ran)",
+                "interrupted",
+                true,
+            ));
+        }
     }
 
     /// Сбросить хвостовое сообщение ассистента, в которое не пришло ни
@@ -197,6 +240,8 @@ impl Conversation {
         self.generation.last_status = Some(status.to_string());
         self.agent_task = None;
         self.discard_empty_assistant();
+        // Ход мог оборваться между объявлением вызовов и их исполнением.
+        self.settle_unanswered_tool_calls();
     }
 
     // ─── Rung 3 (`/compact`) lifecycle ─────────────────────────
@@ -488,5 +533,66 @@ mod tests {
         assert!(conv.messages[0].content.is_empty());
         assert_eq!(conv.messages[1].content, "the answer");
         assert!(conv.messages[1].tool_calls.is_empty());
+    }
+
+    fn a_call(id: &str) -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "x"}),
+        }
+    }
+
+    /// Между открытием сообщения ассистента и его закрытием цикл успевает
+    /// вставить системную заметку (обрезка, спасение вызова). Вызовы должны
+    /// найти своё сообщение, а не прицепиться к заметке — иначе они
+    /// пропадают, и результаты остаются без объявившего их вызова.
+    #[test]
+    fn calls_attach_past_a_system_notice_pushed_in_between() {
+        let mut conv = Conversation::fresh_main(None);
+        conv.begin_assistant_message();
+        conv.messages
+            .push(ChatMessage::system("Warning: stream ended early"));
+        conv.end_assistant_message(&[a_call("call_1")]);
+
+        let assistant = conv
+            .messages
+            .iter()
+            .find(|m| m.role == crate::provider::Role::Assistant)
+            .expect("the assistant message must survive");
+        assert_eq!(assistant.tool_calls, vec![a_call("call_1")]);
+    }
+
+    /// Оборванный ход не оставляет вызова без ответа: провайдер такую
+    /// историю отвергает, а обрывают её обычно на модалке подтверждения.
+    #[test]
+    fn an_interrupted_turn_answers_the_calls_it_left_hanging() {
+        let mut conv = Conversation::fresh_main(None);
+        conv.begin_assistant_message();
+        conv.end_assistant_message(&[a_call("call_1"), a_call("call_2")]);
+        conv.messages.push(ChatMessage::tool("call_1", "done"));
+
+        conv.settle_unanswered_tool_calls();
+
+        let answered: Vec<&str> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::provider::Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(answered, vec!["call_1", "call_2"]);
+    }
+
+    /// Повторный вызов ничего не дублирует: у каждого вызова ровно один
+    /// результат.
+    #[test]
+    fn settling_twice_adds_nothing_the_second_time() {
+        let mut conv = Conversation::fresh_main(None);
+        conv.begin_assistant_message();
+        conv.end_assistant_message(&[a_call("call_1")]);
+        conv.settle_unanswered_tool_calls();
+        let after_first = conv.messages.len();
+        conv.settle_unanswered_tool_calls();
+        assert_eq!(conv.messages.len(), after_first);
     }
 }
