@@ -199,7 +199,7 @@ pooprusteek --config … --data-dir … exec --resume <id> "it doesn't compile: 
 `--resume <session-id>` seeds the driver's `Conversation` from the saved
 session — messages, tag, `broken`, and the session identity — exactly the
 fields `App::handle_load_session` carries over, and then adopts the provider's
-server-side session (`session_is_alive` → `adopt_session`).
+server-side session (`check_session` → `adopt_session`).
 
 Four rules, each of them load-bearing:
 
@@ -213,12 +213,17 @@ Four rules, each of them load-bearing:
   `provider_session_id`, or a failed liveness check all mean the same thing the
   TUI means: replay local history into a fresh remote session. The trace says
   which happened — one `harness.resume` record with `remote` (`adopted` /
-  `replayed`), `reason` and `messages`. That record earned its keep on the
+  `replayed`), `reason`, `detail` (the provider's own words) and `messages`.
+  The two failure reasons are **not** interchangeable: `remote_session_gone`
+  means the provider answered about that session and refused it;
+  `remote_session_unverified` means the check never happened (network, an
+  expired token, a changed wire format). They were one label once, and that
+  label cost a day of unwinding — the endpoint had been answering HTML. That record earned its keep on the
   first live run: `replayed / remote_session_gone` seven seconds after the
   session was created turned out to be a **provider** defect, not a resume one
   — `chat/history` had been removed upstream and answers 200 OK with the site's
   HTML shell (`BUGS.md`, RESOLVED 2026-09-06). Читая `replayed`, сначала
-  посмотрите `reason`.
+  посмотрите `reason` и `detail`.
 - **An unknown id is `setup_failed`.** Starting from scratch instead would hand
   back a run that looks successful while it answered without the history it was
   given — the same defect class as "a run that produced nothing to judge".

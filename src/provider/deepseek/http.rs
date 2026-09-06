@@ -16,6 +16,72 @@ use tokio::time::sleep;
 
 const DEEPSEEK_HOST: &str = "chat.deepseek.com";
 
+/// Текст про «ответ не JSON». Отдельная функция, потому что это и есть весь
+/// смысл проверки — объяснить следующему человеку, что путь снесли; а склейка
+/// из многострочного литерала уже один раз приехала с дырами из пробелов.
+fn not_json_message(label: &str, content_type: &str, bytes: usize) -> String {
+    let kind = if content_type.is_empty() {
+        "an unlabelled body"
+    } else {
+        content_type
+    };
+    format!(
+        "{label}: the endpoint answered {kind} in {bytes} bytes instead of JSON. A removed API path is served the site shell with 200 OK, not a 404 — the path is probably gone"
+    )
+}
+
+/// Отказ, приехавший внутри `200 OK`. Два кода, и означают они разное — от
+/// того, какой сработал, зависит, вправе ли вызывающий что-то стирать.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ApiRefusal {
+    /// Внешний `code`: до дела не дошло — протухший токен, лимит, метод.
+    /// Про сам запрошенный объект это не говорит ничего.
+    Transport(String),
+    /// `data.biz_code`: API ответил **про запрошенное** и отказал. Именно так
+    /// выглядит несуществующая сессия: `code: 0`, `biz_code: 1`,
+    /// `biz_msg: "invalid chat session id"`, `biz_data: null`.
+    Business(String),
+}
+
+impl ApiRefusal {
+    pub(super) fn message(&self) -> &str {
+        match self {
+            Self::Transport(message) | Self::Business(message) => message,
+        }
+    }
+}
+
+/// Отказ из конверта `{code, msg, data: {biz_code, biz_msg, biz_data}}`.
+///
+/// Смотреть **оба** кода обязательно: внешний остаётся нулевым, когда отказ
+/// деловой, и проверка только по нему принимает «такой сессии нет» за успех
+/// с пустыми данными.
+pub(super) fn api_refusal(payload: &Value) -> Option<ApiRefusal> {
+    let text = |value: &Value, fallback: &str| {
+        let message = value.as_str().unwrap_or_default().trim().to_string();
+        if message.is_empty() {
+            fallback.to_string()
+        } else {
+            message
+        }
+    };
+    if let Some(code) = payload["code"].as_i64()
+        && code != 0
+    {
+        let message = text(&payload["msg"], "no message");
+        return Some(ApiRefusal::Transport(format!("{message} (code {code})")));
+    }
+    if let Some(biz_code) = payload["data"]["biz_code"].as_i64()
+        && biz_code != 0
+    {
+        let message = text(&payload["data"]["biz_msg"], "no message");
+        return Some(ApiRefusal::Business(format!(
+            "{message} (biz_code {biz_code})"
+        )));
+    }
+    None
+}
+
 /// Похоже ли тело на JSON. Заголовок — первый довод, но не единственный:
 /// он бывает пустым или обобщённым, а вот HTML-оболочка сайта не начинается
 /// ни с `{`, ни с `[` никогда.
@@ -295,14 +361,10 @@ impl DeepseekProvider {
                     crate::util::truncate_at_char_boundary(&text, 400)
                 ),
             );
-            return Err(AppError::Provider(format!(
-                "{label}: the endpoint answered {} in {} bytes instead of JSON —                  the API path is probably gone (a removed path is served the                  site shell with 200 OK, not a 404)",
-                if content_type.is_empty() {
-                    "an unlabelled body"
-                } else {
-                    &content_type
-                },
-                text.len()
+            return Err(AppError::Provider(not_json_message(
+                label,
+                &content_type,
+                text.len(),
             )));
         }
         serde_json::from_str(&text).map_err(|error| {
@@ -373,7 +435,24 @@ impl DeepseekProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::is_json_body;
+    use super::{ApiRefusal, api_refusal, is_json_body, not_json_message};
+
+    /// Текст объяснения — единственная польза этой проверки, и он уже однажды
+    /// приехал с провалами по 18 пробелов из многострочного литерала.
+    #[test]
+    fn the_explanation_reads_as_one_clean_sentence() {
+        let message = not_json_message("Session history failed", "text/html; charset=utf-8", 10071);
+        assert!(!message.contains("  "), "double spaces in: {message}");
+        assert!(!message.contains('\n'), "newlines in: {message}");
+        assert!(message.contains("text/html"), "{message}");
+        assert!(message.contains("10071 bytes"), "{message}");
+        assert!(message.contains("probably gone"), "{message}");
+        // Без заголовка тип не выдумывается.
+        assert!(
+            not_json_message("x", "", 12).contains("an unlabelled body"),
+            "{message}"
+        );
+    }
 
     /// Ровно та ловушка, ради которой проверка появилась: снесённый путь
     /// отвечает 200 OK и оболочкой сайта, а не 404.
@@ -386,6 +465,55 @@ mod tests {
         assert!(!is_json_body("text/plain", "gateway timeout"));
         // Заголовка нет — решает первый символ тела.
         assert!(!is_json_body("", "<!doctype html>"));
+    }
+
+    /// Ровно тот ответ, которым API встречает несуществующую сессию:
+    /// HTTP 200, внешний `code: 0`, отказ — во внутреннем `biz_code`.
+    /// Проверка только внешнего кода принимала его за успех, сессия
+    /// «подхватывалась», и ход падал пустыми ответами.
+    #[test]
+    fn a_refusal_inside_a_200_is_seen_in_the_inner_code() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "msg": "",
+            "data": { "biz_code": 1, "biz_msg": "invalid chat session id", "biz_data": null }
+        });
+        let refusal = api_refusal(&payload).expect("an inner refusal must be seen");
+        assert!(
+            matches!(refusal, ApiRefusal::Business(_)),
+            "a refusal about the requested object is a business one: {refusal:?}"
+        );
+        assert!(
+            refusal.message().contains("invalid chat session id"),
+            "{refusal:?}"
+        );
+        assert!(refusal.message().contains("biz_code 1"), "{refusal:?}");
+    }
+
+    /// Внешний код — не про запрошенный объект, а про сам запрос: протухший
+    /// токен ничего не сообщает о судьбе сессии.
+    #[test]
+    fn an_outer_code_is_transport_not_business() {
+        let payload = serde_json::json!({
+            "code": 40003,
+            "msg": "Authorization Failed (invalid token)",
+            "data": null
+        });
+        let refusal = api_refusal(&payload).expect("an outer refusal must be seen");
+        assert!(matches!(refusal, ApiRefusal::Transport(_)), "{refusal:?}");
+        assert!(refusal.message().contains("40003"), "{refusal:?}");
+    }
+
+    #[test]
+    fn a_healthy_envelope_carries_no_refusal() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "msg": "",
+            "data": { "biz_code": 0, "biz_msg": "", "biz_data": { "chat_messages": [] } }
+        });
+        assert!(api_refusal(&payload).is_none());
+        // Конверта нет вовсе (не-DeepSeek форма) — отказом это не считается.
+        assert!(api_refusal(&serde_json::json!({ "anything": 1 })).is_none());
     }
 
     #[test]

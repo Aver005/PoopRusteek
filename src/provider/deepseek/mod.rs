@@ -412,26 +412,36 @@ impl LLMProvider for DeepseekProvider {
             .map(|id| (id, state.parent_message_id))
     }
 
-    async fn session_is_alive(&self, session_id: &str) -> bool {
+    async fn check_session(&self, session_id: &str) -> crate::provider::SessionLiveness {
+        use crate::provider::SessionLiveness;
         // `chat/history_messages` is the cheapest existing endpoint that
-        // touches a specific session id. Deliberately the *payload* call and
+        // touches a specific session id. Deliberately the *biz_data* call and
         // not `fetch_remote_history`: liveness must not hinge on the message
         // array being parsed, or a wire-shape change again reads as "the
         // session is gone" — which is exactly how the dead `chat/history`
         // presented (200 OK + the site's HTML shell, see BUGS.md).
-        //
-        // A non-2xx, the API's own non-zero `code`, or an HTML answer all
-        // read as not-alive; so does a transient network error — callers
-        // treat "couldn't verify" the same as "gone" rather than risk
-        // threading onto a session that silently vanished.
-        match self.fetch_remote_history_payload(session_id).await {
-            Ok(_) => true,
-            Err(error) => {
+        match self.fetch_remote_history_biz(session_id).await {
+            Ok(_) => SessionLiveness::Alive,
+            // The API answered about this very session and refused it
+            // (`biz_code != 0`, e.g. "invalid chat session id"). Only this
+            // branch is evidence that the session is gone.
+            Err(stream::HistoryError::SessionRefused(reason)) => {
                 debug_log::log(
                     "session.alive",
-                    format!("session {session_id} reads as gone: {error}"),
+                    format!("session {session_id} refused by the API: {reason}"),
                 );
-                false
+                SessionLiveness::Gone(reason)
+            }
+            // Everything else — network, non-2xx, HTML, an expired token —
+            // leaves the session's state unknown. Reporting "gone" here is
+            // what wiped healthy links off disk.
+            Err(error) => {
+                let reason = AppError::from(error).to_string();
+                debug_log::log(
+                    "session.alive",
+                    format!("session {session_id} could not be checked: {reason}"),
+                );
+                SessionLiveness::Unknown(reason)
             }
         }
     }

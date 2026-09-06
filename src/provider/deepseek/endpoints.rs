@@ -11,6 +11,7 @@
 //! modeling, not litter.
 
 use super::DeepseekProvider;
+use super::http::api_refusal;
 use crate::error::AppResult;
 use crate::provider::types;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -75,8 +76,7 @@ impl DeepseekProvider {
         if !response.status().is_success() {
             return Err(Self::read_error_response(action, response, action).await);
         }
-        let payload: types::ApiResponse<T> = Self::read_json(action, response, action).await?;
-        Ok(payload.data.biz_data)
+        biz_data(action, Self::read_json(action, response, action).await?)
     }
 
     /// POST `url` with `body` using plain auth headers and discard the
@@ -137,9 +137,26 @@ impl DeepseekProvider {
         if !response.status().is_success() {
             return Err(Self::read_error_response(action, response, action).await);
         }
-        let payload: types::ApiResponse<T> = Self::read_json(action, response, action).await?;
-        Ok(payload.data.biz_data)
+        biz_data(action, Self::read_json(action, response, action).await?)
     }
+}
+
+/// `data.biz_data` конверта, разобранный в `T`.
+///
+/// Отдельная функция, а не `ApiResponse<T>` целиком, потому что отказ обязан
+/// читаться **до** разбора полезной нагрузки: при `biz_code != 0` она равна
+/// `null`, и типизированный разбор ругался бы на форму вместо того, чтобы
+/// назвать причину («invalid chat session id»).
+fn biz_data<T: DeserializeOwned>(action: &str, payload: Value) -> AppResult<T> {
+    if let Some(refusal) = api_refusal(&payload) {
+        return Err(crate::error::AppError::Provider(format!(
+            "{action}: {}",
+            refusal.message()
+        )));
+    }
+    serde_json::from_value(payload["data"]["biz_data"].clone()).map_err(|error| {
+        crate::error::AppError::Provider(format!("{action}: unexpected response shape: {error}"))
+    })
 }
 
 /// The `fetch_page` response's `biz_data` — the session array arrives under

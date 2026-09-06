@@ -31,7 +31,7 @@ use crate::debug_log;
 use crate::error::{AppError, AppResult};
 use crate::harness::trace::action;
 use crate::mcp::MCPManager;
-use crate::provider::{ChatMessage, LLMProvider};
+use crate::provider::{ChatMessage, LLMProvider, SessionLiveness};
 use crate::semantic::SemanticService;
 use crate::skills::discovery::discover_all_skills;
 use crate::tools::registry::ToolRegistry;
@@ -456,18 +456,38 @@ fn load_resumed(
 async fn adopt_remote_session(provider: &Arc<dyn LLMProvider>, session: &crate::session::Session) {
     let remote = match (session.broken, session.provider_session_id.as_deref()) {
         (false, Some(id)) => id,
-        (true, _) => return replay_locally(session, "session_marked_broken", provider).await,
-        (false, None) => return replay_locally(session, "no_remote_session", provider).await,
+        (true, _) => return replay_locally(session, "session_marked_broken", None, provider).await,
+        (false, None) => return replay_locally(session, "no_remote_session", None, provider).await,
     };
-    if !provider.session_is_alive(remote).await {
-        return replay_locally(session, "remote_session_gone", provider).await;
+    let liveness = provider.check_session(remote).await;
+    if let Some((label, detail)) = liveness_label(&liveness) {
+        return replay_locally(session, label, Some(detail), provider).await;
     }
     match provider
         .adopt_session(remote, session.provider_parent_message_id)
         .await
     {
-        Ok(()) => log_resume(session, "adopted", None),
-        Err(error) => replay_locally(session, &format!("adopt_failed: {error}"), provider).await,
+        Ok(()) => log_resume(session, "adopted", None, None),
+        Err(error) => {
+            replay_locally(session, "adopt_failed", Some(&error.to_string()), provider).await
+        }
+    }
+}
+
+/// Ярлык для трассы по исходу проверки; `None` — сессия жива.
+///
+/// Отдельной функцией, чтобы «сессии нет» и «проверить не удалось» нельзя
+/// было снова слить в одно слово незаметно. Раньше их сливали, и трасса
+/// говорила `remote_session_gone` про ответ, которого никто не понял —
+/// на деле снесённый эндпоинт отдавал HTML.
+fn liveness_label(liveness: &SessionLiveness) -> Option<(&'static str, &str)> {
+    match liveness {
+        SessionLiveness::Alive => None,
+        // Провайдер ответил про эту сессию и отказал.
+        SessionLiveness::Gone(reason) => Some(("remote_session_gone", reason)),
+        // Проверка не состоялась: сеть, токен, форма ответа. Про сессию
+        // это не утверждает ничего.
+        SessionLiveness::Unknown(reason) => Some(("remote_session_unverified", reason)),
     }
 }
 
@@ -476,13 +496,19 @@ async fn adopt_remote_session(provider: &Arc<dyn LLMProvider>, session: &crate::
 async fn replay_locally(
     session: &crate::session::Session,
     reason: &str,
+    detail: Option<&str>,
     provider: &Arc<dyn LLMProvider>,
 ) {
     let _ = provider.reset().await;
-    log_resume(session, "replayed", Some(reason));
+    log_resume(session, "replayed", Some(reason), detail);
 }
 
-fn log_resume(session: &crate::session::Session, remote: &str, reason: Option<&str>) {
+fn log_resume(
+    session: &crate::session::Session,
+    remote: &str,
+    reason: Option<&str>,
+    detail: Option<&str>,
+) {
     debug_log::log_json(
         action::RESUME,
         &serde_json::json!({
@@ -492,7 +518,10 @@ fn log_resume(session: &crate::session::Session, remote: &str, reason: Option<&s
             // "adopted" — тот же серверный тред; "replayed" — история уедет
             // в свежий одним промптом.
             "remote": remote,
+            // Ярлык (что решили) и подробность (что сказал провайдер) —
+            // порознь: по одному ярлыку причину не восстановить.
             "reason": reason,
+            "detail": detail,
         }),
     );
 }
@@ -1340,6 +1369,21 @@ mod tests {
             4,
             "the run must append to the transcript it resumed: {:?}",
             saved.messages
+        );
+    }
+
+    /// «Сессии нет» и «проверить не удалось» обязаны звучать в трассе по-
+    /// разному: на одном слове для обоих исходов уже потерян день.
+    #[test]
+    fn a_failed_check_is_not_reported_as_a_missing_session() {
+        assert_eq!(liveness_label(&SessionLiveness::Alive), None);
+        assert_eq!(
+            liveness_label(&SessionLiveness::Gone("invalid chat session id".into())),
+            Some(("remote_session_gone", "invalid chat session id"))
+        );
+        assert_eq!(
+            liveness_label(&SessionLiveness::Unknown("answered text/html".into())),
+            Some(("remote_session_unverified", "answered text/html"))
         );
     }
 }

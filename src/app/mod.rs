@@ -807,14 +807,14 @@ impl App {
                 session,
                 remote_id,
                 parent_message_id,
-                alive,
+                liveness,
             } => {
                 self.apply_session_availability(
                     conversation,
                     session,
                     remote_id,
                     parent_message_id,
-                    alive,
+                    liveness,
                 )
                 .await;
             }

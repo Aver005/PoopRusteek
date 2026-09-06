@@ -188,12 +188,14 @@ pub enum AppEvent {
 
     /// Result of a background check (started by `/load`) of whether a local
     /// session's previously-linked remote DeepSeek session is still alive.
+    /// Three-state on purpose — see [`crate::provider::SessionLiveness`]: a
+    /// check that could not be made must not be actioned like a refusal.
     SessionAvailabilityChecked {
         conversation: ConversationId,
         session: crate::session::Session,
         remote_id: String,
         parent_message_id: Option<i64>,
-        alive: bool,
+        liveness: crate::provider::SessionLiveness,
     },
 
     /// A detached MCP admin operation (reload / toggle / reconnect) finished.

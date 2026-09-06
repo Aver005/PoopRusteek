@@ -3,6 +3,7 @@
 //! text chunk plus an optional `parent_message_id` update.
 
 use super::DeepseekProvider;
+use super::http::{ApiRefusal, api_refusal};
 use crate::debug_log;
 use crate::error::{AppError, AppResult};
 use crate::provider::prompt;
@@ -163,52 +164,85 @@ impl DeepseekProvider {
         Ok((response, session.session_id))
     }
 
-    /// Ответ эндпоинта истории целиком. Отдельно от разбора реплик, потому
-    /// что проверке живости сессии сами реплики не нужны — ей достаточно
-    /// того, что API вообще ответил про эту сессию.
-    pub(super) async fn fetch_remote_history_payload(&self, session_id: &str) -> AppResult<Value> {
+    /// `data.biz_data` ответа истории. Отдельно от разбора реплик, потому что
+    /// проверке живости сами реплики не нужны — ей важно лишь, что именно
+    /// API ответил про **эту** сессию.
+    pub(super) async fn fetch_remote_history_biz(
+        &self,
+        session_id: &str,
+    ) -> Result<Value, HistoryError> {
         let url = reqwest::Url::parse_with_params(
             SESSION_HISTORY_URL,
             &[("chat_session_id", session_id)],
         )
-        .map_err(|error| AppError::Provider(format!("bad session id {session_id}: {error}")))?;
-        let headers = self.auth_headers()?;
+        .map_err(|error| {
+            HistoryError::Unusable(AppError::Provider(format!(
+                "bad session id {session_id}: {error}"
+            )))
+        })?;
+        let headers = self.auth_headers().map_err(HistoryError::Unusable)?;
         let response = self
             .send_get_request("session.history.request", url.as_str(), &headers)
-            .await?;
+            .await
+            .map_err(HistoryError::Unusable)?;
         if !response.status().is_success() {
-            return Err(Self::read_error_response(
-                "session.history.request",
-                response,
-                "Session history failed",
-            )
-            .await);
+            return Err(HistoryError::Unusable(
+                Self::read_error_response(
+                    "session.history.request",
+                    response,
+                    "Session history failed",
+                )
+                .await,
+            ));
         }
         let payload: Value = Self::read_json(
             "session.history.request",
             response,
             "Session history failed",
         )
-        .await?;
-        // Свой код ошибки API отдаёт с HTTP 200 — удалённая сессия выглядит
-        // именно так, и без этой проверки читалась бы как пустая история.
-        if let Some(code) = payload["code"].as_i64()
-            && code != 0
-        {
-            let message = payload["msg"].as_str().unwrap_or("no message");
-            return Err(AppError::Provider(format!(
-                "Session history failed: code {code} ({message})"
-            )));
+        .await
+        .map_err(HistoryError::Unusable)?;
+        // Отказ приезжает с HTTP 200 внутри конверта, и он двух видов.
+        // Деловой («invalid chat session id») — ответ про саму сессию;
+        // внешний (протухший токен, лимит) про неё не говорит ничего.
+        match api_refusal(&payload) {
+            Some(ApiRefusal::Business(message)) => Err(HistoryError::SessionRefused(message)),
+            Some(ApiRefusal::Transport(message)) => Err(HistoryError::Unusable(
+                AppError::Provider(format!("Session history failed: {message}")),
+            )),
+            None => Ok(payload["data"]["biz_data"].clone()),
         }
-        Ok(payload)
     }
 
     pub(super) async fn fetch_remote_history(
         &self,
         session_id: &str,
     ) -> AppResult<Vec<ChatMessage>> {
-        let payload = self.fetch_remote_history_payload(session_id).await?;
-        Ok(history_messages(&payload["data"]["biz_data"]))
+        let biz_data = self.fetch_remote_history_biz(session_id).await?;
+        Ok(history_messages(&biz_data))
+    }
+}
+
+/// Почему история не пришла. Виды разделены, потому что решения по ним
+/// разные: «API сказал, что такой сессии нет» вправе стереть связь с
+/// серверным тредом, «дотянуться не удалось» — не вправе.
+#[derive(Debug)]
+pub(super) enum HistoryError {
+    /// Конверт отказал деловым кодом: сессии нет, или она не наша.
+    SessionRefused(String),
+    /// Сеть, не-2xx, HTML вместо JSON, протухший токен — состояние сессии
+    /// осталось неизвестным.
+    Unusable(AppError),
+}
+
+impl From<HistoryError> for AppError {
+    fn from(error: HistoryError) -> Self {
+        match error {
+            HistoryError::SessionRefused(message) => {
+                AppError::Provider(format!("Session history failed: {message}"))
+            }
+            HistoryError::Unusable(error) => error,
+        }
     }
 }
 

@@ -3,6 +3,57 @@
 > Last updated: 2026-08-26 (**five-agent review of the day's context-compaction work**, **42** findings filed below under the prefix `compaction-review-2026-08-26 #N`. Now: **17 closed the same day** (the five data-loss fixes, then **#1, #2, #3, #16, #17**, then the evening batch **#4, #5, #6, #7, #8, #11, #26** — see the RESOLVED entries), **24 open** (#9, #10, #12-#15, #18-#25, #27-#36, spread HIGH 2 / MEDIUM 15 / LOW 7) and **1 accepted** (#37, `chars / 3`, owner decision). **#25 is two thirds closed** and stays open with its scope narrowed to the one third that remains (a verbatim `<template>` echo still validates). The evening batch closed the measurement-and-summary group: the context window is re-polled on every provider/model switch and goes to *unknown* — ladder off — the moment one starts, an old `[agent] auto_compact = false` is migrated instead of silently reversed, the prior summary reaches the summariser once instead of twice, mode 2 folds its chunk summaries into one form mechanically and gives each chunk its own upstream session, the harness driver applies `ToolOutputCleared` the way the TUI does, and mode 1 no longer drops what sits ahead of the first user message. Before, same day: the harness group is closed: the ladder is now reachable from a scenario (`[context]` table + provider-window discovery in the driver), a scenario can assert a rung actually fired (`[[expect.trace]]`), a run that produced nothing to judge is a failure, and the reserve no longer switches the ladder off on windows ≤ 20k. First scenario that exercises rung 1 end to end: `sandbox/scenarios/mock/rung-one-clears-tool-output.toml` (2/2; fails with exit 4 and `0 'context.prune' record(s)` once the window is taken away). `.docs/context-compaction.md` corrected in the same pass and given a «Известные расхождения» section. Before, same day: **context compaction steps 5-6**: rung 3 + `/compact` shipped, closing findings **#3** and **#4**. Tally re-counted against the entries below, because the two header lines had drifted apart: of the review's 20 findings, **9 are closed** (1, 2, 3, 4, 5, 11, 12, 15, 16), **1 refuted** (17), **10 open** (6, 7, 8, 9, 10, 13, 14, 18, 19, 20). Two new HIGH entries opened by the same work, both found by reading rather than by running: `/compact` is a no-op on DeepSeek and pollutes its server-side branch, and a stale doc comment in `src/context/summary.rs`. Before, same day: full-codebase review `.docs/review-2026-08-26-rust.md`, 20 findings — same-day fix batch closed 6 (1,2,5,11,12,16), see RESOLVED and `JOURNAL/2026-08-26.md`; the other 14 added below by severity, source of record is the review doc. Before, same day: the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
 > Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure), `.docs/review-2026-08-26-rust.md` (2026-08-26 full-codebase review, 20 numbered findings — 9 closed, 1 refuted, 10 open as of the evening of 2026-08-26; referenced by number below)
 
+## RESOLVED 2026-09-06 (2) — приёмка починки: ложно-положительная живость
+
+Внешняя приёмка (`pooprusteek-test/.memories/JOURNAL/2026-09-06-fix-review.md`)
+подтвердила закрытие прошлого HIGH **и вернула новый, внесённый той же
+починкой**. Урок записан там же и стоит того, чтобы повторить его здесь:
+починку проверяют с обеих сторон, иначе ложно-отрицательный дефект меняется
+на ложно-положительный и это выглядит как успех.
+
+- ✅ **HIGH — проверка живости не смотрела на `biz_code`, и несуществующая
+  сессия «подхватывалась».** Отказ у этого API приезжает с **HTTP 200 и
+  внешним `code: 0`**, а лежит во внутреннем конверте:
+  `data.biz_code: 1`, `biz_msg: "invalid chat session id"`, `biz_data: null`.
+  Проверялся только внешний код, поэтому `check_session` отвечала «жива»,
+  `--resume` рапортовал `adopted`, и ход падал пустыми ответами
+  (`empty_response_exhausted`). До починки этот случай отрабатывал штатно —
+  то есть починка ухудшила ровно тот сценарий, который чинила, в другую
+  сторону. Второе следствие: `fetch_remote_history` отдавал **пустой список
+  вместо ошибки**, и `/load` несуществующей удалённой сессии показал бы
+  «загружено, 0 сообщений». Теперь конверт разбирается в одном месте —
+  `http::api_refusal` — и оба кода различаются по смыслу.
+  `→ src/provider/deepseek/http.rs::api_refusal`, `stream.rs::fetch_remote_history_biz`
+- ✅ **MEDIUM (вторая половина) — трасса называла «не смог проверить» словами
+  «сессия исчезла».** `session_is_alive -> bool` схлопывала два разных
+  утверждения в одно, и `harness.resume` писал `remote_session_gone` на любую
+  неудачу — включая ответ HTML, который никто не понял. Метод трейта заменён
+  на `check_session -> SessionLiveness {Alive, Gone(reason), Unknown(reason)}`;
+  харнесс различает `remote_session_gone` и `remote_session_unverified` и
+  кладёт рядом `detail` с текстом провайдера.
+  `→ src/provider/mod.rs::SessionLiveness`, `harness/driver.rs::liveness_label`
+- ✅ **HIGH (давний, вскрыт той же приёмкой) — неудачная проверка стирала
+  связь с серверным тредом.** `App::finalize_broken_session` писал
+  `broken = true` и обнулял `provider_session_id`/`provider_parent_message_id`
+  **на диск**, когда проверка всего лишь не состоялась. С мёртвым роутом это
+  означало: любая загрузка сессии в TUI необратимо клеймила здоровую сессию
+  сломанной. Теперь стирание разрешено только при `Gone` — то есть когда API
+  ответил про эту сессию и отказал; при `Unknown` файл не трогается, а
+  пользователю говорится, что связь проверить не удалось и следующий ход
+  пойдёт в свежую серверную сессию.
+  `→ src/app/sessions.rs::apply_session_availability`
+- ✅ **LOW — в самом объяснении про снесённый эндпоинт были дыры из пробелов.**
+  Многострочный литерал с продолжением строки приезжал с провалами по 18
+  пробелов — в тексте, который и есть весь смысл диагностики. Собирается
+  отдельной `not_json_message`, на неё есть тест «одно чистое предложение».
+  `→ src/provider/deepseek/http.rs::not_json_message`
+
+**Проверено:** форма отказа — юнит-тестом по JSON, снятому приёмкой живьём;
+ярлыки трассы — по чистой функции; отрицательный путь end-to-end на моке
+(`--resume` на сессии с непроверяемой ссылкой → `remote_session_unverified`,
+прогон завершается). **Не проверено вживую:** ветка `Gone` на самом DeepSeek —
+токен в `.dev/harness-config.toml` протух (`code 40003`).
+
 ## RESOLVED 2026-09-06 — `chat/history` снесли, а он отвечает 200 OK
 
 - ✅ **HIGH — `session_is_alive` объявляла живую сессию мёртвой через семь

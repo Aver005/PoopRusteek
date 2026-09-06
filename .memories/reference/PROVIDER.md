@@ -18,7 +18,7 @@
 | `fetch_remote_session_messages` | `async (session_id) -> AppResult<Vec<ChatMessage>>` | Pull a remote DeepSeek session (default: error) |
 | `fork` | `() -> Arc<dyn LLMProvider>` (:211) | Fresh-session sibling sharing config/token. DeepSeek rebuilds via `fork_session()` (:144) with a new `SessionState`; `FakeProvider` returns a new instance. Tested for session independence (`deepseek.rs:1773`). |
 | `session_identity` | `() -> Option<(String, Option<i64>)>` | Sync (no I/O) read of the live `(session_id, parent_message_id)`. Default `None`; DeepSeek locks `session_state` and clones. Sampled by `App::auto_save_session` every turn to persist resumable identity. |
-| `session_is_alive` | `async (session_id) -> bool` | Best-effort existence check. Default `false`; DeepSeek asks `GET chat/history_messages?chat_session_id=…` via `fetch_remote_history_payload` — deliberately the payload call, **not** `fetch_remote_history`: liveness must not hinge on the message array parsing, or a wire-shape change reads as "the session is gone". Non-2xx, a non-zero envelope `code`, an HTML body or a network error all read as not-alive. |
+| `check_session` | `async (session_id) -> SessionLiveness` | Three-state, **never a `bool`**: `Alive` / `Gone(reason)` / `Unknown(reason)`. Default `Unknown` — a provider without server-side sessions must not invite callers to destroy a link it knows nothing about. DeepSeek asks `GET chat/history_messages?chat_session_id=…` via `fetch_remote_history_biz` (the biz_data call, **not** `fetch_remote_history`: liveness must not hinge on the message array parsing). Only an envelope refusal about that session (`data.biz_code != 0`, e.g. `invalid chat session id`) is `Gone`; network, non-2xx, HTML, an expired token (outer `code`) are `Unknown`. **Only `Gone` may lead to erasing the stored link** — `App::apply_session_availability` wipes on `Gone` and leaves the file alone on `Unknown`. |
 | `adopt_session` | `async (session_id, parent_message_id) -> AppResult<()>` | Resume a previously-known remote session instead of creating a new one. Default no-op; DeepSeek sets `SessionState{session_id, parent_message_id, system_sent_for_session: true}` directly, skipping `chat_session/create`. |
 
 `DeepseekProvider` is the only real impl; `FakeProvider` (`provider/fake.rs`, `#[cfg(test)]`) is the test double. `provider` is `Option<Arc<dyn LLMProvider>>` and lives **per `Conversation`** (each gets its own via `fork()`) — `None` when token is empty.
@@ -37,6 +37,15 @@
 
 - **Constructor** `new(config, rate_limit_ms, rate_limit_per_minute, max_retries)` (`deepseek/mod.rs`). `max_retries`: -1=infinite, 0=none, N=N+1 attempts.
 - **Base URL**: `https://chat.deepseek.com/api/v0` (:20).
+> **У конверта два кода, и при деловом отказе внешний нулевой.** Успех —
+> `{code: 0, data: {biz_code: 0, biz_data: …}}`; несуществующая сессия — это
+> HTTP 200, `code: 0`, `data.biz_code: 1`, `biz_msg: "invalid chat session id"`,
+> `biz_data: null`. Проверять только `code` значит принимать отказ за успех с
+> пустыми данными (так и вышло — `BUGS.md`, RESOLVED 2026-09-06 (2)). Разбор
+> один на весь клиент: `http::api_refusal` → `ApiRefusal::{Transport, Business}`,
+> где `Transport` (внешний код) про запрошенный объект не говорит ничего, а
+> `Business` — говорит.
+>
 > **Читая любой ответ этого API, идите через `DeepseekProvider::read_json`.**
 > Снесённый путь отдаёт 200 OK и HTML-оболочку сайта, а не 404, поэтому
 > `response.json()` падает ошибкой serde про неожиданный `<`, по которой

@@ -55,13 +55,13 @@ impl App {
                         let parent_message_id = s.provider_parent_message_id;
                         let event_tx = self.event_tx.clone();
                         tokio::spawn(async move {
-                            let alive = provider.session_is_alive(&remote_id).await;
+                            let liveness = provider.check_session(&remote_id).await;
                             let _ = event_tx.send(AppEvent::SessionAvailabilityChecked {
                                 conversation,
                                 session: s,
                                 remote_id,
                                 parent_message_id,
-                                alive,
+                                liveness,
                             });
                         });
                     }
@@ -118,8 +118,10 @@ impl App {
         session: session::Session,
         remote_id: String,
         parent_message_id: Option<i64>,
-        alive: bool,
+        liveness: crate::provider::SessionLiveness,
     ) {
+        use crate::provider::SessionLiveness;
+
         let Some(conv) = self.state.conversations.get(conversation) else {
             return;
         };
@@ -130,17 +132,41 @@ impl App {
         }
         let provider = conv.provider.clone();
 
-        if alive {
+        if liveness == SessionLiveness::Alive {
             if let Some(provider) = provider {
                 let _ = provider.adopt_session(&remote_id, parent_message_id).await;
             }
             return;
         }
 
+        // Either way the next message starts a fresh remote thread with local
+        // history replayed into it — that part never depended on knowing why.
         if let Some(provider) = provider {
             let _ = provider.reset().await;
         }
-        self.finalize_broken_session(conversation, session);
+
+        match liveness {
+            // The API answered about this session and refused it. Only now is
+            // the stored link known to be worthless, so only now may it be
+            // erased.
+            SessionLiveness::Gone(_) => self.finalize_broken_session(conversation, session),
+            // The check never happened (network, an expired token, a changed
+            // wire format). Writing `broken` and wiping the provider ids here
+            // would destroy a healthy link on the strength of an unrelated
+            // failure — which is exactly what a dead endpoint once did to
+            // every `/load` (see BUGS.md). Say so and keep the file intact.
+            SessionLiveness::Unknown(reason) => {
+                self.state.status_message =
+                    format!("Could not check this session's remote link: {reason}");
+                self.state
+                    .focused_mut()
+                    .messages
+                    .push(ChatMessage::system(&format!(
+                        "The remote link for this session could not be verified ({reason}). Your next message starts a fresh remote session with the full local history as context; the saved link on disk is left untouched."
+                    )));
+            }
+            SessionLiveness::Alive => {}
+        }
     }
 
     /// Flag a session's remote link as confirmed dead: persist `broken` +

@@ -279,6 +279,24 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+/// What a liveness check actually established about a server-side session.
+///
+/// Three states, not a `bool`, because the two failure kinds must lead to
+/// different decisions: a session the API **refused by name** may have its
+/// stored link erased, while a check that could not be made (network, an
+/// expired token, a changed wire format) may not — treating "couldn't tell"
+/// as "gone" is what silently branded healthy sessions broken and wiped their
+/// provider ids off disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLiveness {
+    /// The provider answered about this session and it is usable.
+    Alive,
+    /// The provider answered about this session and refused it.
+    Gone(String),
+    /// The check itself did not happen. Carries why.
+    Unknown(String),
+}
+
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
     async fn complete(
@@ -375,12 +393,12 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
-    /// Best-effort check that a previously-established server-side session
-    /// id is still reachable (hasn't been deleted or expired upstream).
-    /// `false` covers both "confirmed gone" and "couldn't tell" — callers
-    /// must not keep threading onto a session they can't verify.
-    async fn session_is_alive(&self, _session_id: &str) -> bool {
-        false
+    /// What could be learned about a previously-established server-side
+    /// session. Default: nothing — a provider with no server-side sessions
+    /// has nothing to check, and saying [`SessionLiveness::Gone`] would
+    /// invite callers to destroy a link it knows nothing about.
+    async fn check_session(&self, _session_id: &str) -> SessionLiveness {
+        SessionLiveness::Unknown("this provider does not track server-side sessions".to_string())
     }
 
     /// Adopt a previously-known server-side session id + parent message id
