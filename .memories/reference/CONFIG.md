@@ -19,6 +19,15 @@ Paths come from the `dirs` crate, so they are **platform-specific**:
 
 > On this machine (Windows), config + data both resolve under `%APPDATA%\Roaming\pooprusteek\`.
 
+> Two global flags move those roots for one process: `--config <file>` (read
+> settings from there instead of the user's own) and `--data-dir <dir>`
+> (everything in the `{data}` rows above lands there instead). `--data-dir` is
+> set in `main` before `logging::setup` and `checkpoints::Store::init` — both
+> read `Config::data_dir()` at startup — and the path is absolutised at once,
+> because the harness chdirs into a scenario's workspace. Harness runs must
+> pass it: on Windows `dirs` has no env override, so without it a test run
+> writes into live user data (`reference/HARNESS.md` §10).
+
 **`whitelist.json`** — auto-approval rules, one object per rule:
 
 ```json

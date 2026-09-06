@@ -17,7 +17,7 @@ use crate::harness::driver::{ContextOverrides, RunOutcome, RunStatus};
 use crate::harness::metrics::RunMetrics;
 use crate::harness::report::{self, RunReport, ScenarioReport, SuiteReport};
 use crate::harness::trace::{Trace, TraceRecord};
-use crate::harness::{ScenarioArgs, SuiteArgs, run_stamp};
+use crate::harness::{GlobalFlags, ScenarioArgs, SuiteArgs, run_stamp};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +58,12 @@ pub struct Scenario {
     /// relative to the scenario file. This is how one task is run under
     /// several prompt variants and the results compared.
     pub system_prompt_append: Option<PathBuf>,
+    /// Session file the run continues, resolved relative to the scenario
+    /// file. Like `workspace_template` it is a **fixture**: each repeat gets
+    /// its own copy planted in the data dir under a fresh id and resumes
+    /// that, so repeats never continue each other and the file in the repo
+    /// is never written to.
+    pub session_template: Option<PathBuf>,
     #[serde(default = "default_approve")]
     pub approve: String,
     pub answer: Option<String>,
@@ -529,6 +535,9 @@ impl Scenario {
         if let Some(append) = scenario.system_prompt_append.take() {
             scenario.system_prompt_append = Some(resolve(append));
         }
+        if let Some(session) = scenario.session_template.take() {
+            scenario.session_template = Some(resolve(session));
+        }
         if scenario.workspace.is_some() && scenario.workspace_template.is_some() {
             return Err(AppError::Custom(format!(
                 "{}: set either `workspace` or `workspace_template`, not both",
@@ -539,14 +548,14 @@ impl Scenario {
     }
 }
 
-pub async fn run_one(args: ScenarioArgs, config_path: Option<PathBuf>) -> AppResult<i32> {
+pub async fn run_one(args: ScenarioArgs, globals: GlobalFlags) -> AppResult<i32> {
     let scenario = Scenario::load(&args.file)?;
     let report = execute(
         &scenario,
         args.repeat,
         &args.out,
         args.concurrency,
-        config_path.as_deref(),
+        &globals,
     )
     .await?;
     emit(&report, args.json)?;
@@ -557,7 +566,7 @@ pub async fn run_one(args: ScenarioArgs, config_path: Option<PathBuf>) -> AppRes
     })
 }
 
-pub async fn run_suite(args: SuiteArgs, config_path: Option<PathBuf>) -> AppResult<i32> {
+pub async fn run_suite(args: SuiteArgs, globals: GlobalFlags) -> AppResult<i32> {
     let files = collect_scenarios(&args.dir)?;
     if files.is_empty() {
         return Err(AppError::Custom(format!(
@@ -574,7 +583,7 @@ pub async fn run_suite(args: SuiteArgs, config_path: Option<PathBuf>) -> AppResu
             args.repeat,
             &args.out,
             args.concurrency,
-            config_path.as_deref(),
+            &globals,
         )
         .await?;
         scenarios.push(report);
@@ -622,7 +631,7 @@ async fn execute(
     repeat_override: Option<usize>,
     out: &Path,
     concurrency: usize,
-    config_path: Option<&Path>,
+    globals: &GlobalFlags,
 ) -> AppResult<ScenarioReport> {
     let repeats = repeat_override
         .or(scenario.repeat)
@@ -638,8 +647,14 @@ async fn execute(
     for index in 0..repeats {
         let permits = Arc::clone(&permits);
         let mut scenario = scenario.clone();
-        let config_path = config_path.map(Path::to_path_buf);
+        let globals = globals.clone();
         let trace_path = dir.join(format!("run-{index}.jsonl"));
+        // Свою копию сессии-фикстуры — по той же причине, что и свою копию
+        // рабочей папки: повторы не должны продолжать друг друга.
+        let resume = match &scenario.session_template {
+            Some(template) => Some(plant_session(template)?),
+            None => None,
+        };
         // A writable task gets its own copy of the template, kept next to the
         // trace so the files the agent produced can be read afterwards.
         let scratch = match &scenario.workspace_template {
@@ -653,7 +668,12 @@ async fn execute(
         };
         tasks.push(tokio::spawn(async move {
             let _permit = permits.acquire().await;
-            let outcome = spawn_run(&scenario, &trace_path, config_path.as_deref()).await;
+            let child = ChildRun {
+                trace_path: &trace_path,
+                resume: resume.as_deref(),
+                globals: &globals,
+            };
+            let outcome = spawn_run(&scenario, &child).await;
             (index, trace_path, scratch, outcome)
         }));
     }
@@ -686,19 +706,39 @@ async fn execute(
     Ok(report)
 }
 
+/// What one repeat needs beyond the scenario itself. A struct so this list can
+/// grow without every call site growing a positional argument with it.
+struct ChildRun<'a> {
+    trace_path: &'a Path,
+    /// Session id planted for this repeat from `session_template`.
+    resume: Option<&'a str>,
+    globals: &'a GlobalFlags,
+}
+
+/// Copy a session fixture into the data dir under a fresh id and return it.
+///
+/// Parsed rather than copied byte-for-byte on purpose: a malformed fixture
+/// then fails here, naming the file, instead of surfacing as an unexplained
+/// `setup_failed` in every repeat.
+fn plant_session(template: &Path) -> AppResult<String> {
+    let text = std::fs::read_to_string(template)
+        .map_err(|e| AppError::Custom(format!("{}: {e}", template.display())))?;
+    let mut session: crate::session::Session = serde_json::from_str(&text).map_err(|e| {
+        AppError::Custom(format!("{}: not a session file: {e}", template.display()))
+    })?;
+    session.id = crate::session::create_session_id();
+    crate::session::save_local(&session, &crate::config::Config::default())
+        .map_err(|e| AppError::Custom(format!("planting {}: {e}", template.display())))?;
+    Ok(session.id)
+}
+
 /// The child's whole command line. Every flag comes first and the turns last,
 /// after `--`, so a prompt starting with `-` is never read as a flag.
-fn exec_args(
-    scenario: &Scenario,
-    trace_path: &Path,
-    config_path: Option<&Path>,
-) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-
-    // `--config` is a global flag, so it goes before the subcommand.
-    if let Some(path) = config_path {
-        push_flag(&mut args, "--config", path);
-    }
+fn exec_args(scenario: &Scenario, child: &ChildRun) -> Vec<std::ffi::OsString> {
+    // `--config` / `--data-dir` are global flags, so they go before the
+    // subcommand.
+    let mut args = child.globals.to_args();
+    let trace_path = child.trace_path;
     args.push("exec".into());
     args.push("--json".into());
     push_flag(&mut args, "--trace", trace_path);
@@ -751,6 +791,9 @@ fn exec_args(
     if scenario.save_session {
         args.push("--save-session".into());
     }
+    if let Some(id) = child.resume {
+        push_flag(&mut args, "--resume", id);
+    }
 
     args.push("--".into());
     for prompt in scenario.turns() {
@@ -766,17 +809,14 @@ fn push_flag(args: &mut Vec<std::ffi::OsString>, name: &str, value: impl AsRef<s
 
 /// Run one repeat as `pooprusteek exec --json`, killing it if it outlives
 /// its own timeout by a margin.
-async fn spawn_run(
-    scenario: &Scenario,
-    trace_path: &Path,
-    config_path: Option<&Path>,
-) -> AppResult<RunOutcome> {
+async fn spawn_run(scenario: &Scenario, child: &ChildRun<'_>) -> AppResult<RunOutcome> {
     let exe = std::env::current_exe()
         .map_err(|e| AppError::Custom(format!("cannot locate own binary: {e}")))?;
+    let trace_path = child.trace_path;
 
     let mut command = tokio::process::Command::new(exe);
     command
-        .args(exec_args(scenario, trace_path, config_path))
+        .args(exec_args(scenario, child))
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -904,6 +944,26 @@ fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::harness::driver::ToolInvocation;
+
+    /// A child with nothing inherited and nothing to resume — what a plain
+    /// scenario repeat looks like.
+    fn probe_child<'a>() -> ChildRun<'a> {
+        static GLOBALS: GlobalFlags = GlobalFlags {
+            config: None,
+            data_dir: None,
+        };
+        ChildRun {
+            trace_path: Path::new("t.jsonl"),
+            resume: None,
+            globals: &GLOBALS,
+        }
+    }
+
+    fn rendered(args: Vec<std::ffi::OsString>) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
 
     fn outcome(status: RunStatus, text: &str) -> RunOutcome {
         RunOutcome {
@@ -1139,7 +1199,7 @@ mod tests {
             "t.toml",
         )
         .unwrap();
-        let rendered: Vec<String> = exec_args(&scenario, Path::new("t.jsonl"), None)
+        let rendered: Vec<String> = exec_args(&scenario, &probe_child())
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -1425,7 +1485,7 @@ mod tests {
             "t.toml",
         )
         .unwrap();
-        let rendered: Vec<String> = exec_args(&scenario, Path::new("t.jsonl"), None)
+        let rendered: Vec<String> = exec_args(&scenario, &probe_child())
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -1449,7 +1509,7 @@ mod tests {
     #[test]
     fn without_a_context_table_no_context_flag_is_passed() {
         let scenario = Scenario::from_toml("name = \"x\"\nprompt = \"y\"\n", "t.toml").unwrap();
-        let rendered: Vec<String> = exec_args(&scenario, Path::new("t.jsonl"), None)
+        let rendered: Vec<String> = exec_args(&scenario, &probe_child())
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -1470,5 +1530,111 @@ mod tests {
     #[test]
     fn names_are_reduced_to_path_safe_directories() {
         assert_eq!(sanitize("rag: skills/mcp"), "rag--skills-mcp");
+    }
+
+    /// Дочерний процесс сам грузит конфиг и сам решает, где его данные, —
+    /// глобальные флаги обязаны доехать до него раньше подкоманды.
+    #[test]
+    fn global_flags_and_resume_reach_the_child_command_line() {
+        let scenario = Scenario::from_toml(
+            "name = \"x\"
+prompt = \"y\"
+",
+            "t.toml",
+        )
+        .unwrap();
+        let globals = GlobalFlags {
+            config: Some(PathBuf::from("throwaway.toml")),
+            data_dir: Some(PathBuf::from("run-data")),
+        };
+        let child = ChildRun {
+            trace_path: Path::new("t.jsonl"),
+            resume: Some("2026-09-06T00-00-00-000Z-abc123"),
+            globals: &globals,
+        };
+        let rendered = rendered(exec_args(&scenario, &child));
+
+        let subcommand = rendered
+            .iter()
+            .position(|arg| arg == "exec")
+            .expect("the subcommand is on the command line");
+        for (flag, value) in [
+            ("--config", "throwaway.toml"),
+            ("--data-dir", "run-data"),
+            ("--resume", "2026-09-06T00-00-00-000Z-abc123"),
+        ] {
+            let at = rendered
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{flag} is not on the child command line: {rendered:?}"));
+            assert_eq!(rendered[at + 1], value, "{rendered:?}");
+            if flag != "--resume" {
+                assert!(at < subcommand, "{flag} must precede `exec`: {rendered:?}");
+            }
+        }
+    }
+
+    /// Без фикстуры сценарий не должен вдруг начать что-то продолжать.
+    #[test]
+    fn without_a_session_template_no_resume_flag_is_passed() {
+        let scenario = Scenario::from_toml(
+            "name = \"x\"
+prompt = \"y\"
+",
+            "t.toml",
+        )
+        .unwrap();
+        let rendered = rendered(exec_args(&scenario, &probe_child()));
+        assert!(
+            !rendered.iter().any(|arg| arg == "--resume"),
+            "{rendered:?}"
+        );
+    }
+
+    /// Фикстура резолвится относительно файла сценария, как рабочая папка:
+    /// сценарии гоняют из корня репозитория, а лежат в `sandbox/scenarios/`.
+    #[test]
+    fn a_session_template_is_resolved_against_the_scenario_file() {
+        let dir = PathBuf::from("target").join("test-scenario-session-template");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("resumes.toml");
+        std::fs::write(
+            &file,
+            "name = \"x\"
+prompt = \"y\"
+session_template = \"fixtures/chat.json\"
+",
+        )
+        .unwrap();
+
+        let scenario = Scenario::load(&file).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            scenario.session_template,
+            Some(dir.join("fixtures").join("chat.json"))
+        );
+    }
+
+    /// Сценарии проверяет только их собственный прогон — а он требует мока или
+    /// живого провайдера. Опечатка в ключе (`deny_unknown_fields`), сломанная
+    /// регулярка или нечитаемая фикстура должны падать здесь, а не через
+    /// пятнадцать минут в песочнице.
+    #[test]
+    fn every_committed_scenario_loads_with_its_fixtures() {
+        let root = Path::new("sandbox/scenarios");
+        let files = collect_scenarios(root).expect("the scenario corpus must be readable");
+        assert!(!files.is_empty(), "no scenarios under {}", root.display());
+        for file in files {
+            let scenario =
+                Scenario::load(&file).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+            let Some(template) = &scenario.session_template else {
+                continue;
+            };
+            let text = std::fs::read_to_string(template)
+                .unwrap_or_else(|error| panic!("{}: {error}", template.display()));
+            serde_json::from_str::<crate::session::Session>(&text)
+                .unwrap_or_else(|error| panic!("{}: {error}", template.display()));
+        }
     }
 }

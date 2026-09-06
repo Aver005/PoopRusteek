@@ -41,6 +41,33 @@ pub const DEFAULT_REPEATS: usize = 3;
 
 const DEFAULT_OUT_DIR: &str = ".dev/harness";
 
+/// Global flags a child `exec` must inherit from its parent runner. Bundled
+/// rather than passed one by one: every one of them decides *which* config and
+/// *whose* data a run touches, and a child that missed one silently runs
+/// against the user's real ones.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalFlags {
+    /// `--config`: the throwaway config a run was pointed at.
+    pub config: Option<PathBuf>,
+    /// `--data-dir`: where sessions, logs and the semantic index go.
+    pub data_dir: Option<PathBuf>,
+}
+
+impl GlobalFlags {
+    /// Render as the leading part of a child command line — global flags come
+    /// before the subcommand.
+    fn to_args(&self) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        for (flag, value) in [("--config", &self.config), ("--data-dir", &self.data_dir)] {
+            if let Some(path) = value {
+                args.push(flag.into());
+                args.push(path.into());
+            }
+        }
+        args
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Run one agent turn headlessly and write a JSONL trace.
@@ -114,6 +141,13 @@ pub struct ExecArgs {
     /// Save the turn as a session file (feeds `mine` and the history index).
     #[arg(long)]
     pub save_session: bool,
+
+    /// Continue a saved session instead of starting empty: its history and
+    /// its provider-side session are picked up, and the run is saved back
+    /// into the same id (so `--save-session` is implied — a chain that wrote
+    /// a new file per link would not be a chain).
+    #[arg(long, value_name = "SESSION-ID")]
+    pub resume: Option<String>,
 
     /// Model context window in tokens. Without one the compaction ladder has
     /// nothing to measure against and never runs (invariant 12), which is what
@@ -221,14 +255,14 @@ pub struct MockArgs {
 /// Dispatch a harness subcommand. Returns the process exit code so callers
 /// can propagate a scenario failure to CI without an extra error type.
 ///
-/// `config_path` is the global `--config`, if any: the scenario runner has to
-/// hand it to the `exec` children it spawns, or they would load the user's
-/// real config instead of the one this run was pointed at.
-pub async fn run(command: Command, config: Config, config_path: Option<PathBuf>) -> AppResult<i32> {
+/// `globals` carries the process-wide `--config` / `--data-dir`: the scenario
+/// runner has to hand them to the `exec` children it spawns, or they would
+/// load the user's real config and write into the user's real data.
+pub async fn run(command: Command, config: Config, globals: GlobalFlags) -> AppResult<i32> {
     match command {
         Command::Exec(args) => exec(*args, config).await,
-        Command::Scenario(args) => scenario::run_one(args, config_path).await,
-        Command::Suite(args) => scenario::run_suite(args, config_path).await,
+        Command::Scenario(args) => scenario::run_one(args, globals).await,
+        Command::Suite(args) => scenario::run_suite(args, globals).await,
         Command::Mine(args) => mine::run(args),
         Command::MockProvider(args) => mock::run(args).await,
     }
@@ -248,6 +282,7 @@ async fn exec(args: ExecArgs, config: Config) -> AppResult<i32> {
         provider: args.provider,
         model: args.model,
         save_session: args.save_session,
+        resume: args.resume,
         system_append: args.system_append.clone(),
         context: driver::ContextOverrides {
             window: args.context_window,

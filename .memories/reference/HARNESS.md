@@ -1,8 +1,8 @@
 # HARNESS — headless behaviour testing
 
 > Deep reference for `src/harness/` + `sandbox/`. Added 2026-08-25.
-> Last updated: 2026-08-26 (scenario `[context]` table, `[[expect.trace]]`,
-> a run that produced nothing is a failure — §4, §5, §6)
+> Last updated: 2026-09-06 (`exec --resume`, the global `--data-dir`,
+> `session_template` — §5.3, §10)
 
 ## 1. WHY IT EXISTS
 
@@ -80,10 +80,10 @@ the tree is done, so sub-agent work is inside the measured window.
 | File | Purpose |
 |------|---------|
 | `harness/mod.rs` | clap subcommands (`exec`, `scenario`, `suite`, `mine`, `mock-provider`) + dispatch. Returns a process exit code. |
-| `harness/driver.rs` | One or more turns in one conversation: assembles the same deps as `App::new`, spawns a `TurnSpec` per turn against one accumulating `Conversation`, services events under a single wall-clock deadline for the whole run. Also owns `ContextOverrides` (the scenario's `[context]` table, layered over the loaded config before anything reads it), asks the provider for its window in the background like `App::new` does (`ContextWindowLearned` → `harness.context.window`), and applies `AgentEvent::ToolOutputCleared` через тот же `app::reduce::apply`, что и TUI (`reduce::turn_end` для не-корневых бесед), matching by tool-call id. |
+| `harness/driver.rs` | One or more turns in one conversation (optionally continuing a saved one — `--resume`): assembles the same deps as `App::new`, spawns a `TurnSpec` per turn against one accumulating `Conversation`, services events under a single wall-clock deadline for the whole run. Also owns `ContextOverrides` (the scenario's `[context]` table, layered over the loaded config before anything reads it), asks the provider for its window in the background like `App::new` does (`ContextWindowLearned` → `harness.context.window`), and applies `AgentEvent::ToolOutputCleared` через тот же `app::reduce::apply`, что и TUI (`reduce::turn_end` для не-корневых бесед), matching by tool-call id. |
 | `harness/trace.rs` | `TraceRecord` / `Trace` — the reading side of the JSONL. |
 | `harness/metrics.rs` | `RunMetrics::from_trace` — steps, tool calls/errors, malformed count, stream timeouts, `TurnEnd`. |
-| `harness/scenario.rs` | Scenario + `Expect` TOML model, expectation checking, child-process orchestration. |
+| `harness/scenario.rs` | Scenario + `Expect` TOML model, expectation checking, child-process orchestration (`ChildRun` = trace path + planted session id + inherited `GlobalFlags`), and planting `session_template` fixtures. |
 | `harness/report.rs` | `RunReport` / `ScenarioReport` / `SuiteReport`, `Stat` (min/mean/median/max), renderers. |
 | `harness/mine.rs` | Pattern mining: normalise → bucket → rank, over traces and saved sessions. |
 | `harness/mock.rs` | Scripted OpenAI-compatible endpoint. |
@@ -101,8 +101,9 @@ Each repeat is a **child process** (`pooprusteek exec --json`), not an
 in-process loop. Three reasons: the debug-log sink is process-global (one
 trace file per process), no state bleeds between repeats, and a wedged turn
 can be killed (`kill_on_drop` + a `timeout + 60s` backstop) without taking the
-runner down. `--config` is forwarded to children — without it they would load
-the user's real config instead of the one the run was pointed at.
+runner down. The global flags are forwarded to children (`--config`,
+`--data-dir`) — without them a child loads the user's real config and writes
+into the user's real data instead of the ones the run was pointed at.
 
 `deny_unknown_fields` on both `Scenario` and `Expect`: a mistyped expectation
 that silently passes is the worst failure mode a harness can have.
@@ -181,6 +182,58 @@ The first scenario built on this is
 scenario on purpose: `mock-provider` is reached through `CompatClient`, so
 `keeps_server_side_history()` is false and rung 1 applies to it — on DeepSeek
 rung 1 is skipped outright.
+
+### Continuing a conversation between runs: `--resume` (2026-09-06)
+
+`exec "one" "two"` is several turns, but every reply is fixed up front, in one
+process. The test worth having is *adaptive*: give a task, read what it
+produced, say "it doesn't build, here's the error", watch it dig out. That
+needs the conversation to outlive the process.
+
+```
+pooprusteek --config … --data-dir … exec --save-session "build me a thing"
+# → RunOutcome.session_id
+pooprusteek --config … --data-dir … exec --resume <id> "it doesn't compile: …"
+```
+
+`--resume <session-id>` seeds the driver's `Conversation` from the saved
+session — messages, tag, `broken`, and the session identity — exactly the
+fields `App::handle_load_session` carries over, and then adopts the provider's
+server-side session (`session_is_alive` → `adopt_session`).
+
+Four rules, each of them load-bearing:
+
+- **Saving is implied.** A chain whose links do not save is not a chain: the
+  next run would continue a history missing the last turn. `--save-session`
+  stays legal and means the same thing (`ExecOptions::saves_session`).
+- **It saves back into the same id.** `persist` writes the conversation's own
+  `session_id` / `session_started_at`, so five turns are one session file, not
+  five (which would also make `mine --sessions` count one job as five).
+- **A dead remote session is not a refusal.** `broken`, no
+  `provider_session_id`, or a failed liveness check all mean the same thing the
+  TUI means: replay local history into a fresh remote session. The trace says
+  which happened — one `harness.resume` record with `remote` (`adopted` /
+  `replayed`), `reason` and `messages`.
+- **An unknown id is `setup_failed`.** Starting from scratch instead would hand
+  back a run that looks successful while it answered without the history it was
+  given — the same defect class as "a run that produced nothing to judge".
+
+Also fixed on the way: `persist` used to write `SessionMeta::default()`, i.e.
+throw away `provider_session_id`. Invisible for a single run, fatal for a
+chain. It now samples identity the way `App::auto_save_session` does.
+
+**Scenarios resume through a fixture.** `session_template = "chat.json"` is
+resolved against the scenario file and works like `workspace_template`: each
+repeat gets its **own copy** planted in the data dir under a fresh id and
+resumes that, so repeats never continue each other and the file in the repo is
+never written to. The fixture is parsed, not copied byte-for-byte, so a
+malformed one fails at setup naming the file. Keep it a `.json` — any `.toml`
+under `scenarios/` would be collected as a scenario (§7).
+
+`sandbox/scenarios/mock/resumes-a-session.toml` is the gate: `harness.resume`
+with `messages >= 2`, and `history_messages >= 3` on `harness.turn.started`
+(two seeded turns plus the new prompt). History not picked up → the count is 1
+→ the scenario fails.
 
 ## 6. JUDGING BY THE FILESYSTEM, NOT THE ANSWER
 
@@ -382,9 +435,24 @@ cargo build --bin pooprusteek
 ./target/debug/pooprusteek --config .dev/harness-config.toml exec "prompt" --trace .dev/t.jsonl
 ```
 
-`--config` (new, global) keeps a run off the real config and token. Note the
-*data* dir is still the real one on Windows — `dirs::data_dir()` has no env
-override there, unlike XDG on Linux.
+`--config` keeps a run off the real config and token; `--data-dir` keeps it off
+the real *data*. Both are global (they precede the subcommand) and both are
+forwarded to the children `scenario`/`suite` spawn — a child that missed one
+would silently run against the user's own config and data (`GlobalFlags`).
+
+**Always pass `--data-dir` for a run on a real machine.** Without it a run
+writes into live user data: sessions, `checkpoints.jsonl`, the semantic index,
+`history.json`, `pooprusteek.log`, `whitelist.json`. XDG covers this on Linux
+(the sandbox relies on it), but `dirs::data_dir()` has **no env override on
+Windows** at all, so before the flag existed every host run polluted the
+owner's data — and a hundred runs left `mine --sessions` mining its own
+exhaust. The override is a process-wide `OnceLock` set in `main` *before*
+`logging::setup` and `checkpoints::Store::init` (both read `data_dir()` at
+startup), and the path is absolutised immediately because the driver chdirs
+into the scenario's workspace.
+
+A separate data dir is also how you see what a run *produced*, instead of
+losing it among the user's own files.
 
 Several prompts after `--trace` (and any other flags) run as one multi-turn
 conversation (§5):

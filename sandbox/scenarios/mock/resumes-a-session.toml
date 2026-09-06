@@ -1,0 +1,36 @@
+# `exec --resume <id>` продолжает разговор между запусками.
+#
+# `session_template` — фикстура: раннер кладёт свою копию сессии в папку
+# данных под свежим id на каждый повтор и передаёт его ребёнку как
+# `--resume`, поэтому повторы не продолжают друг друга, а файл в репозитории
+# не переписывается. Фикстура лежит рядом в `.json`: любой `.toml` под
+# `scenarios/` был бы подобран как сценарий.
+#
+# Улика — только трасса. `harness.resume` говорит, что сессия поднята
+# (`messages` — сколько реплик в ней было), а `history_messages` записи
+# `harness.turn.started` равен трём: две поднятые реплики плюс новый промпт.
+# Не подхватилась история — счётчик единица, и сценарий валится.
+#
+# Нужен мок:
+#   ./sandbox.ps1 mock resumes-a-session
+name = "resumes-a-session"
+description = "A resumed run starts from the saved transcript, not from scratch"
+prompt = "What was the magic word?"
+session_template = "resume-session.json"
+provider = "mock"
+timeout = 60
+max_steps = 3
+
+[expect]
+status = "completed"
+min_pass_rate = 1.0
+
+[[expect.trace]]
+action = "harness.resume"
+field = "messages"
+min_total = 2
+
+[[expect.trace]]
+action = "harness.turn.started"
+field = "history_messages"
+min_total = 3

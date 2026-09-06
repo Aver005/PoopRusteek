@@ -69,9 +69,11 @@ Unit tests cover code; the harness covers what the agent actually does.
 
 ```
 # one real turn, no terminal, JSONL trace
-pooprusteek --config <throwaway.toml> exec "<prompt>" --trace .dev/t.jsonl
+pooprusteek --config <throwaway.toml> --data-dir .dev/run exec "<prompt>" --trace .dev/t.jsonl
+# continue that conversation in a later process (implies --save-session)
+pooprusteek --config <throwaway.toml> --data-dir .dev/run exec --resume <session-id> "<prompt>"
 # a prompt repeated N times, expectations checked, metrics aggregated
-pooprusteek --config <throwaway.toml> scenario sandbox/scenarios/live/<x>.toml --repeat 5
+pooprusteek --config <throwaway.toml> --data-dir .dev/run scenario sandbox/scenarios/live/<x>.toml --repeat 5
 # rank failure patterns across every trace (and the saved-session corpus)
 pooprusteek mine .dev/harness --sessions
 ```
@@ -79,6 +81,10 @@ pooprusteek mine .dev/harness --sessions
 Run it whenever you touch the agent loop, the tool prompt/parser, or the
 semantic hint path, and record the pass rates in the journal. Always use
 `--config` with a throwaway token: a run drives real tools under a policy.
+Always use `--data-dir` too: without it a run writes into the real user's
+sessions, checkpoints, semantic index and logs (`dirs::data_dir()` has no env
+override on Windows). Both flags are forwarded to the children `scenario` and
+`suite` spawn.
 Inside Docker: `sandbox/README.md` (`./sandbox.ps1 suite live -Repeat 5`).
 `sandbox/scenarios/mock/` runs against `mock-provider` for deterministic
 regressions — the only reliable way to reach failure paths the live model

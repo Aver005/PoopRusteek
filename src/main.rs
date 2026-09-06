@@ -59,6 +59,13 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     config: Option<std::path::PathBuf>,
 
+    /// Keep sessions, logs, the semantic index and the rollback journal in
+    /// this directory instead of the user's real data dir. Harness runs need
+    /// it: `dirs::data_dir()` has no env override on Windows, so without it a
+    /// test run writes into live user data.
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<std::path::PathBuf>,
+
     /// Headless test-harness subcommands (`exec`, `scenario`, `suite`,
     /// `mine`, `mock-provider`). Absent means the TUI, as before.
     #[command(subcommand)]
@@ -77,6 +84,15 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let args = Args::parse();
+
+    // Раньше всех: и журнал, и хранилище откатов читают `Config::data_dir()`
+    // на старте, а перенаправить их после этого уже нечем.
+    if let Some(dir) = &args.data_dir
+        && let Err(error) = config::set_data_dir(dir)
+    {
+        eprintln!("Error: {error}");
+        std::process::exit(3);
+    }
 
     // Tracing goes to files, never stdout/stderr: the TUI owns the terminal
     // (an INFO line mid-frame paints garbage over the interface) and in
@@ -145,7 +161,11 @@ async fn run_async(args: Args, config: Config) -> Result<Option<i32>> {
     // Harness subcommands are checked first: they never build an App and
     // must not be reordered behind the TUI's terminal setup.
     if let Some(Command::Harness(command)) = args.command {
-        return Ok(Some(harness::run(command, config, args.config).await?));
+        let globals = harness::GlobalFlags {
+            config: args.config,
+            data_dir: args.data_dir,
+        };
+        return Ok(Some(harness::run(command, config, globals).await?));
     }
 
     // ACP dispatch stays inside the runtime: the server uses

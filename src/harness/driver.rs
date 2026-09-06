@@ -194,6 +194,12 @@ pub struct ExecOptions {
     /// Persist the turn as a session file, so the run joins the corpus
     /// `harness mine` and the history index read from.
     pub save_session: bool,
+    /// Id of a saved session this run continues. Its history seeds the
+    /// conversation and its provider-side session is adopted, so a chain of
+    /// separate `exec` calls is one conversation — the only way to test an
+    /// *adaptive* exchange, where the next prompt depends on what the last
+    /// run produced.
+    pub resume: Option<String>,
     /// Extra instructions appended to the assembled system prompt. Prompt
     /// wording is the cheapest variable to change and one of the most
     /// influential, so it is a first-class knob here.
@@ -201,6 +207,14 @@ pub struct ExecOptions {
     /// Compaction settings layered over the config, so a scenario can put the
     /// ladder in reach without anyone hand-editing a config file.
     pub context: ContextOverrides,
+}
+
+impl ExecOptions {
+    /// Резюме подразумевает сохранение: иначе цепочка обрывается на первом
+    /// же звене — следующий запуск продолжал бы историю без последнего хода.
+    fn saves_session(&self) -> bool {
+        self.save_session || self.resume.is_some()
+    }
 }
 
 /// How a run ended.
@@ -366,6 +380,16 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
 
     let started = Instant::now();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    // Сессию поднимаем раньше провайдера: неизвестный id — отказ до первого
+    // хода, а не тихий прогон с нуля, который судить нечем.
+    let resumed = match load_resumed(&config, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            let outcome = RunOutcome::setup_failed(options.trace_path.clone(), error.to_string());
+            finish(&outcome);
+            return Ok(outcome);
+        }
+    };
     let harness = match assemble(&config, &options, &workspace, event_tx.clone()).await {
         Ok(harness) => harness,
         Err(error) => {
@@ -374,8 +398,20 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
             return Ok(outcome);
         }
     };
+    if let Some(session) = &resumed {
+        adopt_remote_session(&harness.provider, session).await;
+    }
 
-    let mut outcome = drive(&config, &options, &harness, event_tx, event_rx, started).await;
+    let mut outcome = drive(
+        &config,
+        &options,
+        resumed.as_ref(),
+        &harness,
+        event_tx,
+        event_rx,
+        started,
+    )
+    .await;
     outcome.semantic_ready = harness.semantic_ready;
     finish(&outcome);
     Ok(outcome)
@@ -391,6 +427,74 @@ fn absolutize(path: &std::path::Path) -> AppResult<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|e| AppError::Custom(format!("cannot read current directory: {e}")))?;
     Ok(cwd.join(path))
+}
+
+/// Read the session `--resume` names. A missing or unreadable id is a hard
+/// setup failure: starting from scratch instead would hand back a run that
+/// looks successful while it answered without the history it was given.
+fn load_resumed(
+    config: &Config,
+    options: &ExecOptions,
+) -> AppResult<Option<crate::session::Session>> {
+    let Some(id) = &options.resume else {
+        return Ok(None);
+    };
+    let session = crate::session::load_local(id, config)
+        .map_err(|error| AppError::Custom(format!("cannot resume session {id}: {error}")))?;
+    Ok(Some(session))
+}
+
+/// Continue the provider's own server-side session, or fall back to replaying
+/// local history into a fresh one — the same fork `App::handle_load_session`
+/// makes, minus the TUI's asynchrony (no turn has run yet, so the liveness
+/// check can simply be awaited).
+///
+/// A dead or absent remote link is **not** a refusal: the local transcript is
+/// the source of truth and is replayed as context, exactly as the TUI does.
+/// The trace says which of the two happened, so a run is never silently
+/// judged on a conversation it did not actually continue.
+async fn adopt_remote_session(provider: &Arc<dyn LLMProvider>, session: &crate::session::Session) {
+    let remote = match (session.broken, session.provider_session_id.as_deref()) {
+        (false, Some(id)) => id,
+        (true, _) => return replay_locally(session, "session_marked_broken", provider).await,
+        (false, None) => return replay_locally(session, "no_remote_session", provider).await,
+    };
+    if !provider.session_is_alive(remote).await {
+        return replay_locally(session, "remote_session_gone", provider).await;
+    }
+    match provider
+        .adopt_session(remote, session.provider_parent_message_id)
+        .await
+    {
+        Ok(()) => log_resume(session, "adopted", None),
+        Err(error) => replay_locally(session, &format!("adopt_failed: {error}"), provider).await,
+    }
+}
+
+/// Drop whatever thread the provider was on, so the next turn opens a fresh
+/// one and the local transcript travels with it as context.
+async fn replay_locally(
+    session: &crate::session::Session,
+    reason: &str,
+    provider: &Arc<dyn LLMProvider>,
+) {
+    let _ = provider.reset().await;
+    log_resume(session, "replayed", Some(reason));
+}
+
+fn log_resume(session: &crate::session::Session, remote: &str, reason: Option<&str>) {
+    debug_log::log_json(
+        action::RESUME,
+        &serde_json::json!({
+            "session_id": session.id,
+            "messages": session.messages.len(),
+            "broken": session.broken,
+            // "adopted" — тот же серверный тред; "replayed" — история уедет
+            // в свежий одним промптом.
+            "remote": remote,
+            "reason": reason,
+        }),
+    );
 }
 
 fn finish(outcome: &RunOutcome) {
@@ -530,6 +634,7 @@ async fn await_semantic(semantic: &Arc<SemanticService>, budget: Duration) -> bo
 async fn drive(
     config: &Config,
     options: &ExecOptions,
+    resumed: Option<&crate::session::Session>,
     harness: &Harness,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
@@ -540,6 +645,16 @@ async fn drive(
     // History is accumulated through the app's own reducer, so turn two sees
     // exactly what turn two in the TUI would see.
     let mut history = Conversation::fresh_main(None);
+    if let Some(session) = resumed {
+        // Те же поля, что переносит `App::handle_load_session`. Идентичность
+        // сессии тоже: прогон дописывается в тот же файл, иначе цепочка из
+        // пяти ходов рассыпалась бы на пять сессий.
+        history.messages = session.messages.clone();
+        history.session_id = session.id.clone();
+        history.session_started_at = session.created_at.clone();
+        history.tag = session.tag.clone();
+        history.broken = session.broken;
+    }
     // Namespaces this run's spill directory, the way a session id does in the app.
     let run_id = crate::session::create_session_id();
     // Filled in by `ContextWindowLearned` if the provider answers. Read when
@@ -735,8 +850,8 @@ async fn drive(
 
     drop(event_tx);
 
-    let session_id = if options.save_session {
-        persist(config, &history.messages)
+    let session_id = if options.saves_session() {
+        persist(config, &history, &harness.provider)
     } else {
         None
     };
@@ -819,21 +934,37 @@ fn answer_for(options: &ExecOptions, state: &QuestionState) -> String {
     }
 }
 
-fn persist(config: &Config, transcript: &[ChatMessage]) -> Option<String> {
-    let id = crate::session::create_session_id();
+/// Write the conversation to its session file — the same id it was resumed
+/// from, or the fresh one `Conversation::fresh_main` minted.
+///
+/// The metadata is sampled exactly as `App::auto_save_session` samples it: a
+/// provider that reports an identity has just proved the remote link works, so
+/// it is recorded (this is what lets the *next* `--resume` continue the same
+/// server-side thread) and clears a stale `broken` flag.
+fn persist(
+    config: &Config,
+    conversation: &Conversation,
+    provider: &Arc<dyn LLMProvider>,
+) -> Option<String> {
     let workspace = std::env::current_dir()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_default();
-    let meta = crate::session::SessionMeta::default();
+    let identity = provider.session_identity();
+    let meta = crate::session::SessionMeta {
+        tag: conversation.tag.clone(),
+        broken: identity.is_none() && conversation.broken,
+        provider_session_id: identity.as_ref().map(|(id, _)| id.clone()),
+        provider_parent_message_id: identity.and_then(|(_, parent)| parent),
+    };
     match crate::session::save_session(
-        &id,
-        &crate::session::timestamp_now(),
-        transcript,
+        &conversation.session_id,
+        &conversation.session_started_at,
+        &conversation.messages,
         config,
         &workspace,
         &meta,
     ) {
-        Ok(()) => Some(id),
+        Ok(()) => Some(conversation.session_id.clone()),
         Err(error) => {
             tracing::warn!("harness: could not save session: {error}");
             None
@@ -964,6 +1095,7 @@ mod tests {
             provider: None,
             model: None,
             save_session: false,
+            resume: None,
             system_append: None,
             context: ContextOverrides::default(),
         }
@@ -988,6 +1120,7 @@ mod tests {
         let outcome = drive(
             &probe_config(),
             &options,
+            None,
             &harness,
             event_tx,
             event_rx,
@@ -1030,6 +1163,7 @@ mod tests {
         let outcome = drive(
             &probe_config(),
             &options,
+            None,
             &harness,
             event_tx,
             event_rx,
@@ -1063,6 +1197,7 @@ mod tests {
         let outcome = drive(
             &probe_config(),
             &options,
+            None,
             &harness,
             event_tx,
             event_rx,
@@ -1097,5 +1232,114 @@ mod tests {
             system_prompt: "You are a test.".to_string(),
             semantic_ready: false,
         }
+    }
+
+    /// Продолжение без сохранения — цепочка, которая рвётся на первом звене:
+    /// следующий запуск не увидел бы последнего хода.
+    #[test]
+    fn resuming_implies_saving_the_session() {
+        let mut options = probe_options();
+        assert!(!options.saves_session());
+        options.resume = Some("some-id".to_string());
+        assert!(options.saves_session());
+    }
+
+    /// Неизвестный id обязан быть отказом до первого хода: прогон с нуля
+    /// выглядел бы успешным, отвечая без истории, ради которой его запустили.
+    #[test]
+    fn an_unknown_session_id_is_a_setup_failure() {
+        let options = ExecOptions {
+            resume: Some("pooprusteek_test_no_such_session".to_string()),
+            ..probe_options()
+        };
+        let error = load_resumed(&Config::default(), &options)
+            .expect_err("an unknown id must not resume silently")
+            .to_string();
+        assert!(
+            error.contains("pooprusteek_test_no_such_session"),
+            "{error}"
+        );
+
+        // Без флага — ни загрузки, ни отказа.
+        assert!(
+            load_resumed(&Config::default(), &probe_options())
+                .expect("no --resume is not an error")
+                .is_none()
+        );
+    }
+
+    /// Ради чего всё: следующий запуск и видит прошлый разговор, и дописывает
+    /// себя в тот же файл — иначе цепочка из пяти ходов станет пятью сессиями.
+    #[tokio::test]
+    async fn a_resumed_run_sees_the_history_and_saves_back_to_the_same_id() {
+        let id = "pooprusteek_test_harness_resume_roundtrip";
+        let config = probe_config();
+        let seeded = vec![
+            ChatMessage::user("the first prompt"),
+            ChatMessage::assistant("the first answer"),
+        ];
+        crate::session::save_session(
+            id,
+            "2026-01-01T00:00:00Z",
+            &seeded,
+            &config,
+            "/tmp",
+            &crate::session::SessionMeta::default(),
+        )
+        .expect("the session under test must be written");
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+
+        let fake = Arc::new(crate::provider::fake::FakeProvider::with_response(
+            "the second answer",
+        ));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let harness = probe_harness(Arc::clone(&fake) as Arc<dyn LLMProvider>, event_tx.clone());
+        let options = ExecOptions {
+            prompts: vec!["the second prompt".to_string()],
+            resume: Some(id.to_string()),
+            timeout: Duration::from_secs(30),
+            ..probe_options()
+        };
+        let resumed = load_resumed(&config, &options)
+            .expect("the planted session must load")
+            .expect("--resume was set");
+
+        let outcome = drive(
+            &config,
+            &options,
+            Some(&resumed),
+            &harness,
+            event_tx,
+            event_rx,
+            Instant::now(),
+        )
+        .await;
+
+        let saved = crate::session::load_local(id, &config);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(
+            outcome.session_id.as_deref(),
+            Some(id),
+            "a resumed run must save back into the same session"
+        );
+        let sent = fake.request(0).expect("the turn was sent");
+        let contents: Vec<&str> = sent.iter().map(|m| m.content.as_str()).collect();
+        assert!(contents.contains(&"the first prompt"), "{contents:?}");
+        assert!(contents.contains(&"the first answer"), "{contents:?}");
+        assert_eq!(contents.last(), Some(&"the second prompt"), "{contents:?}");
+
+        let saved = saved.expect("the session file must still be loadable");
+        assert_eq!(
+            saved.created_at, "2026-01-01T00:00:00Z",
+            "created_at drifted"
+        );
+        assert_eq!(
+            saved.messages.len(),
+            4,
+            "the run must append to the transcript it resumed: {:?}",
+            saved.messages
+        );
     }
 }

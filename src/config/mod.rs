@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -856,15 +857,55 @@ impl Config {
             .join("config.toml")
     }
 
+    /// Where every piece of user data lives: sessions, the rollback journal,
+    /// the semantic index, logs, the whitelist. `--data-dir` overrides it for
+    /// the whole process (see [`set_data_dir`]) — on Windows `dirs` has no
+    /// env override, so a harness run would otherwise write into the real
+    /// user's data.
     pub fn data_dir() -> PathBuf {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("pooprusteek")
+        match DATA_DIR_OVERRIDE.get() {
+            Some(path) => path.clone(),
+            None => default_data_dir(),
+        }
     }
 
     pub fn sessions_dir() -> PathBuf {
         Self::data_dir().join("sessions")
     }
+}
+
+/// Папка данных, заданная флагом `--data-dir`. Ставится один раз в `main`,
+/// раньше всего, что читает [`Config::data_dir`].
+static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+fn default_data_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("pooprusteek")
+}
+
+/// Увести пользовательские данные процесса в другую папку. Зовётся из `main`
+/// до `logging::setup` и `checkpoints::Store::init` — оба читают
+/// [`Config::data_dir`] на старте, и переопределение обязано их опередить.
+pub fn set_data_dir(path: &Path) -> AppResult<()> {
+    let resolved = prepare_data_dir(path)?;
+    DATA_DIR_OVERRIDE.set(resolved).map_err(|path: PathBuf| {
+        AppError::Config(format!(
+            "data directory is already set to {}",
+            path.display()
+        ))
+    })
+}
+
+/// Развернуть путь в абсолютный и создать папку. Абсолютный — потому что
+/// харнесс уходит в рабочую папку сценария (`std::env::set_current_dir`), и
+/// относительная папка данных уехала бы вместе с ним.
+fn prepare_data_dir(path: &Path) -> AppResult<PathBuf> {
+    let absolute = std::path::absolute(path)
+        .map_err(|e| AppError::Config(format!("data dir {}: {e}", path.display())))?;
+    std::fs::create_dir_all(&absolute)
+        .map_err(|e| AppError::Config(format!("data dir {}: {e}", absolute.display())))?;
+    Ok(absolute)
 }
 
 /// Keys that moved between sections. Unknown keys are dropped on parse (there
@@ -1446,5 +1487,26 @@ mod tool_protocol_tests {
         assert_eq!(entry.tools, ToolProtocol::Native);
         let text = toml::to_string(&entry).unwrap();
         assert!(text.contains("tools = \"native\""), "{text}");
+    }
+
+    /// `--data-dir` пишется до `chdir` в рабочую папку сценария, поэтому путь
+    /// обязан стать абсолютным сразу, а папка — существовать.
+    #[test]
+    fn a_data_dir_override_is_absolutised_and_created() {
+        let relative = PathBuf::from("target")
+            .join("test-data-dir")
+            .join("pooprusteek_config_prepare");
+        let _ = std::fs::remove_dir_all(&relative);
+
+        let resolved = prepare_data_dir(&relative).expect("the directory must be created");
+
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(resolved.is_dir(), "{}", resolved.display());
+        // Идемпотентно: повторный запуск не спотыкается о существующую папку.
+        assert_eq!(
+            prepare_data_dir(&relative).expect("second call must succeed"),
+            resolved
+        );
+        let _ = std::fs::remove_dir_all(&resolved);
     }
 }

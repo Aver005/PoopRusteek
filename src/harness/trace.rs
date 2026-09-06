@@ -22,6 +22,8 @@ pub mod action {
     pub const APPROVAL: &str = "harness.approval";
     pub const QUESTION: &str = "harness.question";
     pub const SUB_AGENT: &str = "harness.sub_agent";
+    /// `--resume`: what was picked up, and what became of the remote session.
+    pub const RESUME: &str = "harness.resume";
     pub const MESSAGE: &str = "harness.message";
     pub const TOOL_RESULT: &str = "harness.tool.result";
     pub const CONTEXT_WINDOW: &str = "harness.context.window";

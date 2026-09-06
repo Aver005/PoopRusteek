@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "id": "planted-by-the-scenario-runner",
+  "created_at": "2026-09-01T10:00:00Z",
+  "updated_at": "2026-09-01T10:00:00Z",
+  "workspace_root": "/opt/sandbox",
+  "model_type": "mock",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Remember the magic word for this run: pomidor.",
+      "created_at": "2026-09-01T10:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Noted — the magic word is pomidor.",
+      "created_at": "2026-09-01T10:00:01Z"
+    }
+  ]
+}

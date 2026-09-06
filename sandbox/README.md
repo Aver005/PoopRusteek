@@ -158,6 +158,16 @@ and skips rung 1 outright:
 ./sandbox.ps1 scenario rung-one-clears-tool-output -Repeat 2
 ```
 
+`mock-scripts/resumes-a-session.toml` drives the other thing only a mock can
+gate deterministically: `exec --resume`, i.e. a conversation continued between
+processes. The scenario's `session_template` is a fixture whose copy the runner
+plants under a fresh id per repeat, so repeats never continue each other.
+
+```powershell
+./sandbox.ps1 mock resumes-a-session
+./sandbox.ps1 scenario resumes-a-session -Repeat 2
+```
+
 ## Reading a trace
 
 One JSON object per line, `{seq, ts, action, message|data}`. The interesting
@@ -166,6 +176,7 @@ actions:
 | Action | Carries |
 |---|---|
 | `harness.run.started` / `.finished` | Run configuration and verdict |
+| `harness.resume` | `--resume`: the session picked up, and whether its remote thread was `adopted` or `replayed` |
 | `system_prompt.assembled` | Prompt size breakdown (base/tools/mcp/skills) |
 | `agent.step.start` | Step number of max |
 | `agent.step.parsed.payload` | Raw model output, visible text, parsed tool calls |
