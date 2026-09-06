@@ -16,6 +16,20 @@ use tokio::time::sleep;
 
 const DEEPSEEK_HOST: &str = "chat.deepseek.com";
 
+/// Похоже ли тело на JSON. Заголовок — первый довод, но не единственный:
+/// он бывает пустым или обобщённым, а вот HTML-оболочка сайта не начинается
+/// ни с `{`, ни с `[` никогда.
+fn is_json_body(content_type: &str, body: &str) -> bool {
+    let lowered = content_type.to_ascii_lowercase();
+    if lowered.contains("json") {
+        return true;
+    }
+    if lowered.contains("html") || lowered.contains("text/plain") {
+        return false;
+    }
+    matches!(body.trim_start().as_bytes().first(), Some(b'{' | b'['))
+}
+
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
 
 impl DeepseekProvider {
@@ -252,6 +266,57 @@ impl DeepseekProvider {
         AppError::Provider(format!("{label}: {status} {text}"))
     }
 
+    /// Прочитать тело ответа как JSON, отличая «эндпоинта больше нет» от
+    /// «разбор сломался».
+    ///
+    /// Мёртвый путь под CloudFront отвечает не 404, а **200 OK и HTML-обо**
+    /// лочкой сайта, поэтому `response.json()` падал ошибкой serde про
+    /// неожиданный `<` в первой позиции — по ней невозможно догадаться, что
+    /// endpoint просто снесли. Это стоило одного дня разматывания: сессия
+    /// считалась мёртвой через семь секунд после создания.
+    pub(super) async fn read_json<T: serde::de::DeserializeOwned>(
+        action: &str,
+        response: Response,
+        label: &str,
+    ) -> AppResult<T> {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let text = response.text().await.map_err(AppError::Http)?;
+        if !is_json_body(&content_type, &text) {
+            debug_log::log(
+                action,
+                format!(
+                    "response was not JSON: content-type={content_type} bytes={} body={}",
+                    text.len(),
+                    crate::util::truncate_at_char_boundary(&text, 400)
+                ),
+            );
+            return Err(AppError::Provider(format!(
+                "{label}: the endpoint answered {} in {} bytes instead of JSON —                  the API path is probably gone (a removed path is served the                  site shell with 200 OK, not a 404)",
+                if content_type.is_empty() {
+                    "an unlabelled body"
+                } else {
+                    &content_type
+                },
+                text.len()
+            )));
+        }
+        serde_json::from_str(&text).map_err(|error| {
+            debug_log::log(
+                action,
+                format!(
+                    "response JSON did not fit the expected shape: {error} body={}",
+                    crate::util::truncate_at_char_boundary(&text, 400)
+                ),
+            );
+            AppError::Provider(format!("{label}: unexpected response shape: {error}"))
+        })
+    }
+
     // ─── Generic GET request helper ────────────────────────────
 
     pub(super) async fn send_get_request(
@@ -303,5 +368,31 @@ impl DeepseekProvider {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_json_body;
+
+    /// Ровно та ловушка, ради которой проверка появилась: снесённый путь
+    /// отвечает 200 OK и оболочкой сайта, а не 404.
+    #[test]
+    fn the_site_shell_is_not_mistaken_for_json() {
+        assert!(!is_json_body(
+            "text/html; charset=utf-8",
+            "<!doctype html><html><head>"
+        ));
+        assert!(!is_json_body("text/plain", "gateway timeout"));
+        // Заголовка нет — решает первый символ тела.
+        assert!(!is_json_body("", "<!doctype html>"));
+    }
+
+    #[test]
+    fn json_is_recognised_by_header_or_by_body() {
+        assert!(is_json_body("application/json", "{\"code\":0}"));
+        assert!(is_json_body("application/json; charset=utf-8", ""));
+        assert!(is_json_body("", "  {\"code\":0}"));
+        assert!(is_json_body("", "[1,2]"));
     }
 }

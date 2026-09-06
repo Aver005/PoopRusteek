@@ -12,7 +12,10 @@ use serde_json::{Value, json};
 
 const CREATE_POW_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
-const SESSION_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history";
+/// История одной сессии. `chat/history` (POST) снесли: CloudFront отдаёт на
+/// него оболочку сайта с 200 OK, а не 404, — живая замена рядом и берёт
+/// сессию параметром запроса.
+const SESSION_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
 const TARGET_PATH: &str = "/api/v0/chat/completion";
 
 pub(super) enum PathSegment<'a> {
@@ -160,23 +163,18 @@ impl DeepseekProvider {
         Ok((response, session.session_id))
     }
 
-    pub(super) async fn fetch_remote_history(
-        &self,
-        session_id: &str,
-    ) -> AppResult<Vec<ChatMessage>> {
-        let body = json!({
-            "session_id": session_id,
-            "parent_message_id": Value::Null,
-            "count": 1000,
-        });
+    /// Ответ эндпоинта истории целиком. Отдельно от разбора реплик, потому
+    /// что проверке живости сессии сами реплики не нужны — ей достаточно
+    /// того, что API вообще ответил про эту сессию.
+    pub(super) async fn fetch_remote_history_payload(&self, session_id: &str) -> AppResult<Value> {
+        let url = reqwest::Url::parse_with_params(
+            SESSION_HISTORY_URL,
+            &[("chat_session_id", session_id)],
+        )
+        .map_err(|error| AppError::Provider(format!("bad session id {session_id}: {error}")))?;
         let headers = self.auth_headers()?;
         let response = self
-            .send_json_request(
-                "session.history.request",
-                SESSION_HISTORY_URL,
-                &headers,
-                &body,
-            )
+            .send_get_request("session.history.request", url.as_str(), &headers)
             .await?;
         if !response.status().is_success() {
             return Err(Self::read_error_response(
@@ -186,32 +184,92 @@ impl DeepseekProvider {
             )
             .await);
         }
-        let payload: Value = response.json().await?;
-        let items = payload["data"]["biz_data"]["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-
-        let mut messages = Vec::new();
-        for item in &items {
-            let role_str = item["role"].as_str().unwrap_or("user");
-            let content = item["content"].as_str().unwrap_or("").to_string();
-            let role = match role_str {
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                "system" => Role::System,
-                _ => continue,
-            };
-            if role == Role::User || role == Role::Assistant {
-                messages.push(ChatMessage {
-                    // Метки времени в этом ответе нет — оставляем пустой.
-                    created_at: String::new(),
-                    ..ChatMessage::new(role, &content)
-                });
-            }
+        let payload: Value = Self::read_json(
+            "session.history.request",
+            response,
+            "Session history failed",
+        )
+        .await?;
+        // Свой код ошибки API отдаёт с HTTP 200 — удалённая сессия выглядит
+        // именно так, и без этой проверки читалась бы как пустая история.
+        if let Some(code) = payload["code"].as_i64()
+            && code != 0
+        {
+            let message = payload["msg"].as_str().unwrap_or("no message");
+            return Err(AppError::Provider(format!(
+                "Session history failed: code {code} ({message})"
+            )));
         }
-        Ok(messages)
+        Ok(payload)
     }
+
+    pub(super) async fn fetch_remote_history(
+        &self,
+        session_id: &str,
+    ) -> AppResult<Vec<ChatMessage>> {
+        let payload = self.fetch_remote_history_payload(session_id).await?;
+        Ok(history_messages(&payload["data"]["biz_data"]))
+    }
+}
+
+/// Реплики из `biz_data`. Имя массива у эндпоинта своё (`chat_messages`), но
+/// опираться на одно имя дорого: прошлый разбор молча отдавал пустую историю,
+/// когда endpoint сменили. Поэтому берётся первый непустой массив из
+/// известных, а промах записывается в журнал вместе с ключами ответа.
+fn history_messages(biz_data: &Value) -> Vec<ChatMessage> {
+    const KEYS: [&str; 3] = ["chat_messages", "messages", "items"];
+    let items = KEYS
+        .iter()
+        .find_map(|key| biz_data[key].as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        debug_log::log(
+            "session.history.request",
+            format!(
+                "no known message array in the response; biz_data keys: {}",
+                biz_data
+                    .as_object()
+                    .map(|map| map.keys().cloned().collect::<Vec<_>>().join(", "))
+                    .unwrap_or_else(|| "not an object".to_string())
+            ),
+        );
+    }
+
+    let mut messages = Vec::new();
+    for item in &items {
+        let role = match item["role"].as_str().unwrap_or_default() {
+            "USER" | "user" => Role::User,
+            "ASSISTANT" | "assistant" => Role::Assistant,
+            _ => continue,
+        };
+        messages.push(ChatMessage {
+            // Метки времени в этом ответе нет — оставляем пустой.
+            created_at: String::new(),
+            ..ChatMessage::new(role, &message_text(item))
+        });
+    }
+    messages
+}
+
+/// Текст реплики: строковый `content`, а если его нет — склейка фрагментов
+/// (`fragments[].content`), которыми отвечает нынешний эндпоинт.
+fn message_text(item: &Value) -> String {
+    if let Some(text) = item["content"].as_str() {
+        return text.to_string();
+    }
+    let Some(fragments) = item["fragments"].as_array() else {
+        return String::new();
+    };
+    fragments
+        .iter()
+        .filter_map(|fragment| {
+            fragment["content"]
+                .as_str()
+                .or_else(|| fragment["text"].as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 pub(super) fn get_value_by_path<'a>(
@@ -713,5 +771,62 @@ mod tests {
         assert!(process_stream_line(": keep-alive").is_none());
         assert!(process_stream_line("event: message").is_none());
         assert!(process_stream_line("").is_none());
+    }
+
+    /// Ответ нынешнего эндпоинта: реплики лежат в `chat_messages`, а текст
+    /// ассистента приходит фрагментами, а не строкой.
+    #[test]
+    fn history_is_read_from_fragments_and_strings_alike() {
+        let biz_data = serde_json::json!({
+            "chat_messages": [
+                { "role": "USER", "content": "first prompt" },
+                {
+                    "role": "ASSISTANT",
+                    "fragments": [
+                        { "type": "RESPONSE", "content": "first " },
+                        { "type": "RESPONSE", "content": "answer" }
+                    ]
+                },
+                { "role": "SYSTEM", "content": "ignored" }
+            ]
+        });
+
+        let messages = history_messages(&biz_data);
+
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].content, "first prompt");
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].content, "first answer");
+    }
+
+    /// Прежний ключ (`items`) читается тем же кодом: смена имени массива не
+    /// должна снова оборачиваться молчаливо пустой историей.
+    #[test]
+    fn the_older_items_key_still_reads() {
+        let biz_data = serde_json::json!({
+            "items": [{ "role": "user", "content": "hi" }]
+        });
+        let messages = history_messages(&biz_data);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hi");
+    }
+
+    /// Неизвестная форма — пустой список, а не паника: разбор чужого API
+    /// обязан деградировать (промах пишется в журнал).
+    #[test]
+    fn an_unknown_shape_yields_no_messages() {
+        assert!(history_messages(&serde_json::json!({ "unexpected": 1 })).is_empty());
+        assert!(history_messages(&Value::Null).is_empty());
+    }
+
+    /// Сессия едет параметром запроса, а не телом POST — и экранируется.
+    #[test]
+    fn the_session_id_travels_as_an_escaped_query_parameter() {
+        let url =
+            reqwest::Url::parse_with_params(SESSION_HISTORY_URL, &[("chat_session_id", "a b&c")])
+                .unwrap();
+        assert!(url.path().ends_with("/chat/history_messages"), "{url}");
+        assert_eq!(url.query(), Some("chat_session_id=a+b%26c"), "{url}");
     }
 }

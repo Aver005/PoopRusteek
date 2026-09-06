@@ -413,12 +413,27 @@ impl LLMProvider for DeepseekProvider {
     }
 
     async fn session_is_alive(&self, session_id: &str) -> bool {
-        // `chat/history` is the cheapest existing endpoint that touches a
-        // specific session id; a non-2xx (deleted/expired/not-yours session)
-        // surfaces as `Err` here. A transient network error also reads as
-        // "not alive" — callers treat "couldn't verify" the same as "gone"
-        // rather than risk threading onto a session that silently vanished.
-        self.fetch_remote_history(session_id).await.is_ok()
+        // `chat/history_messages` is the cheapest existing endpoint that
+        // touches a specific session id. Deliberately the *payload* call and
+        // not `fetch_remote_history`: liveness must not hinge on the message
+        // array being parsed, or a wire-shape change again reads as "the
+        // session is gone" — which is exactly how the dead `chat/history`
+        // presented (200 OK + the site's HTML shell, see BUGS.md).
+        //
+        // A non-2xx, the API's own non-zero `code`, or an HTML answer all
+        // read as not-alive; so does a transient network error — callers
+        // treat "couldn't verify" the same as "gone" rather than risk
+        // threading onto a session that silently vanished.
+        match self.fetch_remote_history_payload(session_id).await {
+            Ok(_) => true,
+            Err(error) => {
+                debug_log::log(
+                    "session.alive",
+                    format!("session {session_id} reads as gone: {error}"),
+                );
+                false
+            }
+        }
     }
 
     async fn adopt_session(

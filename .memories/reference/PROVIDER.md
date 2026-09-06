@@ -18,7 +18,7 @@
 | `fetch_remote_session_messages` | `async (session_id) -> AppResult<Vec<ChatMessage>>` | Pull a remote DeepSeek session (default: error) |
 | `fork` | `() -> Arc<dyn LLMProvider>` (:211) | Fresh-session sibling sharing config/token. DeepSeek rebuilds via `fork_session()` (:144) with a new `SessionState`; `FakeProvider` returns a new instance. Tested for session independence (`deepseek.rs:1773`). |
 | `session_identity` | `() -> Option<(String, Option<i64>)>` | Sync (no I/O) read of the live `(session_id, parent_message_id)`. Default `None`; DeepSeek locks `session_state` and clones. Sampled by `App::auto_save_session` every turn to persist resumable identity. |
-| `session_is_alive` | `async (session_id) -> bool` | Best-effort existence check. Default `false`; DeepSeek delegates to `fetch_remote_history` (`chat/history`) — any error (deleted/expired/network) reads as not-alive. |
+| `session_is_alive` | `async (session_id) -> bool` | Best-effort existence check. Default `false`; DeepSeek asks `GET chat/history_messages?chat_session_id=…` via `fetch_remote_history_payload` — deliberately the payload call, **not** `fetch_remote_history`: liveness must not hinge on the message array parsing, or a wire-shape change reads as "the session is gone". Non-2xx, a non-zero envelope `code`, an HTML body or a network error all read as not-alive. |
 | `adopt_session` | `async (session_id, parent_message_id) -> AppResult<()>` | Resume a previously-known remote session instead of creating a new one. Default no-op; DeepSeek sets `SessionState{session_id, parent_message_id, system_sent_for_session: true}` directly, skipping `chat_session/create`. |
 
 `DeepseekProvider` is the only real impl; `FakeProvider` (`provider/fake.rs`, `#[cfg(test)]`) is the test double. `provider` is `Option<Arc<dyn LLMProvider>>` and lives **per `Conversation`** (each gets its own via `fork()`) — `None` when token is empty.
@@ -37,12 +37,19 @@
 
 - **Constructor** `new(config, rate_limit_ms, rate_limit_per_minute, max_retries)` (`deepseek/mod.rs`). `max_retries`: -1=infinite, 0=none, N=N+1 attempts.
 - **Base URL**: `https://chat.deepseek.com/api/v0` (:20).
+> **Читая любой ответ этого API, идите через `DeepseekProvider::read_json`.**
+> Снесённый путь отдаёт 200 OK и HTML-оболочку сайта, а не 404, поэтому
+> `response.json()` падает ошибкой serde про неожиданный `<`, по которой
+> невозможно догадаться о причине. `read_json` смотрит на `content-type` (а при
+> пустом — на первый символ тела) и говорит прямо: «endpoint answered text/html
+> in N bytes instead of JSON — the API path is probably gone».
+
 - **Auth**: cookie/token session (NOT an API key). `auth_headers()` (:144) sets `Authorization: Bearer {token}` + spoofed Android client headers (`x-client-platform: android`, `x-client-version: 1.8.0`, `x-client-locale: zh_CN`, a Chrome/YaBrowser UA).
 - **`SessionState`** (:84) — `session_id?, parent_message_id?, system_sent_for_session`. Held in a `Mutex`. Tracks DeepSeek-side conversation continuity; system prompt sent once per session.
   - ⚠ **Session-fork hazard (fixed)**: the DeepSeek session is a tree keyed by `parent_message_id`; a stale id silently forks onto an *invisible* branch — messages show in the TUI but never reach the web view/model context. Interrupted/errored streams used to desync it. Fix (`183712e`): persist `parent_message_id` incrementally + flush-on-error. Per-conversation `fork()` isolation prevents cross-conversation desync structurally.
 
 ### Reverse-engineered endpoints (~30, declared :19–75)
-- **Chat**: `chat/create_pow_challenge`, `chat/completion` (SSE), `chat/history`, `chat/history_messages`, `chat/edit_message`†, `chat/regenerate`†, `chat/continue`, `chat/stop_stream`, `chat/resume_stream`, `chat/message_feedback`.
+- **Chat**: `chat/create_pow_challenge`, `chat/completion` (SSE), ~~`chat/history`~~ (**removed upstream 2026-09 — answers 200 OK + the site's HTML shell, not 404; see `BUGS.md`**), `chat/history_messages` (GET, `?chat_session_id=`), `chat/edit_message`†, `chat/regenerate`†, `chat/continue`, `chat/stop_stream`, `chat/resume_stream`, `chat/message_feedback`.
 - **Sessions**: `chat_session/create`, `.../fetch_page`, `.../delete`, `.../delete_all`, `.../update_title`, `.../update_pinned`.
 - **Files**: `file/upload_file`† (multipart), `file/fetch_files`, `file/fork_file_task`.
 - **Share**: `share/create|list|content|delete|fork`.

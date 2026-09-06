@@ -64,13 +64,12 @@ impl DeepseekProvider {
             .await);
         }
 
-        let payload: Value = response.json().await.map_err(|error| {
-            debug_log::log(
-                "session.create.parse",
-                format!("failed to parse session response json: {error}"),
-            );
-            AppError::Http(error)
-        })?;
+        let payload: Value = Self::read_json(
+            "session.create.request",
+            response,
+            "Session creation failed",
+        )
+        .await?;
         debug_log::log_json("session.create.response", &payload);
         let session_id = payload["data"]["biz_data"]["chat_session"]["id"]
             .as_str()

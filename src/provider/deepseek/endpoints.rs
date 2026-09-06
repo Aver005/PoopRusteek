@@ -75,7 +75,7 @@ impl DeepseekProvider {
         if !response.status().is_success() {
             return Err(Self::read_error_response(action, response, action).await);
         }
-        let payload: types::ApiResponse<T> = response.json().await?;
+        let payload: types::ApiResponse<T> = Self::read_json(action, response, action).await?;
         Ok(payload.data.biz_data)
     }
 
@@ -137,7 +137,7 @@ impl DeepseekProvider {
         if !response.status().is_success() {
             return Err(Self::read_error_response(action, response, action).await);
         }
-        let payload: types::ApiResponse<T> = response.json().await?;
+        let payload: types::ApiResponse<T> = Self::read_json(action, response, action).await?;
         Ok(payload.data.biz_data)
     }
 }

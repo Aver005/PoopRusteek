@@ -213,7 +213,12 @@ Four rules, each of them load-bearing:
   `provider_session_id`, or a failed liveness check all mean the same thing the
   TUI means: replay local history into a fresh remote session. The trace says
   which happened — one `harness.resume` record with `remote` (`adopted` /
-  `replayed`), `reason` and `messages`.
+  `replayed`), `reason` and `messages`. That record earned its keep on the
+  first live run: `replayed / remote_session_gone` seven seconds after the
+  session was created turned out to be a **provider** defect, not a resume one
+  — `chat/history` had been removed upstream and answers 200 OK with the site's
+  HTML shell (`BUGS.md`, RESOLVED 2026-09-06). Читая `replayed`, сначала
+  посмотрите `reason`.
 - **An unknown id is `setup_failed`.** Starting from scratch instead would hand
   back a run that looks successful while it answered without the history it was
   given — the same defect class as "a run that produced nothing to judge".
