@@ -969,7 +969,10 @@ fn answer_for(options: &ExecOptions, state: &QuestionState) -> String {
 /// The metadata is sampled exactly as `App::auto_save_session` samples it: a
 /// provider that reports an identity has just proved the remote link works, so
 /// it is recorded (this is what lets the *next* `--resume` continue the same
-/// server-side thread) and clears a stale `broken` flag.
+/// server-side thread) and clears a stale `broken` flag. A provider that
+/// reports none says only that *this* run established nothing — a run that
+/// died on an expired token still must not erase the link it resumed
+/// (`RemoteLink::Unknown`).
 fn persist(
     config: &Config,
     conversation: &Conversation,
@@ -978,12 +981,11 @@ fn persist(
     let workspace = std::env::current_dir()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_default();
-    let identity = provider.session_identity();
+    let remote = crate::session::RemoteLink::from_identity(provider.session_identity());
     let meta = crate::session::SessionMeta {
         tag: conversation.tag.clone(),
-        broken: identity.is_none() && conversation.broken,
-        provider_session_id: identity.as_ref().map(|(id, _)| id.clone()),
-        provider_parent_message_id: identity.and_then(|(_, parent)| parent),
+        broken: !remote.is_established() && conversation.broken,
+        remote,
     };
     match crate::session::save_session(
         &conversation.session_id,

@@ -35,6 +35,51 @@ pub struct Session {
     pub broken: bool,
 }
 
+/// What a save knows about the provider's server-side session.
+///
+/// Three-state in spirit, two variants in code, because `Option` was read
+/// wrong once already: `session_identity() == None` means **"this run never
+/// established a session"**, not "no link exists" — and writing that `None`
+/// through to disk erased the live link of a healthy session (a run against
+/// an expired token was enough). Same defect as
+/// [`crate::provider::SessionLiveness`], one floor down.
+///
+/// Deliberately erasing a link is a different act and has a different door:
+/// rewrite the whole [`Session`] (`provider_session_id: None`) and store it
+/// with [`save_local`], the way `App::finalize_broken_session` does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RemoteLink {
+    /// The run rode a known server-side session — record it.
+    Established {
+        session_id: String,
+        parent_message_id: Option<i64>,
+    },
+    /// The run learned nothing about the link. Whatever is already on disk
+    /// stands.
+    #[default]
+    Unknown,
+}
+
+impl RemoteLink {
+    /// From what `LLMProvider::session_identity()` reports. `None` is
+    /// [`RemoteLink::Unknown`] — never "there is no link".
+    pub fn from_identity(identity: Option<(String, Option<i64>)>) -> Self {
+        match identity {
+            Some((session_id, parent_message_id)) => Self::Established {
+                session_id,
+                parent_message_id,
+            },
+            None => Self::Unknown,
+        }
+    }
+
+    /// Did a run actually establish a link? A live link is also proof the
+    /// remote side works, which is what clears a stale `broken` flag.
+    pub fn is_established(&self) -> bool {
+        matches!(self, Self::Established { .. })
+    }
+}
+
 /// Non-identity fields of [`Session`] that `save_session` needs but doesn't
 /// derive from its other arguments — bundled so that function doesn't grow a
 /// new positional parameter (and every call site) each time one more of
@@ -43,8 +88,7 @@ pub struct Session {
 pub struct SessionMeta {
     pub tag: Option<String>,
     pub broken: bool,
-    pub provider_session_id: Option<String>,
-    pub provider_parent_message_id: Option<i64>,
+    pub remote: RemoteLink,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +125,18 @@ pub fn save_session(
     let dir = Config::sessions_dir();
     std::fs::create_dir_all(&dir)?;
 
+    let path = dir.join(format!("{id}.json"));
+    // «Не знаю» не имеет права затирать то, что уже сохранено: иначе прогон,
+    // который не завёл серверной сессии (упал на токене, например), стирает
+    // связь здоровой сессии, и следующий `--resume` подхватывать уже нечего.
+    let (provider_session_id, provider_parent_message_id) = match &meta.remote {
+        RemoteLink::Established {
+            session_id,
+            parent_message_id,
+        } => (Some(session_id.clone()), *parent_message_id),
+        RemoteLink::Unknown => stored_link(&path),
+    };
+
     let now = chrono::Utc::now().to_rfc3339();
     let session = Session {
         version: SESSION_VERSION,
@@ -91,15 +147,42 @@ pub fn save_session(
         model_type: config.provider.model.clone(),
         messages: messages.to_vec(),
         tag: meta.tag.clone(),
-        provider_session_id: meta.provider_session_id.clone(),
-        provider_parent_message_id: meta.provider_parent_message_id,
+        provider_session_id,
+        provider_parent_message_id,
         broken: meta.broken,
     };
 
-    let path = dir.join(format!("{id}.json"));
     let json = serde_json::to_string_pretty(&session)?;
     crate::util::atomic_write(&path, json.as_bytes())?;
     Ok(())
+}
+
+/// Связь с серверной сессией, уже лежащая в файле. Отсутствие файла или
+/// нечитаемый файл — не ошибка: сохранять надо в любом случае, просто
+/// переносить нечего.
+fn stored_link(path: &std::path::Path) -> (Option<String>, Option<i64>) {
+    /// Только два поля: разбирать весь транскрипт ради них незачем.
+    #[derive(Deserialize)]
+    struct StoredLink {
+        #[serde(default)]
+        provider_session_id: Option<String>,
+        #[serde(default)]
+        provider_parent_message_id: Option<i64>,
+    }
+
+    let Ok(json) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    match serde_json::from_str::<StoredLink>(&json) {
+        Ok(stored) => (
+            stored.provider_session_id,
+            stored.provider_parent_message_id,
+        ),
+        Err(error) => {
+            tracing::warn!("could not read the stored session link from {path:?}: {error}");
+            (None, None)
+        }
+    }
 }
 
 pub fn load_local(id: &str, _config: &Config) -> AppResult<Session> {
@@ -340,8 +423,10 @@ mod tests {
         let meta = SessionMeta {
             tag: Some("Imported".to_string()),
             broken: true,
-            provider_session_id: Some("remote-123".to_string()),
-            provider_parent_message_id: Some(9),
+            remote: RemoteLink::Established {
+                session_id: "remote-123".to_string(),
+                parent_message_id: Some(9),
+            },
         };
 
         save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &meta)
@@ -374,5 +459,119 @@ mod tests {
             result.is_ok(),
             "list_sessions should not error on a corrupt file: {result:?}"
         );
+    }
+
+    /// Дефект, стоивший здоровой сессии связи с серверным тредом: прогон с
+    /// испорченным токеном не заводит серверной сессии, `session_identity()`
+    /// отдаёт `None`, и это «не знаю» записывалось как «связи нет».
+    #[test]
+    fn an_unknown_link_does_not_erase_the_stored_one() {
+        let id = "pooprusteek_test_session_unknown_link_preserves";
+        let config = Config::default();
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+        let _ = std::fs::remove_file(&path);
+
+        save_session(
+            id,
+            "2020-01-01T00:00:00Z",
+            &[],
+            &config,
+            "/tmp",
+            &SessionMeta {
+                remote: RemoteLink::Established {
+                    session_id: "remote-123".to_string(),
+                    parent_message_id: Some(9),
+                },
+                ..SessionMeta::default()
+            },
+        )
+        .expect("the first save must succeed");
+
+        // Второй прогон ничего про связь не узнал.
+        save_session(
+            id,
+            "2020-01-01T00:00:00Z",
+            &[ChatMessage::user("a later turn")],
+            &config,
+            "/tmp",
+            &SessionMeta::default(),
+        )
+        .expect("the second save must succeed");
+
+        let loaded = load_local(id, &config);
+        let _ = std::fs::remove_file(&path);
+
+        let session = loaded.expect("the session must load back");
+        assert_eq!(
+            session.provider_session_id.as_deref(),
+            Some("remote-123"),
+            "an unknown link must leave the stored one alone"
+        );
+        assert_eq!(session.provider_parent_message_id, Some(9));
+        assert_eq!(session.messages.len(), 1, "the turn itself must be saved");
+    }
+
+    /// Обратная сторона: прогон, который завёл свою серверную сессию,
+    /// обязан перезаписать прежнюю — иначе цепочка ходов уедет в чужой тред.
+    #[test]
+    fn an_established_link_replaces_the_stored_one() {
+        let id = "pooprusteek_test_session_established_link_wins";
+        let config = Config::default();
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+        let _ = std::fs::remove_file(&path);
+
+        for (session_id, parent) in [("first-remote", Some(1)), ("second-remote", Some(2))] {
+            save_session(
+                id,
+                "2020-01-01T00:00:00Z",
+                &[],
+                &config,
+                "/tmp",
+                &SessionMeta {
+                    remote: RemoteLink::Established {
+                        session_id: session_id.to_string(),
+                        parent_message_id: parent,
+                    },
+                    ..SessionMeta::default()
+                },
+            )
+            .expect("save must succeed");
+        }
+
+        let loaded = load_local(id, &config);
+        let _ = std::fs::remove_file(&path);
+
+        let session = loaded.expect("the session must load back");
+        assert_eq!(
+            session.provider_session_id.as_deref(),
+            Some("second-remote")
+        );
+        assert_eq!(session.provider_parent_message_id, Some(2));
+    }
+
+    /// Первого файла нет — переносить нечего, и это не ошибка.
+    #[test]
+    fn an_unknown_link_on_a_first_save_is_simply_absent() {
+        let id = "pooprusteek_test_session_unknown_link_first_save";
+        let config = Config::default();
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+        let _ = std::fs::remove_file(&path);
+
+        save_session(
+            id,
+            "2020-01-01T00:00:00Z",
+            &[],
+            &config,
+            "/tmp",
+            &SessionMeta::default(),
+        )
+        .expect("the first save must succeed");
+
+        let loaded = load_local(id, &config);
+        let _ = std::fs::remove_file(&path);
+
+        let session = loaded.expect("the session must load back");
+        assert_eq!(session.provider_session_id, None);
+        assert_eq!(session.provider_parent_message_id, None);
     }
 }

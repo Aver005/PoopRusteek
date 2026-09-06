@@ -3,6 +3,36 @@
 > Last updated: 2026-08-26 (**five-agent review of the day's context-compaction work**, **42** findings filed below under the prefix `compaction-review-2026-08-26 #N`. Now: **17 closed the same day** (the five data-loss fixes, then **#1, #2, #3, #16, #17**, then the evening batch **#4, #5, #6, #7, #8, #11, #26** — see the RESOLVED entries), **24 open** (#9, #10, #12-#15, #18-#25, #27-#36, spread HIGH 2 / MEDIUM 15 / LOW 7) and **1 accepted** (#37, `chars / 3`, owner decision). **#25 is two thirds closed** and stays open with its scope narrowed to the one third that remains (a verbatim `<template>` echo still validates). The evening batch closed the measurement-and-summary group: the context window is re-polled on every provider/model switch and goes to *unknown* — ladder off — the moment one starts, an old `[agent] auto_compact = false` is migrated instead of silently reversed, the prior summary reaches the summariser once instead of twice, mode 2 folds its chunk summaries into one form mechanically and gives each chunk its own upstream session, the harness driver applies `ToolOutputCleared` the way the TUI does, and mode 1 no longer drops what sits ahead of the first user message. Before, same day: the harness group is closed: the ladder is now reachable from a scenario (`[context]` table + provider-window discovery in the driver), a scenario can assert a rung actually fired (`[[expect.trace]]`), a run that produced nothing to judge is a failure, and the reserve no longer switches the ladder off on windows ≤ 20k. First scenario that exercises rung 1 end to end: `sandbox/scenarios/mock/rung-one-clears-tool-output.toml` (2/2; fails with exit 4 and `0 'context.prune' record(s)` once the window is taken away). `.docs/context-compaction.md` corrected in the same pass and given a «Известные расхождения» section. Before, same day: **context compaction steps 5-6**: rung 3 + `/compact` shipped, closing findings **#3** and **#4**. Tally re-counted against the entries below, because the two header lines had drifted apart: of the review's 20 findings, **9 are closed** (1, 2, 3, 4, 5, 11, 12, 15, 16), **1 refuted** (17), **10 open** (6, 7, 8, 9, 10, 13, 14, 18, 19, 20). Two new HIGH entries opened by the same work, both found by reading rather than by running: `/compact` is a no-op on DeepSeek and pollutes its server-side branch, and a stale doc comment in `src/context/summary.rs`. Before, same day: full-codebase review `.docs/review-2026-08-26-rust.md`, 20 findings — same-day fix batch closed 6 (1,2,5,11,12,16), see RESOLVED and `JOURNAL/2026-08-26.md`; the other 14 added below by severity, source of record is the review doc. Before, same day: the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
 > Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure), `.docs/review-2026-08-26-rust.md` (2026-08-26 full-codebase review, 20 numbered findings — 9 closed, 1 refuted, 10 open as of the evening of 2026-08-26; referenced by number below)
 
+## RESOLVED 2026-09-06 (3) — стирала не проверка, а сохранение
+
+Измерено приёмкой: прогон с испорченным токеном обнулил `provider_session_id`
+здоровой сессии, и следующий `--resume` получил `no_remote_session`. Тот же
+дефект, что чинили этажом выше, и та же ошибка чтения `Option`.
+
+- ✅ **HIGH — сохранение прогона стирало связь с серверным тредом.**
+  `session_identity()` отдаёт `None`, когда **этот** ход не заводил серверной
+  сессии (упал, или провайдер был сброшен), а `auto_save_session` и
+  харнессовый `persist` писали это `None` на диск как «связи нет». Одного
+  неудачного хода хватало, чтобы здоровая сессия потеряла тред навсегда —
+  причём тише некуда: файл сохранён, транскрипт цел, пропали два поля.
+  Теперь у записи есть тип для «не знаю»: `SessionMeta.remote: RemoteLink`
+  (`Established { session_id, parent_message_id }` | `Unknown`), и
+  `save_session` при `Unknown` переносит то, что уже лежит в файле.
+  Намеренное стирание живёт отдельной дверью — полная перезапись `Session`
+  через `save_local`, как делает `finalize_broken_session`.
+  `→ src/session.rs::RemoteLink`, `save_session`, `stored_link`
+- ⚠️ **Следствие, о котором стоит помнить.** Обещание, которое TUI даёт при
+  непроверяемой связи («the saved link on disk is left untouched»), было
+  правдой ровно до конца хода — автосохранение обнуляло то, что проверка
+  пощадила. Теперь правда. Урок общий: **не обещать пользователю
+  сохранность, пока все писатели файла не проверены**, а их трое
+  (`auto_save_session`, харнессовый `persist`, `goal.rs`).
+
+**Проверено:** тремя юнит-тестами (`Unknown` не стирает, `Established`
+перезаписывает, первый файл без связи) и воспроизведением целиком — прогон
+`--resume` против недоступного провайдера падает, `provider_session_id`
+и `parent_message_id` остаются, ход дописан в транскрипт.
+
 ## RESOLVED 2026-09-06 (2) — приёмка починки: ложно-положительная живость
 
 Внешняя приёмка (`pooprusteek-test/.memories/JOURNAL/2026-09-06-fix-review.md`)

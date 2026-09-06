@@ -450,8 +450,16 @@ impl App {
         // turn successfully — that's live proof the remote link works again,
         // so a previously-broken conversation is un-flagged here rather than
         // staying permanently yellow after it's actually recovered.
-        let identity = conv.provider.as_ref().and_then(|p| p.session_identity());
-        let broken = if identity.is_some() {
+        //
+        // No identity is **not** the opposite claim: it means this turn never
+        // established a session (it failed, or the provider was reset), and
+        // `RemoteLink::Unknown` leaves whatever is on disk alone. Writing the
+        // absence through erased the link of healthy sessions — one turn on
+        // an expired token was enough.
+        let remote = session::RemoteLink::from_identity(
+            conv.provider.as_ref().and_then(|p| p.session_identity()),
+        );
+        let broken = if remote.is_established() {
             false
         } else {
             conv.broken
@@ -459,8 +467,7 @@ impl App {
         let meta = session::SessionMeta {
             tag: conv.tag.clone(),
             broken,
-            provider_session_id: identity.as_ref().map(|(id, _)| id.clone()),
-            provider_parent_message_id: identity.and_then(|(_, pm)| pm),
+            remote,
         };
 
         // Snapshot everything now and hand the write (plus the follow-up
