@@ -591,7 +591,16 @@ async fn assemble(
     );
 
     let instructions = if config.instructions.enabled {
-        crate::instructions::load(workspace, config.instructions.max_bytes).section
+        // Только сама рабочая папка: копия шаблона живёт под `--out`, и
+        // цепочка вверх утаскивала в промпт `AGENTS.md` репозитория, внутри
+        // которого этот каталог оказался. Прогон обязан зависеть от своей
+        // фикстуры, а не от места запуска.
+        crate::instructions::load(
+            workspace,
+            config.instructions.max_bytes,
+            crate::instructions::Scope::WorkspaceOnly,
+        )
+        .section
     } else {
         String::new()
     };

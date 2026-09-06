@@ -26,6 +26,11 @@ pub struct RunReport {
     pub metrics: RunMetrics,
     /// Empty means the run met every expectation.
     pub failures: Vec<String>,
+    /// How many times this repeat had to be re-run because the provider
+    /// throttled it. Environment, not behaviour — but it must be visible, or
+    /// a quiet retry would flatter the numbers.
+    #[serde(default)]
+    pub rate_limited_retries: usize,
 }
 
 impl RunReport {
@@ -307,6 +312,15 @@ pub fn render_scenario(report: &ScenarioReport) -> String {
             report.aggregate.hint_rate * 100.0
         ),
     ];
+    // Пересдачи по лимиту показываем всегда, когда они были: прогон,
+    // придушенный провайдером, ничего не измерил, и молчаливая пересдача
+    // приукрасила бы числа.
+    let throttled: usize = report.runs.iter().map(|run| run.rate_limited_retries).sum();
+    if throttled > 0 {
+        lines.push(format!(
+            "  throttled  {throttled} repeat(s) re-run after a provider rate limit"
+        ));
+    }
     // Only shown for a conversation: a one-turn run is the norm and saying so
     // on every line would be noise.
     let turns: Vec<usize> = report.runs.iter().map(|run| run.outcome.turns).collect();
@@ -424,6 +438,7 @@ mod tests {
             index: 0,
             trace_path: PathBuf::from("t.jsonl"),
             workspace: None,
+            rate_limited_retries: 0,
             outcome: RunOutcome {
                 status: RunStatus::Completed,
                 trace_path: PathBuf::from("t.jsonl"),

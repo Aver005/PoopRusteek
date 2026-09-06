@@ -287,7 +287,11 @@ pub fn reload_instructions(state: &mut AppState, config: &Config) -> Option<Stri
         state.instructions_section.clear();
         return None;
     }
-    let loaded = crate::instructions::load(&state.workspace_path, config.instructions.max_bytes);
+    let loaded = crate::instructions::load(
+        &state.workspace_path,
+        config.instructions.max_bytes,
+        crate::instructions::Scope::UserAndAncestors,
+    );
     state.instructions_section = loaded.section;
     let names: Vec<String> = loaded
         .sources

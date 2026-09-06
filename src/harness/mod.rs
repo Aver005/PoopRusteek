@@ -261,8 +261,8 @@ pub struct MockArgs {
 pub async fn run(command: Command, config: Config, globals: GlobalFlags) -> AppResult<i32> {
     match command {
         Command::Exec(args) => exec(*args, config).await,
-        Command::Scenario(args) => scenario::run_one(args, globals).await,
-        Command::Suite(args) => scenario::run_suite(args, globals).await,
+        Command::Scenario(args) => scenario::run_one(args, &config, globals).await,
+        Command::Suite(args) => scenario::run_suite(args, &config, globals).await,
         Command::Mine(args) => mine::run(args),
         Command::MockProvider(args) => mock::run(args).await,
     }

@@ -40,28 +40,60 @@ pub struct Loaded {
     pub truncated: bool,
 }
 
+/// Откуда разрешено брать правила.
+///
+/// Различение появилось не от любви к настройкам: рабочая папка сценария
+/// лежит там, куда указал `--out`, и подъём по дереву утаскивал в промпт
+/// испытуемого `AGENTS.md` **чужого** репозитория, внутри которого оказался
+/// каталог отчётов. Один и тот же сценарий вёл себя по-разному в зависимости
+/// от того, где на диске его запустили, — для инструмента, который сравнивает
+/// поведение между прогонами, это отменяет сравнимость.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Как у человека в TUI: глобальные правила пользователя плюс цепочка
+    /// каталогов вверх до корня репозитория.
+    UserAndAncestors,
+    /// Только сама рабочая папка. Ни глобальных правил, ни соседей по дереву:
+    /// прогон обязан зависеть только от своей фикстуры. Сценарию, которому
+    /// нужны проектные инструкции, кладут их **в шаблон**.
+    WorkspaceOnly,
+}
+
 /// Загрузить правила для рабочей папки под бюджетом в байтах.
-pub fn load(workspace: &str, max_bytes: usize) -> Loaded {
+pub fn load(workspace: &str, max_bytes: usize, scope: Scope) -> Loaded {
     let mut found = Vec::new();
-    if let Some(global) = global_rules() {
+    if scope == Scope::UserAndAncestors
+        && let Some(global) = global_rules()
+    {
         found.push((true, global));
     }
     // Цепочка каталогов, а не один файл: так делают Codex, Claude Code и
     // Gemini CLI, и только так монорепозиторий видит и корневые правила, и
     // свои. Ближний к работе идёт последним — у хвоста внимание выше.
-    for project in chain(Path::new(workspace)) {
+    let workspace = Path::new(workspace);
+    let projects = match scope {
+        Scope::UserAndAncestors => chain(workspace),
+        Scope::WorkspaceOnly => first_in_dir(workspace).into_iter().collect(),
+    };
+    for project in projects {
         found.push((false, project));
     }
     let loaded = compose(found, max_bytes);
     // Счётчик файлов, а не только байт: размер плавает вместе с чужим
-    // репозиторием, а число источников — точная улика для харнесса.
+    // репозиторием, а число источников — точная улика для харнесса. Область
+    // здесь же: без неё по трассе не отличить «правил не было» от «их не
+    // пустили».
     crate::debug_log::log(
         "instructions.loaded",
         format!(
-            "files={} bytes={} truncated={}",
+            "files={} bytes={} truncated={} scope={}",
             loaded.sources.len(),
             loaded.section.len(),
-            loaded.truncated
+            loaded.truncated,
+            match scope {
+                Scope::UserAndAncestors => "user_and_ancestors",
+                Scope::WorkspaceOnly => "workspace_only",
+            }
         ),
     );
     loaded
@@ -515,8 +547,54 @@ mod tests {
     fn load_reports_its_sources() {
         let repo = TempRepo::new("load");
         let path = repo.write("AGENTS.md", "Project rules here.");
-        let loaded = load(repo.0.to_str().unwrap(), BUDGET);
+        let loaded = load(repo.0.to_str().unwrap(), BUDGET, Scope::UserAndAncestors);
         assert!(loaded.sources.contains(&path), "{loaded:?}");
         assert!(loaded.section.contains("Project rules here."));
+    }
+
+    /// Герметичность: рабочая папка сценария не имеет права утащить в промпт
+    /// `AGENTS.md` репозитория, внутри которого её случайно создали. Иначе
+    /// результат прогона зависит от того, где на диске лежит `--out`.
+    #[test]
+    fn a_workspace_only_load_ignores_the_enclosing_repository() {
+        let repo = TempRepo::new("scope_hermetic");
+        repo.write("AGENTS.md", "rules of the enclosing repository");
+        let workspace = repo.sub("reports/run-0-workspace");
+        let workspace = workspace.to_string_lossy().to_string();
+
+        let inherited = load(&workspace, BUDGET, Scope::UserAndAncestors);
+        assert!(
+            inherited
+                .section
+                .contains("rules of the enclosing repository"),
+            "the TUI behaviour must not change: {:?}",
+            inherited.sources
+        );
+
+        let hermetic = load(&workspace, BUDGET, Scope::WorkspaceOnly);
+        assert!(
+            hermetic.sources.is_empty(),
+            "a scenario workspace must inherit nothing: {:?}",
+            hermetic.sources
+        );
+        assert!(hermetic.section.is_empty(), "{}", hermetic.section);
+    }
+
+    /// Обратная сторона: правила, лежащие **в самой** рабочей папке, — часть
+    /// фикстуры и обязаны читаться.
+    #[test]
+    fn a_workspace_only_load_still_reads_its_own_rules() {
+        let repo = TempRepo::new("scope_own_rules");
+        let workspace = repo.sub("fixture");
+        repo.write("fixture/AGENTS.md", "rules of the fixture");
+
+        let loaded = load(
+            &workspace.to_string_lossy().to_string(),
+            BUDGET,
+            Scope::WorkspaceOnly,
+        );
+
+        assert_eq!(loaded.sources.len(), 1, "{:?}", loaded.sources);
+        assert!(loaded.section.contains("rules of the fixture"));
     }
 }

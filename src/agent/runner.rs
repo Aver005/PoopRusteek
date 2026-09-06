@@ -7,7 +7,7 @@ use crate::agent::tool_parser::{
 use crate::agent::tools_step::{ToolExecContext, run_tool_calls};
 use crate::agent::trace::{self, StepTrace};
 use crate::app::conversation::ConversationId;
-use crate::app::events::{AgentEvent, AgentResult, AppEvent};
+use crate::app::events::{AgentEvent, AgentResult, AppEvent, ToolCallInfo};
 use crate::app::runtime::TurnSpec;
 use crate::debug_log;
 use crate::mcp::MCPManager;
@@ -154,9 +154,12 @@ pub async fn run_agent_loop(
                 &trace,
                 &mut retries,
                 &mut messages,
-                &raw,
-                &visible_text,
-                &parse_errors,
+                StepText {
+                    raw: &raw,
+                    visible: &visible_text,
+                    parse_errors: &parse_errors,
+                },
+                &collected_tool_calls,
             ) {
                 StepEnd::Retry => continue,
                 StepEnd::Answer(text) => {
@@ -278,6 +281,16 @@ fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> Result<StreamN
     }
 }
 
+/// Что шаг вынул из ответа модели, кроме самих вызовов: сырой текст (его
+/// ждёт провайдер с полной историей), видимая часть и ошибки разбора.
+/// Вместе, потому что порознь они не значат ничего и разъезжаются по
+/// сигнатурам.
+struct StepText<'a> {
+    raw: &'a str,
+    visible: &'a str,
+    parse_errors: &'a [String],
+}
+
 /// Шаг без вызовов инструментов: сломанный `<tool_use>`, пустой ответ или
 /// готовый текст. Границы повторов держит `RetryBudget`.
 fn finish_or_retry(
@@ -285,10 +298,14 @@ fn finish_or_retry(
     trace: &StepTrace,
     retries: &mut RetryBudget,
     messages: &mut Vec<ChatMessage>,
-    raw: &str,
-    visible: &str,
-    parse_errors: &[String],
+    step: StepText<'_>,
+    done_so_far: &[ToolCallInfo],
 ) -> StepEnd {
+    let StepText {
+        raw,
+        visible,
+        parse_errors,
+    } = step;
     // Ноль разобранных вызовов при непустых ошибках — это сломанный блок, а
     // не финальный ответ. Молча закончить ход здесь и значило «агент завис».
     if !parse_errors.is_empty() {
@@ -329,11 +346,37 @@ fn finish_or_retry(
         ))));
         return StepEnd::Retry;
     }
-    trace.turn_error("status=empty_response_exhausted");
-    ctx.emit(AgentEvent::Failed(
-        "The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request.".to_string(),
+    trace.turn_error(&format!(
+        "status=empty_response_exhausted tool_calls={}",
+        done_so_far.len()
     ));
+    ctx.emit(AgentEvent::Failed(empty_reply_message(done_so_far)));
     StepEnd::GiveUp
+}
+
+/// Как объяснить ход, оборвавшийся на пустых ответах.
+///
+/// Про **шаг** сказать «ничего не сделано» можно, про **ход** — нет: к этому
+/// месту цикл держит список уже выполненных вызовов, и семь правок файла
+/// вполне могли быть сделаны до того, как модель замолчала. Прежняя константа
+/// утверждала обратное, и это толкало повторять запрос поверх уже изменённых
+/// файлов — самый дорогой способ ошибиться.
+fn empty_reply_message(done_so_far: &[ToolCallInfo]) -> String {
+    if done_so_far.is_empty() {
+        return "The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request."
+            .to_string();
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for call in done_so_far {
+        if !names.contains(&call.name.as_str()) {
+            names.push(&call.name);
+        }
+    }
+    format!(
+        "The model went silent (empty replies) before giving a final answer, but this turn had already run {} tool call(s) ({}). Work may already be done — check the result before repeating the request, or ask the model to continue.",
+        done_so_far.len(),
+        names.join(", ")
+    )
 }
 
 /// How full the window is, from the one source that knows. A provider holding
@@ -927,6 +970,49 @@ mod tests {
         );
     }
 
+    /// Ход, который уже сделал работу, не имеет права отчитываться «ничего не
+    /// изменено»: пользователь на такой отчёт повторяет запрос и накладывает
+    /// правку второй раз на уже изменённый файл.
+    #[test]
+    fn a_turn_that_did_work_is_not_reported_as_having_changed_nothing() {
+        let done = [
+            tool_call_info("read_file"),
+            tool_call_info("edit"),
+            tool_call_info("edit"),
+        ];
+        let message = empty_reply_message(&done);
+        assert!(
+            !message.contains("Nothing was changed"),
+            "the turn edited files: {message}"
+        );
+        assert!(
+            message.contains('3'),
+            "the count must be visible: {message}"
+        );
+        // Имена без повторов — чтобы «edit, edit» не выглядело как список.
+        assert!(message.contains("read_file, edit"), "{message}");
+        assert!(
+            message.contains("check the result"),
+            "the user must be steered away from blindly repeating: {message}"
+        );
+    }
+
+    /// Обратная сторона: ход, который правда ничего не сделал, обязан
+    /// говорить именно это.
+    #[test]
+    fn a_turn_that_did_nothing_still_says_so() {
+        let message = empty_reply_message(&[]);
+        assert!(message.contains("Nothing was changed"), "{message}");
+    }
+
+    fn tool_call_info(name: &str) -> ToolCallInfo {
+        ToolCallInfo {
+            name: name.to_string(),
+            arguments: serde_json::Value::Null,
+            result: None,
+        }
+    }
+
     #[tokio::test]
     async fn agent_loop_reports_an_error_when_every_reply_is_empty() {
         // One more empty reply than the budget allows.
@@ -943,9 +1029,12 @@ mod tests {
         );
         let message = error.expect("empty turn should surface an error");
         assert!(message.contains("empty"), "{message}");
+        // Этот ход и правда ничего не сделал — ни одного вызова. Про ход,
+        // который сделал, утверждение обратное: см.
+        // `a_turn_that_did_work_is_not_reported_as_having_changed_nothing`.
         assert!(
             message.contains("Nothing was changed"),
-            "the message must say no work happened: {message}"
+            "a turn with no tool calls must say no work happened: {message}"
         );
     }
 

@@ -83,6 +83,13 @@ pub struct Scenario {
     pub save_session: bool,
     /// Default repeat count; `--repeat` on the command line wins.
     pub repeat: Option<usize>,
+    /// Gap between repeats, in milliseconds. Absent takes the runner's own
+    /// `[agent] rate_limit_ms`, because the thing being spaced out is exactly
+    /// what that setting throttles. Each repeat is a separate process, so the
+    /// client-side limiter's window resets every time and cannot protect a
+    /// *series* by construction — on a live provider a run of three or more
+    /// repeats throttles itself without this.
+    pub spacing_ms: Option<u64>,
     /// Compaction settings for this scenario's turns, forwarded to the child
     /// as flags. Without them the ladder measures against an unknown window
     /// and never runs, which is why no scenario could reach rungs 1-3.
@@ -153,6 +160,11 @@ pub struct Expect {
     /// *inside* the agent loop, which is where the compaction ladder lives.
     #[serde(default)]
     pub trace: Vec<TraceExpect>,
+    /// "If the answer claims this, the trace must show the agent looked."
+    /// The only expectation that can catch an answer stating file contents
+    /// the agent never read — see [`GroundedExpect`].
+    #[serde(default)]
+    pub grounded: Vec<GroundedExpect>,
     /// Fraction of repeats that must pass. Defaults to 1.0.
     pub min_pass_rate: Option<f64>,
 }
@@ -200,6 +212,30 @@ impl TraceExpect {
             _ => Ok(()),
         }
     }
+}
+
+/// One "claiming it requires having looked" assertion.
+///
+/// Why it exists: an agent that describes a file it never opened passes every
+/// other check. `final_matches` asks whether a name appears in the answer, and
+/// a fabricated answer contains the right names — the invention lives in the
+/// *contents*, mixed in with real data and stated in the same confident tone.
+/// Nor can the check compare the answer against the file: what is invented
+/// does not match the file by definition.
+///
+/// So the assertion is conditional and mechanical: **if** the answer matches
+/// `pattern`, **then** some tool call's arguments must have named
+/// `requires_read`. Reading and then lying is still possible, but claiming
+/// without looking — the failure actually observed — becomes visible.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedExpect {
+    /// Regex over the final answer that means "the answer speaks about this".
+    pub pattern: String,
+    /// Path fragment that must appear in the arguments of some tool call.
+    /// A fragment, not an exact path, because the same file is reached as
+    /// `data/records.csv`, `./data/records.csv` or through a shell command.
+    pub requires_read: String,
 }
 
 /// One "this file must contain this" assertion.
@@ -299,6 +335,18 @@ impl Expect {
         for pattern in &self.final_not_matches {
             if compile(pattern)?.is_match(&outcome.final_text) {
                 failures.push(format!("final answer matches forbidden /{pattern}/"));
+            }
+        }
+
+        for grounded in &self.grounded {
+            if !compile(&grounded.pattern)?.is_match(&outcome.final_text) {
+                continue;
+            }
+            if !trace_shows_a_look_at(trace, &grounded.requires_read) {
+                failures.push(format!(
+                    "the answer speaks about /{}/ but no tool call ever named '{}' — it is describing what it did not look at",
+                    grounded.pattern, grounded.requires_read
+                ));
             }
         }
 
@@ -548,13 +596,18 @@ impl Scenario {
     }
 }
 
-pub async fn run_one(args: ScenarioArgs, globals: GlobalFlags) -> AppResult<i32> {
+pub async fn run_one(
+    args: ScenarioArgs,
+    config: &crate::config::Config,
+    globals: GlobalFlags,
+) -> AppResult<i32> {
     let scenario = Scenario::load(&args.file)?;
     let report = execute(
         &scenario,
         args.repeat,
         &args.out,
         args.concurrency,
+        config,
         &globals,
     )
     .await?;
@@ -566,7 +619,11 @@ pub async fn run_one(args: ScenarioArgs, globals: GlobalFlags) -> AppResult<i32>
     })
 }
 
-pub async fn run_suite(args: SuiteArgs, globals: GlobalFlags) -> AppResult<i32> {
+pub async fn run_suite(
+    args: SuiteArgs,
+    config: &crate::config::Config,
+    globals: GlobalFlags,
+) -> AppResult<i32> {
     let files = collect_scenarios(&args.dir)?;
     if files.is_empty() {
         return Err(AppError::Custom(format!(
@@ -583,6 +640,7 @@ pub async fn run_suite(args: SuiteArgs, globals: GlobalFlags) -> AppResult<i32> 
             args.repeat,
             &args.out,
             args.concurrency,
+            config,
             &globals,
         )
         .await?;
@@ -631,6 +689,7 @@ async fn execute(
     repeat_override: Option<usize>,
     out: &Path,
     concurrency: usize,
+    config: &crate::config::Config,
     globals: &GlobalFlags,
 ) -> AppResult<ScenarioReport> {
     let repeats = repeat_override
@@ -642,6 +701,7 @@ async fn execute(
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Custom(format!("{}: {e}", dir.display())))?;
 
+    let spacing = spacing(scenario, config);
     let permits = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = Vec::with_capacity(repeats);
     for index in 0..repeats {
@@ -668,12 +728,17 @@ async fn execute(
         };
         tasks.push(tokio::spawn(async move {
             let _permit = permits.acquire().await;
+            // Отступ берётся уже под пропуском: при `--concurrency 1` это
+            // пауза между прогонами, а не задержка старта всей серии.
+            if index > 0 && !spacing.is_zero() {
+                tokio::time::sleep(spacing).await;
+            }
             let child = ChildRun {
                 trace_path: &trace_path,
                 resume: resume.as_deref(),
                 globals: &globals,
             };
-            let outcome = spawn_run(&scenario, &child).await;
+            let outcome = run_repeat(&scenario, &child).await;
             (index, trace_path, scratch, outcome)
         }));
     }
@@ -682,7 +747,10 @@ async fn execute(
     for task in futures::future::join_all(tasks).await {
         let (index, trace_path, scratch, outcome) =
             task.map_err(|e| AppError::Custom(format!("scenario run task failed: {e}")))?;
-        let outcome = outcome?;
+        let Repeat {
+            outcome,
+            rate_limited_retries,
+        } = outcome?;
         // A missing trace is itself a finding, not a hard error: the child
         // may have died before writing one.
         let trace = Trace::read(&trace_path).unwrap_or_default();
@@ -697,6 +765,7 @@ async fn execute(
             outcome,
             metrics,
             failures,
+            rate_limited_retries,
         });
     }
     runs.sort_by_key(|run| run.index);
@@ -730,6 +799,18 @@ fn plant_session(template: &Path) -> AppResult<String> {
     crate::session::save_local(&session, &crate::config::Config::default())
         .map_err(|e| AppError::Custom(format!("planting {}: {e}", template.display())))?;
     Ok(session.id)
+}
+
+/// Did any tool call's arguments name this path fragment?
+///
+/// Any tool counts, not just `read_file`: `bash cat`, `powershell Get-Content`
+/// and a grep all amount to having looked, and a check that only recognised
+/// one tool would accuse an honest run.
+fn trace_shows_a_look_at(trace: &Trace, fragment: &str) -> bool {
+    trace
+        .by_action("agent.tool.call.payload")
+        .filter_map(|record| record.data.as_ref()?.get("arguments"))
+        .any(|arguments| arguments.to_string().contains(fragment))
 }
 
 /// The child's whole command line. Every flag comes first and the turns last,
@@ -805,6 +886,62 @@ fn exec_args(scenario: &Scenario, child: &ChildRun) -> Vec<std::ffi::OsString> {
 fn push_flag(args: &mut Vec<std::ffi::OsString>, name: &str, value: impl AsRef<std::ffi::OsStr>) {
     args.push(name.into());
     args.push(value.as_ref().to_owned());
+}
+
+/// Пауза между повторами. Сценарий решает сам; иначе берём то, чем этот же
+/// конфиг тормозит отправку — величина ровно про ту же нагрузку.
+fn spacing(scenario: &Scenario, config: &crate::config::Config) -> Duration {
+    Duration::from_millis(scenario.spacing_ms.unwrap_or(config.agent.rate_limit_ms))
+}
+
+/// Backoff before re-running a repeat the provider throttled. Two attempts,
+/// generously spaced: the limiter that fired is a per-minute one, so trying
+/// again in a second only feeds it.
+const RATE_LIMIT_BACKOFF: [Duration; 2] = [Duration::from_secs(20), Duration::from_secs(50)];
+
+/// Один повтор и то, что о нём стоит знать сверх исхода.
+struct Repeat {
+    outcome: RunOutcome,
+    /// Сколько раз повтор пришлось перезапустить из-за лимита провайдера.
+    rate_limited_retries: usize,
+}
+
+/// Прогнать повтор, пересдав его, если провайдер придушил серию.
+///
+/// Лимит провайдера — свойство площадки, а не проверяемого поведения:
+/// повторы идут отдельными процессами, клиентский ограничитель живёт в
+/// процессе, и защитить серию он не может устройством. Прогон, убитый
+/// лимитом, ничего не измерил, поэтому он пересдаётся, а не засчитывается
+/// провалом — иначе «3 из 6» читается как нестабильность агента.
+async fn run_repeat(scenario: &Scenario, child: &ChildRun<'_>) -> AppResult<Repeat> {
+    let mut rate_limited_retries = 0;
+    loop {
+        let outcome = spawn_run(scenario, child).await?;
+        if !is_rate_limited(&outcome) {
+            return Ok(Repeat {
+                outcome,
+                rate_limited_retries,
+            });
+        }
+        let Some(backoff) = RATE_LIMIT_BACKOFF.get(rate_limited_retries) else {
+            return Ok(Repeat {
+                outcome,
+                rate_limited_retries,
+            });
+        };
+        rate_limited_retries += 1;
+        tokio::time::sleep(*backoff).await;
+    }
+}
+
+/// Провайдер придушил запрос? Совпадение по его собственному коду причины
+/// (`rate_limit_reached`), который доезжает в текст ошибки прогона.
+fn is_rate_limited(outcome: &RunOutcome) -> bool {
+    outcome.status != RunStatus::Completed
+        && outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("rate_limit"))
 }
 
 /// Run one repeat as `pooprusteek exec --json`, killing it if it outlives
@@ -1636,5 +1773,59 @@ session_template = \"fixtures/chat.json\"
             serde_json::from_str::<crate::session::Session>(&text)
                 .unwrap_or_else(|error| panic!("{}: {error}", template.display()));
         }
+    }
+
+    /// Класс дефектов, который харнесс до сих пор не видел: ответ описывает
+    /// содержимое файла, которого агент не открывал. Проверка условная —
+    /// заговорил про файл, значит в трассе обязан быть вызов, назвавший его.
+    #[test]
+    fn claiming_a_file_the_agent_never_opened_is_a_failure() {
+        let expect = Expect {
+            grounded: vec![GroundedExpect {
+                pattern: "warehouse,quantity".to_string(),
+                requires_read: "records.csv".to_string(),
+            }],
+            ..Expect::default()
+        };
+        let outcome = outcome(
+            RunStatus::Completed,
+            "The file holds warehouse,quantity rows: A 10, B 5.",
+        );
+        let metrics = ran();
+
+        // Трасса, в которой читали совсем другой файл.
+        let elsewhere = Trace::parse(
+            r#"{"seq":1,"ts":"t","action":"agent.tool.call.payload","data":{"tool_name":"read_file","arguments":{"path":"README.md"}}}"#,
+        );
+        let failures = expect.check(&outcome, &metrics, &elsewhere, None).unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("records.csv"), "{failures:?}");
+
+        // Тот же ответ, но файл действительно открывали — претензий нет.
+        let looked = Trace::parse(
+            r#"{"seq":1,"ts":"t","action":"agent.tool.call.payload","data":{"tool_name":"bash","arguments":{"command":"cat data/records.csv"}}}"#,
+        );
+        assert!(
+            expect
+                .check(&outcome, &metrics, &looked, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Ответ, который про файл вовсе не говорит, ни к чему не обязывает:
+    /// проверка ловит утверждение без основания, а не молчание.
+    #[test]
+    fn saying_nothing_about_the_file_requires_nothing() {
+        let expect = Expect {
+            grounded: vec![GroundedExpect {
+                pattern: "warehouse,quantity".to_string(),
+                requires_read: "records.csv".to_string(),
+            }],
+            ..Expect::default()
+        };
+        let outcome = outcome(RunStatus::Completed, "I listed the folder and stopped.");
+        let failures = expect.check(&outcome, &ran(), &no_trace(), None).unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
     }
 }
