@@ -10,7 +10,7 @@ impl Command for DebugCommand {
     }
 
     fn description(&self) -> &str {
-        "Toggle debug logging to .dev/debug.log"
+        "Toggle the developer debug log"
     }
 
     fn usage(&self) -> &str {
@@ -31,11 +31,14 @@ impl Command for DebugCommand {
         }
 
         let message = if target {
-            "Debug logging enabled — writing to .dev/debug.log"
+            format!(
+                "Debug logging enabled — writing to {}",
+                crate::debug_log::path().display()
+            )
         } else {
-            "Debug logging disabled"
+            "Debug logging disabled".to_string()
         };
-        state.push_system(message);
+        state.push_system(&message);
 
         CommandResult::Handled
     }

@@ -2,9 +2,6 @@
 /target/
 /**/target/
 
-# Cargo lockfiles
-Cargo.lock
-
 # Rust build artifacts (extra safety)
 /*.rs.bk
 **/*.rmeta

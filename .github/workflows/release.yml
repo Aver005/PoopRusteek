@@ -1,0 +1,131 @@
+name: Release
+
+# Стабильный релиз по тегу vX.Y.Z (ставит scripts/release.sh). Публикуется как
+# «Latest» — это канал обновлений `stable` (releases/latest/download/manifest.json).
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml and CHANGELOG
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Канал stable = «Latest» на GitHub, пререлизам туда нельзя.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::stable releases need a plain X.Y.Z version, got ${VERSION}"
+            exit 1
+          fi
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} doesn't match Cargo.toml version ${VERSION}"
+            exit 1
+          fi
+          if [ -z "$(bash scripts/ci/changelog-section.sh "$VERSION")" ]; then
+            echo "::error::CHANGELOG.md has no section for ${VERSION}"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: verify
+    uses: ./.github/workflows/checks.yml
+
+  build:
+    needs: checks
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    name: Publish release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: release-assets
+
+      - name: Collect assets, manifest and checksums
+        shell: bash
+        run: bash scripts/ci/collect-assets.sh release-assets "$VERSION" "$TAG" "${{ github.sha }}"
+
+      - name: Render release notes
+        shell: bash
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          export CHANGES="$(bash scripts/ci/changelog-section.sh "$VERSION")"
+          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "${TAG}^" 2>/dev/null || git rev-list --max-parents=0 HEAD | tail -1)
+          export PREVIOUS_TAG="$PREV"
+          bash scripts/render-release-notes.sh scripts/stable-release.template.md release-body.md \
+            VERSION TAG REPO_URL CHANGES PREVIOUS_TAG
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Pooprusteek ${{ needs.verify.outputs.version }}
+          prerelease: false
+          make_latest: "true"
+          body_path: release-body.md
+          preserve_order: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/pooprusteek-*
+            release-assets/install.sh
+            release-assets/SHA256SUMS
+            release-assets/manifest.json
+
+  # TODO(0.3.0): удалить. Сборки ≤0.1.0 обновлялись с тега `latest` по SHA256SUMS —
+  # переводим их на stable, дальше они сами ходят по manifest.json. Отдельная джоба:
+  # её можно перезапустить, не публикуя релиз заново.
+  legacy-latest:
+    name: Refresh legacy `latest` channel
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download the published assets
+        shell: bash
+        run: |
+          mkdir -p legacy-assets
+          gh release download "$TAG" --dir legacy-assets --pattern 'pooprusteek-*' --pattern SHA256SUMS
+      - name: Point `latest` at this release
+        shell: bash
+        run: |
+          git tag -f latest
+          git push origin latest --force
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest legacy-assets/* --clobber
+            gh release edit latest --prerelease --latest=false --title "Legacy update channel (→ ${TAG})"
+          else
+            gh release create latest legacy-assets/* --prerelease --latest=false \
+              --title "Legacy update channel (→ ${TAG})" \
+              --notes "Kept only so builds ≤ 0.1.0 can self-update. Download ${TAG} instead."
+          fi

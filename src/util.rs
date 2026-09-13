@@ -196,6 +196,20 @@ pub fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// `assets/` исходников — только в debug-сборке, чтобы правки промптов шли без пересборки.
+/// Release берёт лишь встроенные копии: файл из cwd или рядом с exe их не подменит.
+pub fn dev_assets_dir() -> Option<std::path::PathBuf> {
+    source_assets_dir(cfg!(debug_assertions))
+}
+
+fn source_assets_dir(debug_build: bool) -> Option<std::path::PathBuf> {
+    if !debug_build {
+        return None;
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    dir.is_dir().then_some(dir)
+}
+
 /// Total physical RAM in bytes, or `None` when it can't be determined.
 /// Best-effort and platform-specific; never panics. Used to size
 /// memory-bounded work (the embedder batch) to the host it runs on.
@@ -256,6 +270,13 @@ pub fn total_ram_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_build_never_reads_source_assets() {
+        // Тесты — debug-сборка, поэтому release-ветку проверяем явно.
+        assert_eq!(source_assets_dir(false), None);
+        assert!(source_assets_dir(true).is_some_and(|dir| dir.ends_with("assets")));
+    }
 
     /// Encode as UTF-16LE the way a Windows console tool does.
     fn utf16le(text: &str) -> Vec<u8> {

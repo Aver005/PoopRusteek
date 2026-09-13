@@ -31,7 +31,7 @@ use config::Config;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "pooprusteek")]
+#[command(name = "pooprusteek", version)]
 #[command(about = "A fast TUI coding agent powered by DeepSeek")]
 struct Args {
     #[arg(long)]
@@ -84,6 +84,7 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let args = Args::parse();
+    update::register_running_instance();
 
     // Раньше всех: и журнал, и хранилище откатов читают `Config::data_dir()`
     // на старте, а перенаправить их после этого уже нечем.

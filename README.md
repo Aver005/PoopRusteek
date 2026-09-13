@@ -80,18 +80,36 @@ Markdown + syntax highlighting, streaming with a live thinking indicator, multi-
 
 ## 📦 Installation
 
-```bash
-cargo install --path .
+**Windows** — grab **`pooprusteek-setup.exe`** from the
+[latest release](https://github.com/Aver005/pooprusteek/releases/latest) and click
+through: pick a folder, press Install. No admin rights. It adds `pooprusteek` to
+your PATH and the Start menu and registers an uninstaller in *Apps*. Uninstalling
+asks whether to delete your settings and sessions too. The installer isn't
+code-signed yet, so SmartScreen may warn: *More info → Run anyway*.
+
+**macOS (Apple Silicon) · Linux (x86_64 / arm64)**
+
+```sh
+curl -fsSL https://github.com/Aver005/pooprusteek/releases/latest/download/install.sh | sh
 ```
 
-Requires a Rust toolchain (edition 2024, MSRV 1.91).
+Installs to `~/.local/bin` and adds it to PATH. Options go after `sh -s --`:
+`--dir <path>`, `--channel dev`, `--uninstall`. Linux builds need glibc 2.39+
+(Ubuntu 24.04 / Debian 13 or newer); Intel Macs aren't supported, since ONNX
+Runtime ships no prebuilt library for them.
+
+The folder you install into is also where `/update` puts new versions, so it
+must stay writable by you.
+
+**From source** — `cargo install --path .` (Rust edition 2024, MSRV 1.91).
 
 ## 🚀 Usage
 
 ```bash
 pooprusteek            # launch the TUI
 pooprusteek --acp      # run as an ACP server (JSON-RPC over stdio, for IDEs)
-pooprusteek --debug_log  # write a debug log to .dev/debug.log
+pooprusteek --version  # print the version
+pooprusteek --debug-log  # developer debug log (data dir; .dev/ in debug builds)
 ```
 
 On first launch, an onboarding flow helps you set your DeepSeek token and model.
@@ -168,7 +186,7 @@ On first launch, an onboarding flow helps you set your DeepSeek token and model.
 |---------|-------------|
 | `/rate <ms>\|<N>/min\|off` | Rate limit: ms between requests and/or max requests per minute |
 | `/retry <N\|on\|off\|-1>` | Max retries on API failure (-1 = infinite) |
-| `/update` · `/autoupdate [on\|off]` | Self-update from the `latest` release now · toggle the startup auto-check |
+| `/update [channel stable\|dev]` · `/autoupdate [on\|off]` | Self-update now or pick the update channel · toggle the startup auto-check |
 | `/debug [on\|off]` | Toggle debug logging to `.dev/debug.log` (no args = switch) |
 | `/help` · `/version` · `/quit` | Help · version · exit |
 
@@ -210,30 +228,41 @@ mcp_schemas = "auto"    # "auto" (defer above 12 tools) | "full" | "deferred"
 
 ## ⬆️ Self-update
 
-**`/update`** compares the SHA-256 of the running binary against the
-`SHA256SUMS` asset of the GitHub Release tagged **`latest`**; on a mismatch it
-downloads the raw platform binary, verifies its hash, stages it next to the
-current one, and swaps it in (the new binary applies on the next launch — a
-running executable is renamed aside, never overwritten live). **`/autoupdate
-on`** runs that check in the background on every startup (off by default —
-`[update] auto`). In a `cargo run` dev build `/update` asks for confirmation
-first, since a debug binary always differs from the release.
+**`/update`** checks your update channel and installs a newer build. The
+binary is downloaded, verified against the release's `manifest.json`, staged
+next to the current one and swapped in. It takes effect on the next launch,
+because a running executable is renamed aside rather than overwritten.
+**`/autoupdate on`** runs the same check in the background on every startup
+(off by default, `[update] auto`).
 
-CI publishes that channel: the `publish` job (`.github/workflows/ci.yml`)
-extracts the raw per-platform binaries, writes `SHA256SUMS` over them, and
-force-re-points the `latest` tag/release at every successful `develop`
-release — ordered after the versioned release so a failed publish never moves
-`latest`.
+| Channel | Source | Installs when |
+|---|---|---|
+| `stable` (default) | the latest tagged release `vX.Y.Z` | its version is **newer** than yours; never downgrades |
+| `dev` | the rolling `dev` prerelease, rebuilt on every `develop` push | the binary differs from yours |
 
-> [!IMPORTANT]
-> Two things must stay in lock-step: the raw asset names in
-> `update::platform_asset()` and the CI extraction step, and the `latest` tag
-> in `update::RELEASE_DOWNLOAD_BASE` and the CI tag/release steps. The full
-> list of load-bearing contract points lives in
-> [`.memories/reference/AUTO-UPDATE.md`](.memories/reference/AUTO-UPDATE.md).
-> Note the check is identity ("am I exactly `latest`"), not version ordering —
-> there's no downgrade protection, and integrity (not authenticity) is
-> guaranteed: trust rests on TLS + GitHub, there's no binary signing yet.
+Switch with `/update channel stable|dev` (`[update] channel`). In a
+`cargo run` dev build `/update` asks for confirmation first.
+
+Releases are cut with `scripts/release.sh patch|minor|major` (see
+[Releasing](#-releasing)). Integrity is guaranteed, authenticity isn't: trust
+rests on TLS + GitHub, and binaries aren't signed yet. The contract between the
+app and CI lives in
+[`.memories/reference/AUTO-UPDATE.md`](.memories/reference/AUTO-UPDATE.md).
+
+## 🔖 Releasing
+
+```sh
+bash scripts/release.sh minor      # or patch | major | 1.4.0; --dry-run to preview
+```
+
+The script checks that you're on a clean, up-to-date `develop` and that
+`CHANGELOG.md` has something under `[Unreleased]`. It then bumps `Cargo.toml`,
+turns `[Unreleased]` into the new version section, commits
+`chore(release): 🔖 Release vX.Y.Z`, tags it and pushes both. Pushing the tag
+starts `.github/workflows/release.yml`, which runs the checks and builds every
+platform plus the Windows installer. It publishes the GitHub release that the
+`stable` channel and `install.sh` read. Details:
+[`.memories/reference/RELEASING.md`](.memories/reference/RELEASING.md).
 
 ## 🏗️ Architecture
 
@@ -260,7 +289,7 @@ main ─ App (thin coordinator on a single select! loop)
 
 ```
 src/
-├── main.rs        — entry point, CLI flags (--acp, --debug_log), file-based tracing
+├── main.rs        — entry point, CLI flags (--acp, --debug-log, --version), file-based tracing
 ├── app/           — coordinator: conversations, event loop, runtime, keys, goal,
 │                    multichat, search screen, providers panel
 ├── provider/      — DeepSeek web API (auth, PoW, SSE, sessions) + OpenAI-compat,

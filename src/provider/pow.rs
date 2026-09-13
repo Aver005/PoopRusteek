@@ -2,15 +2,15 @@ use crate::debug_log;
 use crate::error::{AppError, AppResult};
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use wasmtime::{Engine, Linker, Memory, Module, Store, TypedFunc};
 
 const WASM_ASSET_NAME: &str = "sha3_wasm_bg.7b9ca65ddd.wasm";
 /// DeepSeek's own solver, embedded so an installed binary works with no
 /// `assets/` folder nearby (the compile-time `CARGO_MANIFEST_DIR` fallback
-/// broke as soon as the source checkout moved). A file on disk still wins —
-/// see [`WasmPowRuntime::load`].
+/// broke as soon as the source checkout moved). A debug build prefers the
+/// checkout's copy — see [`resolve_wasm_path`].
 const EMBEDDED_WASM: &[u8] = include_bytes!("../../assets/sha3_wasm_bg.7b9ca65ddd.wasm");
 static WASM_RUNTIME: OnceLock<Result<WasmPowRuntime, String>> = OnceLock::new();
 
@@ -129,9 +129,8 @@ fn get_wasm_runtime() -> Result<&'static WasmPowRuntime, String> {
 
 impl WasmPowRuntime {
     fn load() -> Result<Self, String> {
-        // A wasm file on disk (dev checkout / manual drop-in) overrides the
-        // embedded copy, so a newer upstream solver takes effect without a
-        // rebuild; with no file anywhere the binary is self-contained.
+        // В debug-сборке wasm из исходников перекрывает встроенный — новый
+        // солвер работает без пересборки; release самодостаточен.
         let (bytes, source) = match resolve_wasm_path() {
             Some(path) => {
                 let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
@@ -252,16 +251,9 @@ fn read_f64(store: &Store<()>, memory: &Memory, offset: usize) -> Result<f64, St
     Ok(f64::from_le_bytes(bytes))
 }
 
+/// Wasm из исходников в debug-сборке; release всегда берёт встроенный.
 fn resolve_wasm_path() -> Option<PathBuf> {
-    let asset_rel = Path::new("assets").join(WASM_ASSET_NAME);
-    let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join(&asset_rel);
-    let cwd_candidate = std::env::current_dir().ok().map(|dir| dir.join(&asset_rel));
-    let exe_candidate = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join(&asset_rel)));
-
-    [Some(manifest_candidate), cwd_candidate, exe_candidate]
-        .into_iter()
-        .flatten()
-        .find(|path| path.exists())
+    crate::util::dev_assets_dir()
+        .map(|dir| dir.join(WASM_ASSET_NAME))
+        .filter(|path| path.exists())
 }

@@ -65,12 +65,12 @@ aliases, source file), read `references/all-commands.md`.
 | `/rag [on\|off\|reload]` | Semantic matching: status · on/off · reinitialize |
 | `/rag-limit [<N>\|auto\|off]` | Embedder batch cap (ONNX memory guard) |
 | `/themes [new\|<name>]` | Theme gallery with live preview + custom-theme wizard |
-| `/debug [on\|off]` | Toggle debug logging to `.dev/debug.log` |
+| `/debug [on\|off]` | Toggle debug logging (`.dev/debug.log` in a debug build, `{data}/debug.log` in a release build) |
 
 ## Lifecycle & misc
 
 | Command | Purpose |
 |---------|---------|
-| `/update` · `/autoupdate [on\|off]` | Self-update now · toggle the startup auto-check |
+| `/update [channel [stable\|dev]]` · `/autoupdate [on\|off]` | Self-update on the current channel, or switch between `stable`/`dev` · toggle the startup auto-check |
 | `/logout` · `/wipe` | Clear token → onboarding · factory reset → onboarding (both confirm) |
 | `/help` · `/version` · `/quit` | Help · version · exit |

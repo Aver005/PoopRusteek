@@ -1,14 +1,8 @@
 name: CI
 
-# One pipeline, strictly sequential: `test` + `lint` gate everything else.
-# `release-build`/`publish` (the rolling dev-build release, see
-# scripts/dev-release.template.md) only start once both pass, and only for
-# a push to `develop` — so a broken commit never gets released, and CI
-# doesn't waste minutes building release binaries for code that's already
-# failing. After the versioned dev release publishes, the `latest`
-# tag/release is re-pointed at the same assets — that is the auto-update
-# channel the app's `/update` + `/autoupdate` check against (src/update.rs
-# compares the local binary's SHA-256 with the SHA256SUMS asset).
+# Проверки на каждый пуш и PR. Пуш в develop сверх того собирает и публикует
+# rolling-релиз `dev` — канал обновлений `dev` (src/update/mod.rs). Стабильные
+# релизы делает release.yml по тегу v* (scripts/release.sh).
 
 on:
   push:
@@ -23,177 +17,63 @@ on:
       - '.memories/**'
       - 'LICENSE'
 
+# PR-прогоны отменяются, пуши — нет: отмена посреди публикации оставила бы канал `dev` пустым.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    name: Build & test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --bin pooprusteek
-      - name: Test
-        run: cargo test --bin pooprusteek
+  checks:
+    uses: ./.github/workflows/checks.yml
 
-  lint:
-    name: Format & clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --bin pooprusteek -- -D warnings
-
-  release-build:
-    name: Release build (${{ matrix.os }})
-    needs: [test, lint]
+  build:
+    needs: checks
     if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: windows-x86_64
-          - os: ubuntu-latest
-            target: linux-x86_64
-          - os: macos-latest
-            target: macos-arm64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+    uses: ./.github/workflows/build.yml
 
-      # The macos-latest runner selects a bleeding-edge Xcode (e.g. 26.5)
-      # whose toolchain omits the static compiler-rt at the path aws-lc-sys
-      # links against (`-lclang_rt.osx`), causing `ld: library 'clang_rt.osx'
-      # not found`. Pin to the latest *stable* Xcode, which ships it.
-      - name: Select stable Xcode (macOS)
-        if: runner.os == 'macOS'
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - name: Build release binary
-        run: cargo build --release --bin pooprusteek
-
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp target/release/pooprusteek dist/
-          strip dist/pooprusteek || true
-          tar -C dist -czf pooprusteek-${{ matrix.target }}.tar.gz pooprusteek
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/pooprusteek.exe dist/pooprusteek.exe
-          Compress-Archive -Path dist/pooprusteek.exe -DestinationPath pooprusteek-${{ matrix.target }}.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pooprusteek-${{ matrix.target }}
-          path: pooprusteek-${{ matrix.target }}.*
-          retention-days: 7
-
-  publish:
-    name: Publish dev-build release
-    needs: release-build
-    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+  publish-dev:
+    name: Publish dev release
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          merge-multiple: true
+          path: release-assets
 
-      - name: Flatten binary artifacts
-        shell: bash
-        run: |
-          mkdir -p release-assets
-          find artifacts -type f -exec cp {} release-assets/ \;
-          ls -la release-assets
-
-      # The self-updater (src/update.rs) downloads raw binaries and verifies
-      # them against SHA256SUMS — hashes are over the *uncompressed*
-      # binaries so they compare directly with the installed file. Asset
-      # names must stay in step with `update::platform_asset`.
-      - name: Extract raw binaries + SHA256SUMS (auto-update assets)
-        shell: bash
-        run: |
-          cd release-assets
-          mkdir unpacked
-          unzip -o pooprusteek-windows-x86_64.zip -d unpacked
-          mv unpacked/pooprusteek.exe pooprusteek-windows-x86_64.exe
-          tar -xzf pooprusteek-linux-x86_64.tar.gz -C unpacked
-          mv unpacked/pooprusteek pooprusteek-linux-x86_64
-          tar -xzf pooprusteek-macos-arm64.tar.gz -C unpacked
-          mv unpacked/pooprusteek pooprusteek-macos-arm64
-          rmdir unpacked
-          sha256sum pooprusteek-windows-x86_64.exe pooprusteek-linux-x86_64 pooprusteek-macos-arm64 > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Compute rolling tag from Cargo.toml version
+      - name: Read version
         id: ver
         shell: bash
         run: |
-          VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v${VERSION}-dev" >> "$GITHUB_OUTPUT"
+          echo "version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+          echo "short=$(printf '%s' "${{ github.sha }}" | cut -c1-8)" >> "$GITHUB_OUTPUT"
 
-      - name: Capture previous dev-build commit
+      - name: Collect assets, manifest and checksums
+        shell: bash
+        run: bash scripts/ci/collect-assets.sh release-assets "${{ steps.ver.outputs.version }}" "$TAG" "${{ github.sha }}"
+
+      - name: Capture previous dev build commit
         id: prev
         shell: bash
         run: |
-          TAG="${{ steps.ver.outputs.tag }}"
           if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
-            PREV_SHA=$(git rev-parse "refs/tags/$TAG")
+            PREV_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
             echo "sha=$PREV_SHA" >> "$GITHUB_OUTPUT"
-            echo "label=\`$TAG\` (\`$(printf '%s' "$PREV_SHA" | cut -c1-8)\`)" >> "$GITHUB_OUTPUT"
+            echo "label=\`$(printf '%s' "$PREV_SHA" | cut -c1-8)\`" >> "$GITHUB_OUTPUT"
           else
             echo "sha=" >> "$GITHUB_OUTPUT"
             echo "label=(none — first dev build)" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Move tag to current commit
-        shell: bash
-        run: |
-          git tag -f "${{ steps.ver.outputs.tag }}"
-          git push origin "${{ steps.ver.outputs.tag }}" --force
-
-      - name: Delete previous release for this tag (if any)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release delete "${{ steps.ver.outputs.tag }}" --yes || true
 
       - name: Compute changelog since previous dev build
         id: log
@@ -238,7 +118,6 @@ jobs:
       - name: Render release notes
         shell: bash
         env:
-          TAG: ${{ steps.ver.outputs.tag }}
           VERSION: ${{ steps.ver.outputs.version }}
           PREVIOUS_TAG: ${{ steps.prev.outputs.label }}
           BRANCH: ${{ github.ref_name }}
@@ -263,8 +142,7 @@ jobs:
           export COMMIT_TITLE="$(printf '%s\n' "$COMMIT_MESSAGE" | head -1)"
           export RUST_VERSION="$(rustc --version)"
           export BUILD_DATE="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          chmod +x scripts/render-release-notes.sh
-          scripts/render-release-notes.sh scripts/dev-release.template.md release-body.md \
+          bash scripts/render-release-notes.sh scripts/dev-release.template.md release-body.md \
             TAG VERSION PREVIOUS_TAG BRANCH REPO REPO_URL \
             COMMIT_SHA COMMIT_SHORT_SHA COMMIT_TITLE COMMIT_MESSAGE \
             COMMIT_AUTHOR_NAME COMMIT_AUTHOR_EMAIL COMMIT_TIMESTAMP \
@@ -273,36 +151,27 @@ jobs:
             CONTRIBUTORS_SINCE_LAST_BUILD CHANGED_FILES_COUNT \
             ARTIFACT_COUNT ARTIFACT_LIST
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: "Dev build ${{ steps.ver.outputs.tag }}"
-          prerelease: true
-          body_path: release-body.md
-          files: release-assets/*
-
-      # The `latest` tag/release is the auto-update channel: a stable
-      # download URL (releases/download/latest/…) re-pointed at every
-      # successful dev release. Ordered after the versioned release above so
-      # a failed publish never moves `latest`.
-      - name: Move `latest` tag to current commit
+      # Rolling-релиз: тег `dev` переезжает на текущий коммит, релиз обновляется на месте.
+      - name: Move `dev` tag to current commit
         shell: bash
         run: |
-          git tag -f latest
-          git push origin latest --force
+          git tag -f "$TAG"
+          git push origin "$TAG" --force
 
-      - name: Delete previous `latest` release (if any)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release delete latest --yes || true
-
-      - name: Publish `latest` release (auto-update channel)
-        uses: softprops/action-gh-release@v2
+      # Без удаления релиза канал не пропадает; manifest.json грузится последним,
+      # чтобы клиенты не увидели новый манифест раньше новых бинарников.
+      - name: Publish `dev` release
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: latest
-          name: "Latest dev build (${{ steps.ver.outputs.tag }})"
+          tag_name: dev
+          name: "Dev build ${{ steps.ver.outputs.version }} (${{ steps.ver.outputs.short }})"
           prerelease: true
+          make_latest: "false"
           body_path: release-body.md
-          files: release-assets/*
+          preserve_order: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/pooprusteek-*
+            release-assets/install.sh
+            release-assets/SHA256SUMS
+            release-assets/manifest.json

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Renders a `{{VAR}}` markdown template by substituting listed variables from
-# the environment. Shared by .github/workflows/dev-release.yml and
-# .gitlab-ci.yml so both pipelines produce identical dev-build release notes.
+# the environment. Used for dev notes (ci.yml, .gitlab-ci.yml) and stable
+# notes (release.yml).
 #
 # Usage: render-release-notes.sh <template-file> <output-file> VAR1 [VAR2 ...]
 # Each VARn must already be exported (empty string if unavailable) — this
@@ -12,11 +12,25 @@ template_file="$1"
 output_file="$2"
 shift 2
 
-text=$(cat "$template_file")
+declare -A allowed=()
 for name in "$@"; do
-  token="{{${name}}}"
-  value="${!name}"
-  text="${text//$token/$value}"
+  allowed[$name]=1
 done
 
-printf '%s\n' "$text" > "$output_file"
+# Один проход по шаблону: значения вставляются как есть — без обработки `&`, `\`
+# и без повторной подстановки `{{…}}`, случайно попавших в текст коммита.
+rest=$(cat "$template_file")
+out=""
+while [[ "$rest" == *"{{"* ]]; do
+  out+="${rest%%"{{"*}"
+  rest="${rest#*"{{"}"
+  name="${rest%%"}}"*}"
+  if [[ -n "$name" && "$rest" == *"}}"* && -n "${allowed[$name]:-}" ]]; then
+    out+="${!name}"
+    rest="${rest#*"}}"}"
+  else
+    out+="{{"
+  fi
+done
+
+printf '%s\n' "$out$rest" > "$output_file"

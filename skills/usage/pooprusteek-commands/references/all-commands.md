@@ -69,13 +69,13 @@ opens a picker. Run `/help` in-app for the live list.
 | `/rag` | — | `[on \| off \| reload]` | Semantic matching (RAG): status, on/off, full reload | `rag.rs` |
 | `/rag-limit` | — | `[<N> \| auto \| off]` | Embedder batch cap (ONNX RAM guard): auto, off, or a fixed number | `rag_limit.rs` |
 | `/themes` | — | `[new \| <name>]` | Pick a color theme (live preview) or build your own with a step-by-step wizard | `themes.rs` |
-| `/debug` | — | `[on \| off]` | Toggle debug logging to `.dev/debug.log` (no args = switch) | `debug.rs` |
+| `/debug` | — | `[on \| off]` | Toggle debug logging — `.dev/debug.log` in a debug build, `{data}/debug.log` in a release build (no args = switch) | `debug.rs` |
 
 ## Lifecycle & misc
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
-| `/update` | — | — | Self-update from the latest dev release | `update.rs` |
+| `/update` | — | `[channel [stable \| dev]]` | Self-update on the configured channel (`stable` = latest tagged release, `dev` = rolling prerelease); bare `channel` shows or `channel <name>` switches it | `update.rs` |
 | `/autoupdate` | — | `[on \| off]` | Auto-update on startup: status, on/off | `update.rs` |
 | `/logout` | — | — | Log out — remove the saved DeepSeek token (confirms) | `logout.rs` |
 | `/wipe` | — | — | Factory reset — delete ALL local Pooprusteek data (confirms) | `wipe.rs` |

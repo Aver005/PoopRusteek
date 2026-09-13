@@ -1,105 +1,126 @@
-# REFERENCE: Self-update (`/update`, `/autoupdate`, `latest` channel)
+# REFERENCE: самообновление (`/update`, `/autoupdate`, каналы stable/dev)
 
-> The self-updater and its CI release channel. Source of truth:
-> `src/update.rs`, `.github/workflows/ci.yml` (`publish` job),
+> Обновлятор и его контракт с CI. Источники правды: `src/update/` (`mod.rs`,
+> `manifest.rs`, `swap.rs`, `install_record.rs`), `.github/workflows/ci.yml`
+> (`publish-dev`), `.github/workflows/release.yml`, `scripts/ci/make-manifest.sh`,
 > `commands/defs/update.rs`, `app/keys/dispatch.rs::apply_update_action`.
-> Added 2026-07-07 — see `JOURNAL/2026-07-07.md` pt.3.
+> Переписан 2026-09-13 (`JOURNAL/2026-09-13-distribution.md`); прежняя схема —
+> один rolling-тег `latest` и сравнение хэша — описана в `JOURNAL/2026-07-07.md`.
+> Выпуск релизов и установщики — `reference/RELEASING.md`.
 
-## WHAT IT DOES
+## ЧТО ДЕЛАЕТ
 
-Compares the SHA-256 of the **running executable's file** against the
-`SHA256SUMS` asset of the GitHub Release tagged `latest`. On mismatch it
-downloads the raw platform binary, re-verifies its hash, stages it in full
-next to the target, and swaps it in. The new binary takes effect on the
-**next launch** (a running process can't be replaced live — see SWAP below).
+`update::run(channel)` скачивает `manifest.json` канала и решает, ставить ли сборку:
 
-- **`/update`** — manual, one-shot. In a **debug build** (`cargo run`) it
-  first opens a confirm modal (`ConfirmAction::Update` → `ConfirmState::
-  update_dev`), because a dev binary always mismatches the released hash and
-  would otherwise be silently swapped for the release build. Release builds
-  update straight away.
-- **`/autoupdate [on|off]`** — persists `[update] auto` (default **off**).
-  When on, every TUI startup (`App::new`) runs the same check in the
-  background, quiet when already current (status line only).
+| Канал | Манифест | Ставит, если |
+|---|---|---|
+| `stable` (по умолчанию) | `releases/latest/download/manifest.json` — последний не-prerelease релиз | хэш файла на диске ≠ хэшу из манифеста **и** `manifest.version` > `CARGO_PKG_VERSION` (SemVer, `manifest::Version`) |
+| `dev` | `releases/download/dev/manifest.json` — rolling prerelease | хэш файла на диске ≠ хэшу из манифеста |
 
-Entry flow: command → `CommandResult::Update(UpdateAction)` →
-`apply_update_action` (dispatch.rs) → `app::spawn_update_task(event_tx,
-update_in_flight, quiet)` → `update::run()` off the event loop →
-`AppEvent::UpdateStatus { message, notable }`.
+Дальше: бинарник качается по `releases/download/<manifest.tag>/<asset>`,
+сверяется с хэшем и подменяется через `swap::install`. Новая версия работает
+со следующего запуска. На Windows после замены `install_record::sync_display_version`
+правит `DisplayVersion` в записи установщика, если `InstallLocation` совпадает с папкой exe.
 
-## SWAP MECHANICS (`update::install` / `promote`)
+Исходы (`UpdateOutcome`):
+- `UpToDate { channel_build }` — ставить нечего.
+- `Updated { build }` — заменено, нужен перезапуск.
+- `PendingRestart { build }` — этот процесс уже ставил сборку. Повторная замена
+  сломалась бы: на Windows `.old` занят запущенным образом, на Linux
+  `current_exe` указывает на удалённый inode. Флаг `INSTALLED_THIS_RUN`.
+- `NoRelease` — манифест канала отдаёт 404 (например, до первого тега). Не ошибка,
+  при автопроверке молчит.
 
-The running binary is **renamed, never overwritten** — the OS locks a live
-exe against write/delete but allows renaming it aside.
+Команды:
+- **`/update`** — проверить сейчас. В debug-сборке сначала модалка (`ConfirmState::update_dev`).
+- **`/update channel [stable|dev]`** — показать или сохранить `[update] channel`.
+- **`/autoupdate [on|off]`** — `[update] auto` (по умолчанию off), проверка на каждом старте `App::new`.
 
-1. Download → verify hash → `atomic_write` the bytes to a sibling
-   `<exe>.new` (**staged in full first** — the live binary isn't touched
-   until the new one exists complete on disk; no window the length of a
-   multi-MB download).
+Поток: команда → `CommandResult::Update(UpdateAction)` → `apply_update_action` →
+`app::spawn_update_task(event_tx, in_flight, channel, quiet)` → `update::run` вне
+цикла событий → `AppEvent::UpdateStatus { message, notable }`.
+
+## ФОРМАТ `manifest.json`
+
+Пишет `scripts/ci/make-manifest.sh`, читают `update::manifest::Manifest` (serde)
+и `scripts/install.sh` (sed, **одна пара `"ключ": "значение"` на строку**).
+
+```json
+{
+  "schema": 1,
+  "version": "0.2.0",
+  "tag": "v0.2.0",
+  "commit": "<sha>",
+  "assets": {
+    "pooprusteek-linux-x86_64": "<sha256>",
+    "pooprusteek-windows-x86_64.exe": "<sha256>"
+  }
+}
+```
+
+- `schema` ≠ 1 — клиент отказывается («update manually»). Новые поля добавлять
+  можно (serde их игнорирует), менять смысл старых — только с новой схемой.
+- `tag` должен начинаться с буквы или цифры и состоять из `[A-Za-z0-9._-]` —
+  он идёт в URL.
+- В `assets` только «сырые» бинарники: архивы, `-setup.exe`, `install.sh` сюда не попадают.
+- `commit` показывается в сообщениях dev-канала: у dev-сборок одна версия на много сборок.
+
+## ЗАМЕНА ФАЙЛА (`swap::install` / `promote`)
+
+Запущенный бинарник **переименовывается**, а не перезаписывается.
+1. Байты целиком пишутся в `<exe>.new` через `atomic_write`.
 2. `promote`:
-   - **Unix**: one atomic `rename(<exe>.new, <exe>)` — replaces the dir
-     entry; the running process keeps executing the old (now-unlinked)
-     inode. No backup, no absent-file window.
-   - **Windows**: `rename(<exe>, <exe>.old)` then `rename(<exe>.new, <exe>)`
-     — the gap is two metadata ops, not a download. `<exe>.old` can't be
-     deleted while the process runs; `cleanup_stale_backup()` (called every
-     `App::new`) reaps both `.old` and a stranded `.new` next launch.
+   - **Unix**: один атомарный `rename(.new, exe)`.
+   - **Windows**: `rename(exe, .old)`, затем `rename(.new, exe)`, при сбое откат.
+     Если `.old` не удаляется (его держит ещё работающий старый процесс),
+     используется `.old.<pid>`.
+3. `cleanup_stale_backup()` в `App::new` удаляет `.new`, `.old` и `.old.<pid>`
+   (`swap::is_backup_name`).
 
-## CONTRACT POINTS — DO NOT DESYNC
+## ТОЧКИ КОНТРАКТА — НЕ РАССИНХРОНИЗИРОВАТЬ
 
-Load-bearing couplings. Change one side of any row, change the other in the
-same commit:
+| Контракт | Приложение | CI / установщик |
+|---|---|---|
+| Имена целей `windows-x86_64`, `windows-arm64`, `linux-x86_64`, `linux-arm64`, `macos-arm64` | `update::platform_target` | матрица `build.yml` (`target`) |
+| Имя ассета `pooprusteek-<target>[.exe]` | `update::platform_asset` | `scripts/ci/package.sh`, `install.sh::do_install` |
+| Формат манифеста | `update::manifest` | `make-manifest.sh`, `install.sh::manifest_value` |
+| Имя `manifest.json` | `manifest::MANIFEST_ASSET` | `make-manifest.sh`, `files:` в `ci.yml`/`release.yml` |
+| Тег dev-канала `dev` | `update::DEV_TAG` | `ci.yml` `publish-dev` (`TAG: dev`), `install.sh` |
+| stable = GitHub «Latest» | `update::manifest_url` | `release.yml`: `make_latest: "true"`; у `dev` и legacy `latest` — `false` + prerelease |
+| Репозиторий `Aver005/pooprusteek` | `update::RELEASES_BASE` | реальный путь репозитория, `install.sh::REPO_URL` |
+| `AppId` установщика | `install_record::UNINSTALL_KEY` | `packaging/windows/pooprusteek.iss` (`AppId`, `UninstallKey`) |
+| Мьютекс `PooprusteekRunning` | `install_record::INSTANCE_MUTEX` (создаётся в `main` через `update::register_running_instance`) | `.iss` `AppMutex` |
+| Порядок загрузки ассетов | — | `manifest.json` последним (`preserve_order`), чтобы новый манифест не опередил бинарники |
 
-| Contract | Reader (app) | Writer / counterpart (CI or OS) |
-|----------|--------------|---------------------------------|
-| Raw asset names `pooprusteek-{windows-x86_64.exe, linux-x86_64, macos-arm64}` | `update::platform_asset()` | `publish` job step "Extract raw binaries + SHA256SUMS" (the `mv unpacked/… <name>` lines) |
-| Checksum asset name + format (`sha256sum` lines, hashes over **uncompressed** binaries) | `CHECKSUMS_ASSET` + `parse_sha256sums` | `sha256sum … > SHA256SUMS` step in CI |
-| Release tag `latest` in the download URL | `RELEASE_DOWNLOAD_BASE` | CI steps `git tag -f latest` / `gh release delete latest` / the second `action-gh-release` (`tag_name: latest`) |
-| Repo owner/name in the download URL (`Aver005/pooprusteek`) | `RELEASE_DOWNLOAD_BASE` | the actual GitHub repo path |
-| Archive names + inner filename (`pooprusteek-<target>.{zip,tar.gz}`, inside `pooprusteek[.exe]`) | CI extraction step (`unzip`/`tar` + `mv`) | `release-build` job packaging steps |
-| Binary name `pooprusteek` | inner filenames above | `[[bin]]` / package name in `Cargo.toml` |
-| Step ordering in `publish` | extraction **before** "Create release" (else assets aren't attached); all `latest` steps **after** the versioned release (else a failed dev publish still moves `latest`) | — |
-| `permissions: contents: write` on `publish` | — | needed for the `latest` tag push + release create/delete |
-| `cleanup_stale_backup()` at startup + `.old`/`.new` suffixes | `App::new` calls it; `backup_path`/`staged_path` define suffixes | Windows leaves `.old`; a crash can leave `.new` |
-| Update work runs only via `spawn_update_task` (never on the event loop) | invariant #1 (no network/file I/O in `handle_event`) | — |
-| Dev gate = `cfg!(debug_assertions)` | `apply_update_action` `UpdateAction::Run` | release binaries are built `--release` (debug_assertions off) → no prompt |
+## LEGACY-МОСТ ДЛЯ СБОРОК ≤ 0.1.0
 
-## FAILURE / FRAGILITY MODES
+Старый обновлятор читает `releases/download/latest/SHA256SUMS` и ставит при несовпадении хэша.
+Джоба `legacy-latest` в `release.yml` после каждого стабильного релиза переносит тег
+`latest` и кладёт туда те же сырые бинарники и `SHA256SUMS`. Старые сборки получают
+стабильную версию, а с ней и новый обновлятор. Develop-пуши `latest` больше не трогают.
+**TODO(0.3.0): удалить джобу и тег.**
 
-- **Dropping a `release-build` matrix leg** (e.g. removing macOS) breaks the
-  extraction step, which fails the **whole `publish` job** — including the
-  ordinary versioned dev release. The extraction now makes all three
-  platform archives mandatory for any release.
-- **Asset-name drift** between `platform_asset()` and CI → "SHA256SUMS has
-  no entry for …" forever.
-- **Repo rename** → the hardcoded URL 404s once the old name is free
-  (GitHub redirects only while the old owner/name is unclaimed).
-- **Manual tinkering with the `latest` tag/release** (deleting it, creating
-  the tag without assets) → 404s.
-- **The delete→recreate window** for the `latest` release: a client checking
-  in those seconds gets a clean 404, not a crash.
-- **`SHA256SUMS` guards integrity, not authenticity** — it sits beside the
-  binary. Trust rests entirely on TLS + the GitHub account. No signing yet
-  (minisign / code-signing is the fix if that ever matters).
-- **Downgrade / no version ordering**: the check is identity ("am I exactly
-  the latest"), not "am I older". A bad build published to `latest` updates
-  everyone with `autoupdate on`. Hash carries no release time — an ordering
-  key (build timestamp / CI run number baked into the binary + published in
-  the manifest) would be needed to gate downgrades; not implemented.
-- **Read-only install dir** (Program Files, root-owned `/usr/local/bin`) →
-  the swap fails cleanly; the feature needs write access to the exe's dir.
-- **Two running instances** race on the swap (`update_in_flight` is a
-  per-process flag, not a lock); launching a new instance exactly during the
-  Windows two-rename gap can hit "file not found".
-- **Repeated `/update` in one Linux session**: after a swap `/proc/self/exe`
-  points at the unlinked `.old`, so a second check without restart errors on
-  read. Windows reports "up to date" (the on-disk file is new even though the
-  process runs the old one).
+## РЕЖИМЫ ОТКАЗА
 
-## TESTS
+- **Канал пуст** (нет ни одного тегового релиза или dev ещё не собирался) → `NoRelease`.
+- **Окно обновления релиза**: ассеты перезаливаются по одному. Клиент может увидеть
+  старый манифест с новым бинарником → «checksum mismatch — try /update again».
+  Манифест грузится последним, так что наоборот не бывает.
+- **Папка установки без прав записи** (Program Files, root-owned `/usr/local/bin`) →
+  замена падает чисто. Установщик Windows не даёт выбрать такую папку
+  (`NextButtonClick`), `install.sh` ставит в `~/.local/bin`.
+- **dev → stable с той же версией** → `UpToDate`: stable не откатывает dev-сборку,
+  текущая остаётся до выхода более новой версии (об этом говорит `/update channel stable`).
+- **`SHA256SUMS` и манифест лежат рядом с бинарником** → целостность, не подлинность.
+  Доверие держится на TLS и аккаунте GitHub; подписи нет.
+- **Переименование репозитория** → URL в `RELEASES_BASE` и `install.sh` протухнут.
 
-`update::tests` — SHA256SUMS parsing (+ binary marker / junk rejection),
-sha256 vector, `backup_path`/`staged_path` suffixing, `install` swap +
-re-install round-trip (asserts no stale `.new` lingers), platform-asset
-contract. Config compat/round-trip: `config_without_update_section_still_loads`.
-Command parse: `autoupdate_subcommands_map_to_the_right_actions`.
+## ТЕСТЫ
+
+- `update::tests`: вектор sha256, имена ассетов, stable только вперёд, URL манифестов.
+- `update::manifest::tests`: разбор, битый хэш против отсутствующей сборки,
+  опасные теги, порядок SemVer вместе с пререлизами.
+- `update::swap::tests`: суффиксы, распознавание `.old.<pid>`, замена и повторная замена.
+- `update::install_record::tests`: сравнение путей.
+- `config::tests::update_channel_round_trips_and_rejects_unknown`,
+  `commands::defs::update::tests`.

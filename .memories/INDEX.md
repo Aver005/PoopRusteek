@@ -30,7 +30,8 @@
 | `reference/TOOLS.md` | Tool system, agent loop, background PTY |
 | `reference/MCP.md` | MCP clients, transports, 8 config sources |
 | `reference/CONFIG.md` | Config schema, storage paths, sessions |
-| `reference/AUTO-UPDATE.md` | Self-updater (`/update`, `/autoupdate`) + the `latest` CI release channel — swap mechanics, **contract points that must not desync**, failure modes |
+| `reference/AUTO-UPDATE.md` | Self-updater (`/update`, `/autoupdate`) + its two CI release channels (`stable`/`dev`) — swap mechanics, **contract points that must not desync**, failure modes |
+| `reference/RELEASING.md` | Выпуск релиза, установщики, CI-пайплайн релизов |
 | `reference/PROMPTS.md` | Prompt library + skills discovery |
 | `reference/HARNESS.md` | **Headless behaviour testing** — `pooprusteek exec`, JSONL traces, scenarios/expectations, pattern mining, mock provider, the Docker sandbox, and why `auto_approve` must stay false |
 | `reference/AUDIT-2026-07-02.md` | Full-codebase audit (2026-07-02): severity-ranked defects, `[FIXED]`/`[OPEN]`/`[ACCEPTED]` status |
@@ -54,7 +55,7 @@
 - Original repo (TS): https://github.com/aver005/poopseek
 - This project: Rust rewrite (edition 2024, MSRV 1.91), ~42k LOC incl. inline tests (166 files), License MIT.
 - LLM backend: DeepSeek **web** API (reverse-engineered, v0) — cookie/token auth, requires PoW.
-- Primary verification: `cargo build` + `cargo test --bin pooprusteek` (434 passing) + `cargo clippy` (0 warnings). CI (`.github/workflows/ci.yml`): `test` (build+test, win+linux) and `lint` (fmt --check + clippy -D warnings) are both blocking and gate the dev-build release.
+- Primary verification: `cargo build` + `cargo test --bin pooprusteek` (434 passing) + `cargo clippy` (0 warnings). CI: `ci.yml` runs the reusable `checks.yml` (test win/ubuntu/macos + fmt/clippy, blocking) on every push/PR; a `develop` push additionally runs `build.yml` and publishes the rolling `dev` release channel. `release.yml` cuts a `stable` release on a `v*` tag (`scripts/release.sh`). Details: `reference/RELEASING.md`.
 
 ## 4. MAINTENANCE RULE
 

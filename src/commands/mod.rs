@@ -71,12 +71,16 @@ pub enum ServeAction {
 /// guard, the event channel, and the mutable config these effects need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
-    /// `/update` — check the `latest` release, install on hash mismatch.
+    /// `/update` — check the configured channel and install a newer build.
     Run,
     /// `/autoupdate` — show whether the startup check is enabled.
     AutoStatus,
     /// `/autoupdate on` / `/autoupdate off` — persist the flag.
     SetAuto(bool),
+    /// `/update channel` — show the channel and running version.
+    ChannelStatus,
+    /// `/update channel stable|dev` — persist the channel.
+    SetChannel(crate::config::UpdateChannel),
 }
 
 /// `/refetch-providers` + `/cache-providers` intents — interpreted in

@@ -15,8 +15,9 @@
 # depending on project settings.
 #
 # Release notes are rendered from `scripts/dev-release.template.md` (shared
-# with .github/workflows/dev-release.yml) via `scripts/render-release-notes.sh`
-# — see that template for the full list of substitutable variables.
+# with the `publish-dev` job in .github/workflows/ci.yml) via
+# `scripts/render-release-notes.sh` — see that template for the full list of
+# substitutable variables.
 #
 # Only the Linux leg runs on a default shared runner. Windows/macOS need
 # GitLab SaaS runners (`saas-windows-medium-amd64` / `saas-macos-medium-m1`,

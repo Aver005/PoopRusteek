@@ -1,6 +1,6 @@
 //! Opt-in developer log (`--debug-log`, `/debug`). Two sinks share one
 //! writer: the human `[ts] [action] message` lines developers read in
-//! `.dev/debug.log`, and a machine-readable JSONL stream the test harness
+//! `debug.log` (see `default_path`), and a machine-readable JSONL stream the test harness
 //! (`src/harness`) consumes as a turn trace. The agent loop is already
 //! instrumented for the human sink, so the harness gets its trace without a
 //! second, drift-prone set of instrumentation points.
@@ -17,7 +17,7 @@ use std::sync::{Mutex, OnceLock};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOGGER: OnceLock<DebugLogger> = OnceLock::new();
 /// Where and in which shape to open the log. Set by [`configure`] before
-/// first use; absent means the developer default (`.dev/debug.log`, human).
+/// first use; absent means [`default_path`] in human format.
 static SINK: OnceLock<(PathBuf, Format)> = OnceLock::new();
 /// Monotonic record counter. Millisecond timestamps tie under load, and the
 /// harness needs a total order to reason about step/tool sequencing.
@@ -119,11 +119,31 @@ fn logger() -> AppResult<&'static DebugLogger> {
     }
     let (path, format) = match SINK.get() {
         Some((path, format)) => (path.clone(), *format),
-        None => (Path::new(".dev").join("debug.log"), Format::Human),
+        None => (default_path(), Format::Human),
     };
     let logger = DebugLogger::new(path, format)?;
     let _ = LOGGER.set(logger);
     Ok(LOGGER.get().expect("logger was just set"))
+}
+
+/// Debug-сборка пишет в `.dev/` рядом с проектом, release — в data dir, а не в cwd пользователя.
+fn default_path() -> PathBuf {
+    if cfg!(debug_assertions) {
+        Path::new(".dev").join("debug.log")
+    } else {
+        crate::config::Config::data_dir().join("debug.log")
+    }
+}
+
+/// Путь, куда пишет (или начнёт писать) журнал — для сообщений пользователю.
+pub fn path() -> PathBuf {
+    LOGGER.get().map_or_else(
+        || {
+            SINK.get()
+                .map_or_else(default_path, |(path, _)| path.clone())
+        },
+        |logger| logger.path.clone(),
+    )
 }
 
 /// Point the log at a specific file and line format. Must be called before

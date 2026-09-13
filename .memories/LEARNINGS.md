@@ -1,6 +1,6 @@
 # LEARNINGS
 > Hard-won technical knowledge. Gotchas. Patterns. (Deep detail lives in `reference/`.)
-> Last updated: 2026-06-30 (added refactor + conversation/fork learnings)
+> Last updated: 2026-09-13 (asset resolution row: release builds now embed only, debug reads the source checkout). Before: 2026-06-30 (added refactor + conversation/fork learnings)
 
 ## CI И ЛОКАЛЬНЫЕ ПРОВЕРКИ
 
@@ -66,7 +66,7 @@
 | Event loop | One `tokio::select!` @120ms over tick / crossterm / internal channel / Ctrl+C. Agent runs in a spawned task. |
 | State | Only the main loop mutates `AppState`; async tasks talk via `AppEvent` + `Notify` handshakes. |
 | Cross-task req/resp | `Arc<Mutex<Option<T>>> + tokio::Notify` (tool approval, questions). |
-| Assets | Resolve via `CARGO_MANIFEST_DIR` → CWD → exe-dir (prompts, PoW WASM). |
+| Assets | Release build: embedded only (`include_str!`/`include_bytes!`) — cwd/exe-dir files can no longer shadow them. Debug build: `util::dev_assets_dir()` also reads the source checkout's `assets/` (via `CARGO_MANIFEST_DIR`) so prompt edits don't need a rebuild. |
 
 ## AGENT LOOP  (→ `reference/TOOLS.md`)
 

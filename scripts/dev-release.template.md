@@ -1,10 +1,10 @@
 <!--
   dev-release.template.md — release notes template for the rolling
-  "dev-build" release, rendered by scripts/render-release-notes.sh from
-  both .github/workflows/dev-release.yml and .gitlab-ci.yml.
+  "dev" release, rendered by scripts/render-release-notes.sh from
+  .github/workflows/ci.yml (publish-dev) and .gitlab-ci.yml.
 
   Available placeholders (empty string if a pipeline can't compute one):
-    {{TAG}}                          release tag, e.g. v0.1.0-dev
+    {{TAG}}                          release tag, always `dev`
     {{VERSION}}                      version from Cargo.toml, e.g. 0.1.0
     {{PREVIOUS_TAG}}                 tag/commit this release replaces, or
                                       "(none — first dev build)"

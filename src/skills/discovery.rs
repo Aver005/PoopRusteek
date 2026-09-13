@@ -98,17 +98,9 @@ fn collect_skill_dirs() -> Vec<(PathBuf, SkillSource)> {
     // ── Pooprusteek's own skills directory ──
     dirs.push((Config::data_dir().join("skills"), SkillSource::Installed));
 
-    // ── Built-in prompts from assets/prompts/ ──
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        dirs.push((dir.join("assets").join("prompts"), SkillSource::BuiltIn));
-    }
-    let cargo_prompts = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join("prompts");
-    if !dirs.iter().any(|(p, _)| p == &cargo_prompts) {
-        dirs.push((cargo_prompts, SkillSource::BuiltIn));
+    // ── Built-in prompts: живые из исходников в debug, иначе встроенные (ниже) ──
+    if let Some(assets) = crate::util::dev_assets_dir() {
+        dirs.push((assets.join("prompts"), SkillSource::BuiltIn));
     }
 
     dirs

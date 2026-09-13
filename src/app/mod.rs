@@ -196,6 +196,7 @@ pub struct App {
 pub(crate) fn spawn_update_task(
     event_tx: mpsc::UnboundedSender<AppEvent>,
     in_flight: Arc<AtomicBool>,
+    channel: crate::config::UpdateChannel,
     quiet_when_current: bool,
 ) {
     if in_flight.swap(true, Ordering::SeqCst) {
@@ -206,17 +207,26 @@ pub(crate) fn spawn_update_task(
         return;
     }
     tokio::spawn(async move {
-        let (message, notable) = match crate::update::run().await {
-            Ok(crate::update::UpdateOutcome::UpToDate) => (
-                "Already up to date — the binary matches the `latest` release.".to_string(),
+        let current = crate::update::CURRENT_VERSION;
+        let name = channel.as_str();
+        let (message, notable) = match crate::update::run(channel).await {
+            Ok(crate::update::UpdateOutcome::UpToDate { channel_build }) => (
+                format!(
+                    "Already up to date — running {current}, {name} channel has {channel_build}."
+                ),
                 !quiet_when_current,
             ),
-            Ok(crate::update::UpdateOutcome::Updated { new_hash }) => (
-                format!(
-                    "⬇ Updated to the latest dev build (sha256 {}…) — restart to apply.",
-                    crate::util::truncate_at_char_boundary(&new_hash, 12)
-                ),
+            Ok(crate::update::UpdateOutcome::Updated { build }) => (
+                format!("⬇ Updated {current} → {build} ({name} channel) — restart to apply."),
                 true,
+            ),
+            Ok(crate::update::UpdateOutcome::PendingRestart { build }) => (
+                format!("{build} is already installed — restart to apply."),
+                true,
+            ),
+            Ok(crate::update::UpdateOutcome::NoRelease) => (
+                format!("The {name} channel has no release yet — nothing to install."),
+                !quiet_when_current,
             ),
             Err(e) => (format!("Update failed: {e}"), true),
         };
@@ -514,12 +524,17 @@ impl App {
 
         // Self-updater: clear the `.old` backup a previous update may have
         // left (Windows can't delete it while that binary's process runs),
-        // then — only when opted in via /autoupdate — check the `latest`
-        // release in the background. Quiet when already current.
+        // then — only when opted in via /autoupdate — check the configured
+        // channel in the background. Quiet when already current.
         crate::update::cleanup_stale_backup();
         let update_in_flight = Arc::new(AtomicBool::new(false));
         if config.update.auto {
-            spawn_update_task(event_tx.clone(), Arc::clone(&update_in_flight), true);
+            spawn_update_task(
+                event_tx.clone(),
+                Arc::clone(&update_in_flight),
+                config.update.channel,
+                true,
+            );
         }
 
         Ok(Self {

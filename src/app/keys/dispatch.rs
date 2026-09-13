@@ -393,11 +393,13 @@ impl App {
             }
             UpdateAction::AutoStatus => {
                 let state = if self.config.update.auto { "on" } else { "off" };
+                let channel = self.config.update.channel.as_str();
                 self.state.push_system(&format!(
-                    "Auto-update on startup: {state}.\n\
-                     When on, every launch compares the binary's SHA-256 with the `latest` \
-                     release in the background and installs on mismatch (applied on the next start).\n\
+                    "Auto-update on startup: {state} ({channel} channel).\n\
+                     When on, every launch checks the channel in the background and installs \
+                     a newer build (applied on the next start).\n\
                      \u{2022} /autoupdate on|off — toggle\n\
+                     \u{2022} /update channel stable|dev — pick the channel\n\
                      \u{2022} /update — check and install right now"
                 ));
             }
@@ -408,10 +410,37 @@ impl App {
                     return;
                 }
                 self.state.push_system(if on {
-                    "Auto-update enabled — every startup checks the `latest` release in the background."
+                    "Auto-update enabled — every startup checks for a newer build in the background."
                 } else {
                     "Auto-update disabled. /update still works manually."
                 });
+            }
+            UpdateAction::ChannelStatus => {
+                self.state.push_system(&format!(
+                    "Update channel: {}. Running version {}.\n\
+                     \u{2022} stable — tagged releases only, never downgrades\n\
+                     \u{2022} dev — the build of every develop push\n\
+                     Switch with /update channel stable|dev.",
+                    self.config.update.channel.as_str(),
+                    crate::update::CURRENT_VERSION,
+                ));
+            }
+            UpdateAction::SetChannel(channel) => {
+                self.config.update.channel = channel;
+                if let Err(message) = crate::config::save_or_message(&self.config) {
+                    self.state.push_system(&message);
+                    return;
+                }
+                let note = match channel {
+                    crate::config::UpdateChannel::Stable => {
+                        " The current build stays until a newer version is released."
+                    }
+                    crate::config::UpdateChannel::Dev => "",
+                };
+                self.state.push_system(&format!(
+                    "Update channel set to {}.{note} Run /update to check it now.",
+                    channel.as_str()
+                ));
             }
         }
     }
@@ -420,11 +449,15 @@ impl App {
     /// Shared by the release-build direct path and the dev-build confirm arm
     /// (`ConfirmAction::Update`).
     pub(super) fn start_manual_update(&mut self) {
-        self.state
-            .push_system("Checking for updates against the `latest` release\u{2026}");
+        let channel = self.config.update.channel;
+        self.state.push_system(&format!(
+            "Checking the {} channel for updates\u{2026}",
+            channel.as_str()
+        ));
         crate::app::spawn_update_task(
             self.event_tx.clone(),
             Arc::clone(&self.update_in_flight),
+            channel,
             false,
         );
     }

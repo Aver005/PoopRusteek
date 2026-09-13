@@ -1,6 +1,6 @@
 # REFERENCE: Config, Storage & Sessions
 > Where everything lives on disk. Source: `src/config/mod.rs`, `src/session.rs`.
-> Last updated: 2026-07-06 (added `[server]` — the API-gateway section behind `--serve`/`/serve`/`/server <port>`). Before: 2026-07-04 (added `agent.rate_limit_per_minute`; debug log is now runtime-toggleable via `/debug`, not just the CLI flag)
+> Last updated: 2026-09-13 (added `[update]` — stable/dev channel config; fixed the debug-log row: build-dependent path + the actual `--debug-log` flag spelling). Before: 2026-07-06 (added `[server]` — the API-gateway section behind `--serve`/`/serve`/`/server <port>`). Before: 2026-07-04 (added `agent.rate_limit_per_minute`; debug log is now runtime-toggleable via `/debug`, not just the CLI flag)
 
 ## FILE LOCATIONS (`config/mod.rs:100`)
 
@@ -15,7 +15,7 @@ Paths come from the `dirs` crate, so they are **platform-specific**:
 | MCP own config | `{data}/mcp.json` | … | … | … |
 | Approval rules | `{data}/whitelist.json` | … | … | … |
 | Undo journal | `{data}/checkpoints.jsonl` + `{data}/checkpoints/` | … | … | … |
-| Debug log | `.dev/debug.log` (relative to CWD; enabled by `--debug_log` at startup or toggled at runtime via `/debug`) | — | — | — |
+| Debug log | Debug build: `.dev/debug.log` (relative to CWD). Release build: `{data}/debug.log`. Enabled by `--debug-log` at startup or toggled at runtime via `/debug` | — | — | — |
 
 > On this machine (Windows), config + data both resolve under `%APPDATA%\Roaming\pooprusteek\`.
 
@@ -97,6 +97,10 @@ api = "openai"             # openai | anthropic | gemini — wire dialect; only 
 [provider_models]          # per-entry model lists (provider/model_cache.rs) — feed /v1/models + routing
 refetch_ms = 180000        # background refetch period; /refetch-providers <ms|off>; 0 = off
 cache_ms = 180000          # persisted-cache validity across restarts; /cache-providers <ms|off>; 0 = off
+
+[update]                   # self-updater (src/update/) — /update, /autoupdate
+auto = false               # /autoupdate on|off — check + install on every TUI startup
+channel = "stable"         # stable | dev — /update channel [stable|dev]; UpdateChannel
 ```
 
 - `ProviderEntry.model` may be **empty** (wizard's Model step is optional): the API catalog
@@ -141,4 +145,4 @@ First launch (no config, or after `/logout`/`/wipe`): in-TUI full-screen onboard
 ## ERRORS & LOGGING
 
 - **`AppError`** (`src/error.rs:3`): `Io | Http | Json | Config(String) | Provider(String) | Mcp(String) | Join | SessionNotFound(String) | Custom(String)`. Alias `AppResult<T>`.
-- **Debug log** (`src/debug_log.rs`): enabled by `--debug_log`; writes timestamped `[action] message` lines to `.dev/debug.log` via a `Mutex<File>` `OnceLock`. `log()` and `log_json()`.
+- **Debug log** (`src/debug_log.rs`): enabled by `--debug-log`; writes timestamped `[action] message` lines to `.dev/debug.log` (debug build) or `{data}/debug.log` (release build) via a `Mutex<File>` `OnceLock`. `log()` and `log_json()`.

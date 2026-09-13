@@ -42,7 +42,7 @@ pub struct Config {
     /// `crate::provider::model_cache`.
     #[serde(default)]
     pub provider_models: ProviderModelsConfig,
-    /// Self-update from the rolling `latest` release — see `crate::update`.
+    /// Self-update from GitHub Releases (stable/dev channel) — see `crate::update`.
     #[serde(default)]
     pub update: UpdateConfig,
     /// What a migration changed while loading this file. Never a config key —
@@ -54,12 +54,41 @@ pub struct Config {
 /// `[update]` — the self-updater (`/update`, `/autoupdate`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateConfig {
-    /// `/autoupdate on|off` — when true, every TUI startup checks the
-    /// `latest` release in the background and installs it on hash mismatch
-    /// (takes effect on the next launch). Off by default: replacing the
+    /// `/autoupdate on|off` — when true, every TUI startup checks the update
+    /// channel in the background and installs a newer build (takes effect on
+    /// the next launch). Off by default: replacing the
     /// binary behind the user's back must be an explicit opt-in.
     #[serde(default = "default_update_auto")]
     pub auto: bool,
+    /// `/update channel stable|dev` — откуда брать обновления.
+    #[serde(default)]
+    pub channel: UpdateChannel,
+}
+
+/// Канал обновлений: `stable` — релизы по тегу `v*`, `dev` — сборка каждого пуша в develop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Dev,
+}
+
+impl UpdateChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Dev => "dev",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(Self::Stable),
+            "dev" => Some(Self::Dev),
+            _ => None,
+        }
+    }
 }
 
 fn default_update_auto() -> bool {
@@ -70,6 +99,7 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
             auto: default_update_auto(),
+            channel: UpdateChannel::default(),
         }
     }
 }
@@ -1221,6 +1251,21 @@ mod tests {
     fn update_config_empty_table_still_loads() {
         let parsed: UpdateConfig = toml::from_str("").unwrap();
         assert!(!parsed.auto);
+        assert_eq!(parsed.channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn update_channel_round_trips_and_rejects_unknown() {
+        let parsed: UpdateConfig = toml::from_str("channel = \"dev\"").unwrap();
+        assert_eq!(parsed.channel, UpdateChannel::Dev);
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(text.contains("channel = \"dev\""), "{text}");
+        assert!(toml::from_str::<UpdateConfig>("channel = \"nightly\"").is_err());
+        assert_eq!(
+            UpdateChannel::parse(" STABLE "),
+            Some(UpdateChannel::Stable)
+        );
+        assert_eq!(UpdateChannel::parse("nightly"), None);
     }
 
     #[test]

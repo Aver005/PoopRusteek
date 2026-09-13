@@ -13,6 +13,15 @@ markdown skills, and a fully local RAG layer. Optional extra providers
 
 ## Install & build
 
+Prebuilt releases (no Rust toolchain needed):
+
+```bash
+# Windows: run pooprusteek-setup.exe from the latest GitHub release (per-user install, adds to PATH)
+curl -fsSL https://raw.githubusercontent.com/Aver005/pooprusteek/main/scripts/install.sh | sh   # macOS (arm64) / Linux
+```
+
+From source:
+
 ```bash
 cargo install --path .     # install the binary (needs Rust edition 2024, MSRV 1.91)
 cargo build                # debug build
@@ -34,7 +43,8 @@ Run modes and flags:
 | *(none)* | Interactive TUI (default) |
 | `--acp` | ACP server — JSON-RPC over stdio, for IDE/editor integration |
 | `--serve` / `--server` / `--api` | Start the TUI with the built-in HTTP API gateway already on (see `/serve`, `/server <port>`) |
-| `--debug_log` | Write a debug log to `.dev/debug.log` (also toggleable at runtime via `/debug`) |
+| `--debug-log` | Write a debug log (`.dev/debug.log` in a debug build, `{data}/debug.log` in a release build; also toggleable at runtime via `/debug`) |
+| `--version` | Print version info and exit |
 
 ## Authentication (DeepSeek web API)
 
@@ -75,8 +85,10 @@ skill for the full command list.
 - `/wipe` — factory reset: delete the config-file parent dir + data dir, clear
   whitelist/history, return to onboarding. Never touches foreign configs (`~/.claude`,
   `~/.cursor`, VS Code, etc.). Both prompt for confirmation.
-- `/update` — self-update from the GitHub release tagged `latest`: compares the
-  running binary's SHA-256, downloads + verifies the new binary on mismatch, stages
-  it, and swaps it in on next launch. A `cargo run` dev build asks to confirm first.
+- `/update [channel [stable|dev]]` — self-update on the configured channel: `stable`
+  (default) is the latest tagged GitHub release, installed when newer; `dev` is the
+  rolling prerelease built from every `develop` push, installed on a hash mismatch.
+  Downloads + verifies the new binary, stages it, and swaps it in on next launch. A
+  `cargo run` dev build asks to confirm first.
 - `/autoupdate [on|off]` — run that check in the background on every startup (off by
   default). Bare `/autoupdate` shows status.

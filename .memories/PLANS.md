@@ -1,9 +1,10 @@
 # PLANS
 > Roadmap, active priorities, and ideas.
-> Last updated: 2026-08-26 (context-compaction ladder decided, not built — SHORT-TERM P0 + `.docs/context-compaction.md`). Before: 2026-07-06 (OpenAI-compatible server mode SHIPPED — moved off ACTIVE)
+> Last updated: 2026-09-13 (Windows installer + CI/CD release pipeline SHIPPED — moved off LONG-TERM). Before: 2026-08-26 (context-compaction ladder decided, not built — SHORT-TERM P0 + `.docs/context-compaction.md`). Before: 2026-07-06 (OpenAI-compatible server mode SHIPPED — moved off ACTIVE)
 
 ## RECENTLY SHIPPED (`[DONE]` — was on this roadmap)
 
+- ✅ **Windows installer + GitHub Actions release pipeline** (2026-09-13) — was "Windows MSI installer + GitHub Actions CI/CD" (Phase 5) below. Shipped as an Inno Setup 7.1.0 installer (`packaging/windows/pooprusteek.iss` → `pooprusteek-setup.exe`, per-user install + PATH + Start menu), not an MSI. CI split into `checks.yml`/`build.yml`/`release.yml`/`ci.yml`; two update channels (`stable` tag `v*`, `dev` rolling prerelease), each release carrying a `manifest.json`; `scripts/install.sh` for macOS/Linux, `scripts/release.sh` to cut a stable release. Remaining: code signing, a Homebrew tap/winget/scoop package, an app icon.
 - ✅ **OpenAI-compatible server mode** (2026-07-06) — `src/server/`: hyper-1 listener behind `--serve`/`--server`/`--api` + `/serve on|off` + `/server <port>` (persisted `[server]` config, default port 7667). Serves ALL providers, not just the active one: `deepseek-chat`/`deepseek-reasoner` + `<entry>/<model>` (caller-chosen sub-models pass through). Decisions taken as planned: stateless fork-per-request + `discard_remote_session` for DeepSeek; optional bearer auth; server requests bypass the tool loop (plain completions, v1). Extension seam: `config::ServerApi` reserves `anthropic`/`gemini` inbound dialects (currently 501; outbound halves already exist in `provider/{anthropic,gemini}_compat`).
 - ✅ **Sub-agents** (model `task` tool + `/agent`/`/agents`, fg+bg) — was an `[IDEA]`.
 - ✅ **`/btw` sidechat + parallel sessions** (`/new`/`/chats` + Tab) — concurrent streams, no connection loss.
@@ -43,7 +44,6 @@
 | Multi-provider (OpenAI, Anthropic, local) | `ProviderKind` already has the slots; vendor independence |
 | Plugin system | Third-party tool extensions |
 | Remote session sharing | Multi-device workflow |
-| Windows MSI installer + GitHub Actions CI/CD | Distribution (Phase 5) |
 
 ## IDEAS (`[IDEA]`)
 

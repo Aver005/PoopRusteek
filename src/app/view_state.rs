@@ -509,7 +509,7 @@ impl ConfirmState {
                     "You're running a development build (debug, e.g. `cargo run`).",
                 ),
                 ConfirmLine::soft(
-                    "Updating replaces the running binary with the released build from the `latest` GitHub release.",
+                    "Updating replaces the running binary with the released build from your update channel.",
                 ),
                 ConfirmLine::dim(
                     "Under `cargo run` that file lives in target/debug — cargo may keep running the downloaded release until the next source change or `cargo clean`.",

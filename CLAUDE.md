@@ -39,17 +39,19 @@ cargo test --bin pooprusteek
 cargo clippy --bin pooprusteek
 ```
 
-MSRV 1.91 (edition 2024). CI (`.github/workflows/ci.yml`) is one sequential
-pipeline: `test` (build+test, Windows+Linux) and `lint` (`cargo fmt --check`
-+ `cargo clippy -D warnings`, blocking) gate everything else — the rolling
-`dev-build` release (`release-build` + `publish` jobs, see
-`scripts/dev-release.template.md`) only builds and publishes once both pass,
-and only for a push to `develop`. A local pre-commit hook
-(`.githooks/pre-commit`, opt in via `git config core.hooksPath .githooks`)
-runs the same three checks before a commit is even made; bypass with
-`git commit --no-verify`. `.gitlab-ci.yml` mirrors the same
-`check → build → release` shape for a future GitLab project (unverified,
-no GitLab remote exists yet).
+MSRV 1.91 (edition 2024). CI is split across four workflows: `checks.yml`
+(reusable — tests on Windows/Ubuntu/macOS + `cargo fmt --check` + `cargo
+clippy -D warnings`, blocking) gates `build.yml` (reusable — release binaries
+for 5 targets plus the Windows Inno Setup installer). `ci.yml` runs `checks`
+on every push/PR to `main`/`develop`, and on a `develop` push also runs
+`build` and publishes the rolling `dev` prerelease (the `dev` update channel).
+`release.yml` cuts the `stable` update channel from a `vX.Y.Z` tag pushed by
+`scripts/release.sh`. A local pre-commit hook (`.githooks/pre-commit`, opt in
+via `git config core.hooksPath .githooks`) runs the same test/fmt/clippy
+checks before a commit is even made; bypass with `git commit --no-verify`.
+`.gitlab-ci.yml` mirrors the same `check → build → release` shape for a
+future GitLab project (unverified, no GitLab remote exists yet). Full
+release/installer details: `.memories/reference/RELEASING.md`.
 
 Semantic/retrieval changes have their own quality gate — an `#[ignore]`d MRR
 eval harness that needs the ~120 MB embedding model on disk (downloaded once,

@@ -4,7 +4,7 @@
 ## WHAT
 
 **Pooprusteek** (Пупра́стик) — a Rust TUI coding agent; a DeepSeek-powered alternative to Claude Code.
-Rust rewrite of the TypeScript **Poopseek**. ~15k LOC, edition 2024, MSRV 1.85.
+Rust rewrite of the TypeScript **Poopseek**. ~15k LOC, edition 2024, MSRV 1.91.
 
 - TUI: `ratatui` + `crossterm` (Catppuccin Mocha theme)
 - LLM: DeepSeek **web** API (reverse-engineered; cookie/token auth + SHA-3 PoW via WASM)
@@ -15,7 +15,7 @@ Rust rewrite of the TypeScript **Poopseek**. ~15k LOC, edition 2024, MSRV 1.85.
 
 | Path | Role | Size |
 |------|------|------|
-| `src/main.rs` | Entry, CLI flags (`--acp`, `--debug_log`) | 85 |
+| `src/main.rs` | Entry, CLI flags (`--acp`, `--debug-log`, `--version`) | 85 |
 | `src/app/mod.rs` | Coordinator: App+AppState, event loop, `handle_event`, `send_to_agent` (no longer a god-file) | 925 |
 | `src/app/conversation.rs` | `Conversation` + `Conversations` store (multi-chat core) | 154 |
 | `src/app/multichat.rs` | sub-agents / sidechat / parallel-session spawning + focus | 364 |
