@@ -3,6 +3,26 @@
 > Last updated: 2026-08-26 (**five-agent review of the day's context-compaction work**, **42** findings filed below under the prefix `compaction-review-2026-08-26 #N`. Now: **17 closed the same day** (the five data-loss fixes, then **#1, #2, #3, #16, #17**, then the evening batch **#4, #5, #6, #7, #8, #11, #26** — see the RESOLVED entries), **24 open** (#9, #10, #12-#15, #18-#25, #27-#36, spread HIGH 2 / MEDIUM 15 / LOW 7) and **1 accepted** (#37, `chars / 3`, owner decision). **#25 is two thirds closed** and stays open with its scope narrowed to the one third that remains (a verbatim `<template>` echo still validates). The evening batch closed the measurement-and-summary group: the context window is re-polled on every provider/model switch and goes to *unknown* — ladder off — the moment one starts, an old `[agent] auto_compact = false` is migrated instead of silently reversed, the prior summary reaches the summariser once instead of twice, mode 2 folds its chunk summaries into one form mechanically and gives each chunk its own upstream session, the harness driver applies `ToolOutputCleared` the way the TUI does, and mode 1 no longer drops what sits ahead of the first user message. Before, same day: the harness group is closed: the ladder is now reachable from a scenario (`[context]` table + provider-window discovery in the driver), a scenario can assert a rung actually fired (`[[expect.trace]]`), a run that produced nothing to judge is a failure, and the reserve no longer switches the ladder off on windows ≤ 20k. First scenario that exercises rung 1 end to end: `sandbox/scenarios/mock/rung-one-clears-tool-output.toml` (2/2; fails with exit 4 and `0 'context.prune' record(s)` once the window is taken away). `.docs/context-compaction.md` corrected in the same pass and given a «Известные расхождения» section. Before, same day: **context compaction steps 5-6**: rung 3 + `/compact` shipped, closing findings **#3** and **#4**. Tally re-counted against the entries below, because the two header lines had drifted apart: of the review's 20 findings, **9 are closed** (1, 2, 3, 4, 5, 11, 12, 15, 16), **1 refuted** (17), **10 open** (6, 7, 8, 9, 10, 13, 14, 18, 19, 20). Two new HIGH entries opened by the same work, both found by reading rather than by running: `/compact` is a no-op on DeepSeek and pollutes its server-side branch, and a stale doc comment in `src/context/summary.rs`. Before, same day: full-codebase review `.docs/review-2026-08-26-rust.md`, 20 findings — same-day fix batch closed 6 (1,2,5,11,12,16), see RESOLVED and `JOURNAL/2026-08-26.md`; the other 14 added below by severity, source of record is the review doc. Before, same day: the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
 > Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure), `.docs/review-2026-08-26-rust.md` (2026-08-26 full-codebase review, 20 numbered findings — 9 closed, 1 refuted, 10 open as of the evening of 2026-08-26; referenced by number below)
 
+## RESOLVED 2026-09-14 — `..` через несуществующую папку обходил охрану записи
+
+- ✅ **HIGH (безопасность) — модель могла записать в собственную конфигурацию агента на Linux и macOS.**
+  - **Как:** `safe_write::resolve_for_compare` поднимался к существующему предку, но на
+    компоненте `..` сдавался (у такого пути нет `file_name`) и возвращал сырой путь.
+    Путь `проект/нет/../../<data_dir>/whitelist.json` не распознавался как лежащий в
+    охраняемой папке, а `util::atomic_write` сам создаёт `нет`, после чего `..` честно
+    уводит запись туда.
+  - **Где не проявлялось:** на Windows ОС сворачивает `..` при `canonicalize`, поэтому
+    дефект не срабатывал. На Linux тест проходил случайно: сырой путь совпадал с папкой
+    по префиксу.
+  - **Как нашли:** первый прогон тестов на macOS в CI — временная папка там симлинк
+    (`/var` → `/private/var`), префиксы разошлись, упал
+    `a_dotdot_path_cannot_step_out_and_back_in`.
+  - **Починка:** `..` и `.` в несуществующем хвосте сворачиваются по тексту
+    (`append_lexically`). Это честно: несуществующая папка не может быть симлинком.
+    Тест `missing_dirs_and_dotdot_cannot_smuggle_a_path_into_a_guarded_dir` проверяет обе стороны.
+  - **Отрицательную сторону** локально не воспроизвести — на Windows старая логика тоже
+    проходит. Доказательство — упавший прогон на macOS.
+
 ## RESOLVED 2026-09-06 (4) — находки лестницы испытаний L0-L3
 
 Внешние полевые испытания

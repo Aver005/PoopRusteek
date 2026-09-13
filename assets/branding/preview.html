@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Pooprusteek icon variants</title>
+<style>
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #1e1e1e; color: #ddd; }
+  .row { display: flex; align-items: end; gap: 28px; padding: 22px 28px; }
+  .row.light { background: #f3f3f3; color: #333; }
+  .name { width: 150px; font-family: ui-monospace, monospace; }
+  img { display: block; image-rendering: auto; }
+</style>
+<div id="root"></div>
+<script>
+  const variants = ["icon-a-prompt-pile", "icon-b-neon-outline", "icon-c-terminal-cursor", "icon-d-rust-pile"];
+  const sizes = [256, 96, 48, 32, 16];
+  const root = document.getElementById("root");
+  for (const theme of ["dark", "light"]) {
+    for (const v of variants) {
+      const row = document.createElement("div");
+      row.className = "row " + theme;
+      row.innerHTML = `<div class="name">${v.replace("icon-", "")}</div>` +
+        sizes.map(s => `<img src="${v}.svg" width="${s}" height="${s}">`).join("");
+      root.append(row);
+    }
+  }
+</script>

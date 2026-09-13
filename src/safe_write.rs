@@ -17,28 +17,49 @@ pub fn resolve_for_compare(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return crate::util::strip_verbatim(&canonical);
     }
-    // Канонизируем ближайшего существующего предка и приклеиваем остаток —
-    // так `..` сворачивается, а префикс совпадает с охраняемой стороной.
+    // Канонизируем ближайшего существующего предка и приклеиваем остаток.
+    // `..` в остатке сворачиваем сами: `atomic_write` создаст недостающие папки,
+    // и `нет/../../<данные>` иначе прошёл бы мимо охраны.
     let mut tail: Vec<Component<'_>> = Vec::new();
     let mut cursor = path;
     loop {
         if let Ok(canonical) = cursor.canonicalize() {
-            let mut out = crate::util::strip_verbatim(&canonical);
-            for part in tail.iter().rev() {
-                out.push(part);
-            }
-            return out;
+            return append_lexically(crate::util::strip_verbatim(&canonical), tail.iter().rev());
         }
-        match (cursor.parent(), cursor.file_name()) {
-            (Some(parent), Some(_)) => {
-                if let Some(last) = cursor.components().next_back() {
-                    tail.push(last);
-                }
+        // `parent` снимает и `..`, у которого нет `file_name` — раньше на нём разбор сдавался.
+        match (cursor.parent(), cursor.components().next_back()) {
+            (Some(parent), Some(last)) if !parent.as_os_str().is_empty() => {
+                tail.push(last);
                 cursor = parent;
             }
-            _ => return path.to_path_buf(),
+            _ => {
+                return append_lexically(
+                    PathBuf::new(),
+                    path.components().collect::<Vec<_>>().iter(),
+                );
+            }
         }
     }
+}
+
+/// Дописывает компоненты, сворачивая `.` и `..` по тексту. Честно только для
+/// частей, которых нет на диске: симлинком несуществующая папка быть не может.
+fn append_lexically<'a>(
+    mut base: PathBuf,
+    parts: impl Iterator<Item = &'a Component<'a>>,
+) -> PathBuf {
+    for part in parts {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !base.pop() {
+                    base.push(part);
+                }
+            }
+            other => base.push(other),
+        }
+    }
+    base
 }
 
 /// Лежит ли `path` внутри `dir`. По компонентам, а не по строке: иначе
@@ -156,6 +177,37 @@ mod tests {
         let sneaky = dir.join("sub").join("..").join("target.json");
         assert!(is_inside(&sneaky, &dir), "`..` пронесло путь мимо охраны");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_dirs_and_dotdot_cannot_smuggle_a_path_into_a_guarded_dir() {
+        // Обход: `atomic_write` создаёт `missing`, и `..` уводит запись в охраняемую папку.
+        let root = temp_dir("smuggle");
+        let guarded = root.join("guarded");
+        std::fs::create_dir_all(&guarded).unwrap();
+        let smuggled = root
+            .join("project")
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("guarded")
+            .join("whitelist.json");
+        assert!(
+            is_inside(&smuggled, &guarded),
+            "обход через несуществующую папку и `..`"
+        );
+
+        // И обратная сторона: из охраняемой папки `..` выводит наружу.
+        let escaped = guarded
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("other.json");
+        assert!(
+            !is_inside(&escaped, &guarded),
+            "выход через `..` засчитан как вложенность"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
