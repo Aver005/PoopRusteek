@@ -42,7 +42,7 @@ tag v* ──► release.yml ──► verify ──► checks.yml ──► bui
   На macOS выбирается stable Xcode: на свежем нет `clang_rt.osx` для `aws-lc-sys`.
 - **`build.yml`** (reusable):
   - `binaries` — матрица целей → артефакты `bin-<target>` (сырой бинарник + zip/tar.gz
-    с LICENSE и README), см. `scripts/ci/package.sh`.
+    с LICENSE и README; отсутствие любого из них сборку не роняет), см. `scripts/ci/package.sh`.
   - `windows-arm64` (`windows-11-arm`) и `linux-arm64` (`ubuntu-24.04-arm`) — `experimental`:
     `continue-on-error`, их падение не блокирует релиз. Сделать обязательными после первых зелёных прогонов.
   - `installer` — ставит Inno Setup **7.1.0** с GitHub jrsoftware (на раннере через
