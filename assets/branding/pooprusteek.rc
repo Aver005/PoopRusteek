@@ -1,0 +1,3 @@
+// Иконка exe. Пересобрать после правки pooprusteek.ico:
+//   rc.exe /nologo /fo assets\branding\pooprusteek.res assets\branding\pooprusteek.rc
+1 ICON "pooprusteek.ico"

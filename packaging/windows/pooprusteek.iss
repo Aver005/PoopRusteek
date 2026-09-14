@@ -36,6 +36,9 @@ DisableDirPage=auto
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 WizardStyle=modern dynamic windows11
+; Иконка и картинка мастера — из assets/branding (исходник icon-c-terminal-cursor.svg).
+SetupIconFile=..\..\assets\branding\pooprusteek.ico
+WizardSmallImageFile=..\..\assets\branding\wizard-small.png
 ShowLanguageDialog=no
 ChangesEnvironment=yes
 ; Мьютекс создаёт приложение (src/update/install_record.rs): установщик просит его закрыть.

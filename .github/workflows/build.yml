@@ -12,18 +12,16 @@ jobs:
   binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # arm64 Windows/Linux ещё не обкатаны в CI — их падение не блокирует релиз.
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
-        # `target` — контракт с src/update/mod.rs::platform_target.
+        # `target` — контракт с src/update/mod.rs::platform_target. Все цели обязательны.
         include:
-          - { target: windows-x86_64, os: windows-latest, experimental: false }
-          - { target: windows-arm64, os: windows-11-arm, experimental: true }
-          - { target: linux-x86_64, os: ubuntu-latest, experimental: false }
-          - { target: linux-arm64, os: ubuntu-24.04-arm, experimental: true }
-          - { target: macos-arm64, os: macos-latest, experimental: false }
+          - { target: windows-x86_64, os: windows-latest }
+          - { target: windows-arm64, os: windows-11-arm }
+          - { target: linux-x86_64, os: ubuntu-latest }
+          - { target: linux-arm64, os: ubuntu-24.04-arm }
+          - { target: macos-arm64, os: macos-latest }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

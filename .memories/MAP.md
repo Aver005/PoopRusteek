@@ -181,7 +181,7 @@
 | `assets/sha3_wasm_bg.*.wasm` | DeepSeek PoW solver blob |
 | `.github/workflows/ci.yml` | Checks on every push/PR to `main`/`develop`; a `develop` push additionally builds via `build.yml` and publishes the rolling `dev` prerelease (`publish-dev` job) — the `dev` update channel |
 | `.github/workflows/checks.yml` | Reusable: tests on windows/ubuntu/macos + `fmt --check` + `clippy -D warnings` |
-| `.github/workflows/build.yml` | Reusable: release binaries (windows-x86_64, windows-arm64 experimental, linux-x86_64, linux-arm64 experimental, macos-arm64) + the Windows installer (Inno Setup 7.1.0 over `packaging/windows/pooprusteek.iss`) |
+| `.github/workflows/build.yml` | Reusable: release binaries (windows-x86_64, windows-arm64, linux-x86_64, linux-arm64, macos-arm64) + the Windows installer (Inno Setup 7.1.0 over `packaging/windows/pooprusteek.iss`) |
 | `.github/workflows/release.yml` | Tag-triggered (`v*`) stable release — the `stable` update channel |
 | `.githooks/pre-commit` | Локальная проверка перед коммитом: `cargo fmt --check` + `clippy -D warnings` + тесты. Включается `git config core.hooksPath .githooks` |
 | `packaging/windows/pooprusteek.iss` | Inno Setup script → `pooprusteek-setup.exe` (per-user install under `%LOCALAPPDATA%\Programs\Pooprusteek`, PATH, Start-menu shortcut, uninstall asks to delete `%APPDATA%\pooprusteek`) |

@@ -23,10 +23,11 @@
   сборку каждого пуша в develop.
 - `pooprusteek --version`.
 - Файл `LICENSE` (MIT) — лицензия была указана только в `Cargo.toml`.
+- Иконка приложения (`assets/branding/`): вшита в `pooprusteek.exe` и в установщик,
+  картинка в углу мастера установки.
 - `Cargo.lock` под контролем git, CI собирает с `--locked`: релиз собирается ровно
   из тех версий зависимостей, что прошли тесты.
-- Сборки для Linux arm64 и Windows arm64 (пока экспериментальные: их падение не
-  блокирует релиз). Тесты в CI теперь идут и на macOS.
+- Сборки для Linux arm64 и Windows arm64. Тесты в CI теперь идут и на macOS.
 
 - Шов для родного tool-calling: `ToolCall`, `ChatMessage.tool_calls`,
   `CompletionRequest.tools`, `CompletionChunk.tool_calls` и

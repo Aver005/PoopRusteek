@@ -4,16 +4,27 @@
       <stop offset="0" stop-color="#101a15"/>
       <stop offset="1" stop-color="#070b09"/>
     </linearGradient>
-    <linearGradient id="rust" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#fbbf24"/>
+    <linearGradient id="rust" gradientUnits="userSpaceOnUse" x1="0" y1="96" x2="0" y2="404">
+      <stop offset="0" stop-color="#fcd34d"/>
+      <stop offset=".45" stop-color="#f59e0b"/>
       <stop offset="1" stop-color="#ea580c"/>
     </linearGradient>
+    <!-- Ярусы горки: верхний отбрасывает тень на нижний по своей форме. -->
+    <rect id="tier-top" x="188" y="190" width="136" height="68" rx="34"/>
+    <rect id="tier-mid" x="156" y="252" width="200" height="80" rx="40"/>
+    <rect id="tier-low" x="120" y="324" width="272" height="84" rx="42"/>
+    <clipPath id="clip-mid"><use href="#tier-mid"/></clipPath>
+    <clipPath id="clip-low"><use href="#tier-low"/></clipPath>
   </defs>
   <rect width="512" height="512" rx="112" fill="url(#bg)"/>
   <rect x="6" y="6" width="500" height="500" rx="106" fill="none" stroke="#1d3a2b" stroke-width="4"/>
   <path d="M96 196L172 256L96 316" fill="none" stroke="#4ade80" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
-  <g transform="translate(141 75) scale(0.72)">
-    <path fill="url(#rust)" d="M124 404H388A39 39 0 0 0 388 326H348A35 35 0 0 0 348 256H316A30 30 0 0 0 316 196H296C314 166 300 124 250 100C258 138 244 176 196 196A30 30 0 0 0 196 256H164A35 35 0 0 0 164 326H124A39 39 0 0 0 124 404Z"/>
-    <path d="M182 256H330M152 326H360" fill="none" stroke="#1a0f06" stroke-width="10" stroke-linecap="round" opacity=".45"/>
+  <g transform="translate(141 75) scale(0.72)" fill="url(#rust)">
+    <use href="#tier-low"/>
+    <use href="#tier-mid" y="10" fill="#9a3412" opacity=".5" clip-path="url(#clip-low)"/>
+    <use href="#tier-mid"/>
+    <use href="#tier-top" y="10" fill="#9a3412" opacity=".45" clip-path="url(#clip-mid)"/>
+    <path d="M210 218C206 186 228 170 248 152C262 139 262 118 246 102C292 106 318 140 312 176C309 194 306 206 304 218Z"/>
+    <use href="#tier-top"/>
   </g>
 </svg>

@@ -43,8 +43,8 @@ tag v* ──► release.yml ──► verify ──► checks.yml ──► bui
 - **`build.yml`** (reusable):
   - `binaries` — матрица целей → артефакты `bin-<target>` (сырой бинарник + zip/tar.gz
     с LICENSE и README; отсутствие любого из них сборку не роняет), см. `scripts/ci/package.sh`.
-  - `windows-arm64` (`windows-11-arm`) и `linux-arm64` (`ubuntu-24.04-arm`) — `experimental`:
-    `continue-on-error`, их падение не блокирует релиз. Сделать обязательными после первых зелёных прогонов.
+  - Все пять целей обязательны, включая `windows-arm64` (`windows-11-arm`) и `linux-arm64`
+    (`ubuntu-24.04-arm`). До 2026-09-14 arm64 шли как `experimental`, первый прогон (CI #76) прошёл.
   - `installer` — ставит Inno Setup **7.1.0** с GitHub jrsoftware (на раннере через
     Chocolatey только 6.x), компилирует `packaging/windows/pooprusteek.iss` → `installer-windows`.
 - **`ci.yml` `publish-dev`**: `collect-assets.sh`, заметки из `dev-release.template.md`,
@@ -106,6 +106,25 @@ POSIX sh (работает под dash). `curl -fsSL …/releases/latest/downloa
   при смене `--dir` старая строка заменяется. Rc переписывается через `cat >`, чтобы сохранить симлинк.
 - `--uninstall`: бинарник (или найденный через PATH), строки PATH, данные — с вопросом через `/dev/tty`.
 
+## ИКОНКА (`assets/branding/`)
+
+- Исходник — `icon-c-terminal-cursor.svg`: зелёный `>` и горка ржавого цвета. Остальные `icon-*.svg` —
+  отвергнутые варианты, `preview.html` показывает их все в размерах 256…16.
+- **Производные файлы** (коммитятся, пересобираются руками после правки SVG):
+  - `pooprusteek.ico` — 16…256 px;
+  - `pooprusteek-256.png`;
+  - `wizard-small.png` (116 px, картинка в углу мастера);
+  - `pooprusteek.res` — скомпилированный `pooprusteek.rc`.
+- **Как пересобрать:**
+  1. Отрендерить SVG в 1024 px в браузере.
+  2. Сделать углы прозрачными маской `rx = 112/512` и уменьшить Pillow в размеры `.ico`.
+  3. `rc.exe /nologo /fo pooprusteek.res pooprusteek.rc` из Windows SDK.
+- **В exe** иконку вшивает `build.rs`: отдаёт `pooprusteek.res` линкеру MSVC
+  (`cargo:rustc-link-arg-bins`). Готовый `.res` в репозитории — чтобы сборке не нужны были
+  ни `rc.exe`, ни крейт вроде `winresource`. Для Linux и macOS `build.rs` ничего не делает,
+  но Dockerfile песочницы обязан его копировать.
+- **Установщик:** `SetupIconFile` и `WizardSmallImageFile` в `.iss`.
+
 ## ОГРАНИЧЕНИЯ ПЛАТФОРМ
 
 - **Linux**: glibc ≥ 2.39 (Ubuntu 24.04 / Debian 13): prebuilt ONNX Runtime у `ort`
@@ -116,7 +135,6 @@ POSIX sh (работает под dash). `curl -fsSL …/releases/latest/downloa
 
 ## ОТКРЫТО
 
-- Иконка приложения и установщика: у exe нет ресурса иконки, мастер со стандартной картинкой.
 - Подпись (SignPath Foundation бесплатно для OSS), winget/scoop/Homebrew tap.
 - Сделать arm64-цели обязательными после первых зелёных прогонов.
 - Удалить `legacy-latest` в 0.3.0.

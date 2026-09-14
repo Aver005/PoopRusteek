@@ -23,7 +23,7 @@ FROM rust:1.91-trixie AS builder
 WORKDIR /src
 
 # Manifests first so the dependency layer survives source edits.
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock* build.rs ./
 COPY assets ./assets
 
 # BuildKit cache mounts keep the registry and the target dir across builds —
