@@ -72,10 +72,12 @@ response). Constants in `deepseek/stream.rs` (`COMPLETION_URL`, `CREATE_POW_URL`
 `deepseek/endpoints.rs` (mostly `#[allow(dead_code)]`).
 
 **Auth** — cookie/token session, **not an API key**. `deepseek/http.rs::auth_headers`
-sets `Authorization: Bearer {token}` plus spoofed Android web-client headers:
-`x-client-platform: android`, `x-client-version: 1.8.0`, `x-client-locale: zh_CN`,
-`Host: chat.deepseek.com`, and a Chrome/YaBrowser desktop `User-Agent`
-(`USER_AGENT` const). Every PoW-gated call additionally carries an
+sets `Authorization: Bearer {token}` plus the real web client's identity
+(`deepseek/client.rs::insert_identity`): `x-client-platform: web`,
+`x-client-version: 2.5.0` (override: `[provider] client_version`),
+`x-client-bundle-id: com.deepseek.chat`, `x-client-locale: en_US`,
+`Host: chat.deepseek.com`, and a Chrome desktop `User-Agent` (`USER_AGENT` const).
+An old version is refused with `40005 CLIENT_VERSION_TOO_LOW`. Every PoW-gated call additionally carries an
 `x-ds-pow-response` header (`deepseek/stream.rs::get_chat_headers`).
 
 **Proof-of-work** (`provider/pow.rs`, crux of access):

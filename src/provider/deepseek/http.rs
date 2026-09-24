@@ -69,7 +69,10 @@ pub(super) fn api_refusal(payload: &Value) -> Option<ApiRefusal> {
         && code != 0
     {
         let message = text(&payload["msg"], "no message");
-        return Some(ApiRefusal::Transport(format!("{message} (code {code})")));
+        return Some(ApiRefusal::Transport(super::client::with_hint(
+            format!("{message} (code {code})"),
+            Some(code),
+        )));
     }
     if let Some(biz_code) = payload["data"]["biz_code"].as_i64()
         && biz_code != 0
@@ -80,6 +83,16 @@ pub(super) fn api_refusal(payload: &Value) -> Option<ApiRefusal> {
         )));
     }
     None
+}
+
+/// Ответ помечен как JSON. Для потоковых эндпоинтов это значит отказ:
+/// поток приходит как `text/event-stream`.
+pub(super) fn is_json_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("json"))
 }
 
 /// Похоже ли тело на JSON. Заголовок — первый довод, но не единственный:
@@ -96,7 +109,7 @@ fn is_json_body(content_type: &str, body: &str) -> bool {
     matches!(body.trim_start().as_bytes().first(), Some(b'{' | b'['))
 }
 
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
 
 impl DeepseekProvider {
     pub(super) fn auth_headers(&self) -> AppResult<HeaderMap> {
@@ -108,9 +121,7 @@ impl DeepseekProvider {
         // auto-decompression, and gzip isn't among our enabled features — a
         // server honoring it would hand us bytes we'd garble.
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-        headers.insert("x-client-platform", HeaderValue::from_static("android"));
-        headers.insert("x-client-version", HeaderValue::from_static("1.8.0"));
-        headers.insert("x-client-locale", HeaderValue::from_static("zh_CN"));
+        super::client::insert_identity(&mut headers, &self.client_version);
         headers.insert("accept-charset", HeaderValue::from_static("UTF-8"));
         let bearer = format!("Bearer {}", self.token);
         headers.insert(

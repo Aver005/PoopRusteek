@@ -1,6 +1,27 @@
 # LEARNINGS
 > Hard-won technical knowledge. Gotchas. Patterns. (Deep detail lives in `reference/`.)
-> Last updated: 2026-09-13 (asset resolution row: release builds now embed only, debug reads the source checkout). Before: 2026-06-30 (added refactor + conversation/fork learnings)
+> Last updated: 2026-09-24 (DeepSeek web API: version gate, JSON refusals, login walls). Before: 2026-09-13 (asset resolution row: release builds now embed only, debug reads the source checkout). Before: 2026-06-30 (added refactor + conversation/fork learnings)
+
+## ВЕБ-API DEEPSEEK
+
+- **Мы — клиент, которого сервер знает по заголовкам `x-client-*`, и порог
+  версии поднимают волнами по аккаунтам.** Симптом «у меня работает, у друга
+  нет» при одной сборке — это раскатка, а не баг сборки. Шлём заголовки живого
+  веба (`deepseek/client.rs`); версию снимать из DevTools → Network, не
+  выдумывать: от неё меняется даже форма ответа (`web 1.0.0` отдаёт сессию
+  прямо в `biz_data`, `2.5.0` — в `biz_data.chat_session`).
+- **Порог проверяется до авторизации, поэтому щупается протухшим токеном.**
+  `chat_session/create` с мёртвым токеном отвечает 40005, если версия ниже
+  порога, и 40003, если выше. Так граница находится перебором за минуту без
+  живого аккаунта. Порог, который включается уже после авторизации, так не
+  увидеть — для него нужен токен задетого аккаунта.
+- **Отказ всегда приходит как `200 OK` + JSON-конверт, даже на потоковых
+  эндпоинтах.** Проверка статуса его пропускает, SSE-разбор принимает за
+  незнакомую строку. Перед разбором смотреть `content-type`/`api_refusal`.
+- **Логин через API без браузера упирается в защиту**: `users/login`
+  отвечает `RISK_DEVICE_DETECTED`, а в браузере — AWS WAF-капчей. Токен для
+  тестов берётся из залогиненного браузера (`localStorage.userToken` — запись
+  `{"value":"…","__version":"0"}`), капчу проходит человек.
 
 ## CI И ЛОКАЛЬНЫЕ ПРОВЕРКИ
 
@@ -18,7 +39,11 @@
 - **Проверять — установкой той же версии, а не рассуждением.**
   `rustup toolchain install <ver> --component clippy --profile minimal` и
   `cargo +<ver> clippy` воспроизводят падение CI за минуту, не трогая дефолтный
-  тулчейн. `rustup check` показывает разрыв между локальным stable и свежим.
+  тулчейн.
+- **Код под `#[cfg(unix)]` можно пролинтовать с Windows без сборки крейта**,
+  если файл самодостаточен: `rustup target add <triple>` и
+  `clippy-driver --edition 2024 --crate-type lib --emit=metadata --target <triple> -D warnings файл.rs`
+  (плюс `--test` для тестов). Весь крейт так не собрать — нативные зависимости. `rustup check` показывает разрыв между локальным stable и свежим.
 - **Логи упавшей джобы через API не скачать без прав админа** (`403`), а вот
   список прогонов и статусы шагов — открыты:
   `/repos/<o>/<r>/actions/runs` и `/actions/runs/<id>/jobs`. Их хватает, чтобы

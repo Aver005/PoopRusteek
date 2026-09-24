@@ -19,6 +19,22 @@ const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
 const SESSION_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
 const TARGET_PATH: &str = "/api/v0/chat/completion";
 
+const COMPLETION_REFUSED: &str = "Chat completion refused";
+
+pub(super) fn completion_refused(message: &str) -> AppError {
+    AppError::Provider(format!("{COMPLETION_REFUSED}: {message}"))
+}
+
+/// Конверт отказа, пришедший строкой потока: без `data:`, целиком JSON.
+pub(super) fn refusal_in_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(trimmed).ok()?;
+    api_refusal(&payload).map(|refusal| refusal.message().to_string())
+}
+
 pub(super) enum PathSegment<'a> {
     Key(&'a str),
     Index(usize),
@@ -63,14 +79,24 @@ impl DeepseekProvider {
             "pow.challenge.raw_body",
             format!("len={} body={}", raw_text.len(), raw_text),
         );
+        let parse_error = |error: serde_json::Error| {
+            debug_log::log(
+                "pow.challenge.parse",
+                format!("failed to parse challenge response json: {error}; raw={raw_text}"),
+            );
+            AppError::Json(error)
+        };
+        let payload: Value = serde_json::from_str(&raw_text).map_err(parse_error)?;
+        // Отказ приходит с 200 OK и без `biz_data` — без этой проверки вместо
+        // причины (например, 40005) пользователь видел «missing field biz_data».
+        if let Some(refusal) = api_refusal(&payload) {
+            return Err(AppError::Provider(format!(
+                "PoW challenge refused: {}",
+                refusal.message()
+            )));
+        }
         let raw: super::pow::PowChallengeResponse =
-            serde_json::from_str(&raw_text).map_err(|error| {
-                debug_log::log(
-                    "pow.challenge.parse",
-                    format!("failed to parse challenge response json: {error}; raw={raw_text}"),
-                );
-                AppError::Json(error)
-            })?;
+            serde_json::from_value(payload).map_err(parse_error)?;
         debug_log::log_json("pow.challenge.response", &raw);
         let challenge = raw.data.biz_data.challenge;
         // The solve is a synchronous CPU-bound wasm hash loop (tens to
@@ -82,6 +108,16 @@ impl DeepseekProvider {
             .ok_or_else(|| AppError::Provider("Failed to solve PoW challenge".to_string()))?;
         debug_log::log_json("pow.challenge.solution", &solution);
         super::pow::encode_solution(&solution)
+    }
+
+    pub(super) async fn read_completion_refusal(response: Response) -> AppError {
+        match Self::read_json::<Value>("completion.request", response, COMPLETION_REFUSED).await {
+            Ok(payload) => completion_refused(&api_refusal(&payload).map_or_else(
+                || "the endpoint answered JSON instead of an event stream".to_string(),
+                |refusal| refusal.message().to_string(),
+            )),
+            Err(error) => error,
+        }
     }
 
     pub(super) fn build_body(
@@ -158,6 +194,11 @@ impl DeepseekProvider {
                 "Chat completion failed",
             )
             .await);
+        }
+        // Отказ приходит с 200 OK и JSON вместо потока. Поток такую строку
+        // пропускает как незнакомую, и ход кончался пустым «успехом».
+        if super::http::is_json_response(&response) {
+            return Err(Self::read_completion_refusal(response).await);
         }
         self.add_session_tokens(prompt_tokens);
 
@@ -705,6 +746,59 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+    use super::{DeepseekProvider, refusal_in_line};
+    use crate::provider::deepseek::http::is_json_response;
+
+    fn response(content_type: &str, body: &'static str) -> reqwest::Response {
+        reqwest::Response::from(
+            hyper::Response::builder()
+                .header("content-type", content_type)
+                .body(body)
+                .unwrap(),
+        )
+    }
+
+    /// Ровно так completion отвечает старому клиенту (снято 2026-09-24):
+    /// 200 OK, `application/json`, конверт вместо потока. Раньше ход кончался
+    /// пустым «успехом».
+    #[tokio::test]
+    async fn a_json_body_in_place_of_a_stream_is_a_refusal() {
+        let refused = response(
+            "application/json",
+            r#"{"code":40005,"msg":"CLIENT_VERSION_TOO_LOW","data":{"alt_app":{}}}"#,
+        );
+        assert!(is_json_response(&refused));
+        let error = DeepseekProvider::read_completion_refusal(refused)
+            .await
+            .to_string();
+        assert!(error.contains("Chat completion refused"), "{error}");
+        assert!(
+            error.contains("CLIENT_VERSION_TOO_LOW (code 40005)"),
+            "{error}"
+        );
+        assert!(error.contains("client_version"), "{error}");
+    }
+
+    #[test]
+    fn a_real_event_stream_is_not_taken_for_a_refusal() {
+        assert!(!is_json_response(&response(
+            "text/event-stream; charset=utf-8",
+            "event: ready
+"
+        )));
+    }
+
+    /// Запасной путь, когда заголовок не помечен как JSON: конверт приходит
+    /// строкой без `data:`. Обычные кадры потока отказом не считаются.
+    #[test]
+    fn a_refusal_line_is_told_apart_from_stream_frames() {
+        let refusal = refusal_in_line(r#"{"code":40300,"msg":"MISSING_HEADER","data":null}"#);
+        assert_eq!(refusal.as_deref(), Some("MISSING_HEADER (code 40300)"));
+        assert!(refusal_in_line(r#"data: {"code":40300,"msg":"x"}"#).is_none());
+        assert!(refusal_in_line(r#"{"v":{"response":{"message_id":2}}}"#).is_none());
+        assert!(refusal_in_line("event: close").is_none());
+    }
+
     /// The frame that made the harness's "agent silently did nothing" run
     /// explicable: HTTP 200, an error inside the stream, then a clean EOF.
     #[test]

@@ -5,6 +5,8 @@
 //! by concern:
 //! - `mod.rs` (this file): the `DeepseekProvider` type, construction/forking,
 //!   and the `LLMProvider` trait impl.
+//! - `client`: the client identity headers DeepSeek gates on, and hints
+//!   for the refusal codes they trigger.
 //! - `http`: transport plumbing (headers, redaction/debug logging, retry
 //!   backoff, generic JSON/GET request senders, rate limiting).
 //! - `session`: server-side chat session lifecycle (create/ensure/mark).
@@ -12,6 +14,7 @@
 //! - `endpoints`: the full reverse-engineered REST surface, including the
 //!   large `#[expect(dead_code)]` collection of wrappers kept for parity with
 //!   the upstream API but not yet driven by this TUI.
+mod client;
 mod endpoints;
 mod http;
 mod session;
@@ -34,6 +37,7 @@ use session::SessionState;
 pub struct DeepseekProvider {
     client: Client,
     token: String,
+    client_version: reqwest::header::HeaderValue,
     model: String,
     temperature: f32,
     max_tokens: u32,
@@ -71,6 +75,7 @@ impl DeepseekProvider {
         let provider = Self {
             client,
             token: config.token.clone(),
+            client_version: client::client_version(config.client_version.as_deref()),
             model: config.model.clone(),
             temperature: config.temperature,
             max_tokens: config.max_tokens,
@@ -104,6 +109,7 @@ impl DeepseekProvider {
         DeepseekProvider {
             client: self.client.clone(),
             token: self.token.clone(),
+            client_version: self.client_version.clone(),
             model: self.model.clone(),
             temperature: self.temperature,
             max_tokens: self.max_tokens,
@@ -225,6 +231,10 @@ impl DeepseekProvider {
 
             for line in sse.push_bytes(&chunk) {
                 let Some(event) = stream::process_stream_line(&line) else {
+                    // Отказ без метки JSON в заголовке: строка без `data:`.
+                    if let Some(message) = stream::refusal_in_line(&line) {
+                        return Err(stream::completion_refused(&message));
+                    }
                     // Unrecognized lines are logged so protocol changes stay
                     // visible instead of silently dropping server events.
                     let trimmed = line.trim();
@@ -289,6 +299,10 @@ impl DeepseekProvider {
             }
         }
 
+        // JSON-отказ приходит одной строкой без перевода строки и остаётся в буфере.
+        if let Some(message) = sse.finish().as_deref().and_then(stream::refusal_in_line) {
+            return Err(stream::completion_refused(&message));
+        }
         self.mark_session_after_success(&session_id, parent_message_id)?;
         // DeepSeek's web endpoint routinely finishes a response by just
         // closing the connection — no `data: [DONE]`, no status event. A
@@ -506,8 +520,34 @@ mod tests {
             base_url: None,
             temperature: 0.0,
             max_tokens: 128,
+            client_version: None,
         };
         DeepseekProvider::new(&config, 0, 0, 0).expect("client builds")
+    }
+
+    /// Через настоящий `auth_headers`: тест поймает и выпавший вызов, и
+    /// заголовок, перезаписанный позже. `x-device-id` и часовой пояс веб
+    /// тоже шлёт — мы нет: без них проходит, а опознавательных данных меньше.
+    #[test]
+    fn requests_carry_the_live_web_client_identity() {
+        let headers = provider().auth_headers().unwrap();
+        assert_eq!(headers["x-client-platform"], "web");
+        assert_eq!(headers["x-client-version"], "2.5.0");
+        assert_eq!(headers["x-client-bundle-id"], "com.deepseek.chat");
+        assert_eq!(headers["x-client-locale"], "en_US");
+    }
+
+    #[test]
+    fn a_configured_client_version_reaches_the_wire() {
+        let config = ProviderConfig {
+            client_version: Some("2.7.3".to_string()),
+            ..ProviderConfig::default()
+        };
+        let headers = DeepseekProvider::new(&config, 0, 0, 0)
+            .unwrap()
+            .auth_headers()
+            .unwrap();
+        assert_eq!(headers["x-client-version"], "2.7.3");
     }
 
     #[test]

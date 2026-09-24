@@ -238,6 +238,10 @@ pub struct ProviderConfig {
     pub temperature: f32,
     #[serde(default = "default_provider_max_tokens")]
     pub max_tokens: u32,
+    /// Переопределить `x-client-version` для DeepSeek, когда сервер поднял
+    /// порог (`40005`), а новой сборки ещё нет. Пусто — встроенная версия.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 fn default_provider_kind() -> ProviderKind {
@@ -269,6 +273,7 @@ impl Default for ProviderConfig {
             base_url: None,
             temperature: default_provider_temperature(),
             max_tokens: default_provider_max_tokens(),
+            client_version: None,
         }
     }
 }

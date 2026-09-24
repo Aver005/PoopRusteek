@@ -71,8 +71,12 @@ impl DeepseekProvider {
         )
         .await?;
         debug_log::log_json("session.create.response", &payload);
-        let session_id = payload["data"]["biz_data"]["chat_session"]["id"]
+        // Форма зависит от версии клиента: `2.5.0` вкладывает сессию в
+        // `chat_session`, старые версии кладут её прямо в `biz_data`.
+        let biz_data = &payload["data"]["biz_data"];
+        let session_id = biz_data["chat_session"]["id"]
             .as_str()
+            .or_else(|| biz_data["id"].as_str())
             .map(|id| id.to_string())
             .ok_or_else(|| AppError::Provider(session_create_error(&payload)))?;
         debug_log::log("session.create.success", format!("session_id={session_id}"));
@@ -156,9 +160,10 @@ impl DeepseekProvider {
 fn session_create_error(payload: &Value) -> String {
     let message = payload["msg"].as_str().unwrap_or_default().trim();
     match (payload["code"].as_i64(), message) {
-        (Some(code), msg) if !msg.is_empty() => {
-            format!("DeepSeek refused the session: {msg} (code {code})")
-        }
+        (Some(code), msg) if !msg.is_empty() => super::client::with_hint(
+            format!("DeepSeek refused the session: {msg} (code {code})"),
+            Some(code),
+        ),
         (_, msg) if !msg.is_empty() => format!("DeepSeek refused the session: {msg}"),
         _ => "Invalid session payload: missing chat_session.id".to_string(),
     }
@@ -181,6 +186,22 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("40003"), "{message}");
+    }
+
+    /// Ровно ответ со скрина друга: сырой код заменён объяснением, что делать.
+    #[test]
+    fn a_too_old_client_is_told_how_to_recover() {
+        let payload = json!({
+            "code": 40005,
+            "msg": "CLIENT_VERSION_TOO_LOW",
+            "data": { "alt_app": { "ios_app_id": null, "android_app_link": null } }
+        });
+        let message = session_create_error(&payload);
+        assert!(
+            message.contains("CLIENT_VERSION_TOO_LOW (code 40005)"),
+            "{message}"
+        );
+        assert!(message.contains("client_version"), "{message}");
     }
 
     #[test]

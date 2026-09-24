@@ -58,6 +58,11 @@ impl SseLineBuffer {
         }
         lines
     }
+
+    /// Хвост без `\n`, оставшийся к концу потока. Тело-отказ приходит именно так.
+    pub fn finish(self) -> Option<String> {
+        (!self.buffer.is_empty()).then(|| String::from_utf8_lossy(&self.buffer).into_owned())
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +139,14 @@ mod tests {
         assert_eq!(lines[0].len(), SseLineBuffer::MAX_BUFFERED_LINE + 1);
         // Buffer is empty again afterwards.
         assert!(buf.push_bytes(b"tail\n") == vec!["tail".to_string()]);
+    }
+
+    /// JSON-отказ приходит одной строкой без `\n`: без `finish` он терялся.
+    #[test]
+    fn an_unterminated_tail_is_handed_back_at_the_end() {
+        let mut buf = SseLineBuffer::new();
+        assert!(buf.push_bytes(b"{\"code\":40005}").is_empty());
+        assert_eq!(buf.finish().as_deref(), Some("{\"code\":40005}"));
+        assert_eq!(SseLineBuffer::new().finish(), None);
     }
 }

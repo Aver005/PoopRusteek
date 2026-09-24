@@ -55,6 +55,8 @@ model = "deepseek-chat"    # or "deepseek-reasoner" (enables thinking/expert mod
 base_url = ""              # Option<String>, default None
 temperature = 0.7
 max_tokens = 4096
+client_version = "2.5.0"   # optional; overrides x-client-version for DeepSeek when the
+                           # server raises its floor (40005) before a new build ships
 
 [ui]
 theme = "default"          # only Catppuccin Mocha exists; theme is effectively hardcoded
