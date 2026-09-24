@@ -2,7 +2,9 @@
 //! entry, model toggle, and the Enter transition that hot-creates the
 //! provider and lands on the chat view.
 
-use crate::app::events::View;
+use crate::app::events::{
+    AppEvent, DEEPSEEK_CHAT_URL, OnboardingAction, TOKEN_CONSOLE_SNIPPET, View,
+};
 use crate::app::{App, conversation};
 use crate::error::AppResult;
 
@@ -11,12 +13,21 @@ impl App {
         &mut self,
         key: crossterm::event::KeyEvent,
     ) -> AppResult<bool> {
-        use crossterm::event::{KeyCode, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        // Зажатая клавиша не должна открыть десяток вкладок.
+        let fresh = key.kind != KeyEventKind::Repeat;
 
         match key.code {
             // Ctrl+C quits (handled by the main select! before we get here — belt-and-suspenders).
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(true);
+            }
+            KeyCode::Char('o') if fresh && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.run_onboarding_action(OnboardingAction::OpenSite);
+            }
+            KeyCode::Char('y') if fresh && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.run_onboarding_action(OnboardingAction::CopySnippet);
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Left | KeyCode::BackTab => {
                 self.state.onboarding.toggle_model();
@@ -52,7 +63,10 @@ impl App {
                     self.state.conversations = conversation::Conversations::new(
                         conversation::Conversation::fresh_main(Some(provider)),
                     );
-                    self.state.status_message = "Ready".to_string();
+                    // Токен мог прийти через буфер, а у Windows есть его история.
+                    self.state.status_message =
+                        "Ready · your token may still be in the clipboard — copy something over it"
+                            .to_string();
                     self.state.view = View::Chat;
                 }
                 // If submit() returned None it set an error; the view stays on onboarding.
@@ -60,5 +74,23 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Браузер и буфер обмена — внешние процессы, на цикле событий их не ждём.
+    fn run_onboarding_action(&self, action: OnboardingAction) {
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = match action {
+                OnboardingAction::OpenSite => open::that_detached(DEEPSEEK_CHAT_URL),
+                OnboardingAction::CopySnippet => crate::clipboard::copy(TOKEN_CONSOLE_SNIPPET),
+            };
+            if let Err(error) = &result {
+                tracing::warn!("onboarding {action:?} failed: {error}");
+            }
+            let _ = event_tx.send(AppEvent::OnboardingActionDone {
+                action,
+                ok: result.is_ok(),
+            });
+        });
     }
 }

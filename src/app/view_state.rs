@@ -47,6 +47,31 @@ impl QuestionState {
     }
 }
 
+/// Где человек берёт токен. Прямой редирект на токен невозможен, поэтому
+/// ведём на сайт и даём строку для консоли, которая кладёт токен в буфер.
+pub const DEEPSEEK_CHAT_URL: &str = "https://chat.deepseek.com/";
+pub const TOKEN_CONSOLE_SNIPPET: &str = "copy(JSON.parse(localStorage.userToken).value)";
+
+/// Помощь на экране онбординга, выполняемая в фоне.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingAction {
+    OpenSite,
+    CopySnippet,
+}
+
+impl OnboardingAction {
+    pub fn outcome(self, ok: bool) -> &'static str {
+        match (self, ok) {
+            (Self::OpenSite, true) => {
+                "Sent chat.deepseek.com to your browser — log in, then press F12"
+            }
+            (Self::OpenSite, false) => "Couldn't open a browser — go to chat.deepseek.com yourself",
+            (Self::CopySnippet, true) => "Copied — paste it into the browser console",
+            (Self::CopySnippet, false) => "Couldn't copy — select the line with Shift+drag",
+        }
+    }
+}
+
 /// Pure state for the in-TUI onboarding screen. No app deps — fully testable.
 #[derive(Debug, Clone, Default)]
 pub struct OnboardingState {
@@ -57,12 +82,21 @@ pub struct OnboardingState {
     pub model_reasoner: bool,
     /// Set after a failed submit; cleared on the next keypress.
     pub error: Option<&'static str>,
+    /// Итог фонового действия (открыть сайт, скопировать строку); живёт до
+    /// следующей клавиши, как и `error`.
+    pub info: Option<&'static str>,
 }
 
 impl OnboardingState {
+    /// Clear both status lines — any edit means the user has moved on.
+    fn clear_messages(&mut self) {
+        self.error = None;
+        self.info = None;
+    }
+
     /// Insert a char at the cursor position, advancing the cursor.
     pub fn insert(&mut self, ch: char) {
-        self.error = None;
+        self.clear_messages();
         self.input
             .insert(char_to_byte_pos(&self.input, self.cursor), ch);
         self.cursor += 1;
@@ -70,13 +104,25 @@ impl OnboardingState {
 
     /// Delete the char immediately before the cursor (Backspace).
     pub fn backspace(&mut self) {
-        self.error = None;
+        self.clear_messages();
         if self.cursor == 0 {
             return;
         }
         self.cursor -= 1;
         self.input
             .remove(char_to_byte_pos(&self.input, self.cursor));
+    }
+
+    /// Показать итог фоновой помощи строкой статуса.
+    pub fn report(&mut self, action: OnboardingAction, ok: bool) {
+        let text = action.outcome(ok);
+        if ok {
+            self.error = None;
+            self.info = Some(text);
+        } else {
+            self.info = None;
+            self.error = Some(text);
+        }
     }
 
     /// Toggle the model selector between deepseek-chat and deepseek-reasoner.
@@ -93,9 +139,9 @@ impl OnboardingState {
         }
     }
 
-    /// Validate and return the trimmed token, or set the error and return None.
+    /// Validate and return the token, or set the error and return None.
     pub fn submit(&mut self) -> Option<String> {
-        let token = self.input.trim().to_string();
+        let token = normalize_token(&self.input);
         if token.is_empty() {
             self.error = Some("Token can't be empty — paste your userToken");
             None
@@ -105,9 +151,65 @@ impl OnboardingState {
     }
 }
 
+/// Токен из того, что человек реально скопирует. Вкладка Application отдаёт
+/// всю запись `{"value":"…","__version":"0"}`, Network — `Bearer …`.
+pub fn normalize_token(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{')
+        && let Ok(record) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(value) = record["value"].as_str()
+    {
+        return value.trim().to_string();
+    }
+    let mut token = trimmed.trim_matches(|c| c == '"' || c == '\'');
+    // Из вкладки Network копируют и `Bearer …`, и строку заголовка целиком.
+    for prefix in ["authorization:", "bearer "] {
+        if let (Some(head), Some(rest)) = (token.get(..prefix.len()), token.get(prefix.len()..))
+            && head.eq_ignore_ascii_case(prefix)
+        {
+            token = rest.trim_start();
+        }
+    }
+    token.trim().to_string()
+}
+
 #[cfg(test)]
 mod onboarding_tests {
     use super::*;
+
+    #[test]
+    fn a_token_is_taken_from_every_shape_devtools_hands_out() {
+        let bare = "7CVZpg+abc/def==";
+        for pasted in [
+            bare.to_string(),
+            format!("  {bare}\n"),
+            format!("\"{bare}\""),
+            format!("'{bare}'"),
+            format!("Bearer {bare}"),
+            format!("bearer {bare}"),
+            format!("authorization: Bearer {bare}"),
+            format!("{{\"value\":\"{bare}\",\"__version\":\"0\"}}"),
+        ] {
+            assert_eq!(normalize_token(&pasted), bare, "pasted: {pasted}");
+        }
+    }
+
+    /// JSON без `value` — не запись localStorage; строку не портим, пусть
+    /// сервер скажет, что токен плохой.
+    #[test]
+    fn json_without_a_value_is_left_alone() {
+        assert_eq!(normalize_token("{\"x\":1}"), "{\"x\":1}");
+    }
+
+    #[test]
+    fn info_is_cleared_on_the_next_edit() {
+        let mut s = OnboardingState {
+            info: Some("copied"),
+            ..OnboardingState::default()
+        };
+        s.insert('x');
+        assert!(s.info.is_none());
+    }
 
     #[test]
     fn insert_and_backspace_ascii() {

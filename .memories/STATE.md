@@ -1,5 +1,10 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
+> **2026-09-24 — `CLIENT_VERSION_TOO_LOW (40005)` и экран токена.**
+> - Часть аккаунтов получала 40005 на первом ходу: мы представлялись `android 1.8.0`, ровно на пороге, который DeepSeek поднимает волнами. Теперь заголовки живого веба (`deepseek/client.rs`, `web 2.5.0`) и `[provider] client_version` для следующего раза. На задетом аккаунте фикс **ещё не проверен** — нет токена.
+> - Отказ в `200 OK` + JSON на completion больше не даёт пустой «успешный» ход; PoW-отказ не маскируется ошибкой serde; коды 40005/40003 объясняют, что делать.
+> - Онбординг: `Ctrl+O` — сайт, `Ctrl+Y` — строка для консоли, которая кладёт токен в буфер; поле принимает запись localStorage целиком. Буфер обмена — `src/clipboard.rs`, без крейта.
+> - Тесты 902 → 911, живые `exec` и набор `live` на тестовом аккаунте. `JOURNAL/2026-09-24-client-version-40005.md`.
 > **2026-09-13 — установщики и стабильные релизы.**
 > - **Установщики.** Windows: `pooprusteek-setup.exe` на Inno Setup 7 (`packaging/windows/pooprusteek.iss`) — per-user без UAC, один экран, PATH, «Пуск», деинсталлятор. macOS/Linux: `scripts/install.sh` (`curl | sh`).
 > - **Релизы.** Стабильные — по тегу через `scripts/release.sh patch|minor|major` → `release.yml`. CI разбит на reusable `checks.yml` (тесты теперь и на macOS) и `build.yml` (+ экспериментальные Windows/Linux arm64).

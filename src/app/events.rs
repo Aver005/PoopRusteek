@@ -147,6 +147,11 @@ pub enum AppEvent {
         rows: u16,
     },
     Tick,
+    /// Фоновая помощь онбординга (браузер, буфер обмена) закончилась.
+    OnboardingActionDone {
+        action: OnboardingAction,
+        ok: bool,
+    },
 
     /// Событие одного хода агента. Все трое потребителей — фокус, фон
     /// и харнесс — применяют его через `app::reduce`.

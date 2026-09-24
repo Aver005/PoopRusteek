@@ -779,6 +779,9 @@ impl App {
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::Resize { rows } => self.state.terminal_rows = rows,
             AppEvent::Paste(text) => self.handle_paste(text),
+            AppEvent::OnboardingActionDone { action, ok } => {
+                self.state.onboarding.report(action, ok);
+            }
             AppEvent::CompactFinished {
                 conversation,
                 messages,

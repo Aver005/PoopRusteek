@@ -112,7 +112,16 @@ pooprusteek --version  # print the version
 pooprusteek --debug-log  # developer debug log (data dir; .dev/ in debug builds)
 ```
 
-On first launch, an onboarding flow helps you set your DeepSeek token and model.
+On first launch, an onboarding screen walks you through getting your DeepSeek token: `Ctrl+O` opens chat.deepseek.com, you log in, press `F12` → **Console** and run the one-liner shown on screen (`Ctrl+Y` copies it for you):
+
+```js
+copy(JSON.parse(localStorage.userToken).value)
+```
+
+It copies your own token into the clipboard — paste it into the token box and press `Enter`. Prefer not to run code in the console? Copy `userToken` from `F12` → **Application** → **Local Storage** instead; the whole `{"value":…}` record is accepted as is.
+
+> [!NOTE]
+> **`CLIENT_VERSION_TOO_LOW (code 40005)`** means DeepSeek raised the minimum client version. Run `/update`. If no fixed build is out yet, open chat.deepseek.com with DevTools → **Network**, copy the `x-client-version` request header, and set it as `client_version` under `[provider]` in `config.toml`. **`Authorization Failed (code 40003)`** means the token expired — `/logout` and paste a fresh one.
 
 > [!TIP]
 > The first launch also downloads the embedding model (~120 MB) in the background and indexes your saved sessions — the status bar reports progress; everything else is usable meanwhile. Every launch after that is fully offline. Don't want it? `/rag off` or `[semantic] enabled = false`.
@@ -203,6 +212,7 @@ token = "your-deepseek-token"
 model = "deepseek-chat"
 temperature = 0.7
 max_tokens = 4096
+# client_version = "2.5.0"  # only if DeepSeek answers 40005 before an update ships
 
 # Extra endpoints managed via /providers land here as [[providers]] entries
 # (protocol = "openai" | "anthropic" | "gemini"); `active_provider` picks one.

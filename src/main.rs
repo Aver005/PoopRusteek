@@ -3,6 +3,7 @@ mod agent;
 mod app;
 mod checkpoints;
 mod cli;
+mod clipboard;
 mod commands;
 mod config;
 mod context;
