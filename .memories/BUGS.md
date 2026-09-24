@@ -3,6 +3,19 @@
 > Last updated: 2026-08-26 (**five-agent review of the day's context-compaction work**, **42** findings filed below under the prefix `compaction-review-2026-08-26 #N`. Now: **17 closed the same day** (the five data-loss fixes, then **#1, #2, #3, #16, #17**, then the evening batch **#4, #5, #6, #7, #8, #11, #26** — see the RESOLVED entries), **24 open** (#9, #10, #12-#15, #18-#25, #27-#36, spread HIGH 2 / MEDIUM 15 / LOW 7) and **1 accepted** (#37, `chars / 3`, owner decision). **#25 is two thirds closed** and stays open with its scope narrowed to the one third that remains (a verbatim `<template>` echo still validates). The evening batch closed the measurement-and-summary group: the context window is re-polled on every provider/model switch and goes to *unknown* — ladder off — the moment one starts, an old `[agent] auto_compact = false` is migrated instead of silently reversed, the prior summary reaches the summariser once instead of twice, mode 2 folds its chunk summaries into one form mechanically and gives each chunk its own upstream session, the harness driver applies `ToolOutputCleared` the way the TUI does, and mode 1 no longer drops what sits ahead of the first user message. Before, same day: the harness group is closed: the ladder is now reachable from a scenario (`[context]` table + provider-window discovery in the driver), a scenario can assert a rung actually fired (`[[expect.trace]]`), a run that produced nothing to judge is a failure, and the reserve no longer switches the ladder off on windows ≤ 20k. First scenario that exercises rung 1 end to end: `sandbox/scenarios/mock/rung-one-clears-tool-output.toml` (2/2; fails with exit 4 and `0 'context.prune' record(s)` once the window is taken away). `.docs/context-compaction.md` corrected in the same pass and given a «Известные расхождения» section. Before, same day: **context compaction steps 5-6**: rung 3 + `/compact` shipped, closing findings **#3** and **#4**. Tally re-counted against the entries below, because the two header lines had drifted apart: of the review's 20 findings, **9 are closed** (1, 2, 3, 4, 5, 11, 12, 15, 16), **1 refuted** (17), **10 open** (6, 7, 8, 9, 10, 13, 14, 18, 19, 20). Two new HIGH entries opened by the same work, both found by reading rather than by running: `/compact` is a no-op on DeepSeek and pollutes its server-side branch, and a stale doc comment in `src/context/summary.rs`. Before, same day: full-codebase review `.docs/review-2026-08-26-rust.md`, 20 findings — same-day fix batch closed 6 (1,2,5,11,12,16), see RESOLVED and `JOURNAL/2026-08-26.md`; the other 14 added below by severity, source of record is the review doc. Before, same day: the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
 > Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure), `.docs/review-2026-08-26-rust.md` (2026-08-26 full-codebase review, 20 numbered findings — 9 closed, 1 refuted, 10 open as of the evening of 2026-08-26; referenced by number below)
 
+## RESOLVED 2026-09-24 (2) — вызовы в родном формате DeepSeek (DSML) терялись
+
+- ✅ **HIGH (главная функция) — агент молча пропускал часть вызовов инструментов.**
+  - **Как:** после обновления модели DeepSeek 2026-09-24 она часто пишет вызов
+    в своей разметке DSML (`<｜｜DSML｜｜ calls>… invoke name="read_file" …`),
+    иногда сразу после обычного `<tool_use>`. Парсер знал только `<tool_use>` и
+    `[TOOL:…]`, второй вызов пропадал, ход кончался без нужного чтения.
+  - **Как нашли:** набор `live` после фикса 40005 — `shell-reads-workspace` 0/2,
+    `multi-turn-history` 1/2. DSML только в трассах от 2026-09-24, в августовских
+    нет; с `android 1.8.0` он тоже есть — значит, дело в модели, не в заголовках.
+  - **Починка:** разбор DSML в `tool_parser.rs`, вызовы по порядку в тексте,
+    вырезание из показа. После: оба сценария 3/3, DSML во всех шести прогонах.
+
 ## RESOLVED 2026-09-24 — `CLIENT_VERSION_TOO_LOW (40005)` на части аккаунтов
 
 - ✅ **CRITICAL (главная функция) — первый же ход падал у части пользователей.**
@@ -289,6 +302,28 @@ L0-L3 и дали пять пунктов. Три закрыты здесь, о�
   `EndAssistantMessage { tool_calls }`: оно прикрепляет вызовы и сбрасывает
   сообщение, только если нет ни текста, ни вызовов.
   `→  src/app/conversation.rs::end_assistant_message`, `src/app/reduce.rs`
+
+## OPEN — вызовы и ответ DeepSeek после обновления модели (2026-09-24)
+
+Отложено ревью фиксов DSML и 40005 (`JOURNAL/2026-09-24-dsml-tool-calls.md`).
+
+- ⚠️ **MEDIUM (не проверено живьём) — рассуждения модели разбираются как ответ.**
+  `extract_response_fragments_content` и APPEND в `response/fragments/-1/content`
+  склеивают текст всех фрагментов, включая `THINK`, в один `raw` без тегов
+  `<thinking>`. Вызов, «набросанный» в рассуждениях (режим expert /
+  `deepseek-reasoner`), может выполниться. Касается и `<tool_use>`, не только
+  DSML. Проверить: трасса хода на `deepseek-reasoner` с инструментом.
+  `→ src/provider/deepseek/stream.rs`
+- **LOW — вызов внутри блока кода тоже выполняется.** Ни `<tool_use>`, ни DSML
+  не смотрят на ограждения ```` ``` ````. Класс риска старый, DSML лишь расширил
+  поверхность. Исправлять в обоих парсерах сразу.
+- **LOW — проза после вызова не видна при стриминге.** Трекер режет видимый
+  текст на первом `<`; после хода проза есть в истории, но не в TUI.
+- **LOW — подсказки `/update` / `/logout` уходят клиентам HTTP-сервера и ACP**
+  вместе с текстом отказа 40005/40003 (`client::with_hint` в `api_refusal`).
+- **LOW — оборванный DSML рядом с целым вызовом теряется молча**: диагностика
+  доходит до модели, только когда целых вызовов нет. Так же ведёт себя битый
+  `<tool_use>` рядом с целым.
 
 ## OPEN — харнесс и бюджеты промпта (2026-08-30)
 

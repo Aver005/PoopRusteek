@@ -5,6 +5,7 @@
 > - Отказ в `200 OK` + JSON на completion больше не даёт пустой «успешный» ход; PoW-отказ не маскируется ошибкой serde; коды 40005/40003 объясняют, что делать.
 > - Онбординг: `Ctrl+O` — сайт, `Ctrl+Y` — строка для консоли, которая кладёт токен в буфер; поле принимает запись localStorage целиком. Буфер обмена — `src/clipboard.rs`, без крейта.
 > - Тесты 902 → 911, живые `exec` и набор `live` на тестовом аккаунте. `JOURNAL/2026-09-24-client-version-40005.md`.
+> - **Вторая находка того же дня — DSML.** Обновлённая модель DeepSeek пишет вызовы своей разметкой (`<｜DSML｜invoke …>`), часто сразу после `<tool_use>`; такие вызовы терялись. Парсер понимает DSML, вызовы идут в порядке текста. `shell-reads-workspace` 0/2 → 3/3, `multi-turn-history` 1/2 → 3/3. `JOURNAL/2026-09-24-dsml-tool-calls.md`.
 > **2026-09-13 — установщики и стабильные релизы.**
 > - **Установщики.** Windows: `pooprusteek-setup.exe` на Inno Setup 7 (`packaging/windows/pooprusteek.iss`) — per-user без UAC, один экран, PATH, «Пуск», деинсталлятор. macOS/Linux: `scripts/install.sh` (`curl | sh`).
 > - **Релизы.** Стабильные — по тегу через `scripts/release.sh patch|minor|major` → `release.yml`. CI разбит на reusable `checks.yml` (тесты теперь и на macOS) и `build.yml` (+ экспериментальные Windows/Linux arm64).

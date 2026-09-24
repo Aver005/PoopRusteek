@@ -117,12 +117,21 @@ for step in 0..max_steps:                       # default max_steps_per_turn = 2
 
 ## TOOL-CALL PARSING (`agent/tool_parser.rs`)
 
-Three formats parsed from raw LLM text (DeepSeek web API has NO native function-calling):
+Four formats parsed from raw LLM text (DeepSeek web API has NO native function-calling):
 1. **XML** (primary): `<tool_use><name>…</name><arguments>{json}</arguments></tool_use>`.
 2. **XML+JSON**: `<tool_use>{"tool":…,"args":…}</tool_use>`.
 3. **Legacy**: `[TOOL:name] {json}`.
+4. **DSML** — DeepSeek's own native markup, which the model started emitting on
+   2026-09-24 (instead of or right after a `<tool_use>`):
+   `<｜DSML｜function_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="p" string="true|false">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>`.
+   The web mangles the markers (`<｜｜DSML｜｜ calls>`), so the `DSML` regex
+   fragment tolerates any number of `｜`/`|` and spaces. `string="true"` = raw
+   text, otherwise JSON with a string fallback. An unterminated `invoke` becomes
+   a diagnostic (retry), not a silent drop. Journal: `JOURNAL/2026-09-24-dsml-tool-calls.md`.
 
-- `strip_tool_calls()` removes `<tool_use>`, `<thinking>`, `[TOOL:…]` blocks.
+- Calls from all formats are returned **in text order** (sorted by match start),
+  so a mixed reply runs its calls in the order the model wrote them.
+- `strip_tool_calls()` removes `<tool_use>`, `<thinking>`, DSML blocks/invokes and `[TOOL:…]` blocks.
 - `stream_visible_text()` also cuts at the first bare `<` or partial marker — **gotcha**: truncates legit text containing `<` (e.g. C++ templates, `a < b`).
 - Regexes are `LazyLock`-compiled. Has unit tests for all three formats.
 

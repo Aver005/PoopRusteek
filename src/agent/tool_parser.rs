@@ -23,6 +23,35 @@ static STRIP_THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
 static STRIP_LEGACY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[TOOL:[^\]]+\]\s*\{[^}]*\}").expect("hardcoded regex is valid"));
 
+/// Маркер родного формата вызовов DeepSeek (DSML). Веб отдаёт его искажённым —
+/// `<｜｜DSML｜｜ calls>` вместо `<｜DSML｜function_calls>`, — поэтому терпим
+/// любое число черт и пробелов вокруг.
+const DSML: &str = r"[｜|]+\s*DSML\s*[｜|]+\s*";
+static DSML_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?s)<{DSML}(?:\w+_)?calls\s*>.*?</{DSML}(?:\w+_)?calls\s*>"
+    ))
+    .expect("hardcoded regex is valid")
+});
+static DSML_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?s)<{DSML}invoke\s+name="([^"]+)"\s*>(.*?)</{DSML}invoke\s*>"#
+    ))
+    .expect("hardcoded regex is valid")
+});
+static DSML_INVOKE_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r#"<{DSML}invoke\s+name="[^"]+"\s*>"#)).expect("hardcoded regex is valid")
+});
+static DSML_PARAM_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"<{DSML}parameter\s+name=")).expect("hardcoded regex is valid")
+});
+static DSML_PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?s)<{DSML}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</{DSML}parameter\s*>"#
+    ))
+    .expect("hardcoded regex is valid")
+});
+
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
     /// Идентификатор от провайдера, если вызов пришёл родным протоколом.
@@ -72,21 +101,34 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
 /// guessed at — repairing it risks running the wrong command — it becomes a
 /// diagnostic instead.
 pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<String>) {
-    let mut calls = Vec::new();
+    // Позиция в тексте: форматы смешиваются в одном ответе, а выполнять
+    // вызовы надо в том порядке, в каком их написала модель.
+    let mut calls: Vec<(usize, ParsedToolCall)> = Vec::new();
     let mut errors = Vec::new();
+    // Текст внутри DSML-вызова — это его аргумент (например, содержимое для
+    // `write`), а не отдельный вызов, даже если там написан `<tool_use>`.
+    let dsml_spans: Vec<_> = DSML_INVOKE_RE.find_iter(text).map(|m| m.range()).collect();
+    let inside_dsml = |at: usize| dsml_spans.iter().any(|span| span.contains(&at));
 
     for cap in XML_TOOL_RE.captures_iter(text) {
+        let at = cap.get(0).map_or(0, |m| m.start());
+        if inside_dsml(at) {
+            continue;
+        }
         let body = cap[1].trim();
 
         if let Some(name_cap) = XML_NAME_RE.captures(body) {
             let name = name_cap[1].trim().to_string();
             match extract_arguments(body) {
                 Some(args_str) => match serde_json::from_str::<Value>(args_str.trim()) {
-                    Ok(arguments) => calls.push(ParsedToolCall {
-                        id: None,
-                        name,
-                        arguments,
-                    }),
+                    Ok(arguments) => calls.push((
+                        at,
+                        ParsedToolCall {
+                            id: None,
+                            name,
+                            arguments,
+                        },
+                    )),
                     Err(error) => errors.push(format!(
                         "tool `{name}`: <arguments> is not valid JSON ({error}). Re-send \
                          with a valid JSON object and escape every backslash (\\\\) and \
@@ -115,11 +157,14 @@ pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<Str
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
                 match name {
-                    Some(name) => calls.push(ParsedToolCall {
-                        id: None,
-                        name,
-                        arguments,
-                    }),
+                    Some(name) => calls.push((
+                        at,
+                        ParsedToolCall {
+                            id: None,
+                            name,
+                            arguments,
+                        },
+                    )),
                     None => errors.push(
                         "a <tool_use> block had no <name> tag and no \"tool\"/\"name\" \
                          field in its JSON."
@@ -135,16 +180,23 @@ pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<Str
     }
 
     for cap in LEGACY_TOOL_RE.captures_iter(text) {
+        let at = cap.get(0).map_or(0, |m| m.start());
+        if inside_dsml(at) {
+            continue;
+        }
         let name = cap[1].to_string();
         let args_str = &cap[2];
 
         match serde_json::from_str::<Value>(args_str) {
             Ok(args) => {
-                calls.push(ParsedToolCall {
-                    id: None,
-                    name,
-                    arguments: args,
-                });
+                calls.push((
+                    at,
+                    ParsedToolCall {
+                        id: None,
+                        name,
+                        arguments: args,
+                    },
+                ));
             }
             Err(e) => {
                 errors.push(format!(
@@ -154,7 +206,76 @@ pub fn parse_tool_calls_with_errors(text: &str) -> (Vec<ParsedToolCall>, Vec<Str
         }
     }
 
-    (calls, errors)
+    parse_dsml_calls(text, &mut calls, &mut errors);
+
+    calls.sort_by_key(|(at, _)| *at);
+    (calls.into_iter().map(|(_, call)| call).collect(), errors)
+}
+
+/// Вызовы в родном формате DeepSeek. С обновлением модели 2026-09-24 она
+/// иногда пишет его вместо `<tool_use>` или следом за ним; раньше такой вызов
+/// молча терялся, и ход кончался без нужного чтения.
+fn parse_dsml_calls(
+    text: &str,
+    calls: &mut Vec<(usize, ParsedToolCall)>,
+    errors: &mut Vec<String>,
+) {
+    // Вызовы других форматов из этого же ответа: модель порой дублирует
+    // `<tool_use>` тем же вызовом в DSML, а запись дважды — не безобидна.
+    let foreign = calls.len();
+    let mut starts = Vec::new();
+    for cap in DSML_INVOKE_RE.captures_iter(text) {
+        let at = cap.get(0).map_or(0, |m| m.start());
+        starts.push(at);
+        let arguments = Value::Object(
+            DSML_PARAM_RE
+                .captures_iter(&cap[2])
+                .map(|param| {
+                    let string = param.get(2).map(|m| m.as_str());
+                    (param[1].trim().to_string(), dsml_value(&param[3], string))
+                })
+                .collect(),
+        );
+        let name = cap[1].trim().to_string();
+        let duplicate = calls[..foreign]
+            .iter()
+            .any(|(_, call)| call.name == name && call.arguments == arguments);
+        if !duplicate {
+            calls.push((
+                at,
+                ParsedToolCall {
+                    id: None,
+                    name,
+                    arguments,
+                },
+            ));
+        }
+    }
+    // Обрыв — это открытый `invoke`, за которым уже пошли параметры. Просто
+    // процитированный в ответе тег обрывом не считается, иначе хороший ответ
+    // отвергался бы как «битый вызов».
+    let cut_off = DSML_INVOKE_OPEN_RE.find_iter(text).any(|open| {
+        !starts.contains(&open.start())
+            && text
+                .get(open.end()..)
+                .is_some_and(|rest| DSML_PARAM_OPEN_RE.is_match(rest))
+    });
+    if cut_off {
+        errors.push(
+            "a native DSML <invoke> block was cut off before its closing tag. Re-send the \
+             call as <tool_use><name>TOOL</name><arguments>{ valid JSON }</arguments></tool_use>."
+                .to_string(),
+        );
+    }
+}
+
+/// `string="true"` — значение как есть; иначе это JSON (число, bool,
+/// объект), а негодный JSON остаётся строкой, как делает vLLM.
+fn dsml_value(raw: &str, string: Option<&str>) -> Value {
+    if string == Some("true") {
+        return Value::String(raw.to_string());
+    }
+    serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 /// Pull the JSON arguments out of a `<tool_use>` body, tolerating the common
@@ -200,8 +321,11 @@ pub fn strip_thinking_only(text: &str) -> String {
 pub fn strip_tool_calls(text: &str) -> String {
     let without_xml = STRIP_TOOL_XML_RE.replace_all(text, "");
     let without_thinking = STRIP_THINKING_RE.replace_all(&without_xml, "");
+    let without_dsml_blocks = DSML_BLOCK_RE.replace_all(&without_thinking, "");
+    // Одиночный `invoke` без обёртки тоже бывает (см. sglang #40236).
+    let without_dsml = DSML_INVOKE_RE.replace_all(&without_dsml_blocks, "");
     STRIP_LEGACY_RE
-        .replace_all(without_thinking.trim(), "")
+        .replace_all(without_dsml.trim(), "")
         .trim()
         .to_string()
 }
@@ -378,6 +502,117 @@ pub fn stream_visible_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Дословно ответ из прогона `shell-reads-workspace` 2026-09-24: вызов
+    /// `<tool_use>`, а следом — второй в искажённом DSML. Второй терялся.
+    const MIXED_REPLY: &str = "I'll look at the directory contents and then read `Cargo.toml`.\n\n<tool_use>\n<name>powershell</name>\n<arguments>\n{\"command\":\"Get-ChildItem -Force\"}\n</arguments>\n</tool_use><｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"read_file\">\n<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">Cargo.toml</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>";
+
+    #[test]
+    fn a_dsml_call_after_a_tool_use_is_not_lost() {
+        let (calls, errors) = parse_tool_calls_with_errors(MIXED_REPLY);
+        assert!(errors.is_empty(), "{errors:?}");
+        let names: Vec<_> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["powershell", "read_file"]);
+        assert_eq!(calls[1].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn the_canonical_dsml_shape_and_typed_parameters_parse() {
+        let text = "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"edit\">\n<｜DSML｜parameter name=\"path\" string=\"true\">a.rs</｜DSML｜parameter>\n<｜DSML｜parameter name=\"count\" string=\"false\">3</｜DSML｜parameter>\n<｜DSML｜parameter name=\"opts\" string=\"false\">{\"dry\": true}</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">b.rs</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+        assert_eq!(calls[0].arguments["count"], 3);
+        assert_eq!(calls[0].arguments["opts"]["dry"], true);
+        assert_eq!(calls[1].name, "read_file");
+    }
+
+    /// `string="true"` не трогается: код с отступами и переводами строк
+    /// приходит ровно как написан.
+    #[test]
+    fn a_string_parameter_keeps_its_exact_text() {
+        let text = "<｜DSML｜invoke name=\"write\"><｜DSML｜parameter name=\"content\" string=\"true\">\n  fn x() {}\n</｜DSML｜parameter></｜DSML｜invoke>";
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls[0].arguments["content"], "\n  fn x() {}\n");
+    }
+
+    #[test]
+    fn a_cut_off_dsml_invoke_is_reported_not_dropped() {
+        let text = "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">a</｜DSML｜parameter>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert!(calls.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn dsml_markup_never_reaches_the_shown_answer() {
+        let shown = strip_tool_calls(MIXED_REPLY);
+        assert_eq!(
+            shown,
+            "I'll look at the directory contents and then read `Cargo.toml`."
+        );
+    }
+
+    /// Модель написала DSML раньше `<tool_use>` — так и выполняем.
+    #[test]
+    fn calls_run_in_the_order_they_were_written() {
+        let text = "<｜DSML｜invoke name=\"first\"></｜DSML｜invoke>\n[TOOL:second] {}\n<tool_use><name>third</name><arguments>{}</arguments></tool_use>";
+        let names: Vec<_> = parse_tool_calls(text).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["first", "second", "third"]);
+    }
+
+    /// Искажённая веб-обёртка с двумя вызовами, ASCII-черты, вызов без
+    /// параметров, `string="false"` с негодным JSON и без атрибута вовсе.
+    #[test]
+    fn tolerant_shapes_all_parse() {
+        let text = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"a\">\n<｜｜DSML｜｜ parameter name=\" n \" string=\"false\">not json</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n<|DSML|invoke name=\"b\"><|DSML|parameter name=\"k\">42</|DSML|parameter></|DSML|invoke>\n<｜DSML｜invoke name=\"c\"></｜DSML｜invoke>\n</｜｜DSML｜｜ calls>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(calls[0].arguments["n"], "not json");
+        assert_eq!(calls[1].arguments["k"], 42);
+        assert_eq!(calls[2].arguments, serde_json::json!({}));
+    }
+
+    /// Тот же вызов дважды — `<tool_use>` и следом DSML — выполняется раз.
+    #[test]
+    fn a_dsml_echo_of_a_tool_use_runs_once() {
+        let text = "<tool_use><name>bash</name><arguments>{\"command\": \"echo 1 >> log\"}</arguments></tool_use><｜DSML｜invoke name=\"bash\"><｜DSML｜parameter name=\"command\" string=\"true\">echo 1 >> log</｜DSML｜parameter></｜DSML｜invoke>";
+        assert_eq!(parse_tool_calls(text).len(), 1);
+    }
+
+    /// `<tool_use>` внутри аргумента DSML-вызова — это текст для записи.
+    #[test]
+    fn a_tool_use_inside_a_dsml_argument_is_not_a_second_call() {
+        let text = "<｜DSML｜invoke name=\"write\"><｜DSML｜parameter name=\"content\" string=\"true\">see <tool_use><name>bash</name><arguments>{\"command\":\"rm -rf x\"}</arguments></tool_use></｜DSML｜parameter></｜DSML｜invoke>";
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write");
+    }
+
+    /// Процитированный тег в объяснении не делает ответ «битым вызовом».
+    #[test]
+    fn a_quoted_opener_is_not_reported_as_cut_off() {
+        let text =
+            "Each call starts with `<｜DSML｜invoke name=\"tool\">` and ends with a closing tag.";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert!(calls.is_empty() && errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_bare_invoke_is_stripped_from_the_shown_answer() {
+        let text = "Reading it now.\n<｜DSML｜invoke name=\"read_file\"><｜DSML｜parameter name=\"path\" string=\"true\">a</｜DSML｜parameter></｜DSML｜invoke>";
+        assert_eq!(strip_tool_calls(text), "Reading it now.");
+    }
+
+    /// Обычный текст про DSML — не вызов.
+    #[test]
+    fn prose_mentioning_dsml_is_left_alone() {
+        let text = "DeepSeek's DSML format wraps calls in invoke tags.";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert!(calls.is_empty() && errors.is_empty());
+        assert_eq!(strip_tool_calls(text), text);
+    }
 
     #[test]
     fn test_parse_simple_tool_call() {

@@ -1,0 +1,18 @@
+# Needs `sandbox mock dsml-after-tool-use` running, and a `mock` provider
+# entry in the config (the sandbox image writes one).
+name = "runs-dsml-calls"
+description = "A call in DeepSeek's native DSML markup runs alongside <tool_use>"
+prompt = "What is the package version?"
+workspace = "../../fixtures/tiny-repo"
+provider = "mock"
+timeout = 60
+max_steps = 4
+
+[expect]
+status = "completed"
+tools_used = ["read_file"]
+max_tool_errors = 0
+no_malformed = true
+# Only reachable if the DSML read of Cargo.toml actually ran.
+final_matches = ['0\.4\.2']
+min_pass_rate = 1.0

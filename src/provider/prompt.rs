@@ -59,7 +59,7 @@ fn format_history_message(message: &ChatMessage) -> String {
 /// in DeepSeek's server-side context; a weak model holds the tool-call
 /// format by recency far better than by primacy, and this costs ~60 tokens
 /// per turn.
-const FORMAT_REMINDER: &str = "[Напоминание формата: инструменты вызывай только блоком <tool_use><name>…</name><arguments>{JSON}</arguments></tool_use>, после </tool_use> — стоп. Имена инструментов не изобретай, результаты не выдумывай — жди TOOL RESULT.]";
+const FORMAT_REMINDER: &str = "[Напоминание формата: инструменты вызывай только блоком <tool_use><name>…</name><arguments>{JSON}</arguments></tool_use>, после </tool_use> — стоп. Другую разметку вызовов (DSML, invoke, function_calls) не используй. Имена инструментов не изобретай, результаты не выдумывай — жди TOOL RESULT.]";
 
 /// Index where the "new input" tail begins: everything after the last
 /// assistant message. That tail is what a continuing session actually needs

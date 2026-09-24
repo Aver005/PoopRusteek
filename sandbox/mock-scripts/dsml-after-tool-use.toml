@@ -1,0 +1,30 @@
+# The reply shape DeepSeek's model started producing on 2026-09-24: a normal
+# <tool_use> call followed by a second call in its native DSML markup, with the
+# markers mangled the way the web API delivers them. Before the parser knew
+# DSML the second call was dropped silently and the turn ended without it.
+
+# Reply 1: README via <tool_use>, then Cargo.toml via DSML.
+[[reply]]
+content = '''
+I'll read the README and then Cargo.toml.
+
+<tool_use>
+<name>read_file</name>
+<arguments>
+{"path": "README.md"}
+</arguments>
+</tool_use><｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="read_file">
+<｜｜DSML｜｜ parameter name="path" string="true">Cargo.toml</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>
+'''
+
+# Served only once Cargo.toml's content came back — i.e. the DSML call ran.
+[[reply]]
+when = 'version = "0.4.2"'
+content = "The package version is 0.4.2."
+
+# Reached when the DSML call was dropped: nothing from Cargo.toml came back.
+[[reply]]
+content = "I could not read Cargo.toml."
