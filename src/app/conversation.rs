@@ -153,20 +153,26 @@ impl Conversation {
     /// нет — а в родном протоколе это обычный вид шага. Сбросив его, мы
     /// оставили бы результаты инструментов без объявившего их вызова, и
     /// следующий ход провайдер отверг бы с 400.
-    pub fn end_assistant_message(&mut self, tool_calls: &[crate::provider::ToolCall]) {
+    pub fn end_assistant_message(&mut self, tool_calls: &[crate::provider::ToolCall], text: &str) {
         // Ищем последнее сообщение ассистента, а не просто последнее: между
         // ним и этим событием цикл успевает вставить системную заметку
         // (обрезка, спасение вызова), и тогда вызовы прикрепились бы к ней —
         // то есть пропали бы вовсе.
-        if let Some(index) = self
+        let Some(index) = self
             .messages
             .iter()
             .rposition(|m| m.role == crate::provider::Role::Assistant)
-            && self.messages[index].tool_calls.is_empty()
-        {
-            self.messages[index].tool_calls = tool_calls.to_vec();
+        else {
+            return;
+        };
+        let message = &mut self.messages[index];
+        message.content = text.to_string();
+        if message.tool_calls.is_empty() {
+            message.tool_calls = tool_calls.to_vec();
         }
-        self.discard_empty_assistant();
+        if message.content.is_empty() && message.tool_calls.is_empty() {
+            self.messages.remove(index);
+        }
     }
 
     /// Закрыть вызовы, на которые не успели прийти результаты.
@@ -494,11 +500,14 @@ mod tests {
     fn an_assistant_message_with_only_tool_calls_survives() {
         let mut conv = Conversation::fresh_main(None);
         conv.begin_assistant_message();
-        conv.end_assistant_message(&[crate::provider::ToolCall {
-            id: "call_1".to_string(),
-            name: "read_file".to_string(),
-            arguments: serde_json::json!({"path": "x"}),
-        }]);
+        conv.end_assistant_message(
+            &[crate::provider::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "x"}),
+            }],
+            "",
+        );
 
         assert_eq!(conv.messages.len(), 1, "{:?}", conv.messages);
         assert_eq!(conv.messages[0].tool_calls.len(), 1);
@@ -511,7 +520,7 @@ mod tests {
     fn an_assistant_message_with_neither_text_nor_calls_is_dropped() {
         let mut conv = Conversation::fresh_main(None);
         conv.begin_assistant_message();
-        conv.end_assistant_message(&[]);
+        conv.end_assistant_message(&[], "");
         assert!(conv.messages.is_empty());
     }
 
@@ -521,11 +530,14 @@ mod tests {
     fn a_new_assistant_message_opens_after_one_that_carried_calls() {
         let mut conv = Conversation::fresh_main(None);
         conv.begin_assistant_message();
-        conv.end_assistant_message(&[crate::provider::ToolCall {
-            id: "call_1".to_string(),
-            name: "t".to_string(),
-            arguments: serde_json::json!({}),
-        }]);
+        conv.end_assistant_message(
+            &[crate::provider::ToolCall {
+                id: "call_1".to_string(),
+                name: "t".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            "",
+        );
         conv.begin_assistant_message();
         conv.append_chunk("the answer");
 
@@ -553,7 +565,7 @@ mod tests {
         conv.begin_assistant_message();
         conv.messages
             .push(ChatMessage::system("Warning: stream ended early"));
-        conv.end_assistant_message(&[a_call("call_1")]);
+        conv.end_assistant_message(&[a_call("call_1")], "");
 
         let assistant = conv
             .messages
@@ -569,7 +581,7 @@ mod tests {
     fn an_interrupted_turn_answers_the_calls_it_left_hanging() {
         let mut conv = Conversation::fresh_main(None);
         conv.begin_assistant_message();
-        conv.end_assistant_message(&[a_call("call_1"), a_call("call_2")]);
+        conv.end_assistant_message(&[a_call("call_1"), a_call("call_2")], "");
         conv.messages.push(ChatMessage::tool("call_1", "done"));
 
         conv.settle_unanswered_tool_calls();
@@ -589,7 +601,7 @@ mod tests {
     fn settling_twice_adds_nothing_the_second_time() {
         let mut conv = Conversation::fresh_main(None);
         conv.begin_assistant_message();
-        conv.end_assistant_message(&[a_call("call_1")]);
+        conv.end_assistant_message(&[a_call("call_1")], "");
         conv.settle_unanswered_tool_calls();
         let after_first = conv.messages.len();
         conv.settle_unanswered_tool_calls();

@@ -102,8 +102,8 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
             conversation.messages.push(message.clone());
             None
         }
-        AgentEvent::EndAssistantMessage { tool_calls } => {
-            conversation.end_assistant_message(tool_calls);
+        AgentEvent::EndAssistantMessage { tool_calls, text } => {
+            conversation.end_assistant_message(tool_calls, text);
             None
         }
         AgentEvent::ContextUsage(used) => {
@@ -160,9 +160,27 @@ mod tests {
             &mut conv,
             &AgentEvent::EndAssistantMessage {
                 tool_calls: Vec::new(),
+                text: String::new(),
             },
         );
         assert!(conv.messages.is_empty());
+    }
+
+    /// Поток обрезан на первом `<`; итог шага возвращает прозу после вызова.
+    #[test]
+    fn the_step_result_replaces_what_the_stream_showed() {
+        let mut conv = conversation();
+        apply(&mut conv, &AgentEvent::BeginAssistantMessage);
+        apply(&mut conv, &AgentEvent::Chunk("Reading.\n".to_string()));
+        apply(
+            &mut conv,
+            &AgentEvent::EndAssistantMessage {
+                tool_calls: Vec::new(),
+                text: "Reading.\n\nThen I'll edit it.".to_string(),
+            },
+        );
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, "Reading.\n\nThen I'll edit it.");
     }
 
     #[test]

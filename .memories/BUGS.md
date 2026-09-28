@@ -306,24 +306,35 @@ L0-L3 и дали пять пунктов. Три закрыты здесь, о�
 ## OPEN — вызовы и ответ DeepSeek после обновления модели (2026-09-24)
 
 Отложено ревью фиксов DSML и 40005 (`JOURNAL/2026-09-24-dsml-tool-calls.md`).
+Четыре пункта из пяти закрыты разбором всех форматов 2026-09-28
+(`JOURNAL/2026-09-28-tool-call-formats.md`), см. ниже.
 
-- ⚠️ **MEDIUM (не проверено живьём) — рассуждения модели разбираются как ответ.**
-  `extract_response_fragments_content` и APPEND в `response/fragments/-1/content`
-  склеивают текст всех фрагментов, включая `THINK`, в один `raw` без тегов
-  `<thinking>`. Вызов, «набросанный» в рассуждениях (режим expert /
-  `deepseek-reasoner`), может выполниться. Касается и `<tool_use>`, не только
-  DSML. Проверить: трасса хода на `deepseek-reasoner` с инструментом.
-  `→ src/provider/deepseek/stream.rs`
-- **LOW — вызов внутри блока кода тоже выполняется.** Ни `<tool_use>`, ни DSML
-  не смотрят на ограждения ```` ``` ````. Класс риска старый, DSML лишь расширил
-  поверхность. Исправлять в обоих парсерах сразу.
-- **LOW — проза после вызова не видна при стриминге.** Трекер режет видимый
-  текст на первом `<`; после хода проза есть в истории, но не в TUI.
 - **LOW — подсказки `/update` / `/logout` уходят клиентам HTTP-сервера и ACP**
   вместе с текстом отказа 40005/40003 (`client::with_hint` в `api_refusal`).
-- **LOW — оборванный DSML рядом с целым вызовом теряется молча**: диагностика
-  доходит до модели, только когда целых вызовов нет. Так же ведёт себя битый
-  `<tool_use>` рядом с целым.
+- ⚠️ **MEDIUM — `task` запускает суб-агента без подтверждения, а суб-агент
+  исполняет shell/write/MCP без человека** (`tools_step.rs::spawn_task`,
+  `sub_agent.rs`). Вызов в чужой разметке теперь требует подтверждения и для
+  `task`, но обычный `<tool_use><name>task</name>…` — по-прежнему нет: одна
+  цитата с `task` открывает путь в обход окна подтверждения. Найдено критиком
+  2026-09-28, вне объёма той работы.
+
+## RESOLVED 2026-09-28 — вызовы в любом формате и их показ
+
+- ✅ **Рассуждения модели разбирались как ответ** (MEDIUM). Провайдер копит
+  фрагменты `THINK` и выпускает их блоком `<thinking>` перед ответом; вызов
+  изнутри рассуждений не исполняется, а если он единственный — модель получает
+  диагностику. **Живьём не проверено:** формат событий `THINK` восстановлен по
+  коду, трасс нет. `→ provider/deepseek/stream.rs::ThinkRouter`
+- ✅ **Вызов внутри блока кода выполнялся.** Теперь — только если в блоке нет
+  ничего, кроме вызовов. `→ agent/tool_parser/scan.rs::fence`
+- ✅ **Проза после вызова не была видна** (и форматы без `<` навсегда оставались
+  в ленте): итог шага (`EndAssistantMessage.text`) заменяет потоковый текст.
+  `→ app/conversation.rs::end_assistant_message`
+- ✅ **Оборванный вызов рядом с целым терялся молча.** Целые выполняются,
+  ошибки уходят модели заметкой. `→ agent/runner.rs::beside_calls_note`
+- ✅ **Незнакомый формат молча становился ответом.** 47 парсеров vLLM и 37
+  детекторов sglang сведены в семейства; нераспознанная разметка с именем
+  инструмента даёт одну попытку повтора. `→ agent/tool_parser/`
 
 ## OPEN — харнесс и бюджеты промпта (2026-08-30)
 
@@ -534,10 +545,10 @@ does not cost anything elsewhere.
 ## MEDIUM
 
 - `[BUG]` MCP tool arguments are passed to `tools/call` with **no schema validation**. `→ src/mcp/client.rs`
-- `[BUG]` `stream_visible_text` truncates at the first bare `<` → legitimate text containing `<` (C++ templates, `a < b`, HTML) is hidden mid-stream. `→ src/agent/tool_parser.rs`
+- `[BUG]` `stream_visible_text` truncates at the first bare `<` → legitimate text containing `<` (C++ templates, `a < b`, HTML) is hidden **while streaming** only: since 2026-09-28 the step's parsed text replaces the stream when the step ends. `→ src/agent/tool_parser/visible.rs`
 - `[BUG]` PoW challenge is solved once before the retry loop, not re-solved per attempt — deliberately left (changing it changes the request pattern); a stale challenge on a slow retry can be rejected. (~~solve ran on the async task~~ — fixed 2026-07-04, now `spawn_blocking`.) `→ src/provider/pow.rs` + `src/provider/deepseek/stream.rs`
-- `[BUG]` Legacy `[TOOL:name] {json}` regex uses a non-nesting brace pattern and can't parse nested JSON objects. `→ src/agent/tool_parser.rs`
-- `[BUG]` Fenced code-block examples containing tool-call syntax can be parsed and executed as real tool calls during auto-approve (background) turns. `→ src/agent/tool_parser.rs`
+- ✅ ~~Legacy `[TOOL:name] {json}` can't parse nested JSON~~ — fixed 2026-09-28: the JSON end is found by parsing. `→ src/agent/tool_parser/formats/tool_use.rs`
+- ✅ ~~Fenced code-block examples containing tool-call syntax are executed~~ — fixed 2026-09-28: a fence's calls run only if it holds nothing but calls. `→ src/agent/tool_parser/scan.rs::fence`
 - `[BUG]` review-2026-08-26 #10: check-then-add on the shared shell output budget (load → compute → `fetch_add`, three unsynchronized steps across two readers) can overshoot the 1 MiB cap by up to one chunk. `→ src/tools/shell.rs`
 - `[BUG]` review-2026-08-26 #13: tests write into the real `Config::sessions_dir()` (a non-injectable global) — parallel runs share state, a failing test leaves files behind. **Scope corrected on re-verification: 1 file, 4 tests** (`plant_session_file` and its callers), not the review's "~13 other files" — every other `data_dir()`/`sessions_dir()` call site is production code or an `#[ignore]`d model-cache test. Fixing it is still tied to #9 (no data-dir redirect). `→ src/session.rs`
 - `[BUG]` compaction-review-2026-08-26 #12: background sub-agent results never enter the harness transcript. The TUI's `finish_background` flushes the answer into the parent chat's messages; `drive` only removes the id from `pending`, because every history-applying arm is behind `conversation == root`. Latent until a multi-turn scenario spawns a background sub-agent. `→ src/harness/driver.rs`

@@ -328,7 +328,8 @@ fn history_messages(biz_data: &Value) -> Vec<ChatMessage> {
 }
 
 /// Текст реплики: строковый `content`, а если его нет — склейка фрагментов
-/// (`fragments[].content`), которыми отвечает нынешний эндпоинт.
+/// (`fragments[].content`), которыми отвечает нынешний эндпоинт. Рассуждения
+/// (`THINK`) — не реплика.
 fn message_text(item: &Value) -> String {
     if let Some(text) = item["content"].as_str() {
         return text.to_string();
@@ -338,6 +339,7 @@ fn message_text(item: &Value) -> String {
     };
     fragments
         .iter()
+        .filter(|fragment| fragment["type"].as_str() != Some("THINK"))
         .filter_map(|fragment| {
             fragment["content"]
                 .as_str()
@@ -573,9 +575,94 @@ pub(super) fn extract_parent_message_id(event: &Value) -> Option<i64> {
     None
 }
 
+/// Фрагмент ответа веба: рассуждение (`THINK`) или всё остальное.
+pub(super) struct Fragment {
+    pub think: bool,
+    pub content: String,
+}
+
+/// Новые фрагменты: снимок ответа (`v.response.fragments`) или дописанные
+/// (`p: response/fragments`, `v: [...]`). Второе раньше не разбиралось вовсе,
+/// и первый кусок нового фрагмента терялся.
+fn new_fragments(event: &Value) -> Option<Vec<Fragment>> {
+    let object = event.as_object()?;
+    let value = object.get("v")?;
+    let list = match object.get("p").and_then(Value::as_str) {
+        Some("response/fragments") => value.as_array()?,
+        None => value.get("response")?.get("fragments")?.as_array()?,
+        Some(_) => return None,
+    };
+    Some(
+        list.iter()
+            .map(|fragment| Fragment {
+                think: fragment.get("type").and_then(Value::as_str) == Some("THINK"),
+                content: fragment
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect(),
+    )
+}
+
+/// Рассуждения веба уходят в `<thinking>`, чтобы разбор не исполнил набросок
+/// вызова. Копятся до первого фрагмента ответа: не дождались — это ответ.
+#[derive(Default)]
+pub(super) struct ThinkRouter {
+    thinking: bool,
+    held: String,
+}
+
+impl ThinkRouter {
+    /// Текст события для вызывающего; пустой, пока копится рассуждение.
+    pub(super) fn route(&mut self, event: &StreamEvent) -> String {
+        let mut out = String::new();
+        for fragment in &event.fragments {
+            if fragment.think {
+                self.thinking = true;
+                self.held.push_str(&fragment.content);
+            } else {
+                self.release(&mut out);
+                out.push_str(&fragment.content);
+            }
+        }
+        if let Some(text) = &event.text {
+            if self.thinking {
+                self.held.push_str(text);
+            } else {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    fn release(&mut self, out: &mut String) {
+        if !std::mem::take(&mut self.thinking) {
+            return;
+        }
+        // Закрывающий тег или `<tool_use>` внутри рассуждения рвали бы блок.
+        let held = std::mem::take(&mut self.held)
+            .replace("</think", "</ think")
+            .replace("<tool_use>", "< tool_use>");
+        out.push_str("<thinking>");
+        out.push_str(&held);
+        out.push_str("</thinking>\n\n");
+    }
+
+    /// Конец потока. Фрагмента ответа так и не было — накопленное и есть
+    /// ответ, как до разделения: потерять ответ хуже.
+    pub(super) fn finish(&mut self) -> String {
+        self.thinking = false;
+        std::mem::take(&mut self.held)
+    }
+}
+
 /// One recognized `data:` line from the completion SSE stream.
 pub(super) struct StreamEvent {
     pub text: Option<String>,
+    /// Новые фрагменты с типом; их текст не входит в `text`.
+    pub fragments: Vec<Fragment>,
     pub parent_message_id: Option<i64>,
     /// The server explicitly marked the response complete: `[DONE]` or a
     /// FINISHED status patch.
@@ -699,6 +786,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
     if payload == "[DONE]" {
         return Some(StreamEvent {
             text: None,
+            fragments: Vec::new(),
             parent_message_id: None,
             finished: true,
             error: None,
@@ -715,12 +803,17 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
     };
     let finished = event_signals_finished(&normalized);
 
-    let mut text_chunk = extract_text_from_event(&normalized);
-    if text_chunk.is_empty() {
-        if let Some(text) = normalized.as_str() {
-            text_chunk = text.to_string();
-        } else if let Some(text) = parsed.as_str() {
-            text_chunk = text.to_string();
+    // Текст новых фрагментов идёт с их типом, а не общей строкой.
+    let fragments = new_fragments(&normalized);
+    let mut text_chunk = String::new();
+    if fragments.is_none() {
+        text_chunk = extract_text_from_event(&normalized);
+        if text_chunk.is_empty() {
+            if let Some(text) = normalized.as_str() {
+                text_chunk = text.to_string();
+            } else if let Some(text) = parsed.as_str() {
+                text_chunk = text.to_string();
+            }
         }
     }
 
@@ -728,7 +821,12 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
     // carries no text and no ids, so it would otherwise be dropped.
     let error = extract_stream_error(&normalized).or_else(|| extract_stream_error(&parsed));
 
-    if text_chunk.is_empty() && parent_message_id.is_none() && !finished && error.is_none() {
+    if text_chunk.is_empty()
+        && fragments.is_none()
+        && parent_message_id.is_none()
+        && !finished
+        && error.is_none()
+    {
         return None;
     }
 
@@ -738,6 +836,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
         } else {
             Some(text_chunk)
         },
+        fragments: fragments.unwrap_or_default(),
         parent_message_id,
         finished,
         error,
@@ -746,8 +845,55 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeepseekProvider, refusal_in_line};
+    use super::{DeepseekProvider, ThinkRouter, process_stream_line, refusal_in_line};
     use crate::provider::deepseek::http::is_json_response;
+
+    /// Строки потока через маршрутизатор рассуждений — то, что получит агент.
+    /// События составлены по устройству протокола: живых трасс с THINK нет.
+    fn routed(lines: &[&str]) -> String {
+        let mut think = ThinkRouter::default();
+        let mut out: String = lines
+            .iter()
+            .filter_map(|line| process_stream_line(line))
+            .map(|event| think.route(&event))
+            .collect();
+        out.push_str(&think.finish());
+        out
+    }
+
+    #[test]
+    fn reasoning_is_wrapped_and_the_answer_streams_after_it() {
+        let out = routed(&[
+            r#"data: {"v":{"response":{"fragments":[{"id":1,"type":"THINK","content":"a"}]}}}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"b <tool_use> </thinking>"}"#,
+            r#"data: {"p":"response/fragments","o":"APPEND","v":[{"id":2,"type":"RESPONSE","content":"Hi"}]}"#,
+            r#"data: {"v":" there"}"#,
+        ]);
+        assert_eq!(
+            out,
+            "<thinking>ab < tool_use> </ thinking></thinking>\n\nHi there"
+        );
+    }
+
+    /// Ответа так и не было — накопленное отдаётся ответом, а не теряется.
+    #[test]
+    fn reasoning_without_an_answer_is_the_answer() {
+        let out = routed(&[
+            r#"data: {"v":{"response":{"fragments":[{"type":"THINK","content":"only"}]}}}"#,
+            r#"data: {"v":" this"}"#,
+        ]);
+        assert_eq!(out, "only this");
+    }
+
+    /// Обычный режим без рассуждений не меняется.
+    #[test]
+    fn a_reply_without_reasoning_is_untouched() {
+        let out = routed(&[
+            r#"data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hel"}]}}}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"lo"}"#,
+        ]);
+        assert_eq!(out, "Hello");
+    }
 
     fn response(content_type: &str, body: &'static str) -> reqwest::Response {
         reqwest::Response::from(

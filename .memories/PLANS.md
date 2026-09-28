@@ -16,6 +16,7 @@
 
 | Priority | What | Why |
 |----------|------|-----|
+| P0 | **Tool calls in every known format** — code done 2026-09-28, live check pending | DeepSeek web drifts between call formats; an unknown one silently ended the turn. One-pass scanner over the formats vLLM/sglang parse, mixed in one reply, with trust levels so quotes and echoes never run. Left: `suite live --repeat 5` before/after, a `deepseek-reasoner` trace for THINK routing. `.docs/tool-call-formats.md` |
 | P2 | Server mode: anthropic/gemini inbound dialects | `[server] api` accepts them but answers 501 — needs inbound wire→internal conversions (outbound halves exist in `provider/{anthropic,gemini}_compat`) + per-dialect routes in `src/server/` (`ApiDialect` dispatch seam is ready in `server/http.rs::route`) |
 | P2 | Server mode: agent-loop-backed completions | v1 serves plain completions (no tools); an opt-in "agentic" model id could run `run_agent_loop` instead |
 | P0 | Multi-theme support | Only Catppuccin Mocha; `ui.theme` is currently ignored |

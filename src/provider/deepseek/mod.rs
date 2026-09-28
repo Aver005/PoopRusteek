@@ -209,6 +209,7 @@ impl DeepseekProvider {
         let mut sse = super::sse::SseLineBuffer::new();
         let mut parent_message_id = None;
         let mut text_bytes = 0usize;
+        let mut think = stream::ThinkRouter::default();
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -279,7 +280,8 @@ impl DeepseekProvider {
                     // the thread id is already saved.
                     let _ = self.mark_session_after_success(&session_id, parent_message_id);
                 }
-                if let Some(text) = event.text {
+                let text = think.route(&event);
+                if !text.is_empty() {
                     debug_log::log(
                         &format!("completion.{log_tag}.chunk"),
                         format!("text_chunk={}", text),
@@ -287,12 +289,16 @@ impl DeepseekProvider {
                     text_bytes += text.len();
                     *reply_chars += text.chars().count();
                     on_text(text);
+                } else if event.text.is_some() || !event.fragments.is_empty() {
+                    // Рассуждение копится: пустой кусок держит таймаут простоя.
+                    on_text(String::new());
                 }
                 if event.finished {
                     debug_log::log(
                         &format!("completion.{log_tag}.done"),
                         "received explicit finish signal",
                     );
+                    flush_thinking(&mut think, on_text, reply_chars);
                     self.mark_session_after_success(&session_id, parent_message_id)?;
                     return Ok(());
                 }
@@ -303,6 +309,7 @@ impl DeepseekProvider {
         if let Some(message) = sse.finish().as_deref().and_then(stream::refusal_in_line) {
             return Err(stream::completion_refused(&message));
         }
+        flush_thinking(&mut think, on_text, reply_chars);
         self.mark_session_after_success(&session_id, parent_message_id)?;
         // DeepSeek's web endpoint routinely finishes a response by just
         // closing the connection — no `data: [DONE]`, no status event. A
@@ -316,6 +323,19 @@ impl DeepseekProvider {
             ),
         );
         Ok(())
+    }
+}
+
+/// Конец потока: рассуждение, так и не сменившееся ответом, отдать ответом.
+fn flush_thinking(
+    think: &mut stream::ThinkRouter,
+    on_text: &mut (impl FnMut(String) + Send),
+    reply_chars: &mut usize,
+) {
+    let rest = think.finish();
+    if !rest.is_empty() {
+        *reply_chars += rest.chars().count();
+        on_text(rest);
     }
 }
 

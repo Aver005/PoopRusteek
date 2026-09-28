@@ -90,6 +90,9 @@ pub enum AgentEvent {
     /// сбросить его, только если не осталось ни текста, ни вызовов.
     EndAssistantMessage {
         tool_calls: Vec<crate::provider::ToolCall>,
+        /// Итог шага без вызовов и рассуждений. Поток видел только текст до
+        /// первого `<`, поэтому сообщение получает этот текст целиком.
+        text: String,
     },
     /// Ход завершён.
     Done(AgentResult),
@@ -340,6 +343,9 @@ pub struct ToolApprovalRequest {
     pub arguments: String,
     /// Что именно можно разрешить «всегда» — см. `tools::approval_scope`.
     pub scope: Option<crate::whitelist::Scope>,
+    /// Белый список не действует: вызов в чужой разметке или с поправленным
+    /// именем решает только человек.
+    pub always_ask: bool,
     decision: Arc<Mutex<Option<bool>>>,
     notify: Arc<Notify>,
 }
@@ -356,9 +362,15 @@ impl ToolApprovalRequest {
             tool_name,
             arguments,
             scope,
+            always_ask: false,
             decision: Arc::new(Mutex::new(None)),
             notify: Arc::new(Notify::new()),
         }
+    }
+
+    pub fn asking_always(mut self, always: bool) -> Self {
+        self.always_ask = always;
+        self
     }
 
     pub async fn wait(&self) -> bool {

@@ -156,6 +156,30 @@ impl StepTrace {
         );
     }
 
+    /// Битые вызовы рядом с целыми: целые выполнены, попытка повтора не тратится.
+    pub fn malformed_beside_calls(&self, calls: usize, errors: &[String]) {
+        debug_log::log(
+            "agent.step.malformed_tool_use",
+            format!(
+                "{} beside_calls={calls} errors={}",
+                self.head(),
+                errors.join(" | ")
+            ),
+        );
+    }
+
+    /// Страховка: похоже на вызов, но ни один формат его не взял.
+    pub fn unparsed_markup(&self, snippet: &str) {
+        debug_log::log(
+            "agent.step.malformed_tool_use",
+            format!(
+                "{} unparsed_markup=1 errors=unparsed markup: {}",
+                self.head(),
+                snippet.split_whitespace().collect::<Vec<_>>().join(" ")
+            ),
+        );
+    }
+
     pub fn malformed_exhausted(&self, errors: &[String]) {
         debug_log::log(
             "agent.step.malformed_tool_use_exhausted",

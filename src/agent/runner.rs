@@ -1,8 +1,7 @@
 use crate::agent::retry::{MAX_EMPTY_RESPONSE_RETRIES, MAX_MALFORMED_TOOL_RETRIES, RetryBudget};
 use crate::agent::stream::{StreamEnd, StreamOutcome, StreamVerdict, collect_stream};
 use crate::agent::tool_parser::{
-    ParsedToolCall, StreamTextTracker, parse_tool_calls_with_errors, strip_thinking_only,
-    strip_tool_calls,
+    ParseCtx, ParsedReply, StreamTextTracker, ToolCatalog, parse_step,
 };
 use crate::agent::tools_step::{ToolExecContext, run_tool_calls};
 use crate::agent::trace::{self, StepTrace};
@@ -47,6 +46,7 @@ pub async fn run_agent_loop(
     let mut collected_tool_calls = Vec::new();
     let mut retries = RetryBudget::default();
     let mut compaction = CompactionState::default();
+    let catalog = ToolCatalog::snapshot(&tools, &mcp).await;
 
     inject_semantic_hint(conversation, &semantic, &mut messages).await;
 
@@ -104,29 +104,27 @@ pub async fn run_agent_loop(
             ..
         } = outcome;
 
-        // Родные вызовы главнее: разбор текста в этом режиме — подстраховка
-        // на случай, когда эндпоинт молча проглотил `tools`, а не второй
-        // источник. Сложив их, мы выполнили бы один и тот же вызов дважды.
-        let (parsed_calls, parse_errors) = parse_tool_calls_with_errors(&raw);
-        let tool_calls: Vec<_> = if native_calls.is_empty() {
-            parsed_calls
-        } else {
-            native_calls.iter().map(ParsedToolCall::from).collect()
-        };
-        // Ошибки разбора текста при родных вызовах ни при чём: текст в этом
-        // случае — просто проза рядом с вызовом.
-        let parse_errors = if native_calls.is_empty() {
-            parse_errors
-        } else {
-            Vec::new()
-        };
-        // На родном протоколе текст — это текст: вырезать из него разметку
-        // вызовов незачем, а навредить она может.
-        let visible_text = if native_calls.is_empty() {
-            strip_tool_calls(&raw)
-        } else {
-            strip_thinking_only(&raw)
-        };
+        let ParsedReply {
+            calls: tool_calls,
+            errors: mut parse_errors,
+            visible: visible_text,
+            suspect,
+        } = parse_step(
+            &raw,
+            &native_calls,
+            &ParseCtx {
+                catalog: &catalog,
+                tool_outputs: tool_outputs(&messages),
+                unattended: auto_approve,
+            },
+        );
+        // Рядом с выполненными вызовами неразобранная разметка идёт в ту же
+        // заметку: бюджет повтора на неё не тратится.
+        if !tool_calls.is_empty()
+            && let Some(suspect) = &suspect
+        {
+            parse_errors.push(unparsed_markup(suspect));
+        }
         trace.parsed(
             got_stop,
             provider_error.as_deref(),
@@ -158,6 +156,7 @@ pub async fn run_agent_loop(
                     raw: &raw,
                     visible: &visible_text,
                     parse_errors: &parse_errors,
+                    suspect: suspect.as_deref(),
                 },
                 &collected_tool_calls,
             ) {
@@ -182,7 +181,9 @@ pub async fn run_agent_loop(
         // который в родном протоколе стирал бы шаг целиком.
         ctx.emit(AgentEvent::EndAssistantMessage {
             tool_calls: native_calls,
+            text: visible_text,
         });
+        let handled: Vec<String> = tool_calls.iter().map(|call| call.name.clone()).collect();
         run_tool_calls(
             tool_calls,
             &ctx,
@@ -191,6 +192,17 @@ pub async fn run_agent_loop(
             &mut collected_tool_calls,
         )
         .await;
+        retries.reset();
+        if !parse_errors.is_empty() {
+            trace.malformed_beside_calls(handled.len(), &parse_errors);
+            messages.push(ChatMessage::system(&beside_calls_note(
+                &parse_errors,
+                &handled,
+            )));
+            ctx.emit(AgentEvent::Message(ChatMessage::system(
+                "⚠ Some tool calls could not be parsed — the rest ran, asking the model to re-send the broken ones",
+            )));
+        }
     }
 
     trace::turn_out_of_steps(conversation, max_steps, collected_tool_calls.len());
@@ -289,6 +301,16 @@ struct StepText<'a> {
     raw: &'a str,
     visible: &'a str,
     parse_errors: &'a [String],
+    /// Имя инструмента в разметке, которую никто не разобрал.
+    suspect: Option<&'a str>,
+}
+
+/// Закрыть сообщение шага без вызовов его итоговым текстом; пустое сбрасывается.
+fn end_message(ctx: &ToolExecContext<'_>, text: &str) {
+    ctx.emit(AgentEvent::EndAssistantMessage {
+        tool_calls: Vec::new(),
+        text: text.to_string(),
+    });
 }
 
 /// Шаг без вызовов инструментов: сломанный `<tool_use>`, пустой ответ или
@@ -305,11 +327,13 @@ fn finish_or_retry(
         raw,
         visible,
         parse_errors,
+        suspect,
     } = step;
     // Ноль разобранных вызовов при непустых ошибках — это сломанный блок, а
     // не финальный ответ. Молча закончить ход здесь и значило «агент завис».
     if !parse_errors.is_empty() {
         if let Some(attempt) = retries.take_malformed() {
+            end_message(ctx, visible);
             // Кладём сырое: провайдеру с полной историей нужно увидеть ошибку.
             messages.push(ChatMessage::assistant(raw));
             messages.push(ChatMessage::user(&malformed_tool_feedback(parse_errors)));
@@ -325,6 +349,23 @@ fn finish_or_retry(
         )));
     }
 
+    // Похоже на вызов, но ни один формат его не взял. Одна попытка: если
+    // модель ответит тем же, это был пример, и ответ отдаётся как есть.
+    if parse_errors.is_empty()
+        && let Some(suspect) = suspect
+        && retries.take_residue().is_some()
+    {
+        end_message(ctx, visible);
+        messages.push(ChatMessage::assistant(raw));
+        messages.push(ChatMessage::system(&unparsed_markup_feedback(suspect)));
+        trace.unparsed_markup(suspect);
+        ctx.emit(AgentEvent::Message(ChatMessage::system(
+            "⚠ The reply looks like a tool call in a format the agent could not read — asking the model to re-send it",
+        )));
+        return StepEnd::Retry;
+    }
+
+    end_message(ctx, visible);
     if !visible.is_empty() {
         messages.push(ChatMessage::assistant(visible));
         return StepEnd::Answer(visible.to_string());
@@ -333,11 +374,6 @@ fn finish_or_retry(
     // Ни текста, ни вызова — ход не сделал ничего. Считать это успехом и
     // значило вернуть «готово» над пустым каталогом.
     trace.empty_assistant();
-    // Ни текста, ни вызовов — закрываем пустым списком, и сообщение
-    // сбрасывается, как и раньше.
-    ctx.emit(AgentEvent::EndAssistantMessage {
-        tool_calls: Vec::new(),
-    });
     if let Some(attempt) = retries.take_empty() {
         messages.push(ChatMessage::user(EMPTY_RESPONSE_FEEDBACK));
         trace.empty_retry(attempt, MAX_EMPTY_RESPONSE_RETRIES);
@@ -818,6 +854,45 @@ pub(crate) fn malformed_tool_feedback(errors: &[String]) -> String {
     )
 }
 
+/// Выводы инструментов беседы: чужая разметка, взятая оттуда, не исполняется.
+pub(crate) fn tool_outputs(messages: &[ChatMessage]) -> Vec<&str> {
+    messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .map(|message| message.content.as_str())
+        .collect()
+}
+
+/// Неразобранная разметка одной строкой — для заметки рядом с вызовами.
+pub(crate) fn unparsed_markup(snippet: &str) -> String {
+    format!(
+        "markup that mentions a tool could not be read as a call: «{}»",
+        snippet.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
+pub(crate) fn unparsed_markup_feedback(snippet: &str) -> String {
+    format!(
+        "Your previous reply seems to contain a tool call in a format this agent cannot read, \
+         so nothing was run:\n{snippet}\n\nIf you meant to call a tool, re-send the call as \
+         <tool_use><name>TOOL</name><arguments>{{ valid JSON }}</arguments></tool_use>. If that \
+         text was only an example, repeat your answer unchanged."
+    )
+}
+
+/// Заметка модели, когда рядом с выполненными вызовами были битые. Системная,
+/// а не от пользователя: в хвосте DeepSeek она идёт как `### NOTE`.
+pub(crate) fn beside_calls_note(errors: &[String], handled: &[String]) -> String {
+    format!(
+        "Some tool calls in your previous message could NOT be parsed and were NOT run:\n- {}\n\n\
+         The other calls from that message were handled — their results are above, do not \
+         repeat them: {}.\nRe-send only the failed calls, as \
+         <tool_use><name>TOOL</name><arguments>{{ valid JSON }}</arguments></tool_use>.",
+        errors.join("\n- "),
+        handled.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1238,7 +1313,7 @@ mod tests {
                     ..
                 } => notices.push(message.content),
                 AppEvent::Agent {
-                    event: AgentEvent::EndAssistantMessage { tool_calls },
+                    event: AgentEvent::EndAssistantMessage { tool_calls, .. },
                     ..
                 } => ended_with.push(tool_calls),
                 AppEvent::Agent {
@@ -1417,6 +1492,117 @@ mod tests {
             "event stream keeps the full output, got {}",
             reported.chars().count()
         );
+    }
+
+    /// Целый вызов выполняется, а про битый рядом модель узнаёт заметкой —
+    /// раньше он терялся молча, если рядом был целый.
+    #[tokio::test]
+    async fn a_broken_call_beside_a_good_one_is_reported_to_the_model() {
+        let reply = concat!(
+            "<tool_use><name>loud</name><arguments>{}</arguments></tool_use>",
+            "<tool_use><name>loud</name><arguments>{\"a\": \"C:\\x\"}</arguments></tool_use>",
+        );
+        let fake = Arc::new(FakeProvider::with_responses(vec![
+            reply.to_string(),
+            "Done.".to_string(),
+        ]));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(LoudTool));
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                messages: vec![ChatMessage::user("go")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 500,
+                context: crate::context::ContextSpec::default(),
+            },
+            tools,
+            mcp,
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let second = fake
+            .request(1)
+            .expect("a second request after the tool ran");
+        assert_eq!(second.iter().filter(|m| m.role == Role::Tool).count(), 1);
+        let note = second
+            .iter()
+            .find(|m| m.role == Role::System && m.content.contains("could NOT be parsed"))
+            .expect("the broken call is reported beside the good one");
+        assert!(
+            note.content.contains("do not repeat them: loud"),
+            "{}",
+            note.content
+        );
+    }
+
+    /// Разметка с именем инструмента, которую не взял ни один формат, не
+    /// становится молча ответом: модель переспрашивают один раз.
+    #[tokio::test]
+    async fn unreadable_call_markup_is_questioned_once() {
+        let fake = Arc::new(FakeProvider::with_responses(vec![
+            "Running <run_tool:loud/>".to_string(),
+            "Done.".to_string(),
+        ]));
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(LoudTool));
+        let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                messages: vec![ChatMessage::user("go")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 500,
+                context: crate::context::ContextSpec::default(),
+            },
+            tools,
+            mcp,
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let second = fake.request(1).expect("the model is asked again");
+        assert!(
+            second
+                .iter()
+                .any(|m| m.role == Role::System && m.content.contains("cannot read")),
+            "{second:?}"
+        );
+        let mut answer = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AppEvent::Agent {
+                event: AgentEvent::Done(result),
+                ..
+            } = event
+            {
+                answer = Some(result.text);
+            }
+        }
+        assert_eq!(answer.as_deref(), Some("Done."));
     }
 
     /// A tool whose single result on its own crosses the prune trigger.

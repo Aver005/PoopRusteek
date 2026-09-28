@@ -115,25 +115,93 @@ for step in 0..max_steps:                       # default max_steps_per_turn = 2
 - The `task` tool (sub-agents) is special-cased in `agent/tools_step.rs::spawn_task`, not a `Tool` impl; the headless runner is `agent/sub_agent.rs::run_sub_agent`.
 - `summarize_tool_result` (`agent/tools_step.rs`) truncates at `floor_char_boundary(200)` — UTF-8/emoji safe (tested).
 
-## TOOL-CALL PARSING (`agent/tool_parser.rs`)
+## TOOL-CALL PARSING (`agent/tool_parser/`)
 
-Four formats parsed from raw LLM text (DeepSeek web API has NO native function-calling):
-1. **XML** (primary): `<tool_use><name>…</name><arguments>{json}</arguments></tool_use>`.
-2. **XML+JSON**: `<tool_use>{"tool":…,"args":…}</tool_use>`.
-3. **Legacy**: `[TOOL:name] {json}`.
-4. **DSML** — DeepSeek's own native markup, which the model started emitting on
-   2026-09-24 (instead of or right after a `<tool_use>`):
-   `<｜DSML｜function_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="p" string="true|false">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>`.
-   The web mangles the markers (`<｜｜DSML｜｜ calls>`), so the `DSML` regex
-   fragment tolerates any number of `｜`/`|` and spaces. `string="true"` = raw
-   text, otherwise JSON with a string fallback. An unterminated `invoke` becomes
-   a diagnostic (retry), not a silent drop. Journal: `JOURNAL/2026-09-24-dsml-tool-calls.md`.
+DeepSeek web has no native function calling: the model writes calls as text.
+Every format that vLLM `ccfd1cea` and sglang `6aacca2d` parse is read, mixed
+freely in one reply, calls run in text order. Plan, decisions and deliberate
+deviations: `.docs/tool-call-formats.md`. Entry points: `parse_step(raw,
+native, &ParseCtx)` (native calls win; text parsing is the fallback) and
+`parse_text`; result `ParsedReply { calls, errors, visible, suspect }`.
 
-- Calls from all formats are returned **in text order** (sorted by match start),
-  so a mixed reply runs its calls in the order the model wrote them.
-- `strip_tool_calls()` removes `<tool_use>`, `<thinking>`, DSML blocks/invokes and `[TOOL:…]` blocks.
-- `stream_visible_text()` also cuts at the first bare `<` or partial marker — **gotcha**: truncates legit text containing `<` (e.g. C++ templates, `a < b`).
-- Regexes are `LazyLock`-compiled. Has unit tests for all three formats.
+**One pass, left to right (`scan.rs`).** Tokens: format openers (built from
+`formats::families()`), code fences, inline code, `<thinking>`/`<think>` and a
+bare closer.
+- One opener can belong to several formats (`<tool_call>`: Hermes JSON, GLM
+  key-value, Qwen3-Coder `<function=`; `<function_calls>`: Claude-like `<invoke>`
+  and Olmo 3). `Scanner::parse_at` tries every family whose opener matches there,
+  in table order; each grammar returns `None` when the body is not its shape.
+- A finding goes through acceptance at once; one with nothing left is prose.
+- Nothing inside a finding is scanned: a call inside a `write` argument is data.
+  An unclosed call that already has a body is an error spanning to the end —
+  nothing after it runs.
+- Fence: its calls are taken only if the fence holds nothing but calls. If a call
+  is cut exactly at a ``` line, a second pass scans through (a DSML `write` of
+  markdown carries its own fences). An unclosed fence with text around a call is
+  not a fence (the prompt says "stop after the call", so fences stay open).
+- Inline code is prose — unless its closing backtick sits inside a call
+  (PowerShell escape char).
+- Reasoning is never parsed; an unclosed block ends at the first real call; a call
+  written only inside reasoning is a diagnostic.
+- Weak formats (pythonic list, bare JSON) count only when the whole visible reply
+  is calls and there are no strong findings (`formats::whole_reply`).
+
+**Acceptance (`accept.rs`, `catalog.rs`).** `ToolCatalog` = builtin + MCP names
+and schemas, snapshotted once per turn. Name: exact; else case/`-`/`_` fold if the
+match is unique; `mcp__…` is never folded. Values: `Declared::Text` as is,
+`Json` = JSON with string fallback, `BySchema` = non-string only when the schema
+explicitly allows it (`"007"` stays a string). A lone `arguments`/`input` param
+absent from the schema is unwrapped. Adjacent identical call in a different
+format is dropped (DSML echo of a `<tool_use>`).
+
+**Trust.** Trusted: `tool_use`, `legacy`, `dsml`, `deepseek_v3`, `deepseek_v31`
+(`accept::TRUSTED`). Anything else, or a renamed call, gets
+`CallOrigin::needs_person()`: the approval modal always shows
+(`ToolApprovalRequest::always_ask` bypasses the whitelist; the modal says why),
+including `task` and `timer`; unattended (auto-approve, sub-agent) → refused with
+"re-send as `<tool_use>`". Untrusted markup copied verbatim from a tool output is
+refused. An untrusted call to an unknown tool is prose (someone's example).
+
+**Residue** (`accept::residue`): a catalog tool name inside call-like markup that
+no grammar took → `ParsedReply::suspect` → one retry (own budget), or a line in
+the beside-calls note when other calls ran.
+
+**Loop.** Parse errors beside good calls: the calls run, the errors go back as a
+system note (`### NOTE`) listing the handled calls; no retry budget is spent.
+`RetryBudget::reset` after a step that ran tools.
+
+**Display.** Each step ends with `EndAssistantMessage { text }` — the parsed
+visible text — and `reduce` replaces what streamed. The stream (`visible.rs`)
+still cuts at the first `<` and at `[TOOL:`/`[TOOL_CALLS`/`functools[`, and holds
+back a reply starting with `[` or `{`.
+
+**DeepSeek reasoning.** The provider holds `THINK` fragments and emits them as a
+leading `<thinking>` block when the answer fragment starts; no answer fragment →
+the held text is the answer (`deepseek::stream::ThinkRouter`). Not verified live.
+
+**Formats** (`formats/`, format id in parentheses):
+- `tool_use.rs` — `<tool_use>` (`tool_use`, all old tolerances; JSON end found by
+  parsing), `[TOOL:name] {json}` (`legacy`, nested objects).
+- `invoke.rs` — invoke/parameter dialects: DSML V3.2/V4/V4.1 (`dsml`; wrappers
+  `function_calls`/`tool_calls`/`calls`/`toolcalls`/`tool`, self-closing invoke,
+  JSON body, strings never trimmed), Claude-like / MiniMax M2 / dots (`invoke`),
+  GigaChat 3.5 (`gcml`), Step3 inner (`step3`).
+- `tokens.rs` — DeepSeek V3/R1 (`deepseek_v3`), V3.1 (`deepseek_v31`), Step3 outer.
+- `json_wrap.rs` — marker + JSON: Hermes/Qwen2.5/Granite/Ernie, Longcat, Jamba,
+  Hunyuan-A13B, granite-20b, Cohere, Inkling, InternLM, Apertus, Mistral (3
+  forms), Phi-4 mini, GigaChat 3, dots JSON, Llama `<|python_tag|>`, OpenAI
+  `tool_calls` object.
+- `tagged.rs` — key-value (GLM 4.5/4.7, Ling3, Spark, Poolside; Hunyuan/Hy3/Hy4;
+  K2 Horizon) and `function=` (Qwen3-Coder, Seed-OSS, MiMo, Step 3.5, Nemotron;
+  MiniCPM5 `<function name=…>`).
+- `kimi.rs` — Kimi K2, K3. `gemma.rs` — Gemma 4, FunctionGemma.
+  `minimax_m3.rs` — MiniMax M3. `channels.rs` — Harmony (gpt-oss), Muse Glimmer.
+- `weak.rs` — pythonic sub-grammar; LFM2, Olmo 3, Llama 4 (strong, with markers);
+  `whole_reply` for bare pythonic / bare JSON.
+
+Adding a format: a grammar file with `families()` + one line in
+`formats::families()`; its `parse` must return `None` for bodies that are not its
+shape. The contract written for the grammar authors is summarised above.
 
 ## SKILLS as tools
 

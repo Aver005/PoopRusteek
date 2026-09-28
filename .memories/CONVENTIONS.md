@@ -71,7 +71,8 @@
 
 ## TESTS
 - **189 tests** today (`cargo test --bin pooprusteek`, was 84 pre-2026-07-02), all in-file `#[cfg(test)] mod tests` — provider `fork` isolation (`deepseek.rs`), goal `apply_verdict` + iteration-cap (`goal.rs`), conversation ids, tool-parser, runner, command-registry round-trips, `mcp_row_layout`, overflow-marker one-shot behavior, etc.
-- Edge cases worth testing: multibyte/emoji boundaries, partial tool-tag streaming, all 3 tool-call formats, fork session independence.
+- Edge cases worth testing: multibyte/emoji boundaries, partial tool-tag streaming, fork session independence.
+- A tool-call grammar (`agent/tool_parser/formats/*.rs`) is tested with a verbatim sample from its vLLM/sglang reference (file named in a comment above the test), a prose mention of its marker (→ no calls, no errors) and a broken body (→ exactly one error). Untrusted formats are only visible through `tool_parser::parse_with` with a catalog: an unknown name is prose.
 - Favor a **pure functional core** (like `goal::apply_verdict`) so logic is testable without a live `App`.
 - **Verification baseline = `cargo build` + `cargo test --bin pooprusteek` + `cargo clippy`.** Clippy is now **0 warnings** (was ~220) — keep it that way; CI runs it advisory for now, but treat new warnings as build breaks.
 

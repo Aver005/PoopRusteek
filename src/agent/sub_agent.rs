@@ -7,11 +7,12 @@
 //! единицей, и блокировать ход вопросом здесь некому.
 
 use crate::agent::retry::RetryBudget;
-use crate::agent::runner::{EMPTY_RESPONSE_FEEDBACK, build_step_request, malformed_tool_feedback};
-use crate::agent::stream::{StreamVerdict, collect_stream};
-use crate::agent::tool_parser::{
-    ParsedToolCall, parse_tool_calls_with_errors, strip_thinking_only, strip_tool_calls,
+use crate::agent::runner::{
+    EMPTY_RESPONSE_FEEDBACK, beside_calls_note, build_step_request, malformed_tool_feedback,
+    tool_outputs, unparsed_markup, unparsed_markup_feedback,
 };
+use crate::agent::stream::{StreamVerdict, collect_stream};
+use crate::agent::tool_parser::{ParseCtx, ParsedReply, ToolCatalog, parse_step};
 use crate::agent::tools_step::{dispatch_generic_tool, tool_skip_message};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, LLMProvider, Role};
@@ -53,6 +54,7 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
     } = spec;
     let mut messages = vec![ChatMessage::user(&user_prompt)];
     let mut retries = RetryBudget::default();
+    let catalog = ToolCatalog::snapshot(&tools, &mcp).await;
 
     for _step in 0..max_steps {
         let request =
@@ -75,22 +77,27 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
         // разбор текста — подстраховка. Без этого шаг с родным вызовом и
         // вводной фразой возвращался бы родителю как готовый ответ, не
         // выполнив ничего.
-        let (parsed_calls, parse_errors) = parse_tool_calls_with_errors(&full);
-        let tool_calls: Vec<_> = if native_calls.is_empty() {
-            parsed_calls
-        } else {
-            native_calls.iter().map(ParsedToolCall::from).collect()
-        };
-        let parse_errors = if native_calls.is_empty() {
-            parse_errors
-        } else {
-            Vec::new()
-        };
-        let visible = if native_calls.is_empty() {
-            strip_tool_calls(&full)
-        } else {
-            strip_thinking_only(&full)
-        };
+        // Суб-агент идёт без человека: чужая разметка и поправленное имя не
+        // исполняются, модель получает просьбу повторить.
+        let ParsedReply {
+            calls: tool_calls,
+            errors: mut parse_errors,
+            visible,
+            suspect,
+        } = parse_step(
+            &full,
+            &native_calls,
+            &ParseCtx {
+                catalog: &catalog,
+                tool_outputs: tool_outputs(&messages),
+                unattended: true,
+            },
+        );
+        if !tool_calls.is_empty()
+            && let Some(suspect) = &suspect
+        {
+            parse_errors.push(unparsed_markup(suspect));
+        }
 
         if tool_calls.is_empty() {
             // Та же развилка, что и в главном цикле: ноль разобранных вызовов
@@ -104,6 +111,13 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
                 }
                 messages.push(ChatMessage::assistant(&full));
                 messages.push(ChatMessage::user(&malformed_tool_feedback(&parse_errors)));
+                continue;
+            }
+            if let Some(suspect) = &suspect
+                && retries.take_residue().is_some()
+            {
+                messages.push(ChatMessage::assistant(&full));
+                messages.push(ChatMessage::system(&unparsed_markup_feedback(suspect)));
                 continue;
             }
             if !visible.is_empty() {
@@ -123,6 +137,7 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
         assistant.tool_calls = native_calls;
         messages.push(assistant);
         let total_calls = tool_calls.len();
+        let handled: Vec<String> = tool_calls.iter().map(|call| call.name.clone()).collect();
         for (call_index, tool_call) in tool_calls.into_iter().enumerate() {
             // Идентификатор от провайдера, если он есть: результат обязан
             // сослаться на тот же, что и объявивший его вызов.
@@ -152,6 +167,13 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
                 &tool_id,
                 &crate::context::cap_tool_output(&result, tool_output_limit),
             ));
+        }
+        retries.reset();
+        if !parse_errors.is_empty() {
+            messages.push(ChatMessage::system(&beside_calls_note(
+                &parse_errors,
+                &handled,
+            )));
         }
     }
 

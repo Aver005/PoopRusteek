@@ -12,10 +12,11 @@ impl App {
     pub(super) async fn on_tool_approval_requested(&mut self, request: ToolApprovalRequest) {
         // Называем правило, а не просто «auto-approved»: с областями человеку
         // важно видеть, какое именно разрешение сработало.
-        if let Some(rule) = self
-            .state
-            .approved_tools
-            .matching(&request.tool_name, request.scope.as_ref())
+        if !request.always_ask
+            && let Some(rule) = self
+                .state
+                .approved_tools
+                .matching(&request.tool_name, request.scope.as_ref())
         {
             let shown = rule.describe();
             request.resolve(true).await;

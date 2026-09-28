@@ -1,5 +1,10 @@
 # 2026-09-24 — модель DeepSeek пишет вызовы в DSML, и они терялись
 
+> Поправка 2026-09-28: «искажённая» разметка ниже — штатный формат DeepSeek
+> V4.1 (` calls`/` invoke`/` parameter` с ведущим пробелом, sglang
+> `deepseekv41_detector.py`); от эталона отличается только удвоенной чертой.
+> См. `2026-09-28-tool-call-formats.md`.
+
 Всплыло при проверке фикса 40005 (`2026-09-24-client-version-40005.md`):
 набор `live` дал 4/6. Упали `shell-reads-workspace` (0/2 — «final answer does
 not match /0\.4\.2/») и `multi-turn-history` (1/2 — «summary.md was not

@@ -526,12 +526,8 @@ pub fn chunk_from_openai(chunk: ChatCompletionChunk) -> CompletionChunk {
 // is treated as reasoning (that is where these models put it), so a normal
 // answer that happens to mention `<think>` mid-text is untouched.
 //
-// NOTE: the built-in DeepSeek *web* reasoner is a separate case — it streams
-// typed THINK fragments the provider currently merges into content with no
-// tags, so there is nothing here to split. Separating those cleanly needs a
-// reasoning channel on `CompletionChunk` + fragment-type tracking in
-// `provider/deepseek/stream.rs` (and it would change the TUI's inline-thinking
-// display) — left as a deliberate follow-up.
+// Веб-рассуждения DeepSeek провайдер сам кладёт в `<thinking>` в начале ответа
+// (`deepseek::stream::ThinkRouter`), так что они расходятся здесь же.
 
 const THINK_OPENERS: [&str; 2] = ["<think>", "<thinking>"];
 const THINK_CLOSERS: [&str; 2] = ["</think>", "</thinking>"];

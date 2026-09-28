@@ -166,6 +166,14 @@ impl ToolExecContext<'_> {
 /// это UX, `task` — запуск суб-агента, `timer` — состояние беседы, а
 /// остальное — аппрув и диспетчер.
 async fn execute_tool_call(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
+    // Чужая разметка не обходит подтверждение и у особых инструментов:
+    // `task` иначе запустил бы суб-агента, который исполняет всё без человека.
+    if call.origin.needs_person()
+        && matches!(call.name.as_str(), TASK_TOOL_NAME | TIMER_TOOL_NAME)
+        && (ctx.auto_approve || !ask_person(&call, ctx, true).await)
+    {
+        return ToolOutcome::failed("Execution denied by user.");
+    }
     match call.name.as_str() {
         QUESTION_TOOL_NAME => ask_the_user(&call, ctx).await,
         TASK_TOOL_NAME => spawn_task(&call, ctx).await,
@@ -352,32 +360,47 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
     // Незнакомое имя (в том числе любой MCP-инструмент) подтверждаем всегда:
     // отказаться от модалки может только тот, кто сам объявил, что ему нечего
     // подтверждать.
-    let needs_approval = ctx
-        .tools
-        .get(&call.name)
-        .is_none_or(|tool| tool.requires_approval());
-    let approved = if ctx.auto_approve || !needs_approval {
+    let person = call.origin.needs_person();
+    let needs_approval = person
+        || ctx
+            .tools
+            .get(&call.name)
+            .is_none_or(|tool| tool.requires_approval());
+    // Такой вызов без человека до сюда не доходит — его отвергает разбор.
+    let approved = if person && ctx.auto_approve {
+        false
+    } else if ctx.auto_approve || !needs_approval {
         true
     } else {
-        // Не сырой JSON: он экранирует переводы строк, и содержимое файла в
-        // модалке становится одной нечитаемой строкой.
-        let arguments_preview = crate::tools::approval_preview(&call.name, &call.arguments);
-        let approval = ToolApprovalRequest::new(
-            ctx.conversation,
-            call.name.clone(),
-            arguments_preview,
-            crate::tools::approval_scope(&call.name, &call.arguments),
-        );
-        let _ = ctx
-            .event_tx
-            .send(AppEvent::RequestToolApproval(approval.clone()));
-        approval.wait().await
+        ask_person(&call, ctx, person).await
     };
     if !approved {
         return ToolOutcome::failed("Execution denied by user.");
     }
     ctx.emit_tool_started(&call.name);
     dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments).await
+}
+
+/// Окно подтверждения. `always` — белый список не действует, а в окне
+/// сказано, почему спрашиваем.
+async fn ask_person(call: &ParsedToolCall, ctx: &ToolExecContext<'_>, always: bool) -> bool {
+    // Не сырой JSON: он экранирует переводы строк, и содержимое файла в
+    // модалке становится одной нечитаемой строкой.
+    let mut preview = crate::tools::approval_preview(&call.name, &call.arguments);
+    if let Some(warning) = call.origin.warning() {
+        preview = format!("{warning}\n{preview}");
+    }
+    let approval = ToolApprovalRequest::new(
+        ctx.conversation,
+        call.name.clone(),
+        preview,
+        crate::tools::approval_scope(&call.name, &call.arguments),
+    )
+    .asking_always(always);
+    let _ = ctx
+        .event_tx
+        .send(AppEvent::RequestToolApproval(approval.clone()));
+    approval.wait().await
 }
 
 /// Явный `tool_result` для вызова, срезанного лимитом шага.
