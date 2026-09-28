@@ -14,26 +14,22 @@
 //!    direction ([`request_to_openai`], [`response_from_openai`],
 //!    [`chunk_from_openai`]).
 //!
-//! Scope (v1): plain chat — messages, temperature/max_tokens, streaming,
-//! finish_reason, usage. Deliberately NOT translated yet: structured
-//! tool-calling (`tools`/`tool_calls`) — pooprusteek's tool calls are
-//! prompt-encoded text parsed by `agent/tool_parser`, and mapping that onto
-//! OpenAI's structured tool protocol is its own design task. Inbound
-//! `tools` are captured (not dropped by serde) so the server can *warn*
-//! rather than silently ignore; multimodal content parts are flattened to
-//! their text parts.
+//! Scope: messages, temperature/max_tokens, streaming, finish_reason, usage,
+//! and the wire half of tool calling — inbound `tools`/`tool_choice`,
+//! assistant `tool_calls` and tool results in the history, outbound
+//! `tool_calls` in responses and deltas. The server emulates the calls
+//! themselves in the prompt (`server::tools`); this module only maps the
+//! shapes. Multimodal content parts are flattened to their text parts.
 //!
-//! Not translating tool-calling still has to mean *tolerating* it on the
-//! wire, in both directions. Inbound: an assistant message whose whole point
-//! is its `tool_calls` carries `"content": null`, which must parse rather
-//! than 400 the request. Outbound: a `Role::Tool` message goes out as user
-//! text, because our assistant messages carry no `tool_calls` for it to
-//! answer and a lone `role:"tool"` is rejected by strict endpoints.
+//! Outbound to a client provider, a `Role::Tool` message still goes out as
+//! user text: on the prompt path our assistant messages carry no
+//! `tool_calls` for it to answer, and a lone `role:"tool"` is rejected by
+//! strict endpoints.
 //!
 //! Everything here is pure data mapping — no I/O, no `App`, no network.
 
 use crate::provider::{
-    ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, Role, Usage,
+    ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, Role, ToolCall, Usage,
     estimate_tokens,
 };
 use serde::{Deserialize, Serialize};
@@ -54,10 +50,12 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: Option<u32>,
     #[serde(default)]
     pub stream: Option<bool>,
-    /// Captured (not silently swallowed by serde) so a server can tell the
-    /// caller that structured tool-calling is not translated yet.
+    /// Инструменты клиента; сервер описывает их модели в промпте.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
+    /// `"auto"` | `"none"` | `"required"` | `{"type":"function","function":{"name":…}}`.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +74,58 @@ pub struct ChatCompletionMessage {
     /// backend emitted a leading `<think>`/`<thinking>` block inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Вызовы инструментов в ассистентском сообщении — во входящей истории и
+    /// в нашем ответе.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<WireToolCall>>,
+}
+
+/// Один вызов на проводе OpenAI. `arguments` — JSON, записанный строкой.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireToolCall {
+    /// Есть только в дельтах стрима: номер вызова в ответе.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    pub id: String,
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
+    pub function: WireFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireFunction {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+fn function_kind() -> String {
+    "function".to_string()
+}
+
+impl WireToolCall {
+    pub fn from_call(call: &ToolCall) -> Self {
+        Self {
+            index: None,
+            id: call.id.clone(),
+            kind: function_kind(),
+            function: WireFunction {
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+            },
+        }
+    }
+
+    /// Аргументы-строку, которая не JSON, сохраняем строкой, а не теряем.
+    fn to_internal(&self) -> ToolCall {
+        let arguments = serde_json::from_str(&self.function.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(self.function.arguments.clone()));
+        ToolCall {
+            id: self.id.clone(),
+            name: self.function.name.clone(),
+            arguments,
+        }
+    }
 }
 
 /// OpenAI message content: a plain string, or an array of typed parts
@@ -169,6 +219,8 @@ pub struct Delta {
     /// live chain-of-thought deltas, routed here by [`ReasoningStreamSplitter`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<WireToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,14 +339,19 @@ pub fn to_internal_request(
     defaults: &RequestDefaults,
 ) -> Result<CompletionRequest, String> {
     let stream = request.stream.unwrap_or(false);
-    let mut messages = Vec::with_capacity(request.messages.len());
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(request.messages.len());
     for message in request.messages {
-        messages.push(message_to_internal(message)?);
+        let mut converted = message_to_internal(message)?;
+        // У результата OpenAI есть только id вызова — имя берём из вызова.
+        if converted.role == Role::Tool && converted.name.is_none() {
+            converted.name = tool_name_for(&messages, converted.tool_call_id.as_deref());
+        }
+        messages.push(converted);
     }
     Ok(CompletionRequest {
         messages,
-        // Входящие `tools` наш сервер не транслирует (см. шапку модуля):
-        // он их фиксирует и предупреждает, а не пробрасывает дальше.
+        // Инструменты клиента сервер описывает в промпте сам (`server::tools`),
+        // провайдеру нативно они не объявляются.
         tools: Vec::new(),
         model: request.model,
         temperature: request.temperature.unwrap_or(defaults.temperature),
@@ -316,7 +373,24 @@ fn message_to_internal(message: ChatCompletionMessage) -> Result<ChatMessage, St
         Role::Tool => ChatMessage::tool(message.tool_call_id.as_deref().unwrap_or_default(), &text),
     };
     converted.name = message.name;
+    converted.tool_calls = message
+        .tool_calls
+        .iter()
+        .flatten()
+        .map(WireToolCall::to_internal)
+        .collect();
     Ok(converted)
+}
+
+/// Имя инструмента по id вызова из уже разобранной истории.
+fn tool_name_for(history: &[ChatMessage], call_id: Option<&str>) -> Option<String> {
+    let call_id = call_id?;
+    history
+        .iter()
+        .rev()
+        .flat_map(|message| &message.tool_calls)
+        .find(|call| call.id == call_id)
+        .map(|call| call.name.clone())
 }
 
 // ── Outbound: internal → OpenAI request (future client providers) ──────
@@ -426,6 +500,7 @@ pub fn response_to_openai(
                 name: None,
                 tool_call_id: None,
                 reasoning_content: reasoning,
+                tool_calls: None,
             },
             finish_reason: Some(
                 response
@@ -457,6 +532,7 @@ pub fn split_delta_chunk(
                 role: first.then(|| "assistant".to_string()),
                 content: (!content.is_empty()).then(|| content.to_string()),
                 reasoning_content: (!reasoning.is_empty()).then(|| reasoning.to_string()),
+                tool_calls: None,
             },
             finish_reason: None,
         }],
@@ -949,6 +1025,7 @@ mod tests {
                     role: None,
                     content: Some("tok".to_string()),
                     reasoning_content: None,
+                    tool_calls: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],

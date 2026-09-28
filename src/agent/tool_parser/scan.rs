@@ -176,6 +176,7 @@ enum Mode {
 pub(super) fn run(text: &str, ctx: &ParseCtx) -> ParsedReply {
     let mut pass = Pass::default();
     scan(text, 0..text.len(), &mut pass, Mode::Normal, ctx);
+    let cut_at = cut_off_at_end(text, &pass.found);
     let (mut calls, mut errors) = accept::collect(pass.found);
     let mut visible = visible(text, pass.cut);
     // Слабый формат (pythonic, голый JSON) — только весь ответ целиком и
@@ -202,7 +203,27 @@ pub(super) fn run(text: &str, ctx: &ParseCtx) -> ParsedReply {
         errors,
         visible,
         suspect,
+        cut_at,
     }
+}
+
+/// Хвост, который дописывается к ответу при проверке на обрыв.
+const CUT_PROBE: &str = "\n\u{1f}";
+
+/// Начало вызова, на котором оборвался ответ. Битый вызов у конца может быть и
+/// закрытым; оборванный — тот, что проглотил бы дописанный к ответу хвост.
+fn cut_off_at_end(text: &str, found: &[Judged]) -> Option<usize> {
+    let end = text.trim_end().len();
+    let start = found
+        .iter()
+        .find(|found| found.span.end >= end && found.items.iter().any(Result::is_err))?
+        .span
+        .start;
+    let probe = format!("{text}{CUT_PROBE}");
+    SCANNER
+        .parse_at(&probe, start)
+        .any(|found| found.span.end == probe.len() && found.items.iter().any(Result::is_err))
+        .then_some(start)
 }
 
 /// Пройти `range`. В режиме `UntilFence` вернуть строку ```, на которой

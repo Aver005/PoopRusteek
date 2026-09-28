@@ -51,7 +51,7 @@ next write.
 [provider]
 kind = "deepseek"          # deepseek | openai | custom (only deepseek implemented)
 token = ""                 # DeepSeek web session token (required to use the agent)
-model = "deepseek-chat"    # or "deepseek-reasoner" (enables thinking/expert mode)
+model = "deepseek-chat"    # deepseek-chat|deepseek-expert, then optional -think / -search; deepseek-reasoner = expert-think
 base_url = ""              # Option<String>, default None
 temperature = 0.7
 max_tokens = 4096

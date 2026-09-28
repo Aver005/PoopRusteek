@@ -85,6 +85,9 @@ pub struct ParsedReply {
     pub visible: String,
     /// Имя инструмента внутри разметки, которую никто не разобрал.
     pub suspect: Option<String>,
+    /// Ответ кончился посреди вызова, начатого с этого байта: его стоит
+    /// продолжить, а не переписать.
+    pub cut_at: Option<usize>,
 }
 
 /// Разобрать ответ модели. Сломанный вызов становится диагностикой, а не
@@ -200,6 +203,24 @@ mod tests {
         let (calls, errors) = parse_tool_calls_with_errors(text);
         assert!(calls.is_empty());
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn a_call_cut_at_the_end_is_flagged_for_continuation() {
+        let cut = "Writing it.\n<tool_use><name>write</name><arguments>{\"path\": \"a.rs\", \"content\": \"fn ma";
+        assert_eq!(parse_reply(cut).cut_at, Some("Writing it.\n".len()));
+        let dsml = "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"write\">\n<｜DSML｜parameter name=\"content\" string=\"true\">fn ma";
+        assert_eq!(parse_reply(dsml).cut_at, Some(0));
+    }
+
+    /// Битый JSON посреди ответа — ошибка для повтора, а не обрыв.
+    #[test]
+    fn a_broken_call_followed_by_text_is_not_cut_off() {
+        let text = "<tool_use><name>bash</name><arguments>{\"command\": \"a \"b\"\"}</arguments></tool_use>\nDone.";
+        let reply = parse_reply(text);
+        assert!(!reply.errors.is_empty());
+        assert_eq!(reply.cut_at, None);
+        assert_eq!(parse_reply("Just prose.").cut_at, None);
     }
 
     #[test]
@@ -366,6 +387,22 @@ Then [TOOL:file.read] {"path": "test.txt"}"#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].arguments["command"], "pwd");
+    }
+
+    /// Лишняя `}` перед закрывающими тегами — концовка склеенного вызова из
+    /// живого прогона. Прочий мусор там по-прежнему ошибка.
+    #[test]
+    fn stray_closing_braces_before_the_closers_are_forgiven() {
+        let text =
+            "<tool_use><name>bash</name><arguments>{\"command\":\"ls\"}}</arguments>\n</tool_use>";
+        let (calls, errors) = parse_tool_calls_with_errors(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(calls[0].arguments, serde_json::json!({"command": "ls"}));
+        let junk =
+            "<tool_use><name>bash</name><arguments>{\"command\":\"ls\"}} x</arguments></tool_use>";
+        let (calls, errors) = parse_tool_calls_with_errors(junk);
+        assert!(calls.is_empty());
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]

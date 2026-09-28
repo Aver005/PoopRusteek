@@ -1,7 +1,8 @@
+use crate::agent::continuation::{MAX_CONTINUATIONS, continue_cut_off};
 use crate::agent::retry::{MAX_EMPTY_RESPONSE_RETRIES, MAX_MALFORMED_TOOL_RETRIES, RetryBudget};
 use crate::agent::stream::{StreamEnd, StreamOutcome, StreamVerdict, collect_stream};
 use crate::agent::tool_parser::{
-    ParseCtx, ParsedReply, StreamTextTracker, ToolCatalog, parse_step,
+    ParseCtx, ParsedReply, StreamTextTracker, ToolCatalog, parse_step, parse_text,
 };
 use crate::agent::tools_step::{ToolExecContext, run_tool_calls};
 use crate::agent::trace::{self, StepTrace};
@@ -93,31 +94,63 @@ pub async fn run_agent_loop(
                 return;
             }
         };
-        if let Some(notice) = notes.truncated {
-            ctx.emit(AgentEvent::Message(ChatMessage::system(&notice)));
-        }
-        let provider_error = notes.provider_error;
+        let mut truncated = notes.truncated;
+        let mut provider_error = notes.provider_error;
+        let continuable = !matches!(outcome.verdict(), StreamVerdict::Failed(_));
         let StreamOutcome {
             text: raw,
             got_stop,
             tool_calls: native_calls,
             ..
         } = outcome;
+        let parse_ctx = ParseCtx {
+            catalog: &catalog,
+            tool_outputs: tool_outputs(&messages),
+            unattended: auto_approve,
+        };
+
+        let raw = if continuable && native_calls.is_empty() {
+            let base =
+                build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
+            let continued = continue_cut_off(
+                &provider,
+                &base,
+                raw,
+                |text| parse_text(text, &parse_ctx).cut_at,
+                |attempt| {
+                    ctx.emit(AgentEvent::Message(ChatMessage::ui_system(&format!(
+                        "↻ The reply was cut off mid tool call — asking the model to continue ({attempt}/{MAX_CONTINUATIONS})"
+                    ))))
+                },
+            )
+            .await;
+            if continued.attempts > 0 {
+                trace.continued(
+                    continued.attempts,
+                    continued.failure.as_deref(),
+                    continued.text.len(),
+                );
+                if continued.failure.is_none() {
+                    // Обрыв закрыт дозапросом — жалобы на стрим больше не про этот ответ.
+                    provider_error = None;
+                    truncated = None;
+                }
+            }
+            continued.text
+        } else {
+            raw
+        };
+        if let Some(notice) = truncated {
+            ctx.emit(AgentEvent::Message(ChatMessage::system(&notice)));
+        }
 
         let ParsedReply {
             calls: tool_calls,
             errors: mut parse_errors,
             visible: visible_text,
             suspect,
-        } = parse_step(
-            &raw,
-            &native_calls,
-            &ParseCtx {
-                catalog: &catalog,
-                tool_outputs: tool_outputs(&messages),
-                unattended: auto_approve,
-            },
-        );
+            ..
+        } = parse_step(&raw, &native_calls, &parse_ctx);
         // Рядом с выполненными вызовами неразобранная разметка идёт в ту же
         // заметку: бюджет повтора на неё не тратится.
         if !tool_calls.is_empty()
@@ -1217,6 +1250,81 @@ mod tests {
             notices.iter().any(|n| n.contains("reason=length")
                 || (n.contains("length") && n.contains("incomplete"))),
             "the truncation must be surfaced, got: {notices:?}"
+        );
+    }
+
+    /// Вызов, оборванный лимитом, дописывается и выполняется; пометки об
+    /// обрезке нет — ответ в итоге цел.
+    #[tokio::test]
+    async fn a_call_cut_by_the_output_limit_is_continued_and_run() {
+        let fake = Arc::new(
+            FakeProvider::with_responses(vec![
+                r#"<tool_use><name>loud</name><arguments>{"a": "x"#.to_string(),
+                r#"y"}</arguments></tool_use>"#.to_string(),
+                "Done.".to_string(),
+            ])
+            .finish_reason("length"),
+        );
+        let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(LoudTool));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        run_agent_loop(
+            TurnSpec {
+                conversation: ConversationId::next(),
+                provider,
+                messages: vec![ChatMessage::user("go")],
+                system_prompt: "system".to_string(),
+                model: "fake".to_string(),
+                temperature: 0.0,
+                max_tokens: 128,
+                max_steps: 4,
+                max_tools_per_step: 4,
+                auto_approve: true,
+                tool_output_limit: 0,
+                context: crate::context::ContextSpec::default(),
+            },
+            tools,
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        )
+        .await;
+
+        let continuation = fake.request(1).expect("a continuation request");
+        assert!(
+            continuation
+                .last()
+                .is_some_and(|m| m.role == Role::User && m.content.contains("cut off"))
+        );
+        let after_tool = fake.request(2).expect("a request after the tool ran");
+        assert_eq!(
+            after_tool.iter().filter(|m| m.role == Role::Tool).count(),
+            1
+        );
+        let mut notices = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AppEvent::Agent {
+                event: AgentEvent::Message(message),
+                ..
+            } = event
+            {
+                notices.push(message.content);
+            }
+        }
+        assert!(
+            notices.iter().any(|n| n.contains("continue (1/")),
+            "{notices:?}"
+        );
+        // Фейк ставит `length` каждому ответу: пометку получает только
+        // последний шаг («Done.»), дописанный вызов — нет.
+        let truncated = notices
+            .iter()
+            .filter(|n| n.contains("may be incomplete"))
+            .count();
+        assert_eq!(
+            truncated, 1,
+            "a continued call must not be reported as truncated"
         );
     }
 

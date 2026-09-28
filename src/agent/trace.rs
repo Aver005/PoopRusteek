@@ -88,6 +88,18 @@ impl StepTrace {
         message
     }
 
+    /// Ответ оборвался посреди вызова и был дописан дозапросами.
+    pub fn continued(&self, attempts: u32, failure: Option<&str>, bytes: usize) {
+        debug_log::log(
+            "agent.step.continued",
+            format!(
+                "{} attempts={attempts} failure={} response_bytes={bytes}",
+                self.head(),
+                failure.unwrap_or("none")
+            ),
+        );
+    }
+
     pub fn provider_ok(&self, bytes: usize) {
         debug_log::log(
             "agent.step.provider_ok",

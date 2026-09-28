@@ -29,7 +29,6 @@ const UPDATE_PINNED_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/u
 const MESSAGE_FEEDBACK_URL: &str = "https://chat.deepseek.com/api/v0/chat/message_feedback";
 const EDIT_MESSAGE_URL: &str = "https://chat.deepseek.com/api/v0/chat/edit_message";
 const REGENERATE_URL: &str = "https://chat.deepseek.com/api/v0/chat/regenerate";
-const CONTINUE_URL: &str = "https://chat.deepseek.com/api/v0/chat/continue";
 const STOP_STREAM_URL: &str = "https://chat.deepseek.com/api/v0/chat/stop_stream";
 const RESUME_STREAM_URL: &str = "https://chat.deepseek.com/api/v0/chat/resume_stream";
 
@@ -307,20 +306,6 @@ impl DeepseekProvider {
             "Regenerate failed",
         )
         .await
-    }
-
-    /// Continue an incomplete assistant response.
-    pub async fn continue_message(
-        &self,
-        session_id: &str,
-        response_message_id: i64,
-    ) -> AppResult<()> {
-        let body = json!({
-            "chat_session_id": session_id,
-            "response_message_id": response_message_id,
-        });
-        self.post_void("message.continue", CONTINUE_URL, body, "Continue failed")
-            .await
     }
 
     /// Stop an active stream.

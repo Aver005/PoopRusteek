@@ -1,3 +1,4 @@
+pub mod continuation;
 mod retry;
 pub mod runner;
 pub mod stream;

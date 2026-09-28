@@ -139,6 +139,20 @@ fn bare_json_call(hay: &str, at: usize, pos: usize) -> Found {
 /// Конец закрывающих тегов после JSON: `</arguments>` и `</tool_use>` в
 /// любом порядке, или конец текста. `None` — после JSON посторонний текст.
 fn closers_end(hay: &str, from: usize) -> Option<usize> {
+    closers_after(hay, from).or_else(|| {
+        // Лишние `}` за целым объектом: так модель дописывает длинный вызов
+        // по кускам (живой прогон 2026-09-29). На аргументы они не влияют.
+        let stray = from
+            + hay[from..]
+                .find(|c: char| c != '}' && !c.is_whitespace())
+                .unwrap_or(hay.len() - from);
+        (hay[from..stray].contains('}'))
+            .then(|| closers_after(hay, stray))
+            .flatten()
+    })
+}
+
+fn closers_after(hay: &str, from: usize) -> Option<usize> {
     let mut end = from;
     let mut seen_args = false;
     let mut seen_close = false;

@@ -6,13 +6,14 @@
 //! (смотреть некому), а `task` и `question` отклоняются: глубина ограничена
 //! единицей, и блокировать ход вопросом здесь некому.
 
+use crate::agent::continuation::continue_cut_off;
 use crate::agent::retry::RetryBudget;
 use crate::agent::runner::{
     EMPTY_RESPONSE_FEEDBACK, beside_calls_note, build_step_request, malformed_tool_feedback,
     tool_outputs, unparsed_markup, unparsed_markup_feedback,
 };
 use crate::agent::stream::{StreamVerdict, collect_stream};
-use crate::agent::tool_parser::{ParseCtx, ParsedReply, ToolCatalog, parse_step};
+use crate::agent::tool_parser::{ParseCtx, ParsedReply, ToolCatalog, parse_step, parse_text};
 use crate::agent::tools_step::{dispatch_generic_tool, tool_skip_message};
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, LLMProvider, Role};
@@ -61,7 +62,7 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
             build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
 
         // Безголово: колбэка прогресса нет, стримить некуда.
-        let outcome = collect_stream(&provider, request, |_| {}).await;
+        let outcome = collect_stream(&provider, request.clone(), |_| {}).await;
         match outcome.verdict() {
             StreamVerdict::IdleTimeout => return Err("sub-agent stream timed out".to_string()),
             StreamVerdict::Failed(error) => return Err(error),
@@ -70,8 +71,20 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
             // тоже текст, и он лучше, чем ничего.
             StreamVerdict::Ok | StreamVerdict::Finished(_) | StreamVerdict::ClosedWithoutStop => {}
         }
-        let full = outcome.text;
         let native_calls = outcome.tool_calls;
+        let parse_ctx = ParseCtx {
+            catalog: &catalog,
+            tool_outputs: tool_outputs(&messages),
+            unattended: true,
+        };
+        let full = if native_calls.is_empty() {
+            let cut_at = |text: &str| parse_text(text, &parse_ctx).cut_at;
+            continue_cut_off(&provider, &request, outcome.text, cut_at, |_| {})
+                .await
+                .text
+        } else {
+            outcome.text
+        };
 
         // Та же очерёдность, что в главном цикле: родные вызовы главнее, а
         // разбор текста — подстраховка. Без этого шаг с родным вызовом и
@@ -84,15 +97,8 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
             errors: mut parse_errors,
             visible,
             suspect,
-        } = parse_step(
-            &full,
-            &native_calls,
-            &ParseCtx {
-                catalog: &catalog,
-                tool_outputs: tool_outputs(&messages),
-                unattended: true,
-            },
-        );
+            ..
+        } = parse_step(&full, &native_calls, &parse_ctx);
         if !tool_calls.is_empty()
             && let Some(suspect) = &suspect
         {

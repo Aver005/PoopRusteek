@@ -17,6 +17,7 @@
 mod client;
 mod endpoints;
 mod http;
+pub mod mode;
 mod session;
 mod stream;
 
@@ -143,7 +144,7 @@ impl DeepseekProvider {
         request: &CompletionRequest,
         log_tag: &str,
         mut on_text: impl FnMut(String) + Send,
-    ) -> AppResult<()> {
+    ) -> AppResult<Ending> {
         let max_attempts = match self.max_retries {
             -1 => usize::MAX,
             // Even with retries disabled, one wait-and-retry is worth it: a
@@ -188,7 +189,7 @@ impl DeepseekProvider {
         request: &CompletionRequest,
         log_tag: &str,
         on_text: &mut (impl FnMut(String) + Send),
-    ) -> AppResult<()> {
+    ) -> AppResult<Ending> {
         let mut reply_chars = 0usize;
         let result = self
             .stream_completion_once(request, log_tag, on_text, &mut reply_chars)
@@ -203,13 +204,88 @@ impl DeepseekProvider {
         log_tag: &str,
         on_text: &mut (impl FnMut(String) + Send),
         reply_chars: &mut usize,
-    ) -> AppResult<()> {
+    ) -> AppResult<Ending> {
         let (response, session_id) = self.send_request(request).await?;
+        // Всё отданное наружу: продолжение начинается с его повтора.
+        let mut delivered = String::new();
+        let mut read = {
+            let mut forward = |text: String| {
+                delivered.push_str(&text);
+                on_text(text);
+            };
+            self.read_reply(
+                response,
+                &session_id,
+                None,
+                log_tag,
+                &mut forward,
+                reply_chars,
+            )
+            .await?
+        };
+        // Лимит вывода — не конец: сервер дописывает свой ответ сам, одним
+        // сообщением и без PoW. Не вышло — `length` уходит наверх, там
+        // продолжат промптом.
+        let mut continues = 0;
+        while read.ending == Ending::Length && continues < MAX_NATIVE_CONTINUES {
+            let Some(message_id) = read.message_id else {
+                break;
+            };
+            continues += 1;
+            let response = match self.send_continue(&session_id, message_id).await {
+                Ok(response) => response,
+                Err(error) => {
+                    debug_log::log(
+                        &format!("completion.{log_tag}.continue_failed"),
+                        format!("attempt={continues} message_id={message_id} error={error}"),
+                    );
+                    break;
+                }
+            };
+            debug_log::log(
+                &format!("completion.{log_tag}.continue"),
+                format!("attempt={continues}/{MAX_NATIVE_CONTINUES} message_id={message_id}"),
+            );
+            let mut skip = stream::SnapshotSkip::new(delivered.clone());
+            // Снимок не считается в расход сессии: он уже посчитан.
+            let mut snapshot_chars = 0usize;
+            let mut forward = |text: String| {
+                let fresh = skip.push(text);
+                *reply_chars += fresh.chars().count();
+                delivered.push_str(&fresh);
+                on_text(fresh);
+            };
+            read = self
+                .read_reply(
+                    response,
+                    &session_id,
+                    Some(message_id),
+                    log_tag,
+                    &mut forward,
+                    &mut snapshot_chars,
+                )
+                .await?;
+        }
+        Ok(read.ending)
+    }
+
+    /// Прочитать поток ответа до конца. `parent_message_id` — id, известный до
+    /// потока (у продолжения это сам дописываемый ответ).
+    async fn read_reply(
+        &self,
+        response: reqwest::Response,
+        session_id: &str,
+        mut parent_message_id: Option<i64>,
+        log_tag: &str,
+        on_text: &mut (impl FnMut(String) + Send),
+        reply_chars: &mut usize,
+    ) -> AppResult<ReplyRead> {
+        let session_id = session_id.to_string();
         let mut stream = response.bytes_stream();
         let mut sse = super::sse::SseLineBuffer::new();
-        let mut parent_message_id = None;
         let mut text_bytes = 0usize;
         let mut think = stream::ThinkRouter::default();
+        let mut ending = Ending::Stop;
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -280,6 +356,13 @@ impl DeepseekProvider {
                     // the thread id is already saved.
                     let _ = self.mark_session_after_success(&session_id, parent_message_id);
                 }
+                if event.incomplete {
+                    ending = Ending::Length;
+                    debug_log::log(
+                        &format!("completion.{log_tag}.incomplete"),
+                        format!("output limit reached text_bytes={text_bytes}"),
+                    );
+                }
                 let text = think.route(&event);
                 if !text.is_empty() {
                     debug_log::log(
@@ -300,7 +383,10 @@ impl DeepseekProvider {
                     );
                     flush_thinking(&mut think, on_text, reply_chars);
                     self.mark_session_after_success(&session_id, parent_message_id)?;
-                    return Ok(());
+                    return Ok(ReplyRead {
+                        ending,
+                        message_id: parent_message_id,
+                    });
                 }
             }
         }
@@ -319,10 +405,41 @@ impl DeepseekProvider {
         debug_log::log(
             &format!("completion.{log_tag}.eof"),
             format!(
-                "clean EOF treated as stop. session_id={session_id} parent_message_id={parent_message_id:?} text_bytes={text_bytes}"
+                "clean EOF treated as {}. session_id={session_id} parent_message_id={parent_message_id:?} text_bytes={text_bytes}",
+                ending.finish_reason()
             ),
         );
-        Ok(())
+        Ok(ReplyRead {
+            ending,
+            message_id: parent_message_id,
+        })
+    }
+}
+
+/// Сколько раз подряд просить сервер дописать ответ.
+const MAX_NATIVE_CONTINUES: u32 = 3;
+
+/// Итог чтения одного потока.
+struct ReplyRead {
+    ending: Ending,
+    /// Id ответа ассистента — его и просят продолжить.
+    message_id: Option<i64>,
+}
+
+/// Чем кончился ответ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Stop,
+    /// Сервер отметил ответ `INCOMPLETE`: упёрся в лимит вывода.
+    Length,
+}
+
+impl Ending {
+    fn finish_reason(self) -> &'static str {
+        match self {
+            Ending::Stop => "stop",
+            Ending::Length => "length",
+        }
     }
 }
 
@@ -342,24 +459,22 @@ fn flush_thinking(
 #[async_trait]
 impl LLMProvider for DeepseekProvider {
     async fn list_models(&self) -> AppResult<Vec<String>> {
-        // The web API has no model-listing endpoint; these are the two
-        // model types the completion endpoint accepts (see prompt.rs's
-        // `resolve_model_type`).
-        Ok(vec![
-            "deepseek-chat".to_string(),
-            "deepseek-reasoner".to_string(),
-        ])
+        // У веб-API нет списка моделей: режимы собираются из id (см. `mode`).
+        Ok(mode::LISTED_MODELS
+            .iter()
+            .map(|id| id.to_string())
+            .collect())
     }
 
     async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
         let mut content = String::new();
-        self.drive_completion(&request, "collect", |text| content.push_str(&text))
+        let ending = self
+            .drive_completion(&request, "collect", |text| content.push_str(&text))
             .await?;
-        // Explicit finish and clean EOF both mean "stop" (see
-        // `drive_completion`); errors have already propagated.
+        // Ошибки уже ушли наверх; остаётся штатный конец или обрыв по лимиту.
         Ok(CompletionResponse {
             content,
-            finish_reason: Some("stop".to_string()),
+            finish_reason: Some(ending.finish_reason().to_string()),
             usage: None,
         })
     }
@@ -369,21 +484,21 @@ impl LLMProvider for DeepseekProvider {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
     ) -> AppResult<()> {
-        self.drive_completion(&request, "stream", |text| {
-            let _ = tx.send(CompletionChunk {
-                content: text,
-                tool_calls: Vec::new(),
-                finish_reason: None,
-            });
-        })
-        .await?;
-        // Explicit finish and clean EOF both mean "stop"; a read error has
-        // already propagated above without a stop chunk, which the runner
-        // treats as a failed turn — same contract as before the extraction.
+        let ending = self
+            .drive_completion(&request, "stream", |text| {
+                let _ = tx.send(CompletionChunk {
+                    content: text,
+                    tool_calls: Vec::new(),
+                    finish_reason: None,
+                });
+            })
+            .await?;
+        // A read error has already propagated above without a stop chunk,
+        // which the runner treats as a failed turn.
         let _ = tx.send(CompletionChunk {
             content: String::new(),
             tool_calls: Vec::new(),
-            finish_reason: Some("stop".to_string()),
+            finish_reason: Some(ending.finish_reason().to_string()),
         });
         Ok(())
     }

@@ -4,8 +4,10 @@
 //! by the `/serve` status display.
 //!
 //! Exposed model ids:
-//! - `deepseek-chat` / `deepseek-reasoner` — the built-in DeepSeek web
+//! - `deepseek-chat`, `deepseek-expert`, … — the built-in DeepSeek web
 //!   client (when a token is configured); also reachable as `deepseek/<id>`.
+//!   The id grammar (model + `-think`/`-search`) lives in
+//!   `provider::deepseek::mode`.
 //! - `<entry>/<model>` — a `/providers` entry with an explicit model: its
 //!   configured default plus every model fetched from the upstream's
 //!   `GET /models` (`provider::model_cache`). The `<model>` half is passed
@@ -18,20 +20,16 @@
 //!   `claude-sonnet-4-5`, …) work unprefixed.
 
 use crate::config::{BUILTIN_PROVIDER_NAME, ProviderEntry};
+use crate::provider::deepseek::mode::{DeepseekMode, LISTED_MODELS as DEEPSEEK_MODELS};
 use std::collections::HashMap;
 
 /// `entry name → fetched model ids` — a `ProviderModelCache::snapshot()`.
 pub type FetchedModels = HashMap<String, Vec<String>>;
 
-/// The built-in DeepSeek web client's fixed model pair (the web API has no
-/// model-listing endpoint; `resolve_model_type` maps these to its
-/// `default`/`expert` mode).
-pub const DEEPSEEK_MODELS: [&str; 2] = ["deepseek-chat", "deepseek-reasoner"];
-
 /// Where one completion request should run.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedModel {
-    /// The built-in DeepSeek web client; `model` picks chat vs reasoner.
+    /// The built-in DeepSeek web client; `model` carries the mode (see `mode`).
     Deepseek { model: String },
     /// A `/providers` entry — `entry.model` already holds the effective
     /// (possibly caller-overridden) model to send upstream.
@@ -96,11 +94,7 @@ pub fn resolve_model(
         return Err("request has no model id".to_string());
     }
 
-    let deepseek_named = |model: &str| {
-        DEEPSEEK_MODELS
-            .iter()
-            .any(|known| model.eq_ignore_ascii_case(known))
-    };
+    let deepseek_named = |model: &str| DeepseekMode::parse(model).is_some();
 
     if has_deepseek && deepseek_named(model_id) {
         return Ok(ResolvedModel::Deepseek {
@@ -121,7 +115,7 @@ pub fn resolve_model(
                 });
             }
             return Err(format!(
-                "unknown deepseek model '{rest}' (available: {})",
+                "unknown deepseek model '{rest}' (available: {}; `-search` may be appended)",
                 DEEPSEEK_MODELS.join(", ")
             ));
         }
@@ -213,13 +207,19 @@ mod tests {
     }
 
     #[test]
-    fn lists_deepseek_pair_then_entries() {
+    fn lists_deepseek_modes_then_entries() {
         let ids = list_model_ids(true, &[entry("lmstudio", "qwen")], &none());
         assert_eq!(
             ids,
-            vec!["deepseek-chat", "deepseek-reasoner", "lmstudio/qwen"]
+            vec![
+                "deepseek-chat",
+                "deepseek-chat-think",
+                "deepseek-expert",
+                "deepseek-reasoner",
+                "lmstudio/qwen"
+            ]
         );
-        // No token → the built-in pair disappears.
+        // No token → the built-in models disappear.
         assert_eq!(list_model_ids(false, &[], &none()), Vec::<String>::new());
     }
 
@@ -342,5 +342,15 @@ mod tests {
         assert_eq!(resolved.internal_model(), "other");
         let resolved = resolve_model("deepseek-reasoner", true, &[], &none()).unwrap();
         assert_eq!(resolved.internal_model(), "deepseek-reasoner");
+    }
+
+    /// Невыставленный в списке вариант с поиском всё равно доступен.
+    #[test]
+    fn an_unlisted_search_variant_resolves_to_deepseek() {
+        let resolved =
+            resolve_model("deepseek/deepseek-expert-search", true, &[], &none()).unwrap();
+        assert!(resolved.is_deepseek());
+        assert_eq!(resolved.internal_model(), "deepseek-expert-search");
+        assert!(resolve_model("deepseek/deepseek-coder", true, &[], &none()).is_err());
     }
 }

@@ -4,13 +4,19 @@
 //! `provider::openai_compat`; this file is routing + execution:
 //! resolve the model id to a backend, run the completion on a fresh fork,
 //! and (for streams) bridge `CompletionChunk`s into SSE frames ending with
-//! the literal `data: [DONE]`.
+//! the literal `data: [DONE]`. A request with `tools` takes the tool path
+//! (`server::tools`): the reply is buffered, a call cut off by the output
+//! limit is continued, and the calls go back as `tool_calls`.
 
 use super::catalog::{self, ResolvedModel};
 use super::http::{ApiBody, LogDetail, ServerContext, full_body, json_response};
+use super::tools::{BridgedReply, ToolBridge, flatten_history};
+use crate::agent::continuation::continue_cut_off;
+use crate::agent::stream::{STREAM_IDLE_TIMEOUT, StreamVerdict, collect_stream};
 use crate::config::ProviderProtocol;
 use crate::provider::openai_compat::{
-    self, ChatCompletionRequest, CompletionMeta, ErrorResponse, ReasoningStreamSplitter,
+    self, ChatCompletionRequest, ChatCompletionResponse, Choice, CompletionMeta, ErrorResponse,
+    MessageContent, ReasoningStreamSplitter, WireToolCall,
 };
 use crate::provider::{ChatMessage, CompletionRequest, CompletionResponse, LLMProvider};
 use http_body_util::{BodyExt, StreamBody};
@@ -147,14 +153,15 @@ async fn chat_completions(
         }
     };
 
-    if wire.tools.as_ref().is_some_and(|tools| !tools.is_null()) {
-        // Captured, not silently swallowed (see openai_compat) — but v1
-        // doesn't translate structured tool-calling, so the caller's tools
-        // are ignored rather than rejected (many clients always send them).
-        tracing::warn!(
-            "server: request carries `tools` — structured tool-calling is not translated, ignoring"
-        );
-    }
+    let bridge = match ToolBridge::from_wire(wire.tools.as_ref(), wire.tool_choice.as_ref()) {
+        Ok(bridge) => bridge,
+        Err(message) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse::invalid_request(message),
+            );
+        }
+    };
 
     let (resolved, provider) = match resolve_backend(&wire.model, context) {
         Ok(pair) => pair,
@@ -173,21 +180,200 @@ async fn chat_completions(
         }
     };
     internal.model = resolved.internal_model().to_string();
+    flatten_history(&mut internal.messages);
+    if let Some(bridge) = &bridge {
+        bridge.prepare(&mut internal);
+    }
 
     let meta = CompletionMeta::generate(&public_model);
     let streaming = internal.stream;
-    let mut response = if streaming {
-        stream_completion(provider, resolved.is_deepseek(), internal, meta)
-    } else {
-        blocking_completion(provider, resolved.is_deepseek(), internal, meta).await
+    let with_tools = bridge.is_some();
+    let is_deepseek = resolved.is_deepseek();
+    let mut response = match (bridge, streaming) {
+        (Some(bridge), true) => tool_stream(provider, is_deepseek, internal, bridge, meta),
+        (Some(bridge), false) => tool_blocking(provider, is_deepseek, internal, bridge, meta).await,
+        (None, true) => stream_completion(provider, is_deepseek, internal, meta),
+        (None, false) => blocking_completion(provider, is_deepseek, internal, meta).await,
     };
     // Enriches the proxy access log; free otherwise.
     response.extensions_mut().insert(LogDetail(format!(
-        "model={public_model} → {}{}",
+        "model={public_model} → {}{}{}",
         resolved.internal_model(),
-        if streaming { " (stream)" } else { "" }
+        if streaming { " (stream)" } else { "" },
+        if with_tools { " (tools)" } else { "" }
     )));
     response
+}
+
+/// Как часто пустой SSE-комментарий держит соединение, пока ответ с
+/// инструментами копится: клиент не должен оборвать его по простою.
+const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ответ с инструментами целиком. Стрим копится, потому что вызов виден только
+/// в готовом тексте; оборванный лимитом вызов дописывается.
+async fn run_tool_completion(
+    provider: &Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    request: &CompletionRequest,
+    bridge: &ToolBridge,
+) -> Result<(BridgedReply, String), String> {
+    let outcome = collect_stream(provider, request.clone(), |_| {}).await;
+    let result = match outcome.verdict() {
+        StreamVerdict::IdleTimeout => Err(format!(
+            "upstream produced no data for {}s",
+            STREAM_IDLE_TIMEOUT.as_secs()
+        )),
+        StreamVerdict::Failed(error) => Err(error),
+        _ => {
+            let stop = outcome.stop_reason.clone();
+            let continued = continue_cut_off(
+                provider,
+                request,
+                outcome.text,
+                |text| bridge.cut_at(text, request),
+                |_| {},
+            )
+            .await;
+            if let Some(failure) = &continued.failure {
+                tracing::debug!("server: tool reply left cut off: {failure}");
+            }
+            let reply = bridge.parse(&continued.text, request);
+            let finish = if reply.calls.is_empty() {
+                stop.unwrap_or_else(|| "stop".to_string())
+            } else {
+                "tool_calls".to_string()
+            };
+            Ok((reply, finish))
+        }
+    };
+    discard_deepseek_session(is_deepseek, provider).await;
+    result
+}
+
+async fn tool_blocking(
+    provider: Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    request: CompletionRequest,
+    bridge: ToolBridge,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    match run_tool_completion(&provider, is_deepseek, &request, &bridge).await {
+        Ok((reply, finish)) => json_response(
+            StatusCode::OK,
+            &tool_response(&request, reply, finish, &meta),
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse::server_error(error),
+        ),
+    }
+}
+
+fn tool_response(
+    request: &CompletionRequest,
+    reply: BridgedReply,
+    finish: String,
+    meta: &CompletionMeta,
+) -> ChatCompletionResponse {
+    let prompt_texts: Vec<&str> = request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    let usage = openai_compat::estimated_usage(&prompt_texts, &reply.content);
+    let has_calls = !reply.calls.is_empty();
+    ChatCompletionResponse {
+        id: meta.id.clone(),
+        object: "chat.completion".to_string(),
+        created: meta.created,
+        model: meta.model.clone(),
+        choices: vec![Choice {
+            index: 0,
+            message: openai_compat::ChatCompletionMessage {
+                role: "assistant".to_string(),
+                // У ответа из одних вызовов текста нет — как у OpenAI.
+                content: if has_calls && reply.content.is_empty() {
+                    MessageContent::Null
+                } else {
+                    MessageContent::Text(reply.content)
+                },
+                name: None,
+                tool_call_id: None,
+                reasoning_content: reply.reasoning,
+                tool_calls: has_calls.then_some(reply.calls),
+            },
+            finish_reason: Some(finish),
+        }],
+        usage,
+    }
+}
+
+/// Стрим с инструментами: пока ответ копится — keep-alive, затем готовые кадры.
+fn tool_stream(
+    provider: Arc<dyn LLMProvider>,
+    is_deepseek: bool,
+    request: CompletionRequest,
+    bridge: ToolBridge,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    sse_stream_response(move |body_tx| async move {
+        let mut work = tokio::spawn(async move {
+            run_tool_completion(&provider, is_deepseek, &request, &bridge).await
+        });
+        let joined = loop {
+            match tokio::time::timeout(KEEPALIVE, &mut work).await {
+                Ok(joined) => break joined,
+                Err(_elapsed) => {
+                    if body_tx
+                        .send(Bytes::from_static(b": keep-alive\n\n"))
+                        .is_err()
+                    {
+                        // Клиент ушёл — ответ больше никому не нужен.
+                        work.abort();
+                        return;
+                    }
+                }
+            }
+        };
+        let frames = match joined {
+            Ok(Ok((reply, finish))) => tool_frames(reply, &finish, &meta),
+            Ok(Err(error)) => vec![sse_data(&ErrorResponse::server_error(error))],
+            Err(join_error) => vec![sse_data(&ErrorResponse::server_error(format!(
+                "completion task failed: {join_error}"
+            )))],
+        };
+        for frame in frames {
+            let _ = body_tx.send(frame);
+        }
+    })
+}
+
+/// Готовый ответ кадрами SSE: текст, затем все вызовы, затем конец.
+fn tool_frames(reply: BridgedReply, finish: &str, meta: &CompletionMeta) -> Vec<Bytes> {
+    let reasoning = reply.reasoning.unwrap_or_default();
+    let mut frames = vec![sse_data(&openai_compat::split_delta_chunk(
+        &reasoning,
+        &reply.content,
+        true,
+        meta,
+    ))];
+    if !reply.calls.is_empty() {
+        let calls: Vec<WireToolCall> = reply
+            .calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| WireToolCall {
+                index: Some(index as u32),
+                ..call
+            })
+            .collect();
+        let mut chunk = openai_compat::split_delta_chunk("", "", false, meta);
+        chunk.choices[0].delta.tool_calls = Some(calls);
+        frames.push(sse_data(&chunk));
+    }
+    frames.push(sse_data(&openai_compat::final_chunk(finish, meta)));
+    frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
+    frames
 }
 
 async fn blocking_completion(
@@ -750,7 +936,32 @@ mod tests {
         let model = parsed["model"].as_str().unwrap_or("?").to_string();
         let reasoning = model.contains("think");
         let streaming = parsed["stream"].as_bool().unwrap_or(false);
-        let response = if streaming {
+        // `tool…` модели отвечают вызовом: `toolcut` — оборванным, который
+        // дописывается на просьбу продолжить.
+        let asked_to_continue = parsed["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|last| last["content"].as_str())
+            .is_some_and(|text| text.contains("cut off by the output limit"));
+        let tool_reply = match model.as_str() {
+            "tool" => Some(
+                "Writing.\n<tool_use><name>write</name><arguments>{\"path\": \"a\"}</arguments></tool_use>",
+            ),
+            "toolcut" if asked_to_continue => Some("a\"}</arguments></tool_use>"),
+            "toolcut" => Some("<tool_use><name>write</name><arguments>{\"path\": \""),
+            _ => None,
+        };
+        let response = if let Some(reply) = tool_reply {
+            let chunk = serde_json::json!({
+                "id": "up-1", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                "choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": "stop"}],
+            });
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Full::new(Bytes::from(format!(
+                    "data: {chunk}\n\ndata: [DONE]\n\n"
+                ))))
+        } else if streaming {
             let sse = concat!(
                 "data: {\"id\":\"up-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
                 "data: {\"id\":\"up-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -937,6 +1148,91 @@ mod tests {
         let message = &completion["choices"][0]["message"];
         assert_eq!(message["content"], "Final answer.");
         assert_eq!(message["reasoning_content"], "inner thoughts");
+        handle.request_shutdown();
+    }
+
+    fn tool_request(model: &str, stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": model,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "create a"}],
+            "tools": [{"type": "function", "function": {
+                "name": "write",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }}],
+        })
+    }
+
+    /// Запрос с `tools`: вызов модели возвращается клиенту как `tool_calls`.
+    #[tokio::test]
+    async fn gateway_returns_tool_calls() {
+        let (base, handle) = start_gateway().await;
+        let completion: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&tool_request("mock/tool", false))
+            .send()
+            .await
+            .expect("completion request")
+            .json()
+            .await
+            .expect("completion json");
+        let choice = &completion["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert_eq!(choice["message"]["content"], "Writing.");
+        let call = &choice["message"]["tool_calls"][0];
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "write");
+        assert_eq!(call["function"]["arguments"], r#"{"path":"a"}"#);
+        handle.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn gateway_streams_tool_calls_as_deltas() {
+        let (base, handle) = start_gateway().await;
+        let body = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&tool_request("mock/tool", true))
+            .send()
+            .await
+            .expect("stream request")
+            .text()
+            .await
+            .expect("stream body");
+        let chunks: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str(payload).expect("chunk json"))
+            .collect();
+        let call = chunks
+            .iter()
+            .find_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"].get(0))
+            .expect("a tool_calls delta");
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["function"]["name"], "write");
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        handle.request_shutdown();
+    }
+
+    /// Вызов, оборванный лимитом, дописывается вторым запросом к модели.
+    #[tokio::test]
+    async fn gateway_continues_a_cut_off_tool_call() {
+        let (base, handle) = start_gateway().await;
+        let completion: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&tool_request("mock/toolcut", false))
+            .send()
+            .await
+            .expect("completion request")
+            .json()
+            .await
+            .expect("completion json");
+        let call = &completion["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["arguments"], r#"{"path":"a"}"#);
         handle.request_shutdown();
     }
 

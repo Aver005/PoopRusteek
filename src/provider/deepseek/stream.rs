@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 
 const CREATE_POW_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
+/// Кнопка «Продолжить» веб-чата: сервер дописывает свой оборванный ответ.
+/// Запрос снят с живого клиента 2026-09-29: без PoW, тело — ниже.
+const CONTINUE_URL: &str = "https://chat.deepseek.com/api/v0/chat/continue";
 /// История одной сессии. `chat/history` (POST) снесли: CloudFront отдаёт на
 /// него оболочку сайта с 200 OK, а не 404, — живая замена рядом и берёт
 /// сессию параметром запроса.
@@ -110,6 +113,36 @@ impl DeepseekProvider {
         super::pow::encode_solution(&solution)
     }
 
+    /// Попросить сервер дописать оборванный ответ `message_id`. Отвечает тем же
+    /// потоком, что и completion, но начинает его снимком всего ответа.
+    pub(super) async fn send_continue(
+        &self,
+        session_id: &str,
+        message_id: i64,
+    ) -> AppResult<Response> {
+        let headers = self.auth_headers()?;
+        let body = json!({
+            "chat_session_id": session_id,
+            "message_id": message_id,
+            "fallback_to_resume": true,
+        });
+        let response = self
+            .send_json_request("completion.continue", CONTINUE_URL, &headers, &body)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error_response(
+                "completion.continue",
+                response,
+                "Continue failed",
+            )
+            .await);
+        }
+        if super::http::is_json_response(&response) {
+            return Err(Self::read_completion_refusal(response).await);
+        }
+        Ok(response)
+    }
+
     pub(super) async fn read_completion_refusal(response: Response) -> AppError {
         match Self::read_json::<Value>("completion.request", response, COMPLETION_REFUSED).await {
             Ok(payload) => completion_refused(&api_refusal(&payload).map_or_else(
@@ -126,19 +159,18 @@ impl DeepseekProvider {
         prompt: String,
         session: &super::session::SessionSnapshot,
     ) -> Value {
-        let model_type = prompt::resolve_model_type(&request.model, session.parent_message_id);
-        let thinking_enabled = matches!(model_type, Some("expert"));
+        let mode = super::mode::DeepseekMode::from_model(&request.model);
 
         json!({
             "prompt": prompt,
             "model": "deepseek-chat",
-            "model_type": model_type,
+            "model_type": mode.wire_model_type(session.parent_message_id),
             "stream": true,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
             "ref_file_ids": [],
-            "thinking_enabled": thinking_enabled,
-            "search_enabled": false,
+            "thinking_enabled": mode.thinking,
+            "search_enabled": mode.search,
             "chat_session_id": session.session_id,
             "parent_message_id": session.parent_message_id,
         })
@@ -658,6 +690,55 @@ impl ThinkRouter {
     }
 }
 
+/// Поток продолжения открывается снимком всего ответа — уже отданное
+/// отбрасывается, наружу идёт только новое.
+pub(super) struct SnapshotSkip {
+    delivered: String,
+    seen: String,
+    passed: bool,
+}
+
+impl SnapshotSkip {
+    pub fn new(delivered: String) -> Self {
+        Self {
+            delivered,
+            seen: String::new(),
+            passed: false,
+        }
+    }
+
+    /// Кусок потока продолжения → его ещё не отданная часть.
+    pub fn push(&mut self, text: String) -> String {
+        if self.passed {
+            return text;
+        }
+        self.seen.push_str(&text);
+        if self.seen.len() < self.delivered.len() && self.delivered.starts_with(&self.seen) {
+            return String::new();
+        }
+        self.passed = true;
+        if let Some(fresh) = self.seen.strip_prefix(self.delivered.as_str()) {
+            return fresh.to_string();
+        }
+        // Снимок разошёлся с отданным: отдаём всё после общего начала.
+        let common: usize = self
+            .seen
+            .chars()
+            .zip(self.delivered.chars())
+            .take_while(|(seen, delivered)| seen == delivered)
+            .map(|(seen, _)| seen.len_utf8())
+            .sum();
+        debug_log::log(
+            "completion.continue.snapshot_mismatch",
+            format!(
+                "delivered_bytes={} common_bytes={common}",
+                self.delivered.len()
+            ),
+        );
+        self.seen[common..].to_string()
+    }
+}
+
 /// One recognized `data:` line from the completion SSE stream.
 pub(super) struct StreamEvent {
     pub text: Option<String>,
@@ -667,6 +748,9 @@ pub(super) struct StreamEvent {
     /// The server explicitly marked the response complete: `[DONE]` or a
     /// FINISHED status patch.
     pub finished: bool,
+    /// Ответ оборван лимитом вывода: `{"p":"response/status","v":"INCOMPLETE"}`.
+    /// Проверено живьём 2026-09-29; поток после этого закрывается сам.
+    pub incomplete: bool,
     /// The server reported a failure *inside* the stream rather than over
     /// HTTP status. Found by the harness: a rate-limited request answers 200
     /// OK and then sends
@@ -778,6 +862,26 @@ fn event_signals_finished(event: &Value) -> bool {
         == Some("FINISHED")
 }
 
+/// Статус INCOMPLETE — только по пути `…status`: голое `{"v":"INCOMPLETE"}`
+/// было бы текстом ответа, дописанным к текущему фрагменту.
+fn event_signals_incomplete(event: &Value) -> bool {
+    let patch_is_incomplete = |patch: &Value| {
+        patch.get("v").and_then(Value::as_str) == Some("INCOMPLETE")
+            && patch
+                .get("p")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("status"))
+    };
+    if patch_is_incomplete(event) {
+        return true;
+    }
+    event.get("o").and_then(Value::as_str) == Some("BATCH")
+        && event
+            .get("v")
+            .and_then(Value::as_array)
+            .is_some_and(|patches| patches.iter().any(patch_is_incomplete))
+}
+
 pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
     let payload = crate::provider::sse::sse_data_payload(line)?;
     if payload.is_empty() {
@@ -789,6 +893,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
             fragments: Vec::new(),
             parent_message_id: None,
             finished: true,
+            incomplete: false,
             error: None,
         });
     }
@@ -802,6 +907,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
         None
     };
     let finished = event_signals_finished(&normalized);
+    let incomplete = event_signals_incomplete(&normalized);
 
     // Текст новых фрагментов идёт с их типом, а не общей строкой.
     let fragments = new_fragments(&normalized);
@@ -825,6 +931,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
         && fragments.is_none()
         && parent_message_id.is_none()
         && !finished
+        && !incomplete
         && error.is_none()
     {
         return None;
@@ -839,6 +946,7 @@ pub(super) fn process_stream_line(line: &str) -> Option<StreamEvent> {
         fragments: fragments.unwrap_or_default(),
         parent_message_id,
         finished,
+        incomplete,
         error,
     })
 }
@@ -987,6 +1095,38 @@ mod tests {
             assert!(event.finished);
             assert!(event.text.is_none());
         }
+    }
+
+    /// Как у живого `continue`: снимок — прежний текст плюс начало нового.
+    #[test]
+    fn a_continuation_snapshot_is_not_delivered_twice() {
+        let mut skip = super::SnapshotSkip::new("1\n2\n30".to_string());
+        assert_eq!(skip.push("1\n2\n".to_string()), "");
+        assert_eq!(skip.push("304".to_string()), "4");
+        assert_eq!(skip.push("\n5".to_string()), "\n5");
+    }
+
+    #[test]
+    fn a_diverging_snapshot_keeps_everything_after_the_common_start() {
+        let mut skip = super::SnapshotSkip::new("abcdef".to_string());
+        assert_eq!(skip.push("abXYZdefgh".to_string()), "XYZdefgh");
+    }
+
+    /// Строки дословно из живого прогона 2026-09-29, ответ упёрся в лимит.
+    #[test]
+    fn an_incomplete_status_is_recognized() {
+        for line in [
+            r#"data: {"p":"response/status","o":"SET","v":"INCOMPLETE"}"#,
+            r#"data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":12931},{"p":"quasi_status","v":"INCOMPLETE"}]}"#,
+        ] {
+            let event = process_stream_line(line).expect("the status line must be recognized");
+            assert!(event.incomplete, "{line}");
+            assert!(!event.finished);
+            assert_eq!(event.text, None);
+        }
+        // Слово в тексте ответа — не статус.
+        let text = process_stream_line(r#"data: {"v":"INCOMPLETE"}"#).expect("text append");
+        assert!(!text.incomplete);
     }
 
     #[test]

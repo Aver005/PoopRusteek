@@ -25,6 +25,7 @@ pub mod catalog;
 mod http;
 mod openai;
 pub mod proxy;
+mod tools;
 
 use crate::app::events::AppEvent;
 use crate::config::{Config, ProviderConfig, ProviderEntry, ServerApi};
