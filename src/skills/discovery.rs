@@ -4,12 +4,20 @@ use std::path::{Path, PathBuf};
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 
+/// Шаблоны системного промпта (`crate::prompts`) — не скиллы.
+const SYSTEM_PROMPT_PARTS: [&str; 4] = [
+    "base.prompt.md",
+    "tools.prompt.md",
+    "tool-calls.prompt.md",
+    "tool-list.prompt.md",
+];
+
 /// Embedded copies of the built-in prompt skills so an installed binary still
 /// offers them with no `assets/` folder nearby (same rationale as the embedded
 /// core prompts in `crate::prompts`). On-disk copies win — embedded entries
-/// are only added for slugs not already discovered. `base.prompt.md` and
-/// `tools.prompt.md` are excluded: they are injected into the system prompt
-/// via `PromptFiles`, not exposed as skills.
+/// are only added for slugs not already discovered. The system-prompt parts
+/// ([`SYSTEM_PROMPT_PARTS`]) are excluded: they are injected via
+/// `PromptFiles`, not exposed as skills.
 const EMBEDDED_BUILTIN_PROMPTS: &[(&str, &str)] = &[
     (
         "compact.prompt.md",
@@ -186,15 +194,13 @@ fn scan_directory(
             }
         }
 
-        // Backward compat: .prompt.md files only in built-in dirs.
-        // Skip base.prompt.md and tools.prompt.md — they are already loaded
-        // by PromptFiles and injected directly into the system prompt.
+        // Backward compat: .prompt.md files only in built-in dirs. Parts of
+        // the system prompt are loaded by PromptFiles, not offered as skills.
         if source == SkillSource::BuiltIn
             && let Some(name) = path.file_name().and_then(|n| n.to_str())
             && name.ends_with(".prompt.md")
             && name != SKILL_FILE_NAME
-            && name != "base.prompt.md"
-            && name != "tools.prompt.md"
+            && !SYSTEM_PROMPT_PARTS.contains(&name)
             && let Some(skill) = load_prompt_file(&path, source)
             && seen_slugs.insert(skill.slug.clone())
         {
@@ -348,9 +354,8 @@ mod tests {
                 let name = entry.file_name().to_str()?.to_string();
                 (entry.path().is_file()
                     && name.ends_with(".prompt.md")
-                    && name != "base.prompt.md"
-                    && name != "tools.prompt.md")
-                    .then_some(name)
+                    && !SYSTEM_PROMPT_PARTS.contains(&name.as_str()))
+                .then_some(name)
             })
             .collect();
         on_disk.sort();

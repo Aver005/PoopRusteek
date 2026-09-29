@@ -35,6 +35,10 @@ pub struct FakeProvider {
     /// model actually received — the only way to observe history rewriting
     /// (tool-output caps, compaction) from outside the loop.
     seen_requests: Mutex<Vec<Vec<ChatMessage>>>,
+    /// Имена инструментов, объявленных полем `tools`, по запросам.
+    seen_tools: Mutex<Vec<Vec<String>>>,
+    /// Что отвечает `native_tools`.
+    native_tools: bool,
     /// How many times the loop asked for a fresh session (rung 2).
     resets: Mutex<usize>,
     /// Терминальная причина в последнем чанке. По умолчанию `stop`; тест
@@ -62,6 +66,8 @@ impl FakeProvider {
             server_side_history: false,
             session_tokens: None,
             seen_requests: Mutex::new(Vec::new()),
+            seen_tools: Mutex::new(Vec::new()),
+            native_tools: false,
             resets: Mutex::new(0),
             finish_reason: "stop".to_string(),
             tool_calls: Mutex::new(Vec::new()),
@@ -96,6 +102,17 @@ impl FakeProvider {
     }
 
     /// Report that the conversation history lives on the provider's side.
+    /// Провайдер с родным протоколом вызовов.
+    pub fn native_tools(mut self) -> Self {
+        self.native_tools = true;
+        self
+    }
+
+    /// Имена инструментов, объявленных полем `tools` в запросе `n`.
+    pub fn declared_tools(&self, n: usize) -> Option<Vec<String>> {
+        self.seen_tools.lock().unwrap().get(n).cloned()
+    }
+
     pub fn server_side_history(mut self) -> Self {
         self.server_side_history = true;
         self
@@ -124,6 +141,10 @@ impl FakeProvider {
             .lock()
             .unwrap()
             .push(request.messages.clone());
+        self.seen_tools
+            .lock()
+            .unwrap()
+            .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
     }
 
     fn next_body(&self) -> String {
@@ -196,6 +217,10 @@ impl LLMProvider for FakeProvider {
 
     fn keeps_server_side_history(&self) -> bool {
         self.server_side_history
+    }
+
+    fn native_tools(&self) -> bool {
+        self.native_tools
     }
 
     fn session_tokens(&self) -> Option<u32> {

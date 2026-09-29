@@ -616,6 +616,7 @@ async fn assemble(
             // Сценарий гоняется в чужой рабочей папке, и её AGENTS.md — часть
             // условий задачи ровно так же, как в TUI.
             project_instructions: &instructions,
+            native_tools: provider.native_tools(),
         })
         .await;
 

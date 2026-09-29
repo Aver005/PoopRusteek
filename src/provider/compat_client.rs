@@ -70,10 +70,18 @@ pub(crate) trait CompatProtocol: Send + Sync + 'static {
     /// Parse a blocking completion response body.
     fn parse_response(body: &[u8]) -> AppResult<CompletionResponse>;
 
+    /// Что протокол копит между событиями одного стрима: вызовы инструментов
+    /// приходят кусками и отдаются наверх только целыми.
+    type StreamState: Default + Send;
+
     /// Interpret one SSE `data:` payload: emit zero or more chunks through
     /// `emit` (Gemini's last payload carries text *and* the finish), then
     /// tell the pump how to proceed.
-    fn handle_sse_payload(payload: &str, emit: &mut dyn FnMut(CompletionChunk)) -> SseFlow;
+    fn handle_sse_payload(
+        payload: &str,
+        state: &mut Self::StreamState,
+        emit: &mut dyn FnMut(CompletionChunk),
+    ) -> SseFlow;
 
     /// Parse the model-listing response body into model ids.
     fn parse_models(body: &[u8]) -> AppResult<Vec<String>>;
@@ -144,6 +152,8 @@ pub(crate) struct CompatClient<P: CompatProtocol> {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    /// Запись объявляет инструменты родным протоколом (`tools = "native"`).
+    native_tools: bool,
     _protocol: PhantomData<P>,
 }
 
@@ -161,6 +171,7 @@ impl<P: CompatProtocol> CompatClient<P> {
             base_url: entry.base_url.trim_end_matches('/').to_string(),
             api_key: entry.api_key.clone(),
             model: entry.model.clone(),
+            native_tools: entry.tools == crate::config::ToolProtocol::Native,
             _protocol: PhantomData,
         })
     }
@@ -213,6 +224,7 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
         let response = self.send(&request, true).await?;
         let mut stream = response.bytes_stream();
         let mut buffer = SseLineBuffer::new();
+        let mut state = P::StreamState::default();
 
         while let Some(piece) = stream.next().await {
             let piece = piece.map_err(AppError::Http)?;
@@ -222,7 +234,7 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
                 let Some(payload) = sse_data_payload(&line) else {
                     continue;
                 };
-                match P::handle_sse_payload(payload, &mut |chunk| {
+                match P::handle_sse_payload(payload, &mut state, &mut |chunk| {
                     let _ = tx.send(chunk);
                 }) {
                     SseFlow::Continue => {}
@@ -284,6 +296,10 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
         &self.model
     }
 
+    fn native_tools(&self) -> bool {
+        self.native_tools
+    }
+
     fn fork(&self) -> Arc<dyn LLMProvider> {
         // Stateless: a fork is just another handle onto the same endpoint.
         Arc::new(Self {
@@ -291,6 +307,7 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
             model: self.model.clone(),
+            native_tools: self.native_tools,
             _protocol: PhantomData,
         })
     }

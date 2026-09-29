@@ -3,6 +3,10 @@
 /// `provider::pow`). A debug build prefers the source checkout — see [`load_asset_text`].
 const EMBEDDED_BASE_PROMPT: &str = include_str!("../assets/prompts/base.prompt.md");
 const EMBEDDED_TOOLS_PROMPT: &str = include_str!("../assets/prompts/tools.prompt.md");
+/// Промптовый путь вызовов: формат `<tool_use>` и список инструментов. На
+/// родном протоколе обе части не нужны — инструменты уходят полем API.
+const EMBEDDED_TOOL_CALLS_PROMPT: &str = include_str!("../assets/prompts/tool-calls.prompt.md");
+const EMBEDDED_TOOL_LIST_PROMPT: &str = include_str!("../assets/prompts/tool-list.prompt.md");
 const EMBEDDED_GOAL_EVALUATOR_PROMPT: &str =
     include_str!("../assets/prompts/goal-evaluator.prompt.md");
 
@@ -10,6 +14,10 @@ const EMBEDDED_GOAL_EVALUATOR_PROMPT: &str =
 pub struct PromptFiles {
     pub base_prompt: String,
     pub tools_prompt: String,
+    /// Подставляется в `{{call_format}}` шаблона `tools_prompt`.
+    pub tool_calls_prompt: String,
+    /// Подставляется в `{{tool_list}}` шаблона `tools_prompt`.
+    pub tool_list_prompt: String,
     pub goal_evaluator_prompt: String,
 }
 
@@ -17,6 +25,11 @@ pub fn load_prompt_files() -> PromptFiles {
     PromptFiles {
         base_prompt: load_asset_text("prompts/base.prompt.md", EMBEDDED_BASE_PROMPT),
         tools_prompt: load_asset_text("prompts/tools.prompt.md", EMBEDDED_TOOLS_PROMPT),
+        tool_calls_prompt: load_asset_text(
+            "prompts/tool-calls.prompt.md",
+            EMBEDDED_TOOL_CALLS_PROMPT,
+        ),
+        tool_list_prompt: load_asset_text("prompts/tool-list.prompt.md", EMBEDDED_TOOL_LIST_PROMPT),
         goal_evaluator_prompt: load_asset_text(
             "prompts/goal-evaluator.prompt.md",
             EMBEDDED_GOAL_EVALUATOR_PROMPT,
@@ -60,11 +73,14 @@ mod tests {
         // Поднято 4500 → 5500 вместе с секцией «План работы» (`todo`):
         // дисциплина обновления плана — это и есть сам инструмент, коротким
         // абзацем она не задаётся. Дальше — только за счёт урезания другого.
+        // Промптовый путь несёт все три части — бюджет на их сумму.
+        let tools = EMBEDDED_TOOLS_PROMPT.len()
+            + EMBEDDED_TOOL_CALLS_PROMPT.len()
+            + EMBEDDED_TOOL_LIST_PROMPT.len();
         assert!(
-            EMBEDDED_TOOLS_PROMPT.len() < 5_500,
-            "tools.prompt.md grew to {} bytes (budget 5500). Trim something \
-             else rather than raising this number.",
-            EMBEDDED_TOOLS_PROMPT.len()
+            tools < 5_500,
+            "tools prompt parts grew to {tools} bytes (budget 5500). Trim something \
+             else rather than raising this number."
         );
     }
 

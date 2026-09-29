@@ -1,6 +1,6 @@
-//! OpenAI tool calling поверх любого бэкенда: инструменты клиента описываются
-//! модели в промпте, её `<tool_use>` (или любой другой формат) разбирается
-//! `agent::tool_parser` и уходит клиенту как `tool_calls`. Исполняет их клиент.
+//! OpenAI tool calling поверх любого бэкенда. Запись с родным протоколом
+//! получает инструменты полем запроса (`declare`); остальным они описываются в
+//! промпте, а ответ разбирает `agent::tool_parser`. Исполняет вызовы клиент.
 
 use crate::agent::tool_parser::{ParseCtx, ToolCatalog, parse_text};
 use crate::provider::openai_compat::{WireToolCall, split_reasoning};
@@ -88,6 +88,22 @@ impl ToolBridge {
         }))
     }
 
+    /// Родной протокол: инструменты — полем запроса, история остаётся структурой.
+    /// `tool_choice` туда не передаётся — у `CompletionRequest` нет такого поля.
+    pub fn declare(&self, request: &mut CompletionRequest) {
+        request.tools = self.tools.clone();
+    }
+
+    /// Ответ родного протокола: вызовы пришли структурой, id — провайдера.
+    pub fn native_reply(text: &str, calls: &[ToolCall]) -> BridgedReply {
+        let (reasoning, content) = split_reasoning(text);
+        BridgedReply {
+            reasoning,
+            content: content.trim().to_string(),
+            calls: calls.iter().map(WireToolCall::from_call).collect(),
+        }
+    }
+
     /// Описать инструменты в системном промпте и напомнить формат в конце.
     pub fn prepare(&self, request: &mut CompletionRequest) {
         let section = self.section();
@@ -137,6 +153,7 @@ impl ToolBridge {
                     id: call_id(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
+                    provider_state: None,
                 })
             })
             .collect();
@@ -351,6 +368,7 @@ mod tests {
             id: "call_1".into(),
             name: "write".into(),
             arguments: json!({"path": "a"}),
+            provider_state: None,
         }];
         let mut messages = vec![assistant];
         flatten_history(&mut messages);
@@ -359,6 +377,31 @@ mod tests {
             messages[0].content,
             "Let me look.\n<tool_use>\n<name>write</name>\n<arguments>\n{\"path\":\"a\"}\n</arguments>\n</tool_use>"
         );
+    }
+
+    #[test]
+    fn declare_puts_the_tools_into_the_request_and_nothing_into_the_prompt() {
+        let mut request = request(vec![ChatMessage::system("rules"), ChatMessage::user("go")]);
+        bridge().declare(&mut request);
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "write");
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].content, "rules");
+    }
+
+    #[test]
+    fn a_native_reply_keeps_the_provider_ids() {
+        let calls = [ToolCall {
+            id: "toolu_1".into(),
+            name: "write".into(),
+            arguments: json!({"path": "a"}),
+            provider_state: None,
+        }];
+        let reply = ToolBridge::native_reply("<think>hm</think>Writing.", &calls);
+        assert_eq!(reply.reasoning.as_deref(), Some("hm"));
+        assert_eq!(reply.content, "Writing.");
+        assert_eq!(reply.calls[0].id, "toolu_1");
+        assert_eq!(reply.calls[0].function.arguments, r#"{"path":"a"}"#);
     }
 
     #[test]

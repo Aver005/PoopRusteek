@@ -13,6 +13,7 @@ use crate::debug_log;
 use crate::mcp::MCPManager;
 use crate::provider::{ChatMessage, CompletionRequest, LLMProvider, Role};
 use crate::semantic::SemanticService;
+use crate::tools::ToolDefinition;
 use crate::tools::registry::ToolRegistry;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -48,6 +49,7 @@ pub async fn run_agent_loop(
     let mut retries = RetryBudget::default();
     let mut compaction = CompactionState::default();
     let catalog = ToolCatalog::snapshot(&tools, &mcp).await;
+    let native_tools = native_tool_definitions(&provider, &tools, &mcp).await;
 
     inject_semantic_hint(conversation, &semantic, &mut messages).await;
 
@@ -82,8 +84,14 @@ pub async fn run_agent_loop(
         let used = apply_ladder(&compaction_ctx, &mut messages, &mut compaction).await;
 
         ctx.emit(AgentEvent::BeginAssistantMessage);
-        let request =
-            build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
+        let request = build_step_request(
+            &system_prompt,
+            &messages,
+            &native_tools,
+            &model,
+            temperature,
+            max_tokens,
+        );
         ctx.emit(AgentEvent::ContextUsage(used));
 
         let outcome = stream_step(conversation, &provider, request, &event_tx).await;
@@ -110,8 +118,14 @@ pub async fn run_agent_loop(
         };
 
         let raw = if continuable && native_calls.is_empty() {
-            let base =
-                build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
+            let base = build_step_request(
+                &system_prompt,
+                &messages,
+                &native_tools,
+                &model,
+                temperature,
+                max_tokens,
+            );
             let continued = continue_cut_off(
                 &provider,
                 &base,
@@ -842,12 +856,34 @@ async fn stream_step(
     .await
 }
 
+/// Инструменты хода для провайдера с родным протоколом: встроенные и все MCP.
+/// Пусто — инструменты описаны текстом в системном промпте.
+pub(crate) async fn native_tool_definitions(
+    provider: &Arc<dyn LLMProvider>,
+    tools: &ToolRegistry,
+    mcp: &tokio::sync::Mutex<MCPManager>,
+) -> Vec<ToolDefinition> {
+    if !provider.native_tools() {
+        return Vec::new();
+    }
+    // Лок MCP — только на копирование списка, как в `ToolCatalog::snapshot`.
+    let mcp_tools = mcp.lock().await.get_all_tools();
+    let mut definitions = tools.definitions();
+    definitions.extend(mcp_tools.into_iter().map(|full| ToolDefinition {
+        name: full.full_name,
+        description: full.tool.description,
+        parameters: full.tool.input_schema,
+    }));
+    definitions
+}
+
 /// Build one step's completion request: system prompt first, then the
 /// running history. Shared by the main and sub-agent loops (the two copies
 /// had already been flagged as drift-prone).
 pub(crate) fn build_step_request(
     system_prompt: &str,
     messages: &[ChatMessage],
+    tools: &[ToolDefinition],
     model: &str,
     temperature: f32,
     max_tokens: u32,
@@ -857,7 +893,7 @@ pub(crate) fn build_step_request(
     request_messages.extend(messages.iter().cloned());
     CompletionRequest {
         messages: request_messages,
-        tools: Vec::new(),
+        tools: tools.to_vec(),
         model: model.to_string(),
         temperature,
         max_tokens,
@@ -1378,6 +1414,48 @@ mod tests {
     /// вставлялась в историю **на каждом** родном шаге и уезжала обратно
     /// модели, сообщая ей, что её же вызов оборвался.
     #[tokio::test]
+    async fn tools_are_declared_only_to_a_native_provider() {
+        for native in [true, false] {
+            let fake = FakeProvider::with_response("Done.");
+            let fake = Arc::new(if native { fake.native_tools() } else { fake });
+            let provider: Arc<dyn LLMProvider> = Arc::clone(&fake) as Arc<dyn LLMProvider>;
+            let tools = Arc::new(ToolRegistry::new());
+            tools.register(Arc::new(LoudTool));
+            let (event_tx, _event_rx) = mpsc::unbounded_channel();
+            run_agent_loop(
+                TurnSpec {
+                    conversation: ConversationId::next(),
+                    provider,
+                    messages: vec![ChatMessage::user("go")],
+                    system_prompt: "system".to_string(),
+                    model: "fake".to_string(),
+                    temperature: 0.0,
+                    max_tokens: 128,
+                    max_steps: 2,
+                    max_tools_per_step: 4,
+                    auto_approve: true,
+                    tool_output_limit: 0,
+                    context: crate::context::ContextSpec::default(),
+                },
+                tools,
+                Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+                SemanticService::disabled(),
+                event_tx,
+            )
+            .await;
+            let declared = fake.declared_tools(0).expect("one request");
+            if native {
+                assert!(declared.contains(&"loud".to_string()), "{declared:?}");
+            } else {
+                assert!(
+                    declared.is_empty(),
+                    "prompt path declares nothing: {declared:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_native_tool_call_is_a_normal_end_of_step_not_a_truncation() {
         let provider: Arc<dyn LLMProvider> = Arc::new(
             FakeProvider::with_responses(vec![String::new(), "All done.".to_string()])
@@ -1385,6 +1463,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
                     arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    provider_state: None,
                 }]),
         );
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();

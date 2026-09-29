@@ -165,6 +165,9 @@ impl App {
                 self.state.providers_view.selected = 0;
                 self.state.providers_view.status_message.clear();
             }
+            CommandResult::SetProviderTools { name, tools } => {
+                self.apply_provider_tools(&name, tools);
+            }
             CommandResult::OpenProviderAdd(args) => match args {
                 None => {
                     self.state.modal = Some(Modal::ProviderAdd(Box::new(

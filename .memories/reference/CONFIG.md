@@ -96,6 +96,13 @@ port = 7667                # persisted by /server <port> ("poop" on T9)
 api = "openai"             # openai | anthropic | gemini — wire dialect; only openai implemented (others answer 501)
 # api_key = "…"            # optional; when set every request needs Authorization: Bearer <api_key>
 
+[[providers]]              # extra endpoints (/providers); one table per entry
+name = "lmstudio"
+base_url = "http://localhost:1234/v1"
+model = "qwen2.5-coder"
+protocol = "openai"        # openai | anthropic | gemini
+tools = "prompt"           # prompt (<tool_use> in the text, default) | native (API `tools` field; /providers tools <name> native)
+
 [provider_models]          # per-entry model lists (provider/model_cache.rs) — feed /v1/models + routing
 refetch_ms = 180000        # background refetch period; /refetch-providers <ms|off>; 0 = off
 cache_ms = 180000          # persisted-cache validity across restarts; /cache-providers <ms|off>; 0 = off

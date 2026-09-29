@@ -505,6 +505,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 arguments: serde_json::json!({"path": "x"}),
+                provider_state: None,
             }],
             "",
         );
@@ -535,6 +536,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "t".to_string(),
                 arguments: serde_json::json!({}),
+                provider_state: None,
             }],
             "",
         );
@@ -552,6 +554,7 @@ mod tests {
             id: id.to_string(),
             name: "read_file".to_string(),
             arguments: serde_json::json!({"path": "x"}),
+            provider_state: None,
         }
     }
 

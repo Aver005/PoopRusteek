@@ -10,7 +10,7 @@ use crate::agent::continuation::continue_cut_off;
 use crate::agent::retry::RetryBudget;
 use crate::agent::runner::{
     EMPTY_RESPONSE_FEEDBACK, beside_calls_note, build_step_request, malformed_tool_feedback,
-    tool_outputs, unparsed_markup, unparsed_markup_feedback,
+    native_tool_definitions, tool_outputs, unparsed_markup, unparsed_markup_feedback,
 };
 use crate::agent::stream::{StreamVerdict, collect_stream};
 use crate::agent::tool_parser::{ParseCtx, ParsedReply, ToolCatalog, parse_step, parse_text};
@@ -56,10 +56,17 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
     let mut messages = vec![ChatMessage::user(&user_prompt)];
     let mut retries = RetryBudget::default();
     let catalog = ToolCatalog::snapshot(&tools, &mcp).await;
+    let native_tools = native_tool_definitions(&provider, &tools, &mcp).await;
 
     for _step in 0..max_steps {
-        let request =
-            build_step_request(&system_prompt, &messages, &model, temperature, max_tokens);
+        let request = build_step_request(
+            &system_prompt,
+            &messages,
+            &native_tools,
+            &model,
+            temperature,
+            max_tokens,
+        );
 
         // Безголово: колбэка прогресса нет, стримить некуда.
         let outcome = collect_stream(&provider, request.clone(), |_| {}).await;

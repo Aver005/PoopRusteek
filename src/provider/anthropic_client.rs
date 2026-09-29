@@ -61,7 +61,13 @@ impl CompatProtocol for AnthropicProtocol {
         Ok(anthropic_compat::response_from_anthropic(parsed))
     }
 
-    fn handle_sse_payload(payload: &str, emit: &mut dyn FnMut(CompletionChunk)) -> SseFlow {
+    type StreamState = anthropic_compat::AnthropicStreamState;
+
+    fn handle_sse_payload(
+        payload: &str,
+        state: &mut Self::StreamState,
+        emit: &mut dyn FnMut(CompletionChunk),
+    ) -> SseFlow {
         match anthropic_compat::parse_stream_event(payload) {
             StreamEvent::Text(text) => {
                 emit(CompletionChunk {
@@ -71,11 +77,34 @@ impl CompatProtocol for AnthropicProtocol {
                 });
                 SseFlow::Continue
             }
+            StreamEvent::ToolStart { index, id, name } => {
+                state.start_tool(index, id, name);
+                SseFlow::Continue
+            }
+            StreamEvent::ToolDelta {
+                index,
+                partial_json,
+            } => {
+                state.append_tool_json(index, &partial_json);
+                SseFlow::Continue
+            }
+            StreamEvent::ToolStop { index } => {
+                state.finish_tool(index);
+                SseFlow::Continue
+            }
+            StreamEvent::Finish(stop_reason) => {
+                state.set_finish_reason(stop_reason);
+                SseFlow::Continue
+            }
             StreamEvent::Done => {
+                // Терминальный чанк: причина остановки — из message_delta,
+                // по умолчанию "stop", если сервер её не прислал.
                 emit(CompletionChunk {
                     content: String::new(),
-                    tool_calls: Vec::new(),
-                    finish_reason: Some("stop".to_string()),
+                    tool_calls: state.take_completed(),
+                    finish_reason: Some(
+                        state.finish_reason().unwrap_or_else(|| "stop".to_string()),
+                    ),
                 });
                 SseFlow::Done
             }

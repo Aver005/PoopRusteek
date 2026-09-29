@@ -11,8 +11,9 @@
 //!    via [`response_to_openai`] / [`delta_chunk`]+[`final_chunk`].
 //! 2. **OpenAI-compatible client providers**
 //!    (`crate::provider::openai_client`): the same types in the opposite
-//!    direction ([`request_to_openai`], [`response_from_openai`],
-//!    [`chunk_from_openai`]).
+//!    direction ([`request_to_openai`], [`response_from_openai`]; streamed
+//!    chunks and tool-call delta assembly are the client's own
+//!    `OpenAiStreamState`, which reuses [`WireToolCall::to_internal`]).
 //!
 //! Scope: messages, temperature/max_tokens, streaming, finish_reason, usage,
 //! and the wire half of tool calling — inbound `tools`/`tool_choice`,
@@ -21,16 +22,20 @@
 //! themselves in the prompt (`server::tools`); this module only maps the
 //! shapes. Multimodal content parts are flattened to their text parts.
 //!
-//! Outbound to a client provider, a `Role::Tool` message still goes out as
-//! user text: on the prompt path our assistant messages carry no
-//! `tool_calls` for it to answer, and a lone `role:"tool"` is rejected by
-//! strict endpoints.
+//! Outbound to a client provider, a `Role::Tool` message goes out natively
+//! (`role:"tool"` + `tool_call_id`) only when it answers a call an EARLIER
+//! assistant message in the same request declared (`request_to_openai`
+//! tracks those ids as it walks the history). Any other tool message —
+//! the prompt path, where assistant messages carry no `tool_calls` — still
+//! goes out as user text: a lone `role:"tool"` with no preceding
+//! `tool_calls` is rejected by strict endpoints (api.openai.com and
+//! gateways) with 400 "messages with role 'tool' must be a response to a
+//! preceeding message with 'tool_calls'".
 //!
 //! Everything here is pure data mapping — no I/O, no `App`, no network.
 
 use crate::provider::{
-    ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, Role, ToolCall, Usage,
-    estimate_tokens,
+    ChatMessage, CompletionRequest, CompletionResponse, Role, ToolCall, Usage, estimate_tokens,
 };
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +91,9 @@ pub struct WireToolCall {
     /// Есть только в дельтах стрима: номер вызова в ответе.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
+    /// В хвостовых дельтах стрима отсутствует — там только `index` и кусок
+    /// `arguments`; пустая строка читается как "не пришло в этом фрагменте".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
     #[serde(rename = "type", default = "function_kind")]
     pub kind: String,
@@ -94,6 +102,8 @@ pub struct WireToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireFunction {
+    /// Как и `id` — только в первом фрагменте вызова.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     #[serde(default)]
     pub arguments: String,
@@ -117,13 +127,30 @@ impl WireToolCall {
     }
 
     /// Аргументы-строку, которая не JSON, сохраняем строкой, а не теряем.
-    fn to_internal(&self) -> ToolCall {
-        let arguments = serde_json::from_str(&self.function.arguments)
-            .unwrap_or_else(|_| serde_json::Value::String(self.function.arguments.clone()));
+    /// Пустая строка (сервер прислал вызов совсем без аргументов) — `{}`.
+    pub(crate) fn to_internal(&self) -> ToolCall {
+        let arguments = if self.function.arguments.is_empty() {
+            serde_json::json!({})
+        } else {
+            match serde_json::from_str(&self.function.arguments) {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::debug_log::log(
+                        "openai_compat.tool_call.arguments_not_json",
+                        format!(
+                            "id={} raw={:?} error={error}",
+                            self.id, self.function.arguments
+                        ),
+                    );
+                    serde_json::Value::String(self.function.arguments.clone())
+                }
+            }
+        };
         ToolCall {
             id: self.id.clone(),
             name: self.function.name.clone(),
             arguments,
+            provider_state: None,
         }
     }
 }
@@ -400,35 +427,68 @@ fn tool_name_for(history: &[ChatMessage], call_id: Option<&str>) -> Option<Strin
 /// are filtered out here for the same reason `provider/prompt.rs` filters
 /// them: UI chrome must never reach a model.
 pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
-    let messages: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .filter(|message| !message.ui_only)
-        .map(|message| {
-            // Результат инструмента уходит текстом от пользователя — ровно
-            // как в anthropic_compat и gemini_compat. Протокол вызовов у нас
-            // промптовый, у ассистента нет `tool_calls`, а `role:"tool"` без
-            // них строгие эндпоинты (api.openai.com и шлюзы) отвергают с 400:
-            // «messages with role 'tool' must be a response to a preceeding
-            // message with 'tool_calls'». Локальные серверы это прощали,
-            // поэтому баг дожил досюда.
-            if message.role == Role::Tool {
+    // Id вызовов, объявленных более ранними ассистентскими сообщениями —
+    // только их результат может уйти как настоящий `role:"tool"`.
+    let mut declared_call_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    for message in request.messages.iter().filter(|message| !message.ui_only) {
+        if message.role == Role::Tool {
+            let matches_declared = message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| declared_call_ids.contains(id));
+            if matches_declared {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": message.tool_call_id,
+                    "content": message.content,
+                }));
+            } else {
+                // Промптовый путь: у ассистента нет `tool_calls`, отвечать
+                // нечему — результат уходит обычным пользовательским текстом
+                // (см. комментарий модуля).
                 let body = match &message.name {
                     Some(name) => format!("[tool result: {name}]\n{}", message.content),
                     None => format!("[tool result]\n{}", message.content),
                 };
-                return serde_json::json!({ "role": "user", "content": body });
+                messages.push(serde_json::json!({ "role": "user", "content": body }));
             }
+            continue;
+        }
+        if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+            let calls: Vec<serde_json::Value> = message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    declared_call_ids.insert(call.id.as_str());
+                    serde_json::to_value(WireToolCall::from_call(call)).unwrap_or_default()
+                })
+                .collect();
+            let content = if message.content.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(message.content)
+            };
             let mut object = serde_json::json!({
-                "role": role_to_openai(&message.role),
-                "content": message.content,
+                "role": "assistant",
+                "content": content,
+                "tool_calls": calls,
             });
             if let Some(name) = &message.name {
                 object["name"] = serde_json::json!(name);
             }
-            object
-        })
-        .collect();
+            messages.push(object);
+            continue;
+        }
+        let mut object = serde_json::json!({
+            "role": role_to_openai(&message.role),
+            "content": message.content,
+        });
+        if let Some(name) = &message.name {
+            object["name"] = serde_json::json!(name);
+        }
+        messages.push(object);
+    }
     let mut body = serde_json::json!({
         "model": request.model,
         "messages": messages,
@@ -569,25 +629,6 @@ pub fn response_from_openai(response: ChatCompletionResponse) -> CompletionRespo
         content,
         finish_reason,
         usage: Some(response.usage),
-    }
-}
-
-pub fn chunk_from_openai(chunk: ChatCompletionChunk) -> CompletionChunk {
-    let (content, finish_reason) = chunk
-        .choices
-        .into_iter()
-        .next()
-        .map(|choice| {
-            (
-                choice.delta.content.unwrap_or_default(),
-                choice.finish_reason,
-            )
-        })
-        .unwrap_or_default();
-    CompletionChunk {
-        content,
-        tool_calls: Vec::new(),
-        finish_reason,
     }
 }
 
@@ -1013,29 +1054,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_chunk_converts_to_internal() {
-        let chunk = ChatCompletionChunk {
-            id: "chatcmpl-x".to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 0,
-            model: "m".to_string(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: Delta {
-                    role: None,
-                    content: Some("tok".to_string()),
-                    reasoning_content: None,
-                    tool_calls: None,
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-        };
-        let internal = chunk_from_openai(chunk);
-        assert_eq!(internal.content, "tok");
-        assert_eq!(internal.finish_reason.as_deref(), Some("stop"));
-    }
-
-    #[test]
     fn model_list_shape() {
         let list = model_list(&["deepseek-chat", "deepseek-reasoner"], "pooprusteek", 1);
         let json = serde_json::to_value(&list).unwrap();
@@ -1175,5 +1193,71 @@ mod tests {
         assert_eq!(wire["tools"][0]["type"], "function");
         assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
         assert_eq!(wire["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    /// Ассистентское сообщение с `tool_calls` и отвечающий на него
+    /// `Role::Tool` — вся пара уходит нативно: `tool_calls` в форме OpenAI,
+    /// результат как настоящий `role:"tool"` с `tool_call_id`.
+    #[test]
+    fn native_history_round_serializes_tool_calls_and_matching_result() {
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({"city": "Boston"}),
+            provider_state: None,
+        }];
+        let wire = request_to_openai(&CompletionRequest {
+            messages: vec![
+                ChatMessage::user("weather?"),
+                assistant,
+                ChatMessage::tool("call_1", "52F"),
+            ],
+            tools: Vec::new(),
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+        });
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(messages[1]["content"].is_null());
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[1]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        let args = messages[1]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(args).unwrap(),
+            serde_json::json!({"city": "Boston"})
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["content"], "52F");
+    }
+
+    /// Результат без объявившего его ассистентского вызова в этом же запросе
+    /// (промптовый путь) — по-прежнему пользовательский текст, не `role:"tool"`.
+    #[test]
+    fn an_unmatched_tool_message_still_goes_out_as_user_text() {
+        let wire = request_to_openai(&CompletionRequest {
+            messages: vec![
+                ChatMessage::user("q"),
+                ChatMessage::tool("call_orphan", "42"),
+            ],
+            tools: Vec::new(),
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+        });
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "user");
+        assert!(messages[1]["content"].as_str().unwrap().contains("42"));
+        assert!(messages[1].get("tool_call_id").is_none());
     }
 }

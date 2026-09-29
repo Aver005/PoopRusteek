@@ -1,5 +1,9 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
+> **2026-09-29 (2) — родной tool calling для записей `/providers`.**
+> - `tools = "native"` (или `/providers tools <name> native`): инструменты уходят полем API, вызовы приходят структурой — OpenAI, Anthropic, Gemini. Промпт без формата `<tool_use>` и списка (на живом прогоне 8,9 КБ вместо 20,5 КБ); на промптовом пути промпт байт-в-байт прежний.
+> - Сервер для такой записи отдаёт `tools` клиента провайдеру напрямую. Gemini: `ToolCall::provider_state` возвращает в истории его id и `thoughtSignature` (Gemini 3).
+> - Живьём на Ollama (`qwen3:14b`): OpenAI и Anthropic — вызов, результат, ответ; сервер — родные `tool_calls`. Gemini — только тесты (ключа нет). Тесты 1145 → 1178. `JOURNAL/2026-09-29-native-tool-calling.md`.
 > **2026-09-29 — tools на сервере, продолжение обрыва, режимы DeepSeek.**
 > - `/serve` понимает `tools`/`tool_choice`: схемы в промпт, ответ разбирает `tool_parser`, клиент получает `tool_calls` (любой бэкенд, эмуляция). Живьём на DeepSeek — оба хода opencode-подобного диалога.
 > - Обрыв по лимиту (~16 КБ) больше не маскируется под `stop`: DeepSeek шлёт статус `INCOMPLETE`, провайдер зовёт родное «Продолжить» (`/chat/continue`, без PoW, снимок срезается). Сверх того любой вызов, оборванный в конце ответа, дописывается запросом-продолжением (`agent/continuation.rs`). Живьём: `write` на 29 КБ за одно сообщение.

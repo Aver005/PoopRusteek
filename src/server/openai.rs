@@ -180,9 +180,17 @@ async fn chat_completions(
         }
     };
     internal.model = resolved.internal_model().to_string();
-    flatten_history(&mut internal.messages);
+    // Родной протокол знает вызовы в истории; остальным они нужны текстом.
+    let native = provider.native_tools();
+    if !native {
+        flatten_history(&mut internal.messages);
+    }
     if let Some(bridge) = &bridge {
-        bridge.prepare(&mut internal);
+        if native {
+            bridge.declare(&mut internal);
+        } else {
+            bridge.prepare(&mut internal);
+        }
     }
 
     let meta = CompletionMeta::generate(&public_model);
@@ -210,7 +218,8 @@ async fn chat_completions(
 const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Ответ с инструментами целиком. Стрим копится, потому что вызов виден только
-/// в готовом тексте; оборванный лимитом вызов дописывается.
+/// в готовом ответе; на промптовом пути оборванный лимитом вызов дописывается.
+/// Непустой `request.tools` — родной протокол (его ставит только `declare`).
 async fn run_tool_completion(
     provider: &Arc<dyn LLMProvider>,
     is_deepseek: bool,
@@ -224,6 +233,15 @@ async fn run_tool_completion(
             STREAM_IDLE_TIMEOUT.as_secs()
         )),
         StreamVerdict::Failed(error) => Err(error),
+        _ if !request.tools.is_empty() => {
+            let reply = ToolBridge::native_reply(&outcome.text, &outcome.tool_calls);
+            let finish = if reply.calls.is_empty() {
+                outcome.stop_reason.unwrap_or_else(|| "stop".to_string())
+            } else {
+                "tool_calls".to_string()
+            };
+            Ok((reply, finish))
+        }
         _ => {
             let stop = outcome.stop_reason.clone();
             let continued = continue_cut_off(

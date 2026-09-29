@@ -210,8 +210,7 @@ impl ProviderAddState {
             api_key: (!api_key.is_empty()).then(|| api_key.to_string()),
             model,
             protocol: self.protocol(),
-            // Мастер родной протокол пока не предлагает: включается правкой
-            // конфига, пока нет экрана выбора.
+            // Мастер родной протокол не предлагает: `/providers tools`.
             tools: crate::config::ToolProtocol::default(),
         })
     }
@@ -475,6 +474,50 @@ impl crate::app::App {
             PickerMode::Single,
             PickerKind::Models,
         )));
+    }
+
+    /// `/providers tools <name> <native|prompt>`. Флаг зашит в клиент при
+    /// сборке, поэтому активную запись пересобираем.
+    pub(crate) fn apply_provider_tools(&mut self, name: &str, tools: crate::config::ToolProtocol) {
+        if name == BUILTIN_PROVIDER_NAME {
+            self.state.push_system(
+                "The built-in DeepSeek web client has no tool-calling channel — its tools are always described in the prompt.",
+            );
+            return;
+        }
+        let Some(entry) = self
+            .config
+            .providers
+            .iter_mut()
+            .find(|entry| entry.name == name)
+        else {
+            self.state
+                .push_system(&format!("No provider named '{name}' — see /providers."));
+            return;
+        };
+        let previous = std::mem::replace(&mut entry.tools, tools);
+        if let Err(message) = crate::config::save_or_message(&self.config) {
+            if let Some(entry) = self.config.providers.iter_mut().find(|e| e.name == name) {
+                entry.tools = previous;
+            }
+            self.state.push_system(&message);
+            return;
+        }
+        let active = self
+            .config
+            .active_provider_entry()
+            .is_some_and(|entry| entry.name == name);
+        if active {
+            self.rebuild_provider();
+        }
+        let mode = match tools {
+            crate::config::ToolProtocol::Native => {
+                "native (the API's tool-calling field; the endpoint must support it)"
+            }
+            crate::config::ToolProtocol::Prompt => "prompt (<tool_use> blocks in the text)",
+        };
+        self.state
+            .push_system(&format!("Provider '{name}' now declares tools: {mode}."));
     }
 
     /// Switch the active provider's model: the active `/providers` entry's

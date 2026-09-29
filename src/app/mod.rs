@@ -1041,7 +1041,7 @@ impl App {
             .filter(|m| !m.ui_only)
             .cloned()
             .collect();
-        let system_prompt = system_prompt::build(self.prompt_inputs()).await;
+        let system_prompt = system_prompt::build(self.prompt_inputs(provider.native_tools())).await;
 
         let spec = runtime::TurnSpec {
             conversation,
@@ -1163,7 +1163,7 @@ impl App {
     /// Drop provider, swap to a single fresh empty conversation, land on onboarding.
     /// Входы сборки промпта из текущего состояния. Три места собирали этот
     /// литерал побайтово одинаково.
-    fn prompt_inputs(&self) -> system_prompt::PromptInputs<'_> {
+    fn prompt_inputs(&self, native_tools: bool) -> system_prompt::PromptInputs<'_> {
         system_prompt::PromptInputs {
             prompts: &self.prompts,
             skills: &self.skills,
@@ -1173,6 +1173,7 @@ impl App {
             mcp_schema_mode: self.config.effective_mcp_schema_mode(),
             workspace: &self.state.workspace_path,
             project_instructions: &self.state.instructions_section,
+            native_tools,
         }
     }
 

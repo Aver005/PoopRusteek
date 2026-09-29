@@ -26,6 +26,9 @@ pub struct PromptInputs<'a> {
     pub workspace: &'a str,
     /// Секция из `AGENTS.md` рабочей папки; пустая строка, если её нет.
     pub project_instructions: &'a str,
+    /// Провайдер получает инструменты полем API (`LLMProvider::native_tools`):
+    /// формат `<tool_use>` и список инструментов в промпте тогда лишние.
+    pub native_tools: bool,
 }
 
 pub async fn build(input: PromptInputs<'_>) -> String {
@@ -38,6 +41,7 @@ pub async fn build(input: PromptInputs<'_>) -> String {
         mcp_schema_mode,
         workspace,
         project_instructions,
+        native_tools,
     } = input;
     let user = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
@@ -64,10 +68,19 @@ pub async fn build(input: PromptInputs<'_>) -> String {
         .replace("{{user}}", &user)
         .replace("{{folder}}", workspace)
         .replace("{{os}}", &os);
-    let tools_prompt = prompts
-        .tools_prompt
-        .replace("{{builtin_tools}}", &builtin_section)
-        .replace("{{mcp_tools}}", &mcp_section);
+    let tools_prompt = if native_tools {
+        prompts
+            .tools_prompt
+            .replace("{{call_format}}", "")
+            .replace("{{tool_list}}", "")
+    } else {
+        prompts
+            .tools_prompt
+            .replace("{{call_format}}", &prompts.tool_calls_prompt)
+            .replace("{{tool_list}}", &prompts.tool_list_prompt)
+            .replace("{{builtin_tools}}", &builtin_section)
+            .replace("{{mcp_tools}}", &mcp_section)
+    };
 
     let skills_section =
         crate::skills::discovery::load_enabled_skills_content(skills, skills_injection);
@@ -179,4 +192,41 @@ fn mcp_resource_section(all_mcp_resources: &[MCPResource], deferred: bool) -> St
         lines.push(format!("- `{}`: {} ({})", name, desc, r.uri));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn assembled(native_tools: bool) -> String {
+        let prompts = crate::prompts::load_prompt_files();
+        let tools = ToolRegistry::new();
+        let mcp = tokio::sync::Mutex::new(MCPManager::new());
+        build(PromptInputs {
+            prompts: &prompts,
+            skills: &[],
+            skills_injection: SkillInjectionMode::default(),
+            tools: &tools,
+            mcp: &mcp,
+            mcp_schema_mode: McpSchemaMode::default(),
+            workspace: "/work",
+            project_instructions: "",
+            native_tools,
+        })
+        .await
+    }
+
+    /// Родной протокол: формат `<tool_use>` и список инструментов не нужны,
+    /// советы по работе с инструментами остаются.
+    #[tokio::test]
+    async fn a_native_provider_gets_no_call_format_and_no_tool_list() {
+        let prompt = assembled(false).await;
+        assert!(prompt.contains("<tool_use>"));
+        assert!(prompt.contains("# Доступные инструменты"));
+        let native = assembled(true).await;
+        assert!(!native.contains("<tool_use>"), "{native}");
+        assert!(!native.contains("# Доступные инструменты"));
+        assert!(!native.contains("{{"), "no slot left unfilled: {native}");
+        assert!(native.contains("## План работы"));
+    }
 }

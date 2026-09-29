@@ -83,11 +83,15 @@ pub enum Role {
 /// Anthropic): результат обязан сослаться на него дословно, иначе строгий
 /// эндпоинт отвечает 400. У Gemini своих идентификаторов нет, там он
 /// синтезируется локально и на провод не уходит.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Что провайдер обязан получить обратно вместе с вызовом в истории
+    /// (у Gemini — свой id и `thoughtSignature`). Для остальных пусто.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +337,12 @@ pub trait LLMProvider: Send + Sync {
         false
     }
 
+    /// Инструменты уходят провайдеру полем `tools`, а вызовы приходят
+    /// структурой, а не текстом (`[[providers]] tools = "native"`).
+    fn native_tools(&self) -> bool {
+        false
+    }
+
     /// Budget tokens this provider has accumulated in its *current* session,
     /// when it keeps history server-side. `None` means "no idea, count the
     /// local history instead".
@@ -444,6 +454,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "read_file".to_string(),
             arguments: serde_json::json!({"path": "Cargo.toml"}),
+            provider_state: None,
         }];
         let json = serde_json::to_string(&message).unwrap();
         let back: ChatMessage = serde_json::from_str(&json).unwrap();

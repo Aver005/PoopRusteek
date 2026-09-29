@@ -149,6 +149,11 @@ pub enum CommandResult {
     /// `<name> <base_url> [model] [api_key]` form and falls back to the
     /// wizard on parse failure.
     OpenProviderAdd(Option<String>),
+    /// `/providers tools <name> <native|prompt>` — как запись объявляет инструменты.
+    SetProviderTools {
+        name: String,
+        tools: crate::config::ToolProtocol,
+    },
     /// `/models` — fetch the active provider's models and open the picker.
     OpenModels,
     /// `/models <id>` — validate the id against the provider's model list
