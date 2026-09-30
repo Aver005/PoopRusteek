@@ -21,7 +21,7 @@
 | `shell_kill` | `id`(req) | `Stopped job #{id}…\nFinal output:…` | force-kill + remove |
 | `shell_list` | — | formatted job table | prunes finished first; shows pid, kind, persist, age, idle, ttl |
 | `shell_input` | `id`(req), `text`, `keys[]` | confirmation | interactive jobs only; `keys` → escape seqs (up/down/enter/esc/tab/ctrl+c…) |
-| `skill` | `action`(list\|load), `name` | list or `# Skill: {name}\n{content}` | backed by `Arc<RwLock<Vec<SkillDefinition>>>` |
+| `skill` | `action`(list\|load), `name` | list or `SkillDefinition::as_attached_file` (`[file name]: <slug>.md` / `[file content begin]` … `[file content end]`) | backed by `Arc<RwLock<Vec<SkillDefinition>>>` |
 | `timer` | `action`(set\|list\|cancel, def `set`), `after`("20m") **or** `at`("18:30"), `note`(req for set), `wake`, `id`(cancel) | `Timer set — #3 — 2026-08-29 18:30 (in 3h 12m), wake: …` | special-cased in the agent loop (needs the conversation id); no approval prompt; refused when `auto_approve`. See DEFERRED TASKS below |
 | `read_file` | `path`(req), `offset`(1-based line, def 1), `limit`(def 400) | `{path} (lines a-b of N)
 {slice}` | expands `~`; escape hatch for the compaction ladder's file-path markers |

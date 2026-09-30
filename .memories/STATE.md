@@ -1,5 +1,8 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
+> **2026-09-30 — скиллы в рамке файла DeepSeek; изменённый системный промпт доходит до идущей сессии.**
+> - Замер: вложение через `ref_file_ids` стоит столько же токенов, сколько тот же текст в `prompt`, и модель видит его той же рамкой `[file name]…[file content end]`. Загрузку файлов не делаем, рамку ставим сами (`provider::prompt::attached_file`).
+> - DeepSeek досылает системный промпт целиком, когда он изменился (`SystemDelivery::Changed`): включённый посреди беседы скилл, поздно подключённый MCP, перезагруженный `AGENTS.md`. Выключение скилла в живой сессии — лучшее усилие (2/3). `JOURNAL/2026-09-30-skills-as-files.md`.
 > **2026-09-29 (2) — родной tool calling для записей `/providers`.**
 > - `tools = "native"` (или `/providers tools <name> native`): инструменты уходят полем API, вызовы приходят структурой — OpenAI, Anthropic, Gemini. Промпт без формата `<tool_use>` и списка (на живом прогоне 8,9 КБ вместо 20,5 КБ); на промптовом пути промпт байт-в-байт прежний.
 > - Сервер для такой записи отдаёт `tools` клиента провайдеру напрямую. Gemini: `ToolCall::provider_state` возвращает в истории его id и `thoughtSignature` (Gemini 3).

@@ -29,6 +29,14 @@ pub struct SkillDefinition {
     pub enabled: bool,
 }
 
+impl SkillDefinition {
+    /// Навык как приложенный файл `<slug>.md`: по этому имени обновление
+    /// промпта сообщает модели, какой скилл включили или выключили.
+    pub fn as_attached_file(&self) -> String {
+        crate::provider::prompt::attached_file(&format!("{}.md", self.slug), &self.content)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillFrontmatter {
     pub name: Option<String>,

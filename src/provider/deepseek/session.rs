@@ -5,6 +5,7 @@
 use super::DeepseekProvider;
 use crate::debug_log;
 use crate::error::{AppError, AppResult};
+use crate::provider::prompt::{FileChanges, SystemDelivery};
 use serde_json::{Value, json};
 
 const CREATE_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
@@ -18,6 +19,11 @@ pub(super) struct SessionState {
     /// minted. `None` = the session came from elsewhere (`adopt_session`), so
     /// what the server still holds is unknown.
     pub(super) session_tokens: Option<u32>,
+    /// Системный промпт, который держит сервер. `None` у подхваченной сессии:
+    /// какой он там, неизвестно, поэтому первая отправка досылает текущий.
+    pub(super) held_system_prompt: Option<String>,
+    /// Промпт отправки, ещё не подтверждённой сервером.
+    pub(super) pending_system_prompt: Option<String>,
 }
 
 impl Default for SessionState {
@@ -30,7 +36,28 @@ impl Default for SessionState {
             parent_message_id: None,
             system_sent_for_session: false,
             session_tokens: Some(0),
+            held_system_prompt: None,
+            pending_system_prompt: None,
         }
+    }
+}
+
+impl SessionState {
+    /// Как доставить `system_prompt` в эту отправку. Он же запоминается
+    /// ожидающим: сервер держит его, только когда примет сообщение.
+    pub(super) fn plan_system_delivery(&mut self, system_prompt: &str) -> SystemDelivery {
+        let delivery = if !self.system_sent_for_session {
+            SystemDelivery::Fresh
+        } else if self.held_system_prompt.as_deref() == Some(system_prompt) {
+            SystemDelivery::Held
+        } else {
+            SystemDelivery::Changed(FileChanges::between(
+                self.held_system_prompt.as_deref(),
+                system_prompt,
+            ))
+        };
+        self.pending_system_prompt = Some(system_prompt.to_string());
+        delivery
     }
 }
 
@@ -101,6 +128,7 @@ impl DeepseekProvider {
         state.session_id = Some(session_id.clone());
         state.parent_message_id = None;
         state.system_sent_for_session = false;
+        state.held_system_prompt = None;
         // The server just forgot everything; so does the meter.
         state.session_tokens = Some(0);
         debug_log::log(
@@ -143,6 +171,9 @@ impl DeepseekProvider {
 
         if state.session_id.as_deref() == Some(session_id) {
             state.system_sent_for_session = true;
+            if let Some(sent) = state.pending_system_prompt.take() {
+                state.held_system_prompt = Some(sent);
+            }
             if parent_message_id.is_some() {
                 state.parent_message_id = parent_message_id;
             }

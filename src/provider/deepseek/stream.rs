@@ -188,11 +188,9 @@ impl DeepseekProvider {
         };
 
         let session = self.ensure_session(should_reset).await?;
-        let prompt = prompt::build_prompt(
-            &non_system_messages,
-            &system_prompt,
-            session.system_sent_for_session,
-        );
+        let delivery = self.session()?.plan_system_delivery(&system_prompt);
+        let delivery_trace = format!("{delivery:?}");
+        let prompt = prompt::build_prompt(&non_system_messages, &system_prompt, delivery);
         // Counted from the prompt that is really sent — for a continuing
         // session that is only the tail, not the whole local history.
         let prompt_tokens = crate::context::budget_tokens(&prompt);
@@ -208,6 +206,7 @@ impl DeepseekProvider {
                 "session_id": session.session_id,
                 "parent_message_id": session.parent_message_id,
                 "system_sent_for_session": session.system_sent_for_session,
+                "system_delivery": delivery_trace,
                 "should_reset": should_reset,
                 "prompt_preview": body["prompt"],
             }),

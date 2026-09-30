@@ -61,6 +61,115 @@ fn format_history_message(message: &ChatMessage) -> String {
 /// per turn.
 const FORMAT_REMINDER: &str = "[Напоминание формата: инструменты вызывай только блоком <tool_use><name>…</name><arguments>{JSON}</arguments></tool_use>, после </tool_use> — стоп. Другую разметку вызовов (DSML, invoke, function_calls) не используй. Имена инструментов не изобретай, результаты не выдумывай — жди TOOL RESULT.]";
 
+const FILE_NAME_PREFIX: &str = "[file name]: ";
+
+/// Текст в рамке, которой веб-чат DeepSeek подаёт модели прикреплённый файл
+/// (снято с живого клиента). По токенам то же, что вложение, но без загрузки.
+pub fn attached_file(name: &str, content: &str) -> String {
+    format!(
+        "{FILE_NAME_PREFIX}{name}\n[file content begin]\n{}\n[file content end]",
+        content.trim()
+    )
+}
+
+/// Имена файлов, приложенных к промпту рамкой [`attached_file`].
+fn attached_file_names(prompt: &str) -> std::collections::BTreeSet<&str> {
+    prompt
+        .lines()
+        .filter_map(|line| line.strip_prefix(FILE_NAME_PREFIX))
+        .map(str::trim)
+        .collect()
+}
+
+/// Приложенные файлы новой версии промпта против той, что держит сервер.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileChanges {
+    added: Vec<String>,
+    removed: Vec<String>,
+    current: Vec<String>,
+    /// Прежний набор известен. У подхваченной сессии нет: тогда отменить
+    /// выключенное можно только через полный список действующих.
+    known: bool,
+}
+
+impl FileChanges {
+    pub(crate) fn between(held: Option<&str>, current: &str) -> Self {
+        fn owned(names: impl Iterator<Item = impl ToString>) -> Vec<String> {
+            names.map(|name| name.to_string()).collect()
+        }
+        let after = attached_file_names(current);
+        let Some(held) = held else {
+            return Self {
+                added: Vec::new(),
+                removed: Vec::new(),
+                current: owned(after.iter()),
+                known: false,
+            };
+        };
+        let before = attached_file_names(held);
+        Self {
+            added: owned(after.difference(&before)),
+            removed: owned(before.difference(&after)),
+            current: owned(after.iter()),
+            known: true,
+        }
+    }
+
+    /// Строки шапки о файлах. Живой прогон 2026-09-30: без имён модель
+    /// продолжала следовать выключенному скиллу, раз уже следовала ему выше.
+    fn describe(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !self.removed.is_empty() {
+            lines.push(format!(
+                "Выключены файлы: {}. Их правила больше не действуют.",
+                self.removed.join(", ")
+            ));
+        }
+        if !self.added.is_empty() {
+            lines.push(format!(
+                "Подключены файлы: {}. Следуй им с этого сообщения.",
+                self.added.join(", ")
+            ));
+        }
+        let nothing_ever_attached =
+            self.known && self.current.is_empty() && self.removed.is_empty();
+        if nothing_ever_attached {
+            return lines;
+        }
+        lines.push(if self.current.is_empty() {
+            "Приложенных файлов сейчас нет: правила всех приложенных раньше файлов больше не действуют, даже если ты следовал им выше в этой беседе.".to_string()
+        } else {
+            format!(
+                "Сейчас действуют только приложенные файлы: {}. Правила остальных приложенных раньше файлов больше не действуют, даже если ты следовал им выше в этой беседе.",
+                self.current.join(", ")
+            )
+        });
+        lines
+    }
+}
+
+/// Что серверная сессия уже знает о системном промпте этой отправки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SystemDelivery {
+    /// Новая сессия: промпт и локальная история уходят целиком.
+    Fresh,
+    /// Сервер держит этот же промпт: уходит только хвост.
+    Held,
+    /// Сервер держит устаревший промпт (включили скилл, подключился MCP).
+    Changed(FileChanges),
+}
+
+/// Шапка новой версии промпта в уже идущей сессии: старая остаётся в
+/// серверном контексте, и модели надо прямо сказать, какая из двух действует.
+const SYSTEM_UPDATE_HEADER: &str = "### SYSTEM PROMPT UPDATE\nСистемные инструкции этой беседы изменились. Текст ниже целиком заменяет прежние системные инструкции: прежние больше не действуют.";
+
+fn update_header(changes: &FileChanges) -> String {
+    std::iter::once(SYSTEM_UPDATE_HEADER.to_string())
+        .chain(changes.describe())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Index where the "new input" tail begins: everything after the last
 /// assistant message. That tail is what a continuing session actually needs
 /// to send — typically one user message, a batch of tool results, or an
@@ -115,16 +224,17 @@ pub(crate) fn is_first_conversational_send(non_system_messages: &[ChatMessage]) 
 
 /// Build the flat prompt string sent to DeepSeek.
 ///
-/// On the first send of a session (`system_sent_for_session == false`) the
-/// system prompt and prior turns are embedded as local memory. On later sends
-/// only the tail after the last assistant message goes out (the newest user
-/// input, tool-result batch, and any system note), since DeepSeek retains the
-/// rest server-side. A user message in the tail always renders as its own
-/// `### USER INPUT` section — system notes must never displace it.
+/// On the first send of a session ([`SystemDelivery::Fresh`]) the system
+/// prompt and prior turns are embedded as local memory. On later sends only
+/// the tail after the last assistant message goes out (the newest user input,
+/// tool-result batch, and any system note), since DeepSeek retains the rest
+/// server-side — preceded by the whole new system prompt when it changed
+/// since the server got it. A user message in the tail always renders as its
+/// own `### USER INPUT` section — system notes must never displace it.
 pub(crate) fn build_prompt(
     messages: &[ChatMessage],
     system_prompt: &str,
-    system_sent_for_session: bool,
+    delivery: SystemDelivery,
 ) -> String {
     if messages.is_empty() {
         return system_prompt.trim().to_string();
@@ -133,11 +243,19 @@ pub(crate) fn build_prompt(
     let tail_from = tail_start(messages);
     let tail = render_tail(&messages[tail_from..]);
 
-    if system_sent_for_session {
-        if tail.is_empty() {
-            return tail;
+    match delivery {
+        SystemDelivery::Held if tail.is_empty() => return tail,
+        SystemDelivery::Held => return format!("{tail}\n\n{FORMAT_REMINDER}"),
+        // Новая версия уходит и при пустом хвосте: сессия засчитает её
+        // доставленной, значит она обязана быть в отправленном тексте.
+        SystemDelivery::Changed(changes) => {
+            let update = format!("{}\n\n{}", update_header(&changes), system_prompt.trim());
+            if tail.is_empty() {
+                return update;
+            }
+            return format!("{update}\n\n{tail}\n\n{FORMAT_REMINDER}");
         }
-        return format!("{tail}\n\n{FORMAT_REMINDER}");
+        SystemDelivery::Fresh => {}
     }
 
     let mut parts = Vec::new();
@@ -188,7 +306,7 @@ mod tests {
     #[test]
     fn first_turn_embeds_system_and_user_input() {
         let messages = vec![ChatMessage::user("hello")];
-        let prompt = build_prompt(&messages, "SYSTEM PROMPT", false);
+        let prompt = build_prompt(&messages, "SYSTEM PROMPT", SystemDelivery::Fresh);
         assert!(prompt.starts_with("SYSTEM PROMPT"));
         assert!(prompt.contains("### USER INPUT\nhello"));
         assert!(!prompt.contains("### LOCAL MEMORY")); // single message → no history
@@ -201,7 +319,7 @@ mod tests {
             ChatMessage::assistant("reply"),
             ChatMessage::user("now"),
         ];
-        let prompt = build_prompt(&messages, "SYS", false);
+        let prompt = build_prompt(&messages, "SYS", SystemDelivery::Fresh);
         assert!(prompt.contains("### LOCAL MEMORY"));
         assert!(prompt.contains("[ASSISTANT]\nreply"));
         assert!(prompt.contains("### USER INPUT\nnow"));
@@ -214,7 +332,7 @@ mod tests {
             ChatMessage::assistant("a"),
             ChatMessage::user("new"),
         ];
-        let prompt = build_prompt(&messages, "SYS", true);
+        let prompt = build_prompt(&messages, "SYS", SystemDelivery::Held);
         assert_eq!(prompt, format!("### USER INPUT\nnew\n\n{FORMAT_REMINDER}"));
         assert!(!prompt.contains("old")); // server already has earlier turns
     }
@@ -227,7 +345,7 @@ mod tests {
             ChatMessage::tool_with_display("id1", "bash", "out-a", "out-a", false),
             ChatMessage::tool_with_display("id2", "grep", "out-b", "out-b", false),
         ];
-        let prompt = build_prompt(&messages, "SYS", true);
+        let prompt = build_prompt(&messages, "SYS", SystemDelivery::Held);
         assert_eq!(
             prompt,
             format!(
@@ -247,7 +365,7 @@ mod tests {
             ChatMessage::system("[Hint] maybe use skill X"),
             ChatMessage::user("real question"),
         ];
-        let prompt = build_prompt(&messages, "SYS", true);
+        let prompt = build_prompt(&messages, "SYS", SystemDelivery::Held);
         assert_eq!(
             prompt,
             format!(
@@ -267,7 +385,7 @@ mod tests {
             ChatMessage::user("real question"),
             ChatMessage::system("[Hint] maybe use skill X"),
         ];
-        let prompt = build_prompt(&messages, "SYS", true);
+        let prompt = build_prompt(&messages, "SYS", SystemDelivery::Held);
         assert!(prompt.contains("### USER INPUT\nreal question"));
         assert!(prompt.contains("### NOTE\n[Hint] maybe use skill X"));
     }
@@ -278,7 +396,7 @@ mod tests {
             ChatMessage::system("[Hint] maybe use skill X"),
             ChatMessage::user("hello"),
         ];
-        let prompt = build_prompt(&messages, "SYSTEM PROMPT", false);
+        let prompt = build_prompt(&messages, "SYSTEM PROMPT", SystemDelivery::Fresh);
         assert!(prompt.starts_with("SYSTEM PROMPT"));
         assert!(prompt.contains("### NOTE\n[Hint] maybe use skill X"));
         assert!(prompt.contains("### USER INPUT\nhello"));
@@ -292,7 +410,110 @@ mod tests {
             ChatMessage::assistant("a"),
             ChatMessage::user(""),
         ];
-        assert_eq!(build_prompt(&messages, "SYS", true), "");
+        assert_eq!(build_prompt(&messages, "SYS", SystemDelivery::Held), "");
+    }
+
+    /// Скилл включили посреди беседы: сервер держит старый промпт, и новый
+    /// обязан уйти целиком — до ввода пользователя, чтобы тот остался последним.
+    #[test]
+    fn a_changed_system_prompt_is_resent_before_the_tail() {
+        let messages = vec![
+            ChatMessage::user("old"),
+            ChatMessage::assistant("a"),
+            ChatMessage::user("new"),
+        ];
+        let prompt = build_prompt(
+            &messages,
+            "NEW SYS",
+            SystemDelivery::Changed(FileChanges::between(Some("SYS"), "NEW SYS")),
+        );
+        assert_eq!(
+            prompt,
+            format!(
+                "{SYSTEM_UPDATE_HEADER}\n\nNEW SYS\n\n### USER INPUT\nnew\n\n{FORMAT_REMINDER}"
+            )
+        );
+        assert!(!prompt.contains("old"), "history stays server-side");
+    }
+
+    /// Пустой хвост не повод потерять обновление: сессия засчитает его
+    /// доставленным по факту отправки.
+    #[test]
+    fn a_changed_system_prompt_goes_out_even_with_an_empty_tail() {
+        let messages = vec![
+            ChatMessage::user("old"),
+            ChatMessage::assistant("a"),
+            ChatMessage::user(""),
+        ];
+        assert_eq!(
+            build_prompt(
+                &messages,
+                "NEW SYS",
+                SystemDelivery::Changed(FileChanges::between(Some("SYS"), "NEW SYS"))
+            ),
+            format!("{SYSTEM_UPDATE_HEADER}\n\nNEW SYS")
+        );
+    }
+
+    fn prompt_with(files: &[&str]) -> String {
+        let blocks: Vec<String> = files
+            .iter()
+            .map(|name| attached_file(name, "body"))
+            .collect();
+        format!("BASE\n\n{}", blocks.join("\n"))
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// Оба направления: включённый и выключенный файл названы, общий — нет.
+    #[test]
+    fn file_changes_name_what_was_added_and_removed() {
+        let held = prompt_with(&["keep.md", "gone.md"]);
+        let current = prompt_with(&["keep.md", "new.md"]);
+        let changes = FileChanges::between(Some(&held), &current);
+        assert_eq!(changes.added, names(&["new.md"]));
+        assert_eq!(changes.removed, names(&["gone.md"]));
+
+        let lines = changes.describe().join("\n");
+        assert!(lines.contains("Выключены файлы: gone.md."), "{lines}");
+        assert!(lines.contains("Подключены файлы: new.md."), "{lines}");
+        assert!(lines.contains("действуют только приложенные файлы: keep.md, new.md"));
+    }
+
+    /// Промпт сменился не из-за файлов (подключился MCP) и файлов не было:
+    /// шапка про файлы молчит.
+    #[test]
+    fn a_change_without_files_says_nothing_about_files() {
+        assert!(FileChanges::between(Some("A"), "B").describe().is_empty());
+    }
+
+    /// Подхваченная сессия: прежний набор неизвестен, разницу не выдумываем, но
+    /// полный список действующих отменяет всё остальное. Живой прогон
+    /// 2026-09-30: без этого модель следовала выключенному скиллу.
+    #[test]
+    fn an_unknown_held_prompt_revokes_everything_not_listed() {
+        let changes = FileChanges::between(None, &prompt_with(&["a.md"]));
+        assert!(changes.added.is_empty() && changes.removed.is_empty());
+        let lines = changes.describe().join("\n");
+        assert!(
+            lines.contains("действуют только приложенные файлы: a.md"),
+            "{lines}"
+        );
+
+        let none = FileChanges::between(None, "BASE").describe().join("\n");
+        assert!(none.contains("Приложенных файлов сейчас нет"), "{none}");
+    }
+
+    #[test]
+    fn the_update_header_leads_the_resent_prompt() {
+        let messages = vec![ChatMessage::assistant("a"), ChatMessage::user("go")];
+        let changes = FileChanges::between(Some(&prompt_with(&["gone.md"])), "SYS");
+        let prompt = build_prompt(&messages, "SYS", SystemDelivery::Changed(changes));
+        assert!(prompt.starts_with(SYSTEM_UPDATE_HEADER), "{prompt}");
+        assert!(prompt.contains("Выключены файлы: gone.md."), "{prompt}");
+        assert!(prompt.ends_with(FORMAT_REMINDER));
     }
 
     #[test]
@@ -312,14 +533,14 @@ mod tests {
 
     #[test]
     fn empty_messages_returns_trimmed_system() {
-        assert_eq!(build_prompt(&[], "  sys  ", false), "sys");
+        assert_eq!(build_prompt(&[], "  sys  ", SystemDelivery::Fresh), "sys");
     }
 
     #[test]
     fn long_code_blocks_collapse_in_history() {
         let big = format!("```\n{}\n```", "x".repeat(400));
         let messages = vec![ChatMessage::assistant(&big), ChatMessage::user("now")];
-        let prompt = build_prompt(&messages, "", false);
+        let prompt = build_prompt(&messages, "", SystemDelivery::Fresh);
         assert!(prompt.contains("[...]"));
         assert!(!prompt.contains(&"x".repeat(400)));
     }

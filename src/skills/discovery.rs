@@ -322,12 +322,12 @@ pub fn load_enabled_skills_content(
         }
         sections.push(String::new());
     } else {
+        sections.push(
+            "\nВключённые скиллы приложены ниже файлами. Следуй скиллу, когда задача входит в его тему.\n"
+                .to_string(),
+        );
         for skill in &enabled {
-            sections.push(format!(
-                "\n## Skill: {}\n{}\n",
-                skill.name,
-                skill.content.trim()
-            ));
+            sections.push(format!("{}\n", skill.as_attached_file()));
         }
     }
 
@@ -402,8 +402,12 @@ mod tests {
         use crate::config::SkillInjectionMode;
         let skills = vec![enabled_skill("tiny", "full body here")];
         let section = load_enabled_skills_content(&skills, SkillInjectionMode::Auto);
-        assert!(section.contains("full body here"));
-        assert!(section.contains("## Skill: tiny"));
+        assert!(
+            section.contains(
+                "[file name]: tiny.md\n[file content begin]\nfull body here\n[file content end]"
+            ),
+            "{section}"
+        );
     }
 
     #[test]

@@ -501,6 +501,9 @@ impl MCPManager {
         for entry in self.servers.values() {
             result.extend(entry.resources.clone());
         }
+        // Порядок `HashMap` меняется при переподключении, а промпт из этого
+        // списка обязан быть стабильным: DeepSeek досылает его при любом отличии.
+        result.sort_by(|a, b| a.uri.cmp(&b.uri));
         result
     }
 
@@ -516,6 +519,8 @@ impl MCPManager {
                 });
             }
         }
+        // Та же причина, что у ресурсов: стабильный промпт.
+        result.sort_by(|a, b| a.full_name.cmp(&b.full_name));
         result
     }
 

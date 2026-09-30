@@ -70,9 +70,7 @@ impl Tool for SkillTool {
                 });
 
                 match skill {
-                    Some(s) => {
-                        ToolResult::success(&format!("# Skill: {}\n{}", s.name, s.content.trim()))
-                    }
+                    Some(s) => ToolResult::success(&s.as_attached_file()),
                     None => {
                         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
                         ToolResult::error(&format!(

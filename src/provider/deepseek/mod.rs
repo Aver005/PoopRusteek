@@ -606,6 +606,9 @@ impl LLMProvider for DeepseekProvider {
         // The remote thread already has the system prompt/history from
         // whatever session created it — resending it would duplicate context.
         state.system_sent_for_session = true;
+        // Какой промпт у той сессии, отсюда не узнать: первая отправка дошлёт текущий.
+        state.held_system_prompt = None;
+        state.pending_system_prompt = None;
         // How much that thread already holds is unknowable from here, so the
         // meter says so and callers fall back to the local history.
         state.session_tokens = None;
@@ -645,6 +648,7 @@ impl LLMProvider for DeepseekProvider {
 mod tests {
     use super::*;
     use crate::config::{ProviderConfig, ProviderKind};
+    use crate::provider::prompt::SystemDelivery;
 
     fn provider() -> DeepseekProvider {
         // Builds a reqwest client only — no network, no token needed.
@@ -770,6 +774,53 @@ mod tests {
         // Must be true — otherwise the next turn would resend the system
         // prompt + local history into a thread that already has them.
         assert!(s.system_sent_for_session);
+    }
+
+    fn plan(p: &DeepseekProvider, system_prompt: &str) -> SystemDelivery {
+        p.session_state
+            .lock()
+            .unwrap()
+            .plan_system_delivery(system_prompt)
+    }
+
+    /// Скилл включили посреди беседы: сервер держит старый промпт, и новый
+    /// уходит один раз. Тот же промпт не досылается повторно.
+    #[test]
+    fn a_changed_system_prompt_is_resent_once_the_server_holds_the_old_one() {
+        let p = provider();
+        p.session_state.lock().unwrap().session_id = Some("sess".to_string());
+        assert_eq!(plan(&p, "A"), SystemDelivery::Fresh);
+        p.mark_session_after_success("sess", Some(1)).unwrap();
+
+        assert_eq!(plan(&p, "A"), SystemDelivery::Held, "unchanged: tail only");
+        assert!(matches!(plan(&p, "B"), SystemDelivery::Changed(_)));
+        p.mark_session_after_success("sess", Some(2)).unwrap();
+        assert_eq!(plan(&p, "B"), SystemDelivery::Held, "delivered once");
+    }
+
+    /// Сервер не принял сообщение — значит, новой версии у него нет, и
+    /// следующая отправка обязана повторить её.
+    #[test]
+    fn an_unconfirmed_update_is_not_counted_as_delivered() {
+        let p = provider();
+        p.session_state.lock().unwrap().session_id = Some("sess".to_string());
+        plan(&p, "A");
+        p.mark_session_after_success("sess", Some(1)).unwrap();
+
+        assert!(matches!(plan(&p, "B"), SystemDelivery::Changed(_)));
+        // Отправка упала до ответа сервера: mark не вызывался.
+        assert!(matches!(plan(&p, "B"), SystemDelivery::Changed(_)));
+    }
+
+    /// У подхваченной сессии промпт неизвестен (скилл могли включить между
+    /// запусками): первая отправка досылает текущий, дальше он известен.
+    #[tokio::test]
+    async fn an_adopted_session_resends_the_prompt_once() {
+        let p = provider();
+        p.adopt_session("resumed", Some(17)).await.unwrap();
+        assert!(matches!(plan(&p, "A"), SystemDelivery::Changed(_)));
+        p.mark_session_after_success("resumed", Some(18)).unwrap();
+        assert_eq!(plan(&p, "A"), SystemDelivery::Held);
     }
 
     /// The counter's own arithmetic. The send path that feeds it needs the
