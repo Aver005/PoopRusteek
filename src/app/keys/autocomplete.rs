@@ -56,7 +56,8 @@ impl App {
                 && !self.state.focused_mut().generation.active
                 && self.state.modal.is_none()
             {
-                let cwd = std::env::current_dir().unwrap_or_default();
+                // От рабочей папки, как `@file` в тексте и `/attach`.
+                let cwd = self.state.workspace();
                 let search_path = if path_part.contains('/') || path_part.contains('\\') {
                     std::path::Path::new(path_part).to_path_buf()
                 } else {
@@ -175,36 +176,11 @@ impl App {
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = AutocompleteState::default();
             } else {
-                let resolved = if path.is_relative() {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    cwd.join(path)
-                } else {
-                    path.to_path_buf()
-                };
-                if resolved.is_file() {
-                    let display_name = resolved
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("file")
-                        .to_string();
-                    let meta = resolved.metadata().ok();
-                    let ext = resolved
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let is_image = matches!(
-                        ext.as_str(),
-                        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
-                    );
-                    self.state
-                        .attached_files
-                        .push(crate::provider::AttachedFile {
-                            display_name,
-                            path: resolved.to_string_lossy().to_string(),
-                            size: meta.map(|m| m.len()).unwrap_or(0),
-                            is_image,
-                        });
+                let workspace = self.state.workspace();
+                if let Ok(file) =
+                    crate::app::attachments::resolve(&path.to_string_lossy(), &workspace)
+                {
+                    self.state.attached_files.push(file);
                 }
                 let at_pos = self.state.input.buffer.rfind('@').unwrap_or(0);
                 let after_at = &self.state.input.buffer[at_pos + 1..];
@@ -217,7 +193,7 @@ impl App {
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = AutocompleteState::default();
                 self.state.status_message =
-                    format!("{} files attached", self.state.attached_files.len());
+                    crate::commands::defs::attach::attached_status(self.state.attached_files.len());
             }
         } else {
             let new_buf = format!("/{} ", suggestion.name);

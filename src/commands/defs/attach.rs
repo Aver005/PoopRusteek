@@ -1,7 +1,14 @@
 use crate::app::AppState;
 use crate::commands::{Command, CommandResult, with_args};
 use crate::config::Config;
-use crate::provider::AttachedFile;
+
+/// Строка статуса после прикрепления — общая с автодополнением `@`.
+pub fn attached_status(count: usize) -> String {
+    match count {
+        1 => "1 file attached".to_string(),
+        n => format!("{n} files attached"),
+    }
+}
 
 pub struct AttachCommand;
 
@@ -20,68 +27,20 @@ impl Command for AttachCommand {
 
     fn execute(&self, args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
         with_args(args, "/attach <path1> [path2] ...", |args| {
-            let paths = parse_paths(args);
-            let mut attached = 0u32;
-
-            for raw_path in &paths {
-                let path = std::path::Path::new(raw_path);
-                let resolved = if path.is_relative() {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    cwd.join(path)
-                } else {
-                    path.to_path_buf()
-                };
-
-                if !resolved.exists() {
-                    state.push_system(&format!("File not found: {raw_path}"));
-                    continue;
-                }
-                if !resolved.is_file() {
-                    state.push_system(&format!("Not a file: {raw_path}"));
-                    continue;
-                }
-
-                let metadata = match resolved.metadata() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        state.push_system(&format!("Cannot read {raw_path}: {e}"));
-                        continue;
+            let workspace = state.workspace();
+            let mut attached = false;
+            for raw_path in parse_paths(args) {
+                match crate::app::attachments::resolve(&raw_path, &workspace) {
+                    Ok(file) => {
+                        state.attached_files.push(file);
+                        attached = true;
                     }
-                };
-
-                let display_name = resolved
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(raw_path)
-                    .to_string();
-
-                let ext = resolved
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let is_image = matches!(
-                    ext.as_str(),
-                    "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
-                );
-
-                state.attached_files.push(AttachedFile {
-                    display_name,
-                    path: resolved.to_string_lossy().to_string(),
-                    size: metadata.len(),
-                    is_image,
-                });
-                attached += 1;
-            }
-
-            if attached > 0 {
-                if state.attached_files.len() == 1 {
-                    state.status_message = "1 file attached".to_string();
-                } else {
-                    state.status_message = format!("{} files attached", state.attached_files.len());
+                    Err(reason) => state.push_system(&reason),
                 }
             }
-
+            if attached {
+                state.status_message = attached_status(state.attached_files.len());
+            }
             CommandResult::Handled
         })
     }

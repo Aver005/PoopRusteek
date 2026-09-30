@@ -179,6 +179,43 @@ pub fn strip_verbatim(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Сколько байт начала файла смотреть, чтобы отличить текст от двоичного.
+const SNIFF_BYTES: u64 = 8 * 1024;
+
+/// Текст ли файл, по первым килобайтам: UTF-16 с BOM или UTF-8 без нулевых
+/// байт. Читать PDF на 50 МБ целиком, чтобы узнать, что он не текст, незачем.
+pub fn looks_like_text(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)?
+        .take(SNIFF_BYTES)
+        .read_to_end(&mut head)?;
+    if has_utf16_bom(&head) {
+        return Ok(true);
+    }
+    // Обрыв многобайтового символа на границе окна — ещё текст.
+    Ok(!head.contains(&0)
+        && std::str::from_utf8(&head).map_or_else(|e| e.error_len().is_none(), |_| true))
+}
+
+/// UTF-16 признаём только по BOM: догадка по парам байт в двоичном файле
+/// превратила бы PDF в мусорный «текст».
+fn has_utf16_bom(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])
+}
+
+/// Текстовый файл целиком; UTF-16 с BOM декодируется. Не-UTF-8 дальше окна
+/// [`looks_like_text`] — ошибка `InvalidData`, как у `read_to_string`.
+pub fn read_text(path: &std::path::Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    if has_utf16_bom(&bytes) {
+        return Ok(decode_process_output(&bytes).into_owned());
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    String::from_utf8(body.to_vec())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Expand a leading `~` or `~/` to the user's home directory. Plain `~foo`
 /// (other-user syntax) is returned unchanged. The single shared impl — do not
 /// hand-roll tilde handling at call sites (two past copies were both wrong).

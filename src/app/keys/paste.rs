@@ -30,6 +30,23 @@ fn sanitize(text: &str, allow_newline: bool) -> String {
 }
 
 impl App {
+    /// Брошенные файлы — чипами в поле ввода у курсора.
+    fn attach_dropped(&mut self, paths: &[std::path::PathBuf]) {
+        let workspace = self.state.workspace();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            match crate::app::attachments::resolve(&path.to_string_lossy(), &workspace) {
+                Ok(file) => files.push(file),
+                Err(reason) => self.state.push_system(&reason),
+            }
+        }
+        if files.is_empty() {
+            return;
+        }
+        self.state.status_message = crate::commands::defs::attach::attached_status(files.len());
+        self.state.input.insert_files(files);
+    }
+
     pub(crate) fn handle_paste(&mut self, text: String) {
         if text.is_empty() {
             return;
@@ -109,6 +126,12 @@ impl App {
             // (handled above); their base views are list navigation only.
             View::Providers | View::Mcp => {}
             _ => {
+                // Перетащенные мышью файлы: терминал вставляет их пути.
+                if let Some(paths) = crate::app::dropped_paths::parse(&text) {
+                    self.attach_dropped(&paths);
+                    self.refresh_autocomplete();
+                    return;
+                }
                 // Chat prompt (the default view). A multi-line paste collapses
                 // to a `[Pasted #N, L lines]` chip so a big block neither floods
                 // the prompt nor (with the newlines now off in stored content)

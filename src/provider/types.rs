@@ -390,69 +390,37 @@ pub struct DeleteSessionRequest {
 
 // ─── File ──────────────────────────────────────────────────────
 
-// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
-// `rename_all`); renaming the variants would change what's serialized.
-#[expect(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Статус разбора загруженного файла. Снято с клиента 2.5.0: `PENDING` →
+/// `SUCCESS`; прочие значения не видели, поэтому незнакомое не ломает разбор.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FileStatus {
-    PENDING,
-    SUCCESS,
-    FAILED,
+    Pending,
+    Success,
+    Failed,
+    #[serde(other)]
+    Unknown,
 }
 
-// wire format — names must match the API JSON (SCREAMING_SNAKE_CASE via
-// `rename_all`); renaming the variants would change what's serialized.
-#[expect(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ModelKind {
-    NORMAL,
-    R1,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Файл из `file/upload_file` и `file/fetch_files`. Только читаемые поля:
+/// остальные (`model_kind`, дробные `inserted_at`) менялись и ломали разбор.
+#[derive(Debug, Clone, Deserialize)]
 pub struct UploadedFile {
     pub id: FileId,
     pub status: FileStatus,
+    #[serde(default)]
     pub file_name: String,
-    pub from_share: bool,
-    pub file_size: i64,
-    pub model_kind: ModelKind,
     #[serde(default)]
     pub token_usage: Option<i64>,
+    /// Число при отказе (живой ответ 2026-09-30: `40000` на битый PDF); строку
+    /// тоже принимаем. `null` — ошибки нет.
     #[serde(default)]
-    pub error_code: Option<String>,
-    pub inserted_at: i64,
-    pub updated_at: i64,
-    pub is_image: bool,
-    #[serde(default)]
-    pub audit_result: Option<serde_json::Value>,
+    pub error_code: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FetchedFile {
-    pub id: FileId,
-    pub status: FileStatus,
-    pub file_name: String,
-    pub from_share: bool,
-    pub file_size: i64,
-    pub model_kind: ModelKind,
-    #[serde(default)]
-    pub token_usage: Option<i64>,
-    #[serde(default)]
-    pub error_code: Option<String>,
-    pub inserted_at: i64,
-    pub updated_at: i64,
-    pub is_image: bool,
-    #[serde(default)]
-    pub audit_result: Option<serde_json::Value>,
-    pub signed_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FetchFilesData {
-    pub files: Vec<FetchedFile>,
+    pub files: Vec<UploadedFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

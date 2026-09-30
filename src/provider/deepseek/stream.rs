@@ -20,7 +20,13 @@ const CONTINUE_URL: &str = "https://chat.deepseek.com/api/v0/chat/continue";
 /// него оболочку сайта с 200 OK, а не 404, — живая замена рядом и берёт
 /// сессию параметром запроса.
 const SESSION_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
-const TARGET_PATH: &str = "/api/v0/chat/completion";
+const ORIGIN: &str = "https://chat.deepseek.com";
+
+/// Путь, на который выписывается PoW: подпись задачи включает его, и решение
+/// для `chat/completion` сервер на `file/upload_file` не примет.
+pub(super) fn pow_target_path(url: &str) -> &str {
+    url.strip_prefix(ORIGIN).unwrap_or(url)
+}
 
 const COMPLETION_REFUSED: &str = "Chat completion refused";
 
@@ -38,15 +44,27 @@ pub(super) fn refusal_in_line(line: &str) -> Option<String> {
     api_refusal(&payload).map(|refusal| refusal.message().to_string())
 }
 
+/// Пути вложений по порядку, без повторов: один файл дважды — одна загрузка.
+fn attachment_paths(messages: &[ChatMessage]) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for path in messages.iter().flat_map(|m| &m.attachments) {
+        if !paths.contains(path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
 pub(super) enum PathSegment<'a> {
     Key(&'a str),
     Index(usize),
 }
 
 impl DeepseekProvider {
-    pub(super) async fn get_chat_headers(&self) -> AppResult<reqwest::header::HeaderMap> {
+    /// Обычные заголовки плюс решённый PoW для запроса на `url`.
+    pub(super) async fn pow_headers(&self, url: &str) -> AppResult<reqwest::header::HeaderMap> {
         let mut headers = self.auth_headers()?;
-        let pow_b64 = self.solve_pow_challenge().await?;
+        let pow_b64 = self.solve_pow_challenge(pow_target_path(url)).await?;
         headers.insert(
             "x-ds-pow-response",
             HeaderValue::from_str(&pow_b64).map_err(|e| AppError::Provider(e.to_string()))?,
@@ -54,8 +72,8 @@ impl DeepseekProvider {
         Ok(headers)
     }
 
-    pub(super) async fn solve_pow_challenge(&self) -> AppResult<String> {
-        let body = json!({ "target_path": TARGET_PATH });
+    async fn solve_pow_challenge(&self, target_path: &str) -> AppResult<String> {
+        let body = json!({ "target_path": target_path });
         let headers = self.auth_headers()?;
         let response = self
             .send_json_request("pow.challenge.request", CREATE_POW_URL, &headers, &body)
@@ -158,6 +176,7 @@ impl DeepseekProvider {
         request: &CompletionRequest,
         prompt: String,
         session: &super::session::SessionSnapshot,
+        ref_file_ids: &[String],
     ) -> Value {
         let mode = super::mode::DeepseekMode::from_model(&request.model);
 
@@ -168,7 +187,7 @@ impl DeepseekProvider {
             "stream": true,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
-            "ref_file_ids": [],
+            "ref_file_ids": ref_file_ids,
             "thinking_enabled": mode.thinking,
             "search_enabled": mode.search,
             "chat_session_id": session.session_id,
@@ -179,8 +198,10 @@ impl DeepseekProvider {
     pub(super) async fn send_request(
         &self,
         request: &CompletionRequest,
+        heartbeat: &mut (dyn FnMut() + Send),
     ) -> AppResult<(Response, String)> {
-        let (system_prompt, non_system_messages) = prompt::split_system_prompt(&request.messages);
+        let (system_prompt, mut non_system_messages) =
+            prompt::split_system_prompt(&request.messages);
         let should_reset = {
             let state = self.session()?;
             state.system_sent_for_session
@@ -190,11 +211,25 @@ impl DeepseekProvider {
         let session = self.ensure_session(should_reset).await?;
         let delivery = self.session()?.plan_system_delivery(&system_prompt);
         let delivery_trace = format!("{delivery:?}");
+        let attached = self
+            .attach_files(
+                &attachment_paths(prompt::tail(&non_system_messages)),
+                heartbeat,
+            )
+            .await;
+        if let Some(note) = attached.failure_note() {
+            non_system_messages.push(ChatMessage::system(&note));
+        }
+        let files = attached.ready;
+        let ref_file_ids: Vec<String> = files.iter().map(|f| f.id.clone()).collect();
         let prompt = prompt::build_prompt(&non_system_messages, &system_prompt, delivery);
         // Counted from the prompt that is really sent — for a continuing
-        // session that is only the tail, not the whole local history.
-        let prompt_tokens = crate::context::budget_tokens(&prompt);
-        let body = self.build_body(request, prompt, &session);
+        // session that is only the tail, not the whole local history. Файлы
+        // сервер считает сам, и они ложатся в тот же контекст.
+        let prompt_tokens = crate::context::budget_tokens(&prompt).saturating_add(
+            crate::context::budget_tokens_for_counted(files.iter().map(|f| f.tokens).sum()),
+        );
+        let body = self.build_body(request, prompt, &session, &ref_file_ids);
         debug_log::log_json(
             "completion.context",
             &json!({
@@ -207,11 +242,12 @@ impl DeepseekProvider {
                 "parent_message_id": session.parent_message_id,
                 "system_sent_for_session": session.system_sent_for_session,
                 "system_delivery": delivery_trace,
+                "ref_file_ids": ref_file_ids,
                 "should_reset": should_reset,
                 "prompt_preview": body["prompt"],
             }),
         );
-        let headers = self.get_chat_headers().await?;
+        let headers = self.pow_headers(COMPLETION_URL).await?;
 
         let response = self
             .send_json_request("completion.request", COMPLETION_URL, &headers, &body)
@@ -1241,5 +1277,56 @@ mod tests {
                 .unwrap();
         assert!(url.path().ends_with("/chat/history_messages"), "{url}");
         assert_eq!(url.query(), Some("chat_session_id=a+b%26c"), "{url}");
+    }
+
+    fn with_files(role: ChatMessage, files: &[&str]) -> ChatMessage {
+        ChatMessage {
+            attachments: files.iter().map(|f| f.to_string()).collect(),
+            ..role
+        }
+    }
+
+    /// Прикладываются файлы только нового ввода и без повторов: старое
+    /// сообщение с пропавшим файлом не должно валить каждую отправку.
+    #[test]
+    fn only_tail_attachments_are_uploaded_once_each() {
+        let messages = vec![
+            with_files(ChatMessage::user("old"), &["old.pdf"]),
+            ChatMessage::assistant("a"),
+            with_files(ChatMessage::user("new"), &["a.pdf", "b.png", "a.pdf"]),
+        ];
+        let paths = attachment_paths(crate::provider::prompt::tail(&messages));
+        assert_eq!(paths, vec!["a.pdf".to_string(), "b.png".to_string()]);
+    }
+
+    /// Подпись PoW включает путь: для загрузки нужен её собственный.
+    #[test]
+    fn pow_is_issued_for_the_endpoint_path() {
+        assert_eq!(pow_target_path(COMPLETION_URL), "/api/v0/chat/completion");
+        assert_eq!(
+            pow_target_path("https://chat.deepseek.com/api/v0/file/upload_file"),
+            "/api/v0/file/upload_file"
+        );
+    }
+
+    #[test]
+    fn uploaded_ids_ride_in_ref_file_ids() {
+        let provider = DeepseekProvider::new(&crate::config::ProviderConfig::default(), 0, 0, 0)
+            .expect("provider builds offline");
+        let request = CompletionRequest {
+            messages: Vec::new(),
+            tools: Vec::new(),
+            model: "deepseek-chat".to_string(),
+            temperature: 0.7,
+            max_tokens: 100,
+            stream: true,
+        };
+        let session = super::super::session::SessionSnapshot {
+            session_id: "s".to_string(),
+            parent_message_id: None,
+            system_sent_for_session: false,
+        };
+        let body = provider.build_body(&request, "hi".to_string(), &session, &["file-1".into()]);
+        assert_eq!(body["ref_file_ids"], serde_json::json!(["file-1"]));
     }
 }

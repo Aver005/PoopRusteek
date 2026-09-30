@@ -128,6 +128,8 @@ across the whole run, not per turn. `timeout` is likewise one budget for the
 whole run, not one per turn, so a stalled turn 1 fails the run instead of
 quietly eating three turns' worth of wall clock.
 
+`exec --attach <file>` (repeatable) attaches files to the **first** prompt exactly as `/attach` does in the TUI (`app::attachments::user_message`); relative paths resolve against `--workspace`, a missing file is `SetupFailed`. Binary files are uploaded by the DeepSeek provider — the trace shows `file.uploaded`/`file.ready`/`file.attach_failed` and `ref_file_ids` in `completion.context`.
+
 Under the hood, `exec`'s positional argument is `ExecArgs.prompts: Vec<String>`
 (clap `num_args = 1..`) — `pooprusteek exec "one" "two" "three"` runs three
 turns. The child command line puts every flag first and every prompt last,

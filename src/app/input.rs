@@ -21,6 +21,14 @@ pub struct PasteChunk {
     pub content: String,
 }
 
+/// Файлы, брошенные в поле ввода: в тексте — чип с именем, полные пути — здесь.
+#[derive(Debug, Clone)]
+pub struct FileChip {
+    /// Чип в буфере: `[📎 report.pdf]` или `[📎 7 files]`.
+    pub placeholder: String,
+    pub files: Vec<crate::provider::AttachedFile>,
+}
+
 /// Editable state of the prompt input line.
 #[derive(Debug, Default, Clone)]
 pub struct InputState {
@@ -40,6 +48,10 @@ pub struct InputState {
     pub pastes: Vec<PasteChunk>,
     /// Monotonic id for the next paste chip (never reused within a draft).
     pub next_paste_id: usize,
+    /// Файловые чипы черновика; в счёт идут только те, что ещё есть в тексте.
+    pub file_chips: Vec<FileChip>,
+    /// Чипы черновика, отложенные вместе с `unsent` на время листания истории.
+    unsent_chips: Box<(Vec<PasteChunk>, Vec<FileChip>)>,
 }
 
 impl InputState {
@@ -57,25 +69,69 @@ impl InputState {
     }
 
     /// Delete the active selection, if any. Returns whether anything was removed.
+    /// Задетый выделением чип уходит целиком: огрызок не был бы ни текстом, ни файлом.
     pub fn delete_selection(&mut self) -> bool {
         let Some(anchor) = self.selection_anchor.take() else {
             return false;
         };
-        let (start, end) = if anchor <= self.cursor {
+        let (mut start, mut end) = if anchor <= self.cursor {
             (anchor, self.cursor)
         } else {
             (self.cursor, anchor)
         };
+        for (chip_start, chip_end) in self.chip_spans() {
+            if chip_start < end && chip_end > start {
+                start = start.min(chip_start);
+                end = end.max(chip_end);
+            }
+        }
+        self.cursor = end;
+        self.remove_chars(start, end);
+        true
+    }
+
+    /// Места чипов в буфере — индексы знаков, конец не включён.
+    fn chip_spans(&self) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        for placeholder in self.chip_placeholders() {
+            for (byte, _) in self.buffer.match_indices(placeholder) {
+                let start = self.buffer[..byte].chars().count();
+                spans.push((start, start + placeholder.chars().count()));
+            }
+        }
+        spans
+    }
+
+    /// Чип, внутри которого (не на краю) стоит `pos`.
+    fn chip_around(&self, pos: usize) -> Option<(usize, usize)> {
+        self.chip_spans()
+            .into_iter()
+            .find(|&(start, end)| start < pos && pos < end)
+    }
+
+    /// Убрать знаки `start..end`, сдвинув курсор так, будто их не было.
+    fn remove_chars(&mut self, start: usize, end: usize) {
         let bs = char_to_byte_pos(&self.buffer, start);
         let be = char_to_byte_pos(&self.buffer, end);
         self.buffer.drain(bs..be);
-        self.cursor = start;
-        true
+        if self.cursor >= end {
+            self.cursor -= end - start;
+        } else if self.cursor > start {
+            self.cursor = start;
+        }
+    }
+
+    /// Курсор внутри чипа — на его конец: ввод внутрь чипа сломал бы его.
+    fn leave_chip(&mut self) {
+        if let Some((_, end)) = self.chip_around(self.cursor) {
+            self.cursor = end;
+        }
     }
 
     /// Insert a character at the cursor, replacing any selection first.
     pub fn insert_char(&mut self, c: char) {
         self.delete_selection();
+        self.leave_chip();
         let byte_pos = char_to_byte_pos(&self.buffer, self.cursor);
         self.buffer.insert(byte_pos, c);
         self.cursor += 1;
@@ -92,6 +148,7 @@ impl InputState {
             return;
         }
         self.delete_selection();
+        self.leave_chip();
         let byte_pos = char_to_byte_pos(&self.buffer, self.cursor);
         self.buffer.insert_str(byte_pos, s);
         self.cursor += s.chars().count();
@@ -127,6 +184,104 @@ impl InputState {
         out
     }
 
+    /// Вставить файлы чипами: до пяти на сообщение — по чипу на файл, больше —
+    /// один чип-счётчик, в который сливаются и уже стоящие чипы.
+    pub fn insert_files(&mut self, mut files: Vec<crate::provider::AttachedFile>) {
+        let present = self.chip_files();
+        if present.len() + files.len() > crate::app::attachments::MAX_LISTED_NAMES
+            && !present.is_empty()
+        {
+            for (start, end) in self.file_chip_spans().into_iter().rev() {
+                let with_space = self.buffer.chars().nth(end) == Some(' ');
+                self.remove_chars(start, end + usize::from(with_space));
+            }
+            self.file_chips.clear();
+            files.splice(0..0, present);
+        }
+        let groups = if files.len() > crate::app::attachments::MAX_LISTED_NAMES {
+            vec![files]
+        } else {
+            files.into_iter().map(|file| vec![file]).collect()
+        };
+        for files in groups {
+            let label = match files.as_slice() {
+                [one] => one.display_name.clone(),
+                many => format!("{} files", many.len()),
+            };
+            let placeholder = self.unique_placeholder(&label);
+            self.insert_str(&format!("{placeholder} "));
+            self.file_chips.push(FileChip { placeholder, files });
+        }
+    }
+
+    /// `[📎 a.pdf]`, а при совпадении — `[📎 a.pdf #2]`: иначе стёртый чип
+    /// одного файла тянул бы за собой одноимённый другой.
+    fn unique_placeholder(&self, label: &str) -> String {
+        // Занята и та метка, что уже стоит в тексте (например, из истории).
+        let taken = |candidate: &str| {
+            self.buffer.contains(candidate)
+                || self.file_chips.iter().any(|c| c.placeholder == candidate)
+        };
+        let base = format!("[📎 {label}]");
+        if !taken(&base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("[📎 {label} #{n}]"))
+            .find(|candidate| !taken(candidate))
+            .unwrap_or(base)
+    }
+
+    /// Места файловых чипов по порядку в тексте.
+    fn file_chip_spans(&self) -> Vec<(usize, usize)> {
+        let mut spans: Vec<(usize, usize)> = self
+            .file_chips
+            .iter()
+            .flat_map(|chip| {
+                self.buffer
+                    .match_indices(chip.placeholder.as_str())
+                    .map(|(byte, _)| {
+                        let start = self.buffer[..byte].chars().count();
+                        (start, start + chip.placeholder.chars().count())
+                    })
+            })
+            .collect();
+        spans.sort_unstable();
+        spans
+    }
+
+    /// `text` с файловыми чипами, заменёнными полными путями в кавычках: для
+    /// команды (`/attach x [📎 a.pdf]`) и цели чип — это путь.
+    pub fn with_chip_paths(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for chip in &self.file_chips {
+            let paths: Vec<String> = chip
+                .files
+                .iter()
+                .map(|f| format!("\"{}\"", f.path))
+                .collect();
+            out = out.replace(&chip.placeholder, &paths.join(" "));
+        }
+        out
+    }
+
+    /// Файлы чипов, которые ещё стоят в тексте.
+    pub fn chip_files(&self) -> Vec<crate::provider::AttachedFile> {
+        self.file_chips
+            .iter()
+            .filter(|chip| self.buffer.contains(&chip.placeholder))
+            .flat_map(|chip| chip.files.iter().cloned())
+            .collect()
+    }
+
+    /// Все чипы черновика — вставки и файлы; Backspace и Delete стирают их целиком.
+    fn chip_placeholders(&self) -> impl Iterator<Item = &str> {
+        self.pastes
+            .iter()
+            .map(|p| p.placeholder.as_str())
+            .chain(self.file_chips.iter().map(|c| c.placeholder.as_str()))
+    }
+
     /// Reset the editable buffer (text, cursor, selection, paste chips) without
     /// touching recall history. Called after a submit and on history recall,
     /// where a fresh buffer replaces the draft.
@@ -135,11 +290,13 @@ impl InputState {
         self.cursor = 0;
         self.selection_anchor = None;
         self.pastes.clear();
+        self.file_chips.clear();
     }
 
     /// Insert a newline at the cursor, replacing any selection first.
     pub fn insert_newline(&mut self) {
         self.delete_selection();
+        self.leave_chip();
         let byte_pos = char_to_byte_pos(&self.buffer, self.cursor);
         self.buffer.insert(byte_pos, '\n');
         self.cursor += 1;
@@ -147,9 +304,25 @@ impl InputState {
     }
 
     /// Delete the character before the cursor, or the selection if there is one.
+    /// Чип стирается целиком: огрызок `[📎 repo` был бы и не текстом, и не файлом.
     pub fn backspace(&mut self) {
         if self.selection_anchor.is_some() {
             self.delete_selection();
+            return;
+        }
+        if let Some((start, end)) = self.chip_around(self.cursor) {
+            self.remove_chars(start, end);
+            return;
+        }
+        let at = char_to_byte_pos(&self.buffer, self.cursor);
+        let chip = self
+            .chip_placeholders()
+            .find(|p| self.buffer[..at].ends_with(p))
+            .map(str::len);
+        if let Some(len) = chip {
+            let removed = self.buffer[at - len..at].chars().count();
+            self.buffer.replace_range(at - len..at, "");
+            self.cursor -= removed;
             return;
         }
         let char_count = self.char_count();
@@ -166,6 +339,19 @@ impl InputState {
     pub fn delete_forward(&mut self) {
         if self.selection_anchor.is_some() {
             self.delete_selection();
+            return;
+        }
+        if let Some((start, end)) = self.chip_around(self.cursor) {
+            self.remove_chars(start, end);
+            return;
+        }
+        let at = char_to_byte_pos(&self.buffer, self.cursor);
+        let chip = self
+            .chip_placeholders()
+            .find(|p| self.buffer[at..].starts_with(p))
+            .map(str::len);
+        if let Some(len) = chip {
+            self.buffer.replace_range(at..at + len, "");
             return;
         }
         if self.cursor < self.char_count() {
@@ -185,6 +371,10 @@ impl InputState {
         } else {
             clamped.saturating_sub(1)
         };
+        // Чип проходится одним шагом: встать внутрь него нельзя.
+        if let Some((start, _)) = self.chip_around(self.cursor) {
+            self.cursor = start;
+        }
     }
 
     /// Move the cursor right by one character, or one word when `word` is set.
@@ -198,6 +388,9 @@ impl InputState {
         } else {
             self.cursor
         };
+        if let Some((_, end)) = self.chip_around(self.cursor) {
+            self.cursor = end;
+        }
     }
 
     /// Move the cursor to the start of the buffer.
@@ -218,6 +411,14 @@ impl InputState {
         self.cursor = self.char_count();
     }
 
+    /// Выйти из листания истории после отправки: отложенный черновик устарел,
+    /// и Ctrl+↓ не должен вернуть его вместе со старыми файлами.
+    pub fn end_recall(&mut self) {
+        self.history_index = None;
+        self.unsent.clear();
+        *self.unsent_chips = Default::default();
+    }
+
     /// Recall the previous (older) history entry. On first recall the current
     /// buffer is stashed in `unsent`.
     pub fn history_prev(&mut self) {
@@ -227,6 +428,12 @@ impl InputState {
         let idx = match self.history_index {
             None => {
                 self.unsent = self.buffer.clone();
+                // Чипы черновика ждут возврата: текст из истории с таким же
+                // `[📎 a.pdf]` не должен подхватить чужой файл.
+                *self.unsent_chips = (
+                    std::mem::take(&mut self.pastes),
+                    std::mem::take(&mut self.file_chips),
+                );
                 Some(self.history.len() - 1)
             }
             Some(i) if i > 0 => Some(i - 1),
@@ -237,6 +444,8 @@ impl InputState {
             self.cursor = self.char_count();
             self.selection_anchor = None;
             self.pastes.clear();
+            // Брошенное поверх записи из истории к соседней записи не переезжает.
+            self.file_chips.clear();
             self.history_index = Some(i);
         }
     }
@@ -255,6 +464,9 @@ impl InputState {
                 self.buffer = std::mem::take(&mut self.unsent);
                 self.cursor = self.char_count();
                 self.history_index = None;
+                (self.pastes, self.file_chips) = *std::mem::take(&mut self.unsent_chips);
+                self.selection_anchor = None;
+                return;
             }
         }
         self.selection_anchor = None;
@@ -539,5 +751,200 @@ mod tests {
         s.history_prev();
         assert_eq!(s.buffer, "x");
         assert_eq!(s.history_index, None);
+    }
+
+    fn attached(name: &str) -> crate::provider::AttachedFile {
+        crate::provider::AttachedFile {
+            display_name: name.to_string(),
+            path: format!("/docs/{name}"),
+            size: 1,
+            is_image: false,
+        }
+    }
+
+    /// До пяти файлов — по чипу с именем; в тексте только имена, пути — в чипах.
+    #[test]
+    fn dropped_files_become_one_chip_each() {
+        let mut s = InputState::default();
+        s.insert_str("see ");
+        s.insert_files(vec![attached("a.pdf"), attached("b.png")]);
+        assert_eq!(s.buffer, "see [📎 a.pdf] [📎 b.png] ");
+        let paths: Vec<String> = s.chip_files().into_iter().map(|f| f.path).collect();
+        assert_eq!(paths, vec!["/docs/a.pdf", "/docs/b.png"]);
+    }
+
+    #[test]
+    fn more_than_five_dropped_files_become_one_counter_chip() {
+        let mut s = InputState::default();
+        s.insert_files((0..7).map(|i| attached(&format!("{i}.png"))).collect());
+        assert_eq!(s.buffer, "[📎 7 files] ");
+        assert_eq!(s.chip_files().len(), 7);
+    }
+
+    /// Backspace после чипа и Delete перед ним стирают его целиком, и файл
+    /// больше не уходит; обычный текст стирается по знаку, как раньше.
+    #[test]
+    fn a_chip_is_deleted_whole_and_its_files_drop_out() {
+        let mut s = InputState::default();
+        s.insert_files(vec![attached("a.pdf")]);
+        s.backspace(); // пробел после чипа
+        s.backspace(); // сам чип
+        assert_eq!(s.buffer, "");
+        assert!(s.chip_files().is_empty());
+
+        let mut s = InputState::default();
+        s.insert_files(vec![attached("a.pdf")]);
+        s.insert_str("tail");
+        s.move_home(false);
+        s.delete_forward();
+        assert_eq!(s.buffer, " tail");
+        s.move_end(false);
+        s.backspace();
+        assert_eq!(s.buffer, " tai", "plain text still goes one char at a time");
+    }
+
+    /// Одноимённые файлы из разных папок получают разные чипы: стёртый
+    /// один не тянет за собой другой.
+    #[test]
+    fn same_named_files_get_distinct_chips() {
+        let mut s = InputState::default();
+        let mut other = attached("a.pdf");
+        other.path = "/other/a.pdf".to_string();
+        s.insert_files(vec![attached("a.pdf"), other]);
+        assert_eq!(s.buffer, "[📎 a.pdf] [📎 a.pdf #2] ");
+        s.backspace();
+        s.backspace();
+        let paths: Vec<String> = s.chip_files().into_iter().map(|f| f.path).collect();
+        assert_eq!(paths, vec!["/docs/a.pdf"]);
+    }
+
+    #[test]
+    fn a_paste_chip_is_also_deleted_whole() {
+        let mut s = InputState::default();
+        s.insert_paste(
+            "one
+two"
+            .to_string(),
+        );
+        s.backspace();
+        assert_eq!(s.buffer, "");
+    }
+
+    /// Стрелка проходит чип одним шагом, а ввод никогда не попадает внутрь.
+    #[test]
+    fn the_cursor_never_stops_inside_a_chip() {
+        let mut s = InputState::default();
+        s.insert_str("я ");
+        s.insert_files(vec![attached("a.pdf")]);
+        s.move_left(false, false); // с конца: пробел
+        s.move_left(false, false); // через весь чип
+        assert_eq!(s.cursor, 2);
+        s.move_right(false, false);
+        assert_eq!(s.cursor, 2 + "[📎 a.pdf]".chars().count());
+        s.cursor = 4; // как если бы курсор поставили внутрь
+        s.insert_char('x');
+        assert!(s.buffer.contains("[📎 a.pdf]x"), "{}", s.buffer);
+        assert_eq!(s.chip_files().len(), 1);
+    }
+
+    /// Выделение, задевшее край чипа, стирает его целиком; Backspace внутри —
+    /// тоже целиком, после многобайтового текста курсор не съезжает.
+    #[test]
+    fn a_partial_selection_or_backspace_inside_removes_the_whole_chip() {
+        let mut s = InputState::default();
+        s.insert_str("привет ");
+        s.insert_files(vec![attached("a.pdf")]);
+        s.insert_str("пока");
+        s.selection_anchor = Some(9); // внутри чипа
+        s.cursor = s.buffer.chars().count() - 2;
+        s.delete_selection();
+        assert_eq!(s.buffer, "привет ка");
+        assert!(s.chip_files().is_empty());
+
+        let mut s = InputState::default();
+        s.insert_str("привет ");
+        s.insert_files(vec![attached("a.pdf")]);
+        s.cursor = 10;
+        s.backspace();
+        assert_eq!(s.buffer, "привет  ");
+        assert_eq!(s.cursor, 7);
+    }
+
+    /// Листание истории не теряет чипы черновика и не приписывает их файл
+    /// тексту из истории с таким же `[📎 a.pdf]`.
+    #[test]
+    fn history_recall_keeps_draft_chips_aside() {
+        let mut s = InputState {
+            history: vec!["old [📎 a.pdf]".to_string()],
+            ..InputState::default()
+        };
+        s.insert_files(vec![attached("a.pdf")]);
+        s.history_prev();
+        assert_eq!(s.buffer, "old [📎 a.pdf]");
+        assert!(s.chip_files().is_empty(), "recalled text owns no file");
+        s.history_next();
+        assert_eq!(s.chip_files().len(), 1, "the draft chip is back");
+    }
+
+    /// Счётчик — на сообщение: вторая порция, перевалившая за пять, сливается
+    /// с уже стоящими чипами в один.
+    #[test]
+    fn a_second_drop_past_five_merges_into_one_counter() {
+        let mut s = InputState::default();
+        s.insert_str("see ");
+        s.insert_files((0..3).map(|i| attached(&format!("{i}.png"))).collect());
+        s.insert_files((3..6).map(|i| attached(&format!("{i}.png"))).collect());
+        assert_eq!(s.buffer, "see [📎 6 files] ");
+        assert_eq!(s.chip_files().len(), 6);
+    }
+
+    /// Команде чип отдаётся путём в кавычках: `/attach x [📎 a.pdf]` работает.
+    #[test]
+    fn a_command_sees_chips_as_quoted_paths() {
+        let mut s = InputState::default();
+        s.insert_str("/attach ");
+        s.insert_files(vec![attached("a.pdf")]);
+        assert_eq!(
+            s.with_chip_paths(s.buffer.trim()),
+            "/attach \"/docs/a.pdf\""
+        );
+    }
+
+    /// Файл, брошенный поверх записи из истории, к соседней записи не переезжает,
+    /// а после отправки Ctrl+Down не возвращает старый черновик.
+    #[test]
+    fn history_does_not_leak_chips_between_entries_or_after_submit() {
+        let mut s = InputState {
+            history: vec!["one [📎 a.pdf]".to_string(), "two [📎 a.pdf]".to_string()],
+            ..InputState::default()
+        };
+        s.history_prev();
+        s.insert_files(vec![attached("a.pdf")]);
+        s.history_prev();
+        assert_eq!(s.buffer, "one [📎 a.pdf]");
+        assert!(s.chip_files().is_empty());
+
+        let mut s = InputState::default();
+        s.history.push("old".to_string());
+        s.insert_files(vec![attached("draft.pdf")]);
+        s.history_prev();
+        s.clear_buffer();
+        s.end_recall();
+        s.history_next();
+        assert_eq!(s.buffer, "");
+        assert!(
+            s.chip_files().is_empty(),
+            "the stale draft chip must not return"
+        );
+    }
+
+    #[test]
+    fn a_newline_never_splits_a_chip() {
+        let mut s = InputState::default();
+        s.insert_files(vec![attached("a.pdf")]);
+        s.cursor = 3;
+        s.insert_newline();
+        assert!(s.buffer.starts_with("[📎 a.pdf]\n"), "{:?}", s.buffer);
+        assert_eq!(s.chip_files().len(), 1);
     }
 }

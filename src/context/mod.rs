@@ -24,6 +24,9 @@ pub const PRUNE_TRIGGER_PERCENT: u8 = 70;
 pub const SESSION_RESET_PERCENT: u8 = 90;
 mod tool_output;
 
-pub use budget::{ContextBudget, budget_tokens, budget_tokens_for_chars, conversation_tokens};
+pub use budget::{
+    ContextBudget, budget_tokens, budget_tokens_for_chars, budget_tokens_for_counted,
+    conversation_tokens,
+};
 pub use spec::ContextSpec;
 pub use tool_output::cap_tool_output;

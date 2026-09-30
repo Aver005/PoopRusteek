@@ -126,6 +126,11 @@ pub struct ExecArgs {
     #[arg(long)]
     pub system_append: Option<PathBuf>,
 
+    /// File attached to the first prompt, exactly as `/attach` in the TUI does
+    /// it (text inline, PDF/images uploaded by a provider that can). Repeatable.
+    #[arg(long = "attach")]
+    pub attach: Vec<PathBuf>,
+
     /// Connect configured MCP servers first (slow, and depends on hosts
     /// outside the sandbox).
     #[arg(long)]
@@ -284,6 +289,7 @@ async fn exec(args: ExecArgs, config: Config) -> AppResult<i32> {
         save_session: args.save_session,
         resume: args.resume,
         system_append: args.system_append.clone(),
+        attach: args.attach,
         context: driver::ContextOverrides {
             window: args.context_window,
             reserved_tokens: args.context_reserved_tokens,

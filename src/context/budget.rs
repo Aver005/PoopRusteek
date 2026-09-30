@@ -20,6 +20,12 @@ pub fn budget_tokens_for_chars(chars: usize) -> u32 {
     (chars.min(u32::MAX as usize) as u32).div_ceil(CHARS_PER_TOKEN)
 }
 
+/// Точный счёт провайдера (токены вложения у DeepSeek) в той же завышенной
+/// шкале: ~4 знака на токен туда, [`CHARS_PER_TOKEN`] обратно.
+pub fn budget_tokens_for_counted(tokens: u32) -> u32 {
+    budget_tokens_for_chars(tokens as usize * 4)
+}
+
 /// What the whole conversation costs on the wire. `ui_only` messages are
 /// excluded because they never reach the provider. O(n) over every message —
 /// keep it off the event loop on long histories (invariant 9).

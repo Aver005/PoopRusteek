@@ -51,7 +51,23 @@ fn format_history_message(message: &ChatMessage) -> String {
         Role::Assistant => "ASSISTANT",
         Role::Tool => "TOOL",
     };
-    format!("[{role}]\n{}", message.content)
+    format!(
+        "[{role}]\n{}{}",
+        message.content,
+        lost_attachments_note(message)
+    )
+}
+
+/// Вложения из пересылаемой истории заново не грузятся ([`tail`]), и модель
+/// должна знать, что их содержимого в этой сессии нет — есть только пути.
+fn lost_attachments_note(message: &ChatMessage) -> String {
+    if message.attachments.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n(Содержимое вложений этого сообщения в новую сессию не перенесено: {}. Если оно нужно, попроси приложить файлы снова.)",
+        message.attachments.join(", ")
+    )
 }
 
 /// Trailing one-line format anchor appended to every non-empty send. The
@@ -168,6 +184,12 @@ fn update_header(changes: &FileChanges) -> String {
         .chain(changes.describe())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Новый ввод — всё после последнего ответа модели. Вложения едут только с ним:
+/// старые файлы при пересылке истории не грузятся заново (пропавший ронял бы ход).
+pub(crate) fn tail(messages: &[ChatMessage]) -> &[ChatMessage] {
+    &messages[tail_start(messages)..]
 }
 
 /// Index where the "new input" tail begins: everything after the last
@@ -543,5 +565,22 @@ mod tests {
         let prompt = build_prompt(&messages, "", SystemDelivery::Fresh);
         assert!(prompt.contains("[...]"));
         assert!(!prompt.contains(&"x".repeat(400)));
+    }
+
+    /// Новая сессия пересылает историю текстом, а старые вложения заново не
+    /// грузятся — модель узнаёт об этом из пометки у сообщения.
+    #[test]
+    fn replayed_history_says_old_attachments_did_not_travel() {
+        let old = ChatMessage {
+            attachments: vec!["C:/docs/scan.pdf".to_string()],
+            ..ChatMessage::user("see the scan")
+        };
+        let messages = vec![old, ChatMessage::assistant("ok"), ChatMessage::user("now")];
+        let prompt = build_prompt(&messages, "SYS", SystemDelivery::Fresh);
+        assert!(
+            prompt.contains("не перенесено: C:/docs/scan.pdf"),
+            "{prompt}"
+        );
+        assert_eq!(tail(&messages).len(), 1, "only the new input carries files");
     }
 }

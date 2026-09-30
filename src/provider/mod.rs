@@ -104,6 +104,10 @@ pub struct ChatMessage {
     /// объявивших их вызовов.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Полные пути двоичных файлов (PDF, картинки), которые провайдер
+    /// прикладывает сам: текст из них извлекает сервер ([`LLMProvider::accepts_attachment`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +153,7 @@ impl ChatMessage {
             role,
             content: content.to_string(),
             tool_calls: Vec::new(),
+            attachments: Vec::new(),
             name: None,
             tool_call_id: None,
             display_content: None,
@@ -340,6 +345,12 @@ pub trait LLMProvider: Send + Sync {
     /// Инструменты уходят провайдеру полем `tools`, а вызовы приходят
     /// структурой, а не текстом (`[[providers]] tools = "native"`).
     fn native_tools(&self) -> bool {
+        false
+    }
+
+    /// Приложит ли провайдер этот файл из [`ChatMessage::attachments`] сам, извлекая
+    /// из него текст (DeepSeek: PDF, картинки, docx). Иначе модель получает путь.
+    fn accepts_attachment(&self, _path: &std::path::Path) -> bool {
         false
     }
 

@@ -1,36 +1,53 @@
 use std::path::{Path, PathBuf};
 
 pub struct FileMention {
+    /// Слово из ввода как есть (`@src/main.rs:10-20`): его и заменяет содержимое.
+    pub token: String,
     pub path: PathBuf,
     pub line_start: Option<usize>,
     pub line_end: Option<usize>,
     pub content: String,
 }
 
+/// `@`-упоминание существующего файла: исходное слово, путь от рабочей папки
+/// и диапазон строк, если он указан.
+pub struct MentionTarget<'a> {
+    pub token: &'a str,
+    pub path: PathBuf,
+    pub lines: Option<(usize, usize)>,
+}
+
+pub fn mention_targets<'a>(
+    input: &'a str,
+    workspace: &'a Path,
+) -> impl Iterator<Item = MentionTarget<'a>> + 'a {
+    input
+        .split_whitespace()
+        .filter_map(|word| Some((word, word.strip_prefix('@')?)))
+        .map(|(token, path_str)| {
+            let (path, lines) = parse_path_with_lines(path_str);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                workspace.join(&path)
+            };
+            MentionTarget { token, path, lines }
+        })
+        .filter(|target| target.path.is_file())
+}
+
 pub fn extract_mentions(input: &str, workspace: &Path) -> Vec<FileMention> {
     let mut mentions = Vec::new();
 
-    for word in input.split_whitespace() {
-        if !word.starts_with('@') {
+    for MentionTarget {
+        token,
+        path: full_path,
+        lines: line_range,
+    } in mention_targets(input, workspace)
+    {
+        // Двоичный или большой файл уйдёт вложением (`binary_mentions`).
+        let Some(content) = inline_content(&full_path, line_range.is_some()) else {
             continue;
-        }
-
-        let path_str = &word[1..];
-        let (path, line_range) = parse_path_with_lines(path_str);
-
-        let full_path = if path.is_absolute() {
-            path
-        } else {
-            workspace.join(&path)
-        };
-
-        if !full_path.exists() {
-            continue;
-        }
-
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => continue,
         };
 
         let (content, line_start, line_end) = if let Some((start, end)) = line_range {
@@ -54,6 +71,7 @@ pub fn extract_mentions(input: &str, workspace: &Path) -> Vec<FileMention> {
         };
 
         mentions.push(FileMention {
+            token: token.to_string(),
             path: full_path,
             line_start,
             line_end,
@@ -62,6 +80,42 @@ pub fn extract_mentions(input: &str, workspace: &Path) -> Vec<FileMention> {
     }
 
     mentions
+}
+
+/// Содержимое для вставки в текст. С диапазоном строк размер не важен: уйдут
+/// только эти строки (`@big.log:100-120`), без него действует предел вложений.
+fn inline_content(path: &Path, has_range: bool) -> Option<String> {
+    if !has_range {
+        return crate::app::attachments::inline_text(path).ok().flatten();
+    }
+    crate::util::looks_like_text(path)
+        .ok()?
+        .then(|| crate::util::read_text(path).ok())
+        .flatten()
+}
+
+/// Развернёт ли `expand` это упоминание в текст (иначе оно уходит вложением).
+pub fn expands_inline(target: &MentionTarget<'_>) -> bool {
+    inline_content(&target.path, target.lines.is_some()).is_some()
+}
+
+/// `input` с текстовыми `@`-упоминаниями, развёрнутыми в содержимое. Замена
+/// идёт по словам: `@a.rs` не задевает `@a.rs:1-2` и уже вставленный текст.
+pub fn expand(input: &str, workspace: &Path) -> String {
+    let mentions = extract_mentions(input, workspace);
+    if mentions.is_empty() {
+        return input.to_string();
+    }
+    input
+        .split_inclusive(char::is_whitespace)
+        .map(|piece| {
+            let word = piece.trim_end_matches(char::is_whitespace);
+            match mentions.iter().find(|m| m.token == word) {
+                Some(mention) => format!("{}{}", format_mention(mention), &piece[word.len()..]),
+                None => piece.to_string(),
+            }
+        })
+        .collect()
 }
 
 fn parse_path_with_lines(s: &str) -> (PathBuf, Option<(usize, usize)>) {
@@ -172,6 +226,69 @@ mod tests {
         assert!(!mentions[0].content.contains("range out of bounds"));
         assert!(mentions[0].content.starts_with("line 95\n"));
         assert!(mentions[0].content.ends_with("line 100"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Заменяется всё слово: `@sub/hundred.txt:2-3` целиком, а не одно имя.
+    #[test]
+    fn a_mention_remembers_its_whole_token() {
+        let (dir, filename) = write_100_line_file("whole_token");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::copy(dir.join(filename), dir.join("sub").join(filename)).unwrap();
+        let input = format!("look at @sub/{filename}:2-3 please");
+        let mentions = extract_mentions(&input, &dir);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].token, format!("@sub/{filename}:2-3"));
+        assert_eq!(
+            mentions[0].content,
+            "line 2
+line 3"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Одно упоминание — префикс другого: каждое разворачивается в своё, без
+    /// хвоста `:2-3`, и уже вставленное содержимое не трогается.
+    #[test]
+    fn overlapping_mentions_expand_independently() {
+        let (dir, filename) = write_100_line_file("overlap");
+        let input = format!("@{filename} and @{filename}:2-3");
+        let expanded = expand(&input, &dir);
+        assert!(
+            !expanded.contains(
+                ":2-3
+"
+            ) && !expanded.contains("```:2-3"),
+            "{expanded}"
+        );
+        assert_eq!(expanded.matches("File: ").count(), 2, "{expanded}");
+        assert!(expanded.contains("(lines 2-3)"), "{expanded}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Диапазон строк большого файла разворачивается: уйдут только эти строки,
+    /// а без диапазона файл больше предела уходит вложением.
+    #[test]
+    fn a_line_range_of_a_big_file_still_expands() {
+        let dir = std::env::temp_dir()
+            .join("pooprusteek_file_mentions_test")
+            .join("big");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = "x".repeat(1000);
+        let text: Vec<String> = (0..1200).map(|i| format!("{i} {line}")).collect();
+        std::fs::write(dir.join("big.log"), text.join("\n")).unwrap();
+        let ranged = extract_mentions("@big.log:3-4", &dir);
+        assert_eq!(ranged.len(), 1);
+        assert!(
+            ranged[0].content.starts_with("2 x"),
+            "{}",
+            &ranged[0].content[..10]
+        );
+        assert!(
+            extract_mentions("@big.log", &dir).is_empty(),
+            "whole file is too big"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

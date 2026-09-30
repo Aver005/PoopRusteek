@@ -204,6 +204,8 @@ pub struct ExecOptions {
     /// wording is the cheapest variable to change and one of the most
     /// influential, so it is a first-class knob here.
     pub system_append: Option<PathBuf>,
+    /// Файлы к первой реплике — тем же путём, что `/attach` в TUI.
+    pub attach: Vec<PathBuf>,
     /// Compaction settings layered over the config, so a scenario can put the
     /// ladder in reach without anyone hand-editing a config file.
     pub context: ContextOverrides,
@@ -301,6 +303,8 @@ struct Harness {
     provider: Arc<dyn LLMProvider>,
     system_prompt: String,
     semantic_ready: bool,
+    /// `--attach`, разрешённые один раз: пропавший файл — отказ настройки.
+    attachments: Vec<crate::provider::AttachedFile>,
 }
 
 /// Run one turn to completion. Errors are returned as a `SetupFailed`
@@ -537,6 +541,9 @@ async fn assemble(
     workspace: &str,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> AppResult<Harness> {
+    // Пропавший `--attach` — отказ до сборки провайдера и ожидания индекса.
+    let attachments =
+        attached_files(options, std::path::Path::new(workspace)).map_err(AppError::Custom)?;
     let provider = crate::provider::build_provider(config).ok_or_else(|| {
         AppError::Custom(
             "no provider configured: set [provider].token or pick a /providers entry".to_string(),
@@ -647,6 +654,7 @@ async fn assemble(
         provider,
         system_prompt,
         semantic_ready,
+        attachments,
     })
 }
 
@@ -665,6 +673,18 @@ async fn await_semantic(semantic: &Arc<SemanticService>, budget: Duration) -> bo
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     semantic.is_ready()
+}
+
+/// `--attach` пути; относительные — от рабочей папки прогона, как в TUI.
+fn attached_files(
+    options: &ExecOptions,
+    workspace: &std::path::Path,
+) -> Result<Vec<crate::provider::AttachedFile>, String> {
+    options
+        .attach
+        .iter()
+        .map(|path| crate::app::attachments::resolve(&path.to_string_lossy(), workspace))
+        .collect()
 }
 
 /// Drive every turn in order, servicing each one's events until its whole
@@ -714,9 +734,17 @@ async fn drive(
     let deadline = tokio::time::sleep(options.timeout);
     tokio::pin!(deadline);
 
+    let accepts = |path: &std::path::Path| harness.provider.accepts_attachment(path);
     for prompt in &options.prompts {
         turns += 1;
-        history.messages.push(ChatMessage::user(prompt));
+        let first = if turns == 1 {
+            &harness.attachments[..]
+        } else {
+            &[]
+        };
+        history.messages.push(crate::app::attachments::user_message(
+            prompt, prompt, first, first, &accepts,
+        ));
         debug_log::log_json(
             TURN_STARTED,
             &serde_json::json!({
@@ -1138,6 +1166,7 @@ mod tests {
             save_session: false,
             resume: None,
             system_append: None,
+            attach: Vec::new(),
             context: ContextOverrides::default(),
         }
     }
@@ -1272,6 +1301,7 @@ mod tests {
             provider,
             system_prompt: "You are a test.".to_string(),
             semantic_ready: false,
+            attachments: Vec::new(),
         }
     }
 

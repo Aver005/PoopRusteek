@@ -112,20 +112,6 @@ impl DeepseekProvider {
         Ok(())
     }
 
-    /// Solve a proof-of-work challenge, then build the standard auth headers
-    /// with the solution attached as `x-ds-pow-response` — the header set
-    /// required by the PoW-gated endpoints (edit, regenerate, file upload).
-    async fn pow_auth_headers(&self) -> AppResult<HeaderMap> {
-        let pow_b64 = self.solve_pow_challenge().await?;
-        let mut headers = self.auth_headers()?;
-        headers.insert(
-            "x-ds-pow-response",
-            HeaderValue::from_str(&pow_b64)
-                .map_err(|e| crate::error::AppError::Provider(e.to_string()))?,
-        );
-        Ok(headers)
-    }
-
     /// GET `url`, parse the standard `ApiResponse<T>` envelope, and return
     /// `.data.biz_data`. See `post_biz` for why not every GET wrapper uses
     /// this (e.g. `fetch_uploaded_files` unwraps a nested `.files` field,
@@ -137,6 +123,38 @@ impl DeepseekProvider {
             return Err(Self::read_error_response(action, response, action).await);
         }
         biz_data(action, Self::read_json(action, response, action).await?)
+    }
+}
+
+/// MIME-тип части multipart, как его ставит браузер. Незнакомое — поток байт:
+/// сервер разбирает файл по содержимому и имени.
+fn mime_type(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "doc" => "application/msword",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "xls" => "application/vnd.ms-excel",
+        "epub" => "application/epub+zip",
+        "md" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        _ => "application/octet-stream",
     }
 }
 
@@ -262,7 +280,7 @@ impl DeepseekProvider {
         thinking_enabled: bool,
         search_enabled: bool,
     ) -> AppResult<()> {
-        let headers = self.pow_auth_headers().await?;
+        let headers = self.pow_headers(EDIT_MESSAGE_URL).await?;
         let body = json!({
             "chat_session_id": session_id,
             "message_id": message_id,
@@ -289,7 +307,7 @@ impl DeepseekProvider {
         thinking_enabled: bool,
         search_enabled: bool,
     ) -> AppResult<()> {
-        let headers = self.pow_auth_headers().await?;
+        let headers = self.pow_headers(REGENERATE_URL).await?;
         let body = json!({
             "chat_session_id": session_id,
             "parent_message_id": parent_message_id,
@@ -340,39 +358,35 @@ impl DeepseekProvider {
 
     // ─── File Operations ───────────────────────────────────────
 
-    /// Upload a file. Returns the uploaded file info.
-    pub async fn upload_file(&self, file_path: &str) -> AppResult<types::UploadedFile> {
+    /// Загрузка как у веб-клиента 2.5.0 (снято 2026-09-30): PoW на путь загрузки,
+    /// `x-file-size`, поле `file`. Ответ — `PENDING`, готовность ждёт `fetch_files`.
+    pub async fn upload_file(&self, path: &std::path::Path) -> AppResult<types::UploadedFile> {
         use reqwest::multipart;
 
-        let mut headers = self.pow_auth_headers().await?;
-        headers.insert("x-thinking-enabled", HeaderValue::from_static("false"));
-        headers.insert("x-model-type", HeaderValue::from_static("default"));
-
-        let path = std::path::Path::new(file_path);
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(crate::error::AppError::Io)?;
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let file_size = std::fs::metadata(file_path)
-            .map(|m| m.len())
-            .unwrap_or(0)
-            .to_string();
 
-        headers.insert(
-            "x-file-size",
-            HeaderValue::from_str(&file_size)
-                .map_err(|e| crate::error::AppError::Provider(e.to_string()))?,
-        );
+        let mut headers = self.pow_headers(UPLOAD_FILE_URL).await?;
+        // Общий `application/json` затёр бы `multipart/form-data; boundary=…`,
+        // который ставит сам reqwest: сервер отвечал 400 «Invalid boundary».
+        headers.remove(reqwest::header::CONTENT_TYPE);
+        headers.insert("x-thinking-enabled", HeaderValue::from_static("0"));
+        headers.insert("x-model-type", HeaderValue::from_static("default"));
+        headers.insert("x-file-size", HeaderValue::from(bytes.len() as u64));
 
-        let file_bytes = tokio::fs::read(file_path)
-            .await
-            .map_err(crate::error::AppError::Io)?;
-        let file_part = multipart::Part::bytes(file_bytes)
-            .file_name(file_name.clone())
-            .mime_str("application/octet-stream")
+        // «Пульс» держит поток живым, поэтому заглохшая загрузка без своего
+        // предела висела бы вечно: минута плюс секунда на каждые 256 КБ.
+        let timeout = std::time::Duration::from_secs(60 + bytes.len() as u64 / (256 * 1024));
+        let file_part = multipart::Part::bytes(bytes)
+            .file_name(file_name)
+            .mime_str(mime_type(path))
             .map_err(|e| crate::error::AppError::Custom(e.to_string()))?;
-
         let form = multipart::Form::new().part("file", file_part);
 
         self.enforce_rate_limit().await;
@@ -381,50 +395,35 @@ impl DeepseekProvider {
             .post(UPLOAD_FILE_URL)
             .headers(headers)
             .multipart(form)
+            .timeout(timeout)
             .send()
             .await
             .map_err(crate::error::AppError::Http)?;
-
-        let status = response.status();
-        if !status.is_success() {
+        if !response.status().is_success() {
             return Err(
                 Self::read_error_response("file.upload", response, "File upload failed").await,
             );
         }
-
-        let payload: types::ApiResponse<types::UploadedFile> = response.json().await?;
-        Ok(payload.data.biz_data)
+        let payload = Self::read_json("file.upload", response, "File upload failed").await?;
+        biz_data("file.upload", payload)
     }
 
-    /// Fetch uploaded files by their IDs.
+    /// Состояние загруженных файлов по их id.
     pub async fn fetch_uploaded_files(
         &self,
         file_ids: &[String],
-    ) -> AppResult<Vec<types::FetchedFile>> {
+    ) -> AppResult<Vec<types::UploadedFile>> {
         let query: Vec<String> = file_ids
             .iter()
             .map(|id| format!("file_ids={}", urlencoding(id)))
             .collect();
-        let url = if query.is_empty() {
-            FETCH_FILES_URL.to_string()
-        } else {
-            format!("{}?{}", FETCH_FILES_URL, query.join("&"))
-        };
-
-        let headers = self.auth_headers()?;
-        let response = self.send_get_request("file.fetch", &url, &headers).await?;
-        if !response.status().is_success() {
-            return Err(
-                Self::read_error_response("file.fetch", response, "Fetch files failed").await,
-            );
-        }
-
-        let payload: types::ApiResponse<types::FetchFilesData> = response.json().await?;
-        Ok(payload.data.biz_data.files)
+        let url = format!("{FETCH_FILES_URL}?{}", query.join("&"));
+        let data: types::FetchFilesData = self.get_biz("file.fetch", &url).await?;
+        Ok(data.files)
     }
 
     /// Fork a file task (re-process a file).
-    pub async fn fork_file_task(&self, file_id: &str) -> AppResult<types::FetchedFile> {
+    pub async fn fork_file_task(&self, file_id: &str) -> AppResult<types::UploadedFile> {
         let body = json!({ "file_id": file_id });
         self.post_biz("file.fork", FORK_FILE_TASK_URL, body).await
     }
@@ -601,4 +600,18 @@ fn urlencoding(input: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mime_type;
+    use std::path::Path;
+
+    #[test]
+    fn mime_follows_the_extension_case_insensitively() {
+        assert_eq!(mime_type(Path::new("a.PDF")), "application/pdf");
+        assert_eq!(mime_type(Path::new("photo.jpeg")), "image/jpeg");
+        assert_eq!(mime_type(Path::new("blob.bin")), "application/octet-stream");
+        assert_eq!(mime_type(Path::new("noext")), "application/octet-stream");
+    }
 }

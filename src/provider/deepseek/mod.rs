@@ -14,6 +14,7 @@
 //! - `endpoints`: the full reverse-engineered REST surface, including the
 //!   large `#[expect(dead_code)]` collection of wrappers kept for parity with
 //!   the upstream API but not yet driven by this TUI.
+mod attachments;
 mod client;
 mod endpoints;
 mod http;
@@ -48,6 +49,8 @@ pub struct DeepseekProvider {
     max_retries: i32,
     last_request: Mutex<Instant>,
     request_history: Mutex<VecDeque<Instant>>,
+    /// Общий для форков: загрузка файла к сессии не привязана.
+    uploads: Arc<attachments::UploadCache>,
 }
 
 impl DeepseekProvider {
@@ -86,6 +89,7 @@ impl DeepseekProvider {
             max_retries,
             last_request: Mutex::new(Instant::now()),
             request_history: Mutex::new(VecDeque::new()),
+            uploads: Arc::default(),
         };
 
         debug_log::log(
@@ -120,6 +124,7 @@ impl DeepseekProvider {
             max_retries: self.max_retries,
             last_request: Mutex::new(Instant::now()),
             request_history: Mutex::new(VecDeque::new()),
+            uploads: Arc::clone(&self.uploads),
         }
     }
 
@@ -205,7 +210,9 @@ impl DeepseekProvider {
         on_text: &mut (impl FnMut(String) + Send),
         reply_chars: &mut usize,
     ) -> AppResult<Ending> {
-        let (response, session_id) = self.send_request(request).await?;
+        let (response, session_id) = self
+            .send_request(request, &mut || on_text(String::new()))
+            .await?;
         // Всё отданное наружу: продолжение начинается с его повтора.
         let mut delivered = String::new();
         let mut read = {
@@ -505,6 +512,10 @@ impl LLMProvider for DeepseekProvider {
 
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn accepts_attachment(&self, path: &std::path::Path) -> bool {
+        attachments::uploadable(path)
     }
 
     fn keeps_server_side_history(&self) -> bool {

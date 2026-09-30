@@ -263,9 +263,24 @@ pub(super) fn render_attach_bar(frame: &mut Frame, area: Rect, state: &AppState,
         " \u{1F4CE} ",
         Style::default().fg(theme.accent_soft).bg(theme.input_bg),
     )];
+    // Много файлов — счётчик вместо ленты имён, которую всё равно обрежет.
+    let listed = if files.len() > crate::app::attachments::MAX_LISTED_NAMES {
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        spans.push(Span::styled(
+            format!(
+                " {} files {} ",
+                files.len(),
+                crate::util::format_size(total)
+            ),
+            Style::default().fg(theme.fg).bg(theme.input_bg),
+        ));
+        &files[..0]
+    } else {
+        &files[..]
+    };
     let max_w = area.width.saturating_sub(4) as usize;
     let mut remaining = max_w;
-    for (i, f) in files.iter().enumerate() {
+    for (i, f) in listed.iter().enumerate() {
         let icon = if f.is_image { "\u{1F5BC}" } else { "\u{1F4C4}" };
         let size_str = crate::util::format_size(f.size);
         let label = format!(" {} {} {} ", icon, f.display_name, size_str);

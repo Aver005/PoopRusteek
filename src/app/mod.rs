@@ -1,5 +1,7 @@
+pub mod attachments;
 pub mod background_stats;
 pub mod conversation;
+pub mod dropped_paths;
 pub mod events;
 pub mod generation;
 mod goal;
@@ -10,6 +12,7 @@ pub mod list;
 pub mod mcp_add;
 pub mod mcp_status;
 mod multichat;
+pub mod paste_burst;
 mod persist;
 mod pickers;
 pub mod providers;
@@ -319,6 +322,11 @@ pub fn reload_instructions(state: &mut AppState, config: &Config) -> Option<Stri
 }
 
 impl AppState {
+    /// Рабочая папка путём: от неё считаются `@file`, `/attach` и автодополнение.
+    pub fn workspace(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.workspace_path)
+    }
+
     /// Состояние с одним разговором и значениями по умолчанию. Поля, которые
     /// зависят от диска и от наличия провайдера, выставляет вызывающий.
     pub fn new(main: conversation::Conversation) -> Self {
@@ -630,6 +638,7 @@ impl App {
         let tick_rate = std::time::Duration::from_millis(120);
         let mut tick_interval = tokio::time::interval(tick_rate);
         let mut event_stream = EventStream::new();
+        let mut burst = paste_burst::Burst::default();
 
         loop {
             let mut dirty = false;
@@ -639,32 +648,12 @@ impl App {
                     self.handle_event(AppEvent::Tick).await?;
                 }
                 Some(Ok(event)) = event_stream.next() => {
-                    match event {
-                        crossterm::event::Event::Key(key)
-                            if matches!(
-                                key.kind,
-                                crossterm::event::KeyEventKind::Press
-                                    | crossterm::event::KeyEventKind::Repeat
-                            ) =>
-                        {
-                            dirty = true;
-                            if self.handle_event(AppEvent::Key(key)).await? {
-                                return Ok(());
-                            }
+                    for event in gather_paste_burst(event, &mut event_stream, &mut burst).await {
+                        let (visual, quit) = self.handle_terminal_event(event).await?;
+                        dirty |= visual;
+                        if quit {
+                            return Ok(());
                         }
-                        crossterm::event::Event::Mouse(mouse) => {
-                            dirty = true;
-                            self.handle_event(AppEvent::Mouse(mouse)).await?;
-                        }
-                        crossterm::event::Event::Paste(text) => {
-                            dirty = true;
-                            self.handle_event(AppEvent::Paste(text)).await?;
-                        }
-                        crossterm::event::Event::Resize(_, rows) => {
-                            dirty = true;
-                            self.handle_event(AppEvent::Resize { rows }).await?;
-                        }
-                        _ => {}
                     }
                 }
                 Some(event) = self.event_rx.recv() => {
@@ -1235,34 +1224,62 @@ impl App {
         }
     }
 
+    /// Одно событие терминала → `AppEvent`. Возвращает (перерисовать ли, выйти ли).
+    async fn handle_terminal_event(
+        &mut self,
+        event: crossterm::event::Event,
+    ) -> AppResult<(bool, bool)> {
+        use crossterm::event::{Event, KeyEventKind};
+        let app_event = match event {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                AppEvent::Key(key)
+            }
+            Event::Mouse(mouse) => AppEvent::Mouse(mouse),
+            Event::Paste(text) => AppEvent::Paste(text),
+            Event::Resize(_, rows) => AppEvent::Resize { rows },
+            _ => return Ok((false, false)),
+        };
+        let quit = self.handle_event(app_event).await?;
+        Ok((true, quit))
+    }
+
     fn render(&self, terminal: &mut crate::tui::TuiTerminal) -> AppResult<()> {
         crate::tui::render::render(terminal, &self.state, &self.config)
     }
 
     fn expand_file_mentions(&self, input: &str) -> String {
-        let workspace = std::path::Path::new(&self.state.workspace_path);
-        let mentions = crate::cli::file_mentions::extract_mentions(input, workspace);
-
-        if mentions.is_empty() {
-            return input.to_string();
-        }
-
-        let mut result = input.to_string();
-        for mention in &mentions {
-            let tag = format!(
-                "@{}",
-                mention
-                    .path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file")
-            );
-            let replacement = crate::cli::file_mentions::format_mention(mention);
-            result = result.replace(&tag, &replacement);
-        }
-
-        result
+        crate::cli::file_mentions::expand(input, &self.state.workspace())
     }
+}
+
+/// На Windows вставка и перетащенный файл приходят потоком нажатий
+/// ([`paste_burst`]): серию, лежащую в очереди разом, склеиваем во вставку.
+async fn gather_paste_burst(
+    first: crossterm::event::Event,
+    stream: &mut crossterm::event::EventStream,
+    burst: &mut paste_burst::Burst,
+) -> Vec<crossterm::event::Event> {
+    use futures::StreamExt;
+    if !cfg!(windows) || !paste_burst::is_text_press(&first) {
+        return vec![first];
+    }
+    let started = std::time::Instant::now();
+    let mut last_text = started;
+    let mut batch = vec![first];
+    // Окно продлевают только текстовые нажатия: мышью его не растянуть.
+    while started.elapsed() < paste_burst::MAX_GATHER {
+        let wait = paste_burst::GAP.saturating_sub(last_text.elapsed());
+        match tokio::time::timeout(wait, stream.next()).await {
+            Ok(Some(Ok(event))) => {
+                if paste_burst::is_text_press(&event) {
+                    last_text = std::time::Instant::now();
+                }
+                batch.push(event);
+            }
+            _ => break,
+        }
+    }
+    burst.coalesce(batch, started, std::time::Instant::now())
 }
 
 /// Returns the deduplicated list of directories that own all app-owned data.
