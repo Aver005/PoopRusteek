@@ -100,10 +100,16 @@ fn build_native_turns(request: &CompletionRequest) -> (Vec<&str>, Vec<(&'static 
 
     for message in request.messages.iter().filter(|m| !m.ui_only) {
         let (role, blocks): (&'static str, Vec<Value>) = match message.role {
-            Role::System => {
+            // Системное в начале — system prompt; заметка посреди истории
+            // остаётся на своём месте текстом.
+            Role::System if turns.is_empty() => {
                 system_parts.push(&message.content);
                 continue;
             }
+            Role::System => (
+                "user",
+                vec![json!({"type": "text", "text": message.inline_note()})],
+            ),
             Role::User => {
                 if message.content.is_empty() {
                     continue;
@@ -194,7 +200,7 @@ fn tool_blocks(
             }
             Some(vec![json!({
                 "type": "text",
-                "text": format!("[tool result]\n{}", message.content),
+                "text": format!("[tool result]\n{}", message.labelled_tool_output()),
             })])
         }
     }
@@ -521,6 +527,30 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    /// Заметка посреди истории (провал хода, подсказка) остаётся на своём
+    /// месте, а не поднимается в system prompt навсегда.
+    #[test]
+    fn a_mid_history_note_stays_in_place() {
+        let request = CompletionRequest {
+            messages: vec![
+                ChatMessage::system("SYS"),
+                ChatMessage::user("q"),
+                ChatMessage::assistant("partial"),
+                ChatMessage::system("turn failed"),
+                ChatMessage::user("again"),
+            ],
+            tools: Vec::new(),
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+        };
+        let body = request_to_anthropic(&request);
+        assert_eq!(body["system"], "SYS");
+        let messages = body["messages"].to_string();
+        assert!(messages.contains("[Note]\\nturn failed"), "{messages}");
     }
 
     #[test]

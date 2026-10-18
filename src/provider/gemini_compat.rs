@@ -141,8 +141,17 @@ fn build_contents(
 
     for message in request.messages.iter().filter(|message| !message.ui_only) {
         match message.role {
-            Role::System => {
+            // Системное в начале — system prompt; заметка посреди истории
+            // остаётся на своём месте текстом.
+            Role::System if turns.is_empty() => {
                 system_parts.push(&message.content);
+            }
+            Role::System => {
+                push_turn(
+                    &mut turns,
+                    "user",
+                    vec![GeminiPart::Text(message.inline_note())],
+                );
             }
             Role::User => {
                 if !message.content.is_empty() {
@@ -203,8 +212,8 @@ fn build_contents(
                     None => {
                         // Прежнее поведение промптового пути: результат без
                         // объявившего его вызова уходит обычным текстом.
-                        if !message.content.is_empty() {
-                            let text = format!("[tool result]\n{}", message.content);
+                        if !message.labelled_tool_output().is_empty() {
+                            let text = format!("[tool result]\n{}", message.labelled_tool_output());
                             push_turn(&mut turns, "user", vec![GeminiPart::Text(text)]);
                         }
                     }

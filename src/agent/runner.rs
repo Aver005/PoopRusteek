@@ -95,16 +95,17 @@ pub async fn run_agent_loop(
         ctx.emit(AgentEvent::ContextUsage(used));
 
         let outcome = stream_step(conversation, &provider, request, &event_tx).await;
-        let notes = match classify_stream(&outcome, &trace) {
-            Ok(notes) => notes,
-            Err(fatal) => {
-                ctx.emit(AgentEvent::Failed(fatal));
-                return;
-            }
-        };
+        let notes = classify_stream(&outcome, &trace);
         let mut truncated = notes.truncated;
         let mut provider_error = notes.provider_error;
-        let continuable = !matches!(outcome.verdict(), StreamVerdict::Failed(_));
+        // Замолчавшего провайдера не просят продолжать: это ещё один срок тишины.
+        let continuable = !matches!(
+            outcome.verdict(),
+            StreamVerdict::Failed(_) | StreamVerdict::IdleTimeout
+        );
+        // Обрыв именно лимитом вывода: совет «дроби» верен, только если причина — он.
+        let cut_by_limit = truncated.is_some();
+        let mut cut_by_output_limit = false;
         let StreamOutcome {
             text: raw,
             got_stop,
@@ -148,12 +149,15 @@ pub async fn run_agent_loop(
                     // Обрыв закрыт дозапросом — жалобы на стрим больше не про этот ответ.
                     provider_error = None;
                     truncated = None;
+                } else {
+                    cut_by_output_limit = cut_by_limit;
                 }
             }
             continued.text
         } else {
             raw
         };
+        // Модели тоже: иначе она не знает, что её ответ обрезан.
         if let Some(notice) = truncated {
             ctx.emit(AgentEvent::Message(ChatMessage::system(&notice)));
         }
@@ -184,11 +188,14 @@ pub async fn run_agent_loop(
         // повод терять ход: продолжаем и предупреждаем.
         if let Some(error) = provider_error {
             if tool_calls.is_empty() {
-                ctx.emit(AgentEvent::Failed(error));
+                ctx.emit(AgentEvent::Failed(turn_failure(
+                    &error,
+                    &collected_tool_calls,
+                )));
                 return;
             }
             trace.salvaged(&error, tool_calls.len());
-            ctx.emit(AgentEvent::Message(ChatMessage::system(
+            ctx.emit(AgentEvent::Message(ChatMessage::ui_system(
                 "Warning: stream ended early, but a complete tool call was recovered. Continuing.",
             )));
         }
@@ -204,6 +211,7 @@ pub async fn run_agent_loop(
                     visible: &visible_text,
                     parse_errors: &parse_errors,
                     suspect: suspect.as_deref(),
+                    cut_by_output_limit,
                 },
                 &collected_tool_calls,
             ) {
@@ -246,16 +254,41 @@ pub async fn run_agent_loop(
                 &parse_errors,
                 &handled,
             )));
-            ctx.emit(AgentEvent::Message(ChatMessage::system(
+            ctx.emit(AgentEvent::Message(ChatMessage::ui_system(
                 "⚠ Some tool calls could not be parsed — the rest ran, asking the model to re-send the broken ones",
             )));
         }
     }
 
     trace::turn_out_of_steps(conversation, max_steps, collected_tool_calls.len());
-    ctx.emit(AgentEvent::Failed(
-        "Reached max agent steps before producing a final answer".to_string(),
-    ));
+    ctx.emit(AgentEvent::Failed(turn_failure(
+        &format!("Reached the limit of {max_steps} agent steps before a final answer."),
+        &collected_tool_calls,
+    )));
+}
+
+/// Сколько места у причины в тексте провала хода.
+const TURN_FAILURE_REASON_BYTES: usize = 400;
+
+/// Провал хода со списком того, что он успел сделать: без списка повтор
+/// запроса ложится поверх уже изменённых файлов. Читают и человек, и модель.
+pub(crate) fn turn_failure(reason: &str, done: &[ToolCallInfo]) -> String {
+    // Причина бывает длинной (тело ответа, битые вызовы) — список важнее.
+    let reason = crate::util::truncate_with_ellipsis(reason, TURN_FAILURE_REASON_BYTES);
+    if done.is_empty() {
+        return format!("{reason} Nothing was run in this turn, so nothing was changed.");
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for call in done {
+        if !names.contains(&call.name.as_str()) {
+            names.push(&call.name);
+        }
+    }
+    format!(
+        "{reason} Before that, this turn had already run {} tool call(s) ({}), so some work may already be done — check it before repeating.",
+        done.len(),
+        names.join(", ")
+    )
 }
 
 /// Пройти ступени компакции и вернуть заполненность окна для этого шага.
@@ -290,17 +323,15 @@ enum StepEnd {
     GiveUp,
 }
 
-/// Разобрать конец стрима. `Ok(None)` — можно продолжать, `Ok(Some(e))` —
-/// провайдер сбежал, но, может, вызов ещё спасётся; `Err` — ход не спасти.
 /// Что цикл узнал о закончившемся стриме: жалоба провайдера (её ещё можно
-/// пережить, если из текста вынулся вызов) и пометка об обрыве по лимиту.
+/// пережить, если из текста вынулся целый вызов) и пометка об обрыве по лимиту.
 #[derive(Default)]
 struct StreamNotes {
     provider_error: Option<String>,
     truncated: Option<String>,
 }
 
-fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> Result<StreamNotes, String> {
+fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> StreamNotes {
     let verdict = outcome.verdict();
     // Таймаут — это своя строка; вторая про «закрылся без stop» удвоила бы
     // его в отчёте `mine`, где каждая запись считается отдельно.
@@ -318,25 +349,32 @@ fn classify_stream(outcome: &StreamOutcome, trace: &StepTrace) -> Result<StreamN
         StreamEnd::IdleTimeout | StreamEnd::Completed => {}
     }
     match verdict {
+        // Тайм-аут не убивает ход сразу: целый вызов, пришедший до тишины, спасаем.
         StreamVerdict::IdleTimeout => {
             trace.error("reason=stream_timeout");
-            Err("Stream timed out (no data for 120s). Cancelling turn.".to_string())
+            StreamNotes {
+                provider_error: Some(format!(
+                    "Stream timed out ({}).",
+                    crate::agent::stream::idle_timeout_message()
+                )),
+                ..StreamNotes::default()
+            }
         }
-        StreamVerdict::Ok => Ok(StreamNotes::default()),
+        StreamVerdict::Ok => StreamNotes::default(),
         // Ответ дописан, но обрезан. Раньше это был `ClosedWithoutStop`, то
         // есть ошибка, и готовый текст выбрасывался.
-        StreamVerdict::Finished(reason) => Ok(StreamNotes {
+        StreamVerdict::Finished(reason) => StreamNotes {
             truncated: Some(trace.truncated(&reason, outcome.text.len())),
             ..StreamNotes::default()
-        }),
-        StreamVerdict::ClosedWithoutStop => Ok(StreamNotes {
+        },
+        StreamVerdict::ClosedWithoutStop => StreamNotes {
             provider_error: Some(trace.closed_without_stop(outcome.text.len())),
             ..StreamNotes::default()
-        }),
-        StreamVerdict::Failed(error) => Ok(StreamNotes {
+        },
+        StreamVerdict::Failed(error) => StreamNotes {
             provider_error: Some(error),
             ..StreamNotes::default()
-        }),
+        },
     }
 }
 
@@ -350,6 +388,8 @@ struct StepText<'a> {
     parse_errors: &'a [String],
     /// Имя инструмента в разметке, которую никто не разобрал.
     suspect: Option<&'a str>,
+    /// Вызов оборван лимитом вывода (`length`), и дозапросы его не закрыли.
+    cut_by_output_limit: bool,
 }
 
 /// Закрыть сообщение шага без вызовов его итоговым текстом; пустое сбрасывается.
@@ -375,25 +415,52 @@ fn finish_or_retry(
         visible,
         parse_errors,
         suspect,
+        cut_by_output_limit,
     } = step;
     // Ноль разобранных вызовов при непустых ошибках — это сломанный блок, а
     // не финальный ответ. Молча закончить ход здесь и значило «агент завис».
     if !parse_errors.is_empty() {
+        // Обрыв по лимиту вывода — не ошибка формата: «перепиши так же» снова
+        // упрётся в лимит, модели надо дробить.
+        let (feedback, notice) = if cut_by_output_limit {
+            (
+                OUTPUT_LIMIT_FEEDBACK.to_string(),
+                "⚠ The reply hit the output limit mid tool call — asking the model to split it",
+            )
+        } else {
+            (
+                malformed_tool_feedback(parse_errors),
+                "⚠ Malformed tool call — asking the model to retry",
+            )
+        };
         if let Some(attempt) = retries.take_malformed() {
             end_message(ctx, visible);
             // Кладём сырое: провайдеру с полной историей нужно увидеть ошибку.
             messages.push(ChatMessage::assistant(raw));
-            messages.push(ChatMessage::user(&malformed_tool_feedback(parse_errors)));
+            messages.push(ChatMessage::user(&feedback));
             trace.malformed(attempt, MAX_MALFORMED_TOOL_RETRIES, parse_errors);
-            ctx.emit(AgentEvent::Message(ChatMessage::system(&format!(
-                "⚠ Malformed tool call (attempt {attempt}/{MAX_MALFORMED_TOOL_RETRIES}) — asking the model to retry"
+            ctx.emit(AgentEvent::Message(ChatMessage::ui_system(&format!(
+                "{notice} ({attempt}/{MAX_MALFORMED_TOOL_RETRIES})"
             ))));
             return StepEnd::Retry;
         }
+        // Бюджет кончился: ход провален, а не «отвечен» прозой перед вызовом.
         trace.malformed_exhausted(parse_errors);
-        ctx.emit(AgentEvent::Message(ChatMessage::system(
-            "⚠ The model kept emitting malformed tool calls; stopping this turn. Try rephrasing your request.",
-        )));
+        trace.turn_error(&format!(
+            "status=malformed_exhausted tool_calls={}",
+            done_so_far.len()
+        ));
+        end_message(ctx, visible);
+        let reason = if cut_by_output_limit {
+            "The model's tool call kept exceeding the output limit and was never run.".to_string()
+        } else {
+            format!(
+                "The model kept sending tool calls that could not be parsed ({}).",
+                parse_errors.join("; ")
+            )
+        };
+        ctx.emit(AgentEvent::Failed(turn_failure(&reason, done_so_far)));
+        return StepEnd::GiveUp;
     }
 
     // Похоже на вызов, но ни один формат его не взял. Одна попытка: если
@@ -406,7 +473,7 @@ fn finish_or_retry(
         messages.push(ChatMessage::assistant(raw));
         messages.push(ChatMessage::system(&unparsed_markup_feedback(suspect)));
         trace.unparsed_markup(suspect);
-        ctx.emit(AgentEvent::Message(ChatMessage::system(
+        ctx.emit(AgentEvent::Message(ChatMessage::ui_system(
             "⚠ The reply looks like a tool call in a format the agent could not read — asking the model to re-send it",
         )));
         return StepEnd::Retry;
@@ -424,7 +491,7 @@ fn finish_or_retry(
     if let Some(attempt) = retries.take_empty() {
         messages.push(ChatMessage::user(EMPTY_RESPONSE_FEEDBACK));
         trace.empty_retry(attempt, MAX_EMPTY_RESPONSE_RETRIES);
-        ctx.emit(AgentEvent::Message(ChatMessage::system(&format!(
+        ctx.emit(AgentEvent::Message(ChatMessage::ui_system(&format!(
             "⚠ Empty reply from the model (attempt {attempt}/{MAX_EMPTY_RESPONSE_RETRIES}) — retrying"
         ))));
         return StepEnd::Retry;
@@ -433,33 +500,11 @@ fn finish_or_retry(
         "status=empty_response_exhausted tool_calls={}",
         done_so_far.len()
     ));
-    ctx.emit(AgentEvent::Failed(empty_reply_message(done_so_far)));
+    ctx.emit(AgentEvent::Failed(turn_failure(
+        "The model returned only empty replies.",
+        done_so_far,
+    )));
     StepEnd::GiveUp
-}
-
-/// Как объяснить ход, оборвавшийся на пустых ответах.
-///
-/// Про **шаг** сказать «ничего не сделано» можно, про **ход** — нет: к этому
-/// месту цикл держит список уже выполненных вызовов, и семь правок файла
-/// вполне могли быть сделаны до того, как модель замолчала. Прежняя константа
-/// утверждала обратное, и это толкало повторять запрос поверх уже изменённых
-/// файлов — самый дорогой способ ошибиться.
-fn empty_reply_message(done_so_far: &[ToolCallInfo]) -> String {
-    if done_so_far.is_empty() {
-        return "The model returned an empty reply and did nothing. Nothing was changed — try rephrasing the request."
-            .to_string();
-    }
-    let mut names: Vec<&str> = Vec::new();
-    for call in done_so_far {
-        if !names.contains(&call.name.as_str()) {
-            names.push(&call.name);
-        }
-    }
-    format!(
-        "The model went silent (empty replies) before giving a final answer, but this turn had already run {} tool call(s) ({}). Work may already be done — check the result before repeating the request, or ask the model to continue.",
-        done_so_far.len(),
-        names.join(", ")
-    )
 }
 
 /// How full the window is, from the one source that knows. A provider holding
@@ -793,9 +838,17 @@ async fn inject_semantic_hint(
     };
     let user_text = messages[user_idx].content.clone();
     let service = Arc::clone(semantic);
-    let matches = tokio::task::spawn_blocking(move || service.match_prompt(&user_text))
-        .await
-        .unwrap_or_default();
+    // Подсказки не обязательны (инвариант 12), но упавший эмбеддер не должен
+    // выключать их молча.
+    let matches = match tokio::task::spawn_blocking(move || service.match_prompt(&user_text)).await
+    {
+        Ok(matches) => matches,
+        Err(error) => {
+            debug_log::log("agent.semantic_hint.failed", error.to_string());
+            tracing::warn!("semantic hint matching failed: {error}");
+            Default::default()
+        }
+    };
     if let Some(hint) = semantic.render_hint(&matches) {
         let described: Vec<String> = matches
             .skills
@@ -846,7 +899,7 @@ async fn stream_step(
         } else if !next_visible.is_empty() {
             let _ = progress_tx.send(AppEvent::Agent {
                 conversation,
-                event: AgentEvent::Message(ChatMessage::system(
+                event: AgentEvent::Message(ChatMessage::ui_system(
                     "⚠ Streaming sync issue — agent will continue",
                 )),
             });
@@ -904,7 +957,10 @@ pub(crate) fn build_step_request(
 /// Nudge sent back after an empty reply. Deliberately concrete about the two
 /// acceptable shapes of a turn, since the failure is the model producing
 /// neither.
-pub(crate) const EMPTY_RESPONSE_FEEDBACK: &str = "Your last reply was completely empty. Answer the request now: either      write the text of the answer, or emit a tool call in the documented      <tool_use> form. Do not reply with nothing.";
+pub(crate) const EMPTY_RESPONSE_FEEDBACK: &str = "Your last reply was completely empty. Answer the request now: either write the text of the answer, or emit a tool call in the documented <tool_use> form. Do not reply with nothing.";
+
+/// Вызов не влез в лимит вывода даже с дозапросами.
+pub(crate) const OUTPUT_LIMIT_FEEDBACK: &str = "Your previous reply hit the output length limit in the middle of a tool call, so the call was cut off and NOT executed. Re-send it in smaller pieces: write a large file in several parts (create it with the first part, then add the rest with edits), or split the work into several smaller calls.";
 
 /// Correction message handed back to the model after it emitted a `<tool_use>`
 /// block that couldn't be parsed. Names each concrete problem and restates the
@@ -1124,9 +1180,9 @@ mod tests {
             tool_call_info("edit"),
             tool_call_info("edit"),
         ];
-        let message = empty_reply_message(&done);
+        let message = turn_failure("The model returned only empty replies.", &done);
         assert!(
-            !message.contains("Nothing was changed"),
+            !message.contains("nothing was changed"),
             "the turn edited files: {message}"
         );
         assert!(
@@ -1136,7 +1192,7 @@ mod tests {
         // Имена без повторов — чтобы «edit, edit» не выглядело как список.
         assert!(message.contains("read_file, edit"), "{message}");
         assert!(
-            message.contains("check the result"),
+            message.contains("check it before repeating"),
             "the user must be steered away from blindly repeating: {message}"
         );
     }
@@ -1145,8 +1201,8 @@ mod tests {
     /// говорить именно это.
     #[test]
     fn a_turn_that_did_nothing_still_says_so() {
-        let message = empty_reply_message(&[]);
-        assert!(message.contains("Nothing was changed"), "{message}");
+        let message = turn_failure("The model returned only empty replies.", &[]);
+        assert!(message.contains("nothing was changed"), "{message}");
     }
 
     fn tool_call_info(name: &str) -> ToolCallInfo {
@@ -1177,7 +1233,7 @@ mod tests {
         // который сделал, утверждение обратное: см.
         // `a_turn_that_did_work_is_not_reported_as_having_changed_nothing`.
         assert!(
-            message.contains("Nothing was changed"),
+            message.contains("nothing was changed"),
             "a turn with no tool calls must say no work happened: {message}"
         );
     }
@@ -1226,6 +1282,46 @@ mod tests {
             }
         }
         (done, error)
+    }
+
+    /// Модель так и не смогла записать вызов — ход провален, а не «отвечен»
+    /// прозой, стоявшей перед битым вызовом.
+    #[tokio::test]
+    async fn malformed_calls_to_the_end_fail_the_turn() {
+        let broken = "I'll write it now:\n<tool_use>\n<name>write</name>\n<arguments>\n{ not json }\n</arguments>\n</tool_use>";
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(FakeProvider::with_responses(vec![broken.to_string(); 3]));
+        let (done, error) = drive_turn(provider, 8).await;
+        assert!(done.is_none(), "a broken call is not an answer: {done:?}");
+        let error = error.expect("the turn must fail");
+        assert!(error.contains("could not be parsed"), "{error}");
+    }
+
+    /// Любой провал хода называет уже сделанное, а не только пустой ответ.
+    #[test]
+    fn a_turn_failure_names_the_work_already_done() {
+        let message = turn_failure("Stream timed out.", &[tool_call_info("write")]);
+        assert!(message.starts_with("Stream timed out."), "{message}");
+        assert!(message.contains("1 tool call(s) (write)"), "{message}");
+        let idle = turn_failure("Stream timed out.", &[]);
+        assert!(idle.contains("Nothing was run"), "{idle}");
+    }
+
+    /// Тайм-аут простоя — жалоба, которую ещё можно пережить, а не мгновенный
+    /// конец хода: целый вызов, пришедший до тишины, исполняется.
+    #[test]
+    fn an_idle_timeout_is_a_survivable_provider_error() {
+        let outcome = StreamOutcome {
+            text: "<tool_use><name>loud</name><arguments>{}</arguments></tool_use>".to_string(),
+            got_stop: false,
+            tool_calls: Vec::new(),
+            stop_reason: None,
+            end: crate::agent::stream::StreamEnd::IdleTimeout,
+        };
+        let trace = StepTrace::new(ConversationId::next(), 1, 1);
+        let notes = classify_stream(&outcome, &trace);
+        let error = notes.provider_error.expect("the timeout is reported");
+        assert!(error.contains("timed out"), "{error}");
     }
 
     /// Ответ, обрезанный по лимиту токенов, — это ответ. Провайдер сказал

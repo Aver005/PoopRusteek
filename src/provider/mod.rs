@@ -205,6 +205,21 @@ impl ChatMessage {
     }
 
     /// A system-styled notice shown in the chat but never sent to the model.
+    /// Системная заметка из середины истории (провал хода, подсказка, таймер)
+    /// текстом пользователя: поднятая в system prompt, она теряла место и копилась.
+    pub fn inline_note(&self) -> String {
+        format!("[Note]\n{}", self.content)
+    }
+
+    /// Результат инструмента с пометкой провала — там, где у протокола нет флага.
+    pub fn labelled_tool_output(&self) -> String {
+        if self.tool_error {
+            format!("[tool failed]\n{}", self.content)
+        } else {
+            self.content.clone()
+        }
+    }
+
     pub fn ui_system(content: &str) -> Self {
         Self {
             ui_only: true,

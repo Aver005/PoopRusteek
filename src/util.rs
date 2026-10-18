@@ -325,6 +325,18 @@ pub async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Текст об упавшей задаче без текста паники: `JoinError` печатает его целиком,
+/// а дальше он шёл в историю и к модели. Подробности — в журналы.
+pub fn join_error_text(what: &str, error: &tokio::task::JoinError) -> String {
+    if error.is_panic() {
+        tracing::error!("{what} panicked: {error}");
+        crate::debug_log::log("task.panic", format!("{what}: {error}"));
+        format!("{what} crashed (details are in the log)")
+    } else {
+        format!("{what} was cancelled")
+    }
+}
+
 /// Хэндл задачи, который гасит её, когда его роняют. Голый `JoinHandle` при
 /// падении отсоединяет задачу: отменённый ход оставлял жить свой HTTP-поток.
 pub struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);

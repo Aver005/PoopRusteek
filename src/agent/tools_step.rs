@@ -9,6 +9,7 @@ use crate::app::events::{
     AgentEvent, AppEvent, QuestionRequest, QuestionState, ToolApprovalRequest, ToolCallInfo,
 };
 use crate::mcp::MCPManager;
+use crate::mcp::manager::BROKEN_AFTER_FAILURES;
 use crate::provider::{ChatMessage, LLMProvider};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::timer::{Timer, resolve_due};
@@ -162,17 +163,29 @@ impl ToolExecContext<'_> {
     }
 }
 
+/// Человек посмотрел и отказал.
+const DENIED_BY_USER: &str = "Execution denied by user.";
+
+/// Спросить некого, а сам вызов одобрять без человека нельзя.
+const UNATTENDED_FOREIGN_CALL: &str = "This call was written in a non-standard format (or with a corrected tool name), which only a person may approve, and nobody is watching this run. Re-send it as <tool_use><name>…</name><arguments>{…}</arguments></tool_use> with the exact tool name.";
+
 /// Развилка по имени вызова. Четыре ветки живут по своим причинам: вопрос —
 /// это UX, `task` — запуск суб-агента, `timer` — состояние беседы, а
 /// остальное — аппрув и диспетчер.
 async fn execute_tool_call(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
+    if let Some(refusal) = refuse_non_object(&call.name, &call.arguments) {
+        return refusal;
+    }
     // Чужая разметка не обходит подтверждение и у особых инструментов:
     // `task` иначе запустил бы суб-агента, который исполняет всё без человека.
-    if call.origin.needs_person()
-        && matches!(call.name.as_str(), TASK_TOOL_NAME | TIMER_TOOL_NAME)
-        && (ctx.auto_approve || !ask_person(&call, ctx, true).await)
+    if call.origin.needs_person() && matches!(call.name.as_str(), TASK_TOOL_NAME | TIMER_TOOL_NAME)
     {
-        return ToolOutcome::failed("Execution denied by user.");
+        if ctx.auto_approve {
+            return ToolOutcome::failed(UNATTENDED_FOREIGN_CALL);
+        }
+        if !ask_person(&call, ctx, true).await {
+            return ToolOutcome::failed(DENIED_BY_USER);
+        }
     }
     match call.name.as_str() {
         QUESTION_TOOL_NAME => ask_the_user(&call, ctx).await,
@@ -305,7 +318,9 @@ async fn ask_the_user(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolO
 /// суб-агентов нет, поэтому фоновому ходу здесь отказ.
 async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
     if ctx.auto_approve {
-        return ToolOutcome::failed("Nested sub-agents are not allowed.");
+        return ToolOutcome::failed(
+            "Sub-agents are not available here: this is already a background or sub-agent run.",
+        );
     }
     let prompt = call.arguments["prompt"]
         .as_str()
@@ -368,16 +383,12 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
             .tools
             .get(&call.name)
             .is_none_or(|tool| tool.requires_approval());
-    // Такой вызов без человека до сюда не доходит — его отвергает разбор.
-    let approved = if person && ctx.auto_approve {
-        false
-    } else if ctx.auto_approve || !needs_approval {
-        true
-    } else {
-        ask_person(&call, ctx, person).await
-    };
-    if !approved {
-        return ToolOutcome::failed("Execution denied by user.");
+    // Обычно такой вызов без человека отвергает ещё разбор; дошёл — отказ.
+    if person && ctx.auto_approve {
+        return ToolOutcome::failed(UNATTENDED_FOREIGN_CALL);
+    }
+    if !(ctx.auto_approve || !needs_approval || ask_person(&call, ctx, person).await) {
+        return ToolOutcome::failed(DENIED_BY_USER);
     }
     ctx.emit_tool_started(&call.name);
     dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments).await
@@ -422,19 +433,33 @@ pub(crate) async fn dispatch_generic_tool(
     name: &str,
     arguments: serde_json::Value,
 ) -> ToolOutcome {
+    if let Some(refusal) = refuse_non_object(name, &arguments) {
+        return refusal;
+    }
     if name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
-        let client = { mcp.lock().await.client_for(name) };
-        match client {
-            Some((client, bare_name)) => match client.call_tool(&bare_name, arguments).await {
+        let target = { mcp.lock().await.client_for(name) };
+        match target {
+            Ok(target) => match target.client.call_tool(&target.tool, arguments).await {
                 Ok(result) => ToolOutcome {
                     text: result.content,
                     is_error: result.is_error,
                 },
-                Err(error) => ToolOutcome::failed(error.to_string()),
+                Err(error) => {
+                    let reason = error.to_string();
+                    if target.client.failures_in_row() < BROKEN_AFTER_FAILURES {
+                        return ToolOutcome::failed(format!(
+                            "MCP server '{}' failed: {reason}",
+                            target.server
+                        ));
+                    }
+                    mcp.lock().await.mark_broken(&target, &reason);
+                    ToolOutcome::failed(format!(
+                        "MCP server '{}' failed {BROKEN_AFTER_FAILURES} times in a row ({reason}) and is now marked broken; its tools will not work until the user reconnects it with /mcp.",
+                        target.server
+                    ))
+                }
             },
-            None => ToolOutcome::failed(format!(
-                "MCP tool '{name}' is not available (server not connected)"
-            )),
+            Err(unavailable) => ToolOutcome::failed(unavailable.explain(name)),
         }
     } else {
         let result = tools.execute(name, arguments).await;
@@ -443,6 +468,22 @@ pub(crate) async fn dispatch_generic_tool(
             is_error: result.is_error,
         }
     }
+}
+
+/// Аргументы не объект: родной протокол хранит битый JSON строкой, разбор
+/// пропускает массив. Исполнять нельзя, а «Missing 'path'» соврал бы о причине.
+fn refuse_non_object(name: &str, arguments: &serde_json::Value) -> Option<ToolOutcome> {
+    let reason = match arguments {
+        serde_json::Value::Object(_) => return None,
+        serde_json::Value::String(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+            Err(error) => format!("they are not valid JSON: {error}"),
+            Ok(_) => "they are a JSON string, not an object".to_string(),
+        },
+        other => format!("they must be a JSON object, got {other}"),
+    };
+    Some(ToolOutcome::failed(format!(
+        "The arguments of this '{name}' call could not be used ({reason}), so it was not run. Re-send it with a JSON object."
+    )))
 }
 
 /// Короткая выжимка для строки состояния и для трассы. Режет по границе
@@ -461,6 +502,28 @@ fn summarize_tool_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Родной протокол хранит битые аргументы строкой — такое не исполняется,
+    /// и модель узнаёт настоящую причину.
+    #[tokio::test]
+    async fn arguments_that_are_not_json_are_refused_with_the_reason() {
+        let mcp = tokio::sync::Mutex::new(MCPManager::new());
+        let outcome = dispatch_generic_tool(
+            &ToolRegistry::new(),
+            &mcp,
+            "read_file",
+            serde_json::Value::String("{\"path\": ".to_string()),
+        )
+        .await;
+        assert!(outcome.is_error);
+        assert!(outcome.text.contains("not valid JSON"), "{}", outcome.text);
+        let array = refuse_non_object("edit", &serde_json::json!([1, 2])).expect("refused");
+        assert!(
+            array.text.contains("must be a JSON object"),
+            "{}",
+            array.text
+        );
+    }
 
     #[test]
     fn a_short_result_is_kept_whole() {

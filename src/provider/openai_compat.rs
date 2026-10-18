@@ -441,15 +441,17 @@ pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": message.tool_call_id,
-                    "content": message.content,
+                    "content": message.labelled_tool_output(),
                 }));
             } else {
                 // Промптовый путь: у ассистента нет `tool_calls`, отвечать
                 // нечему — результат уходит обычным пользовательским текстом
                 // (см. комментарий модуля).
                 let body = match &message.name {
-                    Some(name) => format!("[tool result: {name}]\n{}", message.content),
-                    None => format!("[tool result]\n{}", message.content),
+                    Some(name) => {
+                        format!("[tool result: {name}]\n{}", message.labelled_tool_output())
+                    }
+                    None => format!("[tool result]\n{}", message.labelled_tool_output()),
                 };
                 messages.push(serde_json::json!({ "role": "user", "content": body }));
             }
@@ -478,6 +480,12 @@ pub fn request_to_openai(request: &CompletionRequest) -> serde_json::Value {
                 object["name"] = serde_json::json!(name);
             }
             messages.push(object);
+            continue;
+        }
+        // Заметка посреди истории — текстом пользователя: строгие локальные
+        // шаблоны (llama.cpp) отвергают system не в начале.
+        if message.role == Role::System && !messages.is_empty() {
+            messages.push(serde_json::json!({ "role": "user", "content": message.inline_note() }));
             continue;
         }
         let mut object = serde_json::json!({
@@ -840,6 +848,36 @@ mod tests {
             created: 1_700_000_000,
             model: "deepseek-chat".to_string(),
         }
+    }
+
+    /// Строгие шаблоны отвергают system не в начале; провал инструмента
+    /// виден в тексте — у протокола нет флага.
+    #[test]
+    fn outbound_notes_stay_in_place_and_failures_are_labelled() {
+        let mut failed = ChatMessage::tool_with_display("c1", "bash", "", "", true);
+        failed.tool_call_id = Some("c1".to_string());
+        let request = CompletionRequest {
+            messages: vec![
+                ChatMessage::system("SYS"),
+                ChatMessage::user("q"),
+                failed,
+                ChatMessage::system("turn failed"),
+            ],
+            tools: Vec::new(),
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+        };
+        let body = request_to_openai(&request);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages[2]["content"],
+            "[tool result: bash]\n[tool failed]\n"
+        );
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "[Note]\nturn failed");
     }
 
     #[test]

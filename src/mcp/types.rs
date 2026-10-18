@@ -54,6 +54,20 @@ pub enum MCPServerStatus {
     Disabled,
 }
 
+impl MCPServerStatus {
+    /// Короткая строка состояния: и для `/mcp`, и для ответа модели.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Pending => "pending".to_string(),
+            Self::Connecting => "connecting".to_string(),
+            Self::Connected => "connected".to_string(),
+            Self::AuthRequired(_) => "auth required".to_string(),
+            Self::Error(e) => format!("error: {e}"),
+            Self::Disabled => "disabled".to_string(),
+        }
+    }
+}
+
 /// Where a server's config came from — determines what `MCPManager`'s
 /// `persist_config` is allowed to write for it. `Own` servers were found in
 /// our own `mcp.json` (or added/edited in-app in the future); their full

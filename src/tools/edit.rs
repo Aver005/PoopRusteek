@@ -238,12 +238,16 @@ fn write_blocking(path_str: &str, content: &str) -> Result<String, String> {
     // Существование берём из метаданных, а не из успеха чтения: бинарный или
     // недоступный файл иначе выглядел бы как создание нового.
     let previous = std::fs::metadata(&path).ok().filter(|m| m.is_file());
-    // Один раз и байтами: перезаписать можно и бинарник, и откат обязан
-    // вернуть его побайтово. Текст для отчёта достаём из тех же байт.
-    let previous_bytes = previous
-        .is_some()
-        .then(|| std::fs::read(&path).ok())
-        .flatten();
+    // Один раз и байтами: откат обязан вернуть и бинарник побайтово. Не
+    // прочитали старое — не пишем: откат счёл бы файл новым и удалил его.
+    let previous_bytes = match previous {
+        Some(_) => Some(std::fs::read(&path).map_err(|e| {
+            format!(
+                "Cannot read the existing {path_str} to back it up, so it was not overwritten: {e}"
+            )
+        })?),
+        None => None,
+    };
     let previous_text = previous_bytes
         .as_deref()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())

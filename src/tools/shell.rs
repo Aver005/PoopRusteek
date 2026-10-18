@@ -34,7 +34,6 @@ const FOREGROUND_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 /// because 1 MiB is the whole point of the cap; the `const _` assertion below
 /// fails the build if the two are ever changed independently.
 const FOREGROUND_TRUNCATION_MARKER: &str = "\n[output truncated at 1 MiB]";
-
 const _: () = assert!(FOREGROUND_OUTPUT_CAP_BYTES == 1024 * 1024);
 
 /// Сколько ждать конца вывода после выхода команды. Дольше — значит пайп
@@ -302,6 +301,24 @@ impl Tool for ShellTool {
     }
 }
 
+/// Что модель узнаёт о завершённой команде: вывод с stderr (предупреждения
+/// компилятора живут там), код выхода при провале, пустой вывод — словами.
+fn command_result(output: String, status: &std::process::ExitStatus) -> String {
+    let mut result = output;
+    if !status.success() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&match status.code() {
+            Some(code) => format!("[exit code {code}]"),
+            None => "[terminated by a signal]".to_string(),
+        });
+    } else if result.trim().is_empty() {
+        result = "(command completed successfully with no output)".to_string();
+    }
+    result
+}
+
 /// Склеить потоки для ответа модели. Пустой поток разделителя не добавляет.
 fn combine_output(stdout: &str, stderr: &str) -> String {
     let mut result = String::from(stdout);
@@ -433,17 +450,15 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
 
     // One decode per stream, on the complete buffer: this is the only
     // place that can tell UTF-16 child output from UTF-8.
-    let mut stdout = crate::util::decode_process_output(&stdout_buf.lock().unwrap()).into_owned();
+    let stdout = crate::util::decode_process_output(&stdout_buf.lock().unwrap()).into_owned();
     let stderr = crate::util::decode_process_output(&stderr_buf.lock().unwrap()).into_owned();
+    // Пометки — после обоих потоков: модель видит их последними, что бы ни вернулось.
+    let mut output = combine_output(&stdout, &stderr);
     if truncated.load(Ordering::Relaxed) {
-        // Appended to `stdout` specifically (not `stderr`) because the
-        // success path below returns stdout only — a marker attached to
-        // stderr would be invisible on success, silently hiding the
-        // fact that output was dropped.
-        stdout.push_str(FOREGROUND_TRUNCATION_MARKER);
+        output.push_str(FOREGROUND_TRUNCATION_MARKER);
     }
     if pipes_held {
-        stdout.push_str(PIPES_HELD_MARKER);
+        output.push_str(PIPES_HELD_MARKER);
     }
     debug_log::log_json(
         "shell.foreground.output",
@@ -464,7 +479,7 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
     );
 
     if timed_out {
-        let mut result = combine_output(&stdout, &stderr);
+        let mut result = output;
         if !result.is_empty() {
             result.push('\n');
         }
@@ -476,33 +491,8 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
 
     match exit_status {
         Some(status) => {
-            if status.success() {
-                if stdout.trim().is_empty() && stderr.trim().is_empty() {
-                    debug_log::log_json(
-                        "shell.foreground.empty_success",
-                        &json!({
-                            "tool": shell.name,
-                            "display": shell.display,
-                            "command": command,
-                            "argv": argv,
-                            "pid": pid,
-                            "exit_code": status.code(),
-                            "note": "command exited successfully but produced no stdout/stderr",
-                        }),
-                    );
-                    if shell.name == "powershell" {
-                        // Genuinely empty output (e.g. a filter that matched
-                        // nothing) is common and not a failure — flagging it
-                        // as `ToolResult::error` used to make the agent treat
-                        // a normal zero-result command as broken.
-                        return ToolResult::success(
-                            "(command completed successfully with no output)",
-                        );
-                    }
-                }
-                ToolResult::success(&stdout)
-            } else {
-                let result = combine_output(&stdout, &stderr);
+            let result = command_result(output, &status);
+            if !status.success() {
                 debug_log::log_json(
                     "shell.foreground.nonzero_exit",
                     &json!({
@@ -516,8 +506,9 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
                         "result": result,
                     }),
                 );
-                ToolResult::error(&result)
+                return ToolResult::error(&result);
             }
+            ToolResult::success(&result)
         }
         None => {
             debug_log::log_json(
@@ -721,6 +712,45 @@ fn job_mode_label(persistent: bool, ttl_secs: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        #[cfg(unix)]
+        return std::process::ExitStatus::from_raw(code << 8);
+        #[cfg(windows)]
+        return std::process::ExitStatus::from_raw(code as u32);
+    }
+
+    /// Предупреждения компилятора живут в stderr: успех не должен их терять.
+    #[test]
+    fn a_successful_command_keeps_its_stderr() {
+        let result = command_result(combine_output("built", "warning: unused"), &exit_status(0));
+        assert_eq!(result, "built\nwarning: unused");
+    }
+
+    /// Провал без вывода (`grep` ничего не нашёл) раньше был пустой строкой.
+    #[test]
+    fn a_failed_command_reports_its_exit_code() {
+        assert_eq!(
+            command_result(String::new(), &exit_status(1)),
+            "[exit code 1]"
+        );
+        assert_eq!(
+            command_result(combine_output("", "boom"), &exit_status(101)),
+            "boom\n[exit code 101]"
+        );
+    }
+
+    #[test]
+    fn an_empty_success_says_so() {
+        assert_eq!(
+            command_result(combine_output("", "  "), &exit_status(0)),
+            "(command completed successfully with no output)"
+        );
+    }
 
     #[test]
     fn bash_builds_dash_c_argv() {

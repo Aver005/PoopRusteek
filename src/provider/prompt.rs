@@ -46,16 +46,29 @@ fn format_history_message(message: &ChatMessage) -> String {
     }
 
     let role = match message.role {
-        Role::System => "SYSTEM",
-        Role::User => "USER",
-        Role::Assistant => "ASSISTANT",
-        Role::Tool => "TOOL",
+        Role::System => "SYSTEM".to_string(),
+        Role::User => "USER".to_string(),
+        Role::Assistant => "ASSISTANT".to_string(),
+        // Не `[TOOL:имя]`: так открывается старый формат вызова, и копия
+        // истории в ответе модели разобралась бы как вызов.
+        Role::Tool => format!("TOOL RESULT: {}", tool_label(message)),
     };
     format!(
         "[{role}]\n{}{}",
         message.content,
         lost_attachments_note(message)
     )
+}
+
+/// Имя инструмента и пометка провала. У DeepSeek нет поля для флага ошибки:
+/// без пометки упавшая команда без вывода читалась как успех.
+fn tool_label(message: &ChatMessage) -> String {
+    let name = message.name.as_deref().unwrap_or("unknown");
+    if message.tool_error {
+        format!("{name} (FAILED)")
+    } else {
+        name.to_string()
+    }
 }
 
 /// Вложения из пересылаемой истории заново не грузятся ([`tail`]), и модель
@@ -212,7 +225,7 @@ fn format_tail_message(message: &ChatMessage) -> Option<String> {
     match message.role {
         Role::Tool => Some(format!(
             "### TOOL RESULT: {}\n{}",
-            message.name.as_deref().unwrap_or("unknown"),
+            tool_label(message),
             message.content
         )),
         Role::User if !message.content.is_empty() => {
@@ -373,6 +386,29 @@ mod tests {
             format!(
                 "### TOOL RESULT: bash\nout-a\n\n### TOOL RESULT: grep\nout-b\n\n{FORMAT_REMINDER}"
             )
+        );
+    }
+
+    /// Флаг ошибки доходит до модели текстом: поля под него у DeepSeek нет.
+    #[test]
+    fn a_failed_tool_result_is_labelled_in_tail_and_history() {
+        let failed = ChatMessage::tool_with_display("id1", "bash", "", "", true);
+        let tail = build_prompt(
+            &[
+                ChatMessage::user("q"),
+                ChatMessage::assistant("<tool_use>…</tool_use>"),
+                failed.clone(),
+            ],
+            "SYS",
+            SystemDelivery::Held,
+        );
+        assert!(
+            tail.starts_with("### TOOL RESULT: bash (FAILED)\n"),
+            "{tail}"
+        );
+        assert_eq!(
+            format_history_message(&failed),
+            "[TOOL RESULT: bash (FAILED)]\n"
         );
     }
 

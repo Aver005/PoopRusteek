@@ -1185,7 +1185,13 @@ impl App {
         };
         let last_model = conv.generation.last_model.clone();
         let last_status = conv.generation.last_status.clone();
-        if let Some(last) = conv.messages.iter_mut().last()
+        // Мимо заметок в хвосте (провал хода кладёт свою последней), но не
+        // дальше: ответ прошлого хода чужой.
+        if let Some(last) = conv
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role != Role::System)
             && last.role == Role::Assistant
             && !last.content.is_empty()
         {

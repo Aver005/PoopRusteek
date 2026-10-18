@@ -102,9 +102,7 @@ impl StreamOutcome {
             },
             StreamEnd::Completed => StreamVerdict::ClosedWithoutStop,
             StreamEnd::ProviderError(error) => StreamVerdict::Failed(error.clone()),
-            StreamEnd::TaskFailed(error) => {
-                StreamVerdict::Failed(format!("Stream task failed: {error}"))
-            }
+            StreamEnd::TaskFailed(error) => StreamVerdict::Failed(error.clone()),
         }
     }
 }
@@ -219,7 +217,10 @@ async fn collect(
     let end = match joined {
         None | Some(Ok(Ok(()))) => StreamEnd::Completed,
         Some(Ok(Err(error))) => StreamEnd::ProviderError(error.to_string()),
-        Some(Err(join_error)) => StreamEnd::TaskFailed(join_error.to_string()),
+        Some(Err(join_error)) => StreamEnd::TaskFailed(crate::util::join_error_text(
+            "the provider stream",
+            &join_error,
+        )),
     };
     StreamOutcome {
         text,

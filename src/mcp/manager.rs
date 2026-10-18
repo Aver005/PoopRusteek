@@ -6,11 +6,9 @@
 //! - Every server's client is `Arc<MCPClient>`. That's what lets
 //!   `client_for` hand a caller (the agent loop) a handle it can run a tool
 //!   call through *without* holding `MCPManager`'s own lock — previously the
-//!   whole `Mutex<MCPManager>` was held across the network await inside
-//!   `call_tool`, which froze the UI event loop for the duration of every
-//!   MCP tool call. `call_tool` on this type still exists and still works
-//!   (it just delegates to `client_for` internally) so existing callers
-//!   don't need to change.
+//!   whole `Mutex<MCPManager>` was held across the network await, which
+//!   froze the UI event loop for the duration of every MCP tool call.
+//!   Сбои транспорта возвращаются через `mark_broken`.
 //! - Each entry remembers a [`ServerSource`]: `Own` (from our `mcp.json`) or
 //!   `Foreign` (discovered from another tool's config). `persist_config`
 //!   uses this to avoid writing foreign servers' full config — including
@@ -20,10 +18,57 @@ use super::client::MCPClient;
 use super::config::{load_mcp_config, load_overrides, load_own_enabled_map, save_mcp_config};
 use super::types::*;
 use crate::error::AppResult;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Куда идёт вызов MCP-инструмента.
+pub struct McpTarget {
+    pub client: Arc<MCPClient>,
+    pub server: String,
+    pub tool: String,
+}
+
+/// Почему вызов некуда отправить. Раньше обе причины звучали как «server not
+/// connected», и опечатку в имени модель чинила переподключением.
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpUnavailable {
+    UnknownTool,
+    NotConnected {
+        server: String,
+        status: MCPServerStatus,
+    },
+}
+
+/// Сколько сбоев транспорта подряд, чтобы считать сервер сломанным.
+pub const BROKEN_AFTER_FAILURES: u32 = 3;
+
+impl McpUnavailable {
+    /// Объяснение для модели: что случилось и что делать дальше.
+    pub fn explain(&self, tool: &str) -> String {
+        match self {
+            Self::UnknownTool => {
+                format!("Unknown MCP tool '{tool}'. Use tool_search to find the right name.")
+            }
+            Self::NotConnected { server, status } => {
+                let state = match status {
+                    MCPServerStatus::Disabled => "is disabled by the user".to_string(),
+                    MCPServerStatus::AuthRequired(_) => {
+                        "needs authorization — ask the user to run /mcp auth".to_string()
+                    }
+                    MCPServerStatus::Error(error) => {
+                        format!("is broken ({error}) — ask the user to reconnect it with /mcp")
+                    }
+                    MCPServerStatus::Pending | MCPServerStatus::Connecting => {
+                        "is still connecting — try again shortly".to_string()
+                    }
+                    MCPServerStatus::Connected => "is connected".to_string(),
+                };
+                format!("MCP tool '{tool}' is not available: server '{server}' {state}.")
+            }
+        }
+    }
+}
 
 /// Determine a discovered server's enabled state and [`ServerSource`].
 ///
@@ -412,87 +457,41 @@ impl MCPManager {
         }
     }
 
-    /// Look up the client and bare tool name for a `mcp__<server>__<tool>`
-    /// prefixed tool name, without calling anything.
-    ///
-    /// This is what lets a caller (the agent loop) run a tool call without
-    /// holding `MCPManager`'s own lock across the network await: clone the
-    /// `Arc<MCPClient>` out here (cheap — bumps a refcount), drop the
-    /// manager lock, then call `client.call_tool(...)` on the owned handle.
-    /// Previously the *only* way to call a tool was `MCPManager::call_tool`,
-    /// which — because it needs `&mut self` for the status check/flip
-    /// below — could only be called while holding the manager's mutex for
-    /// the whole round-trip, freezing the UI event loop for the duration of
-    /// every MCP tool call.
-    ///
-    /// Returns `None` if the tool name is unknown or its server isn't
-    /// currently `Connected` (mirrors the guard `call_tool` used to run
-    /// inline). Reuses the same prefix parsing as `connect_one`'s
-    /// `tool_name_map` population — the map itself, rather than
-    /// re-splitting the `mcp__` string here — so there's exactly one place
-    /// that understands the prefix scheme.
-    pub fn client_for(&self, full_tool_name: &str) -> Option<(Arc<MCPClient>, String)> {
-        let (server_name, tool_name) = self.tool_name_map.get(full_tool_name)?;
-        let entry = self.servers.get(server_name)?;
-        if !matches!(entry.status, MCPServerStatus::Connected) {
-            return None;
-        }
-        Some((Arc::clone(&entry.client), tool_name.clone()))
-    }
-
-    /// Still `&mut self` and still does the full call inline — kept for
-    /// existing callers (delegates to `client_for` for the lookup). New
-    /// callers that want to avoid holding the manager lock across the
-    /// network await should use `client_for` directly instead.
-    ///
-    /// A transport-level failure (`Err` from `MCPClient::call_tool` — I/O
-    /// error, timeout, decode error) means the *connection* is unhealthy,
-    /// so this flips the server to `MCPServerStatus::Error`. A tool that
-    /// merely reported failure (`Ok(MCPToolResult { is_error: true, .. })`
-    /// — a JSON-RPC error response or `isError: true`) does not; the
-    /// connection is fine, the tool just failed, which is a normal outcome
-    /// the caller/LLM handles on its own. Previously nothing ever flipped
-    /// status back to `Error` after a successful connect, so a server whose
-    /// process had died mid-session (or whose transport started timing
-    /// out) would keep reporting "connected" indefinitely.
-    ///
-    /// The in-tree agent loop has since migrated to `client_for` (avoids
-    /// holding the manager lock across the network await), so nothing here
-    /// calls this anymore — kept anyway per the doc comment above.
-    #[expect(
-        dead_code,
-        reason = "back-compat entry point, deliberately kept per doc comment above"
-    )]
-    pub async fn call_tool(
-        &mut self,
-        full_tool_name: &str,
-        args: Value,
-    ) -> AppResult<MCPToolResult> {
-        let server_name = self
+    /// Хэндл клиента для вызова инструмента без замка менеджера (замок через
+    /// сетевой `await` однажды заморозил весь UI). Отказ называет причину.
+    pub fn client_for(&self, full_tool_name: &str) -> Result<McpTarget, McpUnavailable> {
+        let (server_name, tool_name) = self
             .tool_name_map
             .get(full_tool_name)
-            .map(|(s, _)| s.clone())
-            .ok_or_else(|| {
-                crate::error::AppError::Mcp(format!("Unknown MCP tool: {full_tool_name}"))
-            })?;
-
-        let Some((client, tool_name)) = self.client_for(full_tool_name) else {
-            // Either unknown (already ruled out above) or not connected.
-            return Ok(MCPToolResult {
-                content: format!("MCP server '{server_name}' is not connected"),
-                is_error: true,
+            .ok_or(McpUnavailable::UnknownTool)?;
+        let entry = self
+            .servers
+            .get(server_name)
+            .ok_or(McpUnavailable::UnknownTool)?;
+        if !matches!(entry.status, MCPServerStatus::Connected) {
+            return Err(McpUnavailable::NotConnected {
+                server: server_name.clone(),
+                status: entry.status.clone(),
             });
-        };
+        }
+        Ok(McpTarget {
+            client: Arc::clone(&entry.client),
+            server: server_name.clone(),
+            tool: tool_name.clone(),
+        })
+    }
 
-        match client.call_tool(&tool_name, args).await {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                if let Some(entry) = self.servers.get_mut(&server_name) {
-                    entry.status = MCPServerStatus::Error(e.to_string());
-                }
-                tracing::warn!("MCP '{server_name}' tool call transport error, marking Error: {e}");
-                Err(e)
-            }
+    /// Сервер, чей вызов падал [`BROKEN_AFTER_FAILURES`] раз подряд, больше не
+    /// «подключён». Только тот же клиент: переподключённый новый не трогаем.
+    pub fn mark_broken(&mut self, target: &McpTarget, reason: &str) {
+        let Some(entry) = self.servers.get_mut(&target.server) else {
+            return;
+        };
+        if Arc::ptr_eq(&entry.client, &target.client)
+            && matches!(entry.status, MCPServerStatus::Connected)
+        {
+            entry.status = MCPServerStatus::Error(reason.to_string());
+            tracing::warn!("MCP '{}' marked broken: {reason}", target.server);
         }
     }
 
@@ -538,14 +537,7 @@ impl MCPManager {
                 ServerDisplayInfo {
                     name: name.clone(),
                     transport,
-                    status: match &entry.status {
-                        MCPServerStatus::Pending => "pending".to_string(),
-                        MCPServerStatus::Connecting => "connecting".to_string(),
-                        MCPServerStatus::Connected => "connected".to_string(),
-                        MCPServerStatus::AuthRequired(_) => "auth required".to_string(),
-                        MCPServerStatus::Error(e) => format!("error: {e}"),
-                        MCPServerStatus::Disabled => "disabled".to_string(),
-                    },
+                    status: entry.status.label(),
                     tool_count: entry.tools.len(),
                     resource_count: entry.resources.len(),
                     enabled: entry.enabled,
@@ -868,6 +860,16 @@ pub struct FullMCPTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Незнакомое имя — не «сервер не подключён»: модель чинила бы не то.
+    #[test]
+    fn an_unknown_mcp_tool_is_not_blamed_on_the_connection() {
+        let manager = MCPManager::new();
+        assert!(matches!(
+            manager.client_for("mcp__nope__tool"),
+            Err(McpUnavailable::UnknownTool)
+        ));
+    }
 
     #[test]
     fn resolve_enabled_and_source_own_server_uses_own_map() {

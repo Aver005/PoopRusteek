@@ -113,15 +113,21 @@ pub(crate) fn merge_alternating_turns<'m>(
 
     for message in request.messages.iter().filter(|message| !message.ui_only) {
         let (role, text) = match message.role {
-            Role::System => {
+            // Системное в начале — system prompt; заметка посреди истории
+            // остаётся на своём месте текстом.
+            Role::System if turns.is_empty() => {
                 system_parts.push(&message.content);
                 continue;
             }
+            Role::System => ("user", message.inline_note()),
             Role::User => ("user", message.content.clone()),
             Role::Assistant => (assistant_role, message.content.clone()),
             // Results go back as user text, labeled so the model can tell
             // them from the human.
-            Role::Tool => ("user", format!("[tool result]\n{}", message.content)),
+            Role::Tool => (
+                "user",
+                format!("[tool result]\n{}", message.labelled_tool_output()),
+            ),
         };
         if text.is_empty() {
             continue;

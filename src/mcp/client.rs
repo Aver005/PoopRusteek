@@ -17,13 +17,15 @@ use crate::error::AppResult;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 pub struct MCPClient {
     transport: Arc<Mutex<dyn Transport>>,
     server_name: String,
     next_id: AtomicU64,
+    /// Сбоев транспорта подряд: один тайм-аут ещё не повод считать сервер мёртвым.
+    failures_in_row: AtomicU32,
 }
 
 impl MCPClient {
@@ -39,6 +41,7 @@ impl MCPClient {
             transport: Arc::new(Mutex::new(transport)),
             server_name: server_name.to_string(),
             next_id: AtomicU64::new(1),
+            failures_in_row: AtomicU32::new(0),
         })
     }
 
@@ -47,6 +50,7 @@ impl MCPClient {
             transport: Arc::new(Mutex::new(super::transport::DummyTransport)),
             server_name: server_name.to_string(),
             next_id: AtomicU64::new(0),
+            failures_in_row: AtomicU32::new(0),
         }
     }
 
@@ -60,6 +64,7 @@ impl MCPClient {
             transport: Arc::new(Mutex::new(transport)),
             server_name: server_name.to_string(),
             next_id: AtomicU64::new(1),
+            failures_in_row: AtomicU32::new(0),
         })
     }
 
@@ -73,6 +78,7 @@ impl MCPClient {
             transport: Arc::new(Mutex::new(transport)),
             server_name: server_name.to_string(),
             next_id: AtomicU64::new(1),
+            failures_in_row: AtomicU32::new(0),
         })
     }
 
@@ -86,7 +92,7 @@ impl MCPClient {
             }
         });
 
-        let response = self.call_impl("initialize", Some(params)).await?;
+        let response = self.call("initialize", Some(params)).await?;
 
         // Log session ID from transport (set via MCP-Session-Id HTTP header)
         let transport = self.transport.lock().await;
@@ -150,23 +156,28 @@ impl MCPClient {
         Ok(resources)
     }
 
-    /// A transport-level failure (I/O error, timeout, decode error — see
-    /// `call_impl`) surfaces as `Err`; a tool that ran but reported failure
-    /// (JSON-RPC error response, or a successful response with
-    /// `isError: true`) surfaces as `Ok(MCPToolResult { is_error: true, .. })`.
-    /// Callers that track connection health (`MCPManager`) should treat only
-    /// the `Err` case as evidence the *connection* is unhealthy.
+    /// `Err` — сбой транспорта (связь, тайм-аут, разбор); отказ самого
+    /// инструмента или ошибка JSON-RPC — `Ok` с `is_error`.
     pub async fn call_tool(&self, tool_name: &str, args: Value) -> AppResult<MCPToolResult> {
         let params = json!({
             "name": tool_name,
             "arguments": args
         });
 
-        let response = self.call("tools/call", Some(params)).await?;
+        let response = match self.send("tools/call", Some(params)).await {
+            Ok(response) => {
+                self.failures_in_row.store(0, Ordering::Relaxed);
+                response
+            }
+            Err(error) => {
+                self.failures_in_row.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
 
         if let Some(error) = &response.error {
             return Ok(MCPToolResult {
-                content: error.message.clone(),
+                content: format!("MCP error {}: {}", error.code, error.message),
                 is_error: true,
             });
         }
@@ -186,18 +197,9 @@ impl MCPClient {
         })
     }
 
+    /// Запрос, где ошибка JSON-RPC — тоже ошибка (служебные методы).
     async fn call(&self, method: &str, params: Option<Value>) -> AppResult<JsonRpcResponse> {
-        self.call_impl(method, params).await
-    }
-
-    async fn call_impl(&self, method: &str, params: Option<Value>) -> AppResult<JsonRpcResponse> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
-        let request = JsonRpcRequest::new(id, method, params);
-
-        let mut transport = self.transport.lock().await;
-        let response = transport.send_request(&request).await?;
-
+        let response = self.send(method, params).await?;
         if let Some(err) = &response.error {
             return Err(crate::error::AppError::Mcp(format!(
                 "JSON-RPC error (method={method}): code={}, message={}",
@@ -206,6 +208,19 @@ impl MCPClient {
         }
 
         Ok(response)
+    }
+
+    /// Один обмен с сервером; ответ с `error` возвращается как есть.
+    async fn send(&self, method: &str, params: Option<Value>) -> AppResult<JsonRpcResponse> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = JsonRpcRequest::new(id, method, params);
+        let mut transport = self.transport.lock().await;
+        transport.send_request(&request).await
+    }
+
+    /// Сколько вызовов подряд упало на транспорте.
+    pub fn failures_in_row(&self) -> u32 {
+        self.failures_in_row.load(Ordering::Relaxed)
     }
 
     /// Close the underlying transport (kills the child process for stdio;

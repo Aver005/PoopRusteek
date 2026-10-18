@@ -82,6 +82,19 @@ pub fn turn_end(event: &AgentEvent) -> Option<TurnEnd> {
     }
 }
 
+/// Сколько причины провала попадает в историю: тело ответа WAF или битый
+/// вызов модели иначе ехали бы в каждый следующий запрос целиком.
+const FAILURE_NOTE_REASON_BYTES: usize = 900;
+
+/// Заметка о провале хода — и человеку в ленте, и модели в следующем запросе.
+/// Причина в кавычках: это отчёт рантайма, а не указание.
+pub fn failure_note(reason: &str) -> String {
+    let reason = crate::util::truncate_with_ellipsis(reason.trim(), FAILURE_NOTE_REASON_BYTES);
+    format!(
+        "⚠ An earlier turn in this conversation failed and was stopped by the agent runtime. Reported reason: «{reason}». A reply right before this note may be incomplete."
+    )
+}
+
 /// Применить событие к беседе. Возвращает `Some` только на терминальном
 /// событии — по нему вызывающий и ветвится.
 pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<TurnEnd> {
@@ -118,8 +131,13 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
             conversation.finish_turn("FINISHED");
             turn_end(event)
         }
-        AgentEvent::Failed(_) => {
+        AgentEvent::Failed(reason) => {
             conversation.finish_turn("ABORTED");
+            // Причина остаётся в истории: строка состояния её забывала, а модель
+            // следующего хода не знала, что прошлый оборвался.
+            conversation
+                .messages
+                .push(crate::provider::ChatMessage::system(&failure_note(reason)));
             turn_end(event)
         }
         // Ход инструмента и сброс серверной сессии историю не трогают:
@@ -208,6 +226,30 @@ mod tests {
         );
         assert_eq!(end, Some(TurnEnd::Failed("сеть отвалилась".to_string())));
         assert!(!conv.generation.active);
+    }
+
+    /// Причина провала не только в строке состояния: следующий ход её увидит.
+    #[test]
+    fn a_failed_turn_leaves_its_reason_in_the_history() {
+        let mut conv = conversation();
+        apply(&mut conv, &AgentEvent::BeginAssistantMessage);
+        apply(&mut conv, &AgentEvent::Chunk("Начинаю пра".to_string()));
+        apply(
+            &mut conv,
+            &AgentEvent::Failed("сеть отвалилась".to_string()),
+        );
+        let last = conv.messages.last().expect("заметка о провале");
+        assert_eq!(last.role, Role::System);
+        assert!(!last.ui_only, "заметка должна дойти до модели");
+        assert!(last.content.contains("сеть отвалилась"), "{}", last.content);
+        assert!(last.content.contains("incomplete"), "{}", last.content);
+    }
+
+    /// Тело ответа WAF не должно ехать в каждый следующий запрос целиком.
+    #[test]
+    fn a_huge_failure_reason_is_capped() {
+        let note = failure_note(&"<html>".repeat(10_000));
+        assert!(note.len() < 2_000, "{} bytes", note.len());
     }
 
     #[test]

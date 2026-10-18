@@ -71,7 +71,16 @@ impl ToolRegistry {
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult {
         match self.get(name) {
             Some(tool) => tool.execute(args).await,
-            None => ToolResult::error(&format!("Unknown tool: {name}")),
+            // Список имён — единственная подсказка, по которой модель
+            // исправит опечатку, а не повторит её.
+            None => {
+                let mut names: Vec<String> = self.tools.lock().unwrap().keys().cloned().collect();
+                names.sort();
+                ToolResult::error(&format!(
+                    "Unknown tool: {name}. Available tools: {}. MCP tools are named mcp__<server>__<tool>.",
+                    names.join(", ")
+                ))
+            }
         }
     }
 
@@ -104,6 +113,16 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Опечатку модель исправит, только если увидит правильные имена.
+    #[tokio::test]
+    async fn an_unknown_tool_lists_the_real_names() {
+        let result = ToolRegistry::new()
+            .execute("read_flie", serde_json::json!({}))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("read_file"), "{}", result.content);
+    }
 
     #[test]
     fn bash_is_always_registered() {

@@ -125,7 +125,7 @@ impl DeepseekProvider {
         // the async workers that drive the UI and other conversations.
         let solution = tokio::task::spawn_blocking(move || super::pow::solve_pow(&challenge))
             .await
-            .map_err(|e| AppError::Provider(format!("PoW solver task failed: {e}")))?
+            .map_err(|e| AppError::Provider(crate::util::join_error_text("the PoW solver", &e)))?
             .ok_or_else(|| AppError::Provider("Failed to solve PoW challenge".to_string()))?;
         debug_log::log_json("pow.challenge.solution", &solution);
         super::pow::encode_solution(&solution)
