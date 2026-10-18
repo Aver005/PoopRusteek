@@ -107,6 +107,9 @@ pub async fn remove_process(id: u64) -> bool {
     reg.procs.remove(&id).is_some()
 }
 
+/// Срок записи во ввод интерактивного процесса.
+const INPUT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub async fn write_input(id: u64, bytes: &[u8]) -> Result<(), String> {
     let handle = {
         let reg = registry().lock().await;
@@ -118,18 +121,47 @@ pub async fn write_input(id: u64, bytes: &[u8]) -> Result<(), String> {
             "Process is not interactive; start it with interactive=true to send input.".to_string(),
         );
     }
-    let writer = handle.writer.as_ref().ok_or_else(|| {
+    let writer = handle.writer.clone().ok_or_else(|| {
         "Process has no stdin writer (this should not happen for interactive processes)."
             .to_string()
     })?;
-    let mut guard = writer.lock().unwrap();
-    let result = guard
-        .write_all(bytes)
-        .map_err(|e| format!("Failed to write to process stdin: {e}"));
+    // Запись в PTY блокирующая: процесс, который не читает ввод, держал бы
+    // воркер tokio вечно. `try_lock` — прошлый ввод ещё в пути, не копим очередь.
+    let bytes = bytes.to_vec();
+    let write = tokio::task::spawn_blocking(move || {
+        let mut guard = match writer.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(InputError::Busy),
+        };
+        guard
+            .write_all(&bytes)
+            .and_then(|()| guard.flush())
+            .map_err(|e| InputError::Failed(e.to_string()))
+    });
+    let result = match tokio::time::timeout(INPUT_WRITE_TIMEOUT, write).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(InputError::Busy))) => Err(
+            "The previous input to this process is still being delivered; wait and read its output first."
+                .to_string(),
+        ),
+        Ok(Ok(Err(InputError::Failed(e)))) => Err(format!("Failed to write to process stdin: {e}")),
+        Ok(Err(e)) => Err(format!("Failed to write to process stdin: {e}")),
+        Err(_) => Err(format!(
+            "The process has not taken this input within {}s (it is not reading). It may still be delivered later — do not resend it.",
+            INPUT_WRITE_TIMEOUT.as_secs()
+        )),
+    };
     if result.is_ok() {
         handle.touch();
     }
     result
+}
+
+/// Почему ввод не дошёл до процесса.
+enum InputError {
+    Busy,
+    Failed(String),
 }
 
 pub async fn kill_process(id: u64) -> Option<std::io::Result<()>> {

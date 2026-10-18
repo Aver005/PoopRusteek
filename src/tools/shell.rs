@@ -34,7 +34,15 @@ const FOREGROUND_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 /// because 1 MiB is the whole point of the cap; the `const _` assertion below
 /// fails the build if the two are ever changed independently.
 const FOREGROUND_TRUNCATION_MARKER: &str = "\n[output truncated at 1 MiB]";
+
 const _: () = assert!(FOREGROUND_OUTPUT_CAP_BYTES == 1024 * 1024);
+
+/// Сколько ждать конца вывода после выхода команды. Дольше — значит пайп
+/// держит запущенный ею процесс.
+const PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Пометка для модели: команда вышла, но запущенный ею процесс держит вывод.
+const PIPES_HELD_MARKER: &str = "\n[the command exited, but a process it started is still running and holding its output open; later output is not captured. Start servers and watchers with background=true]";
 
 /// Read `pipe` to EOF in raw-byte chunks, appending to `dest` only while the
 /// process-wide `budget` (shared across stdout+stderr) has room; past the cap
@@ -306,11 +314,28 @@ fn combine_output(stdout: &str, stderr: &str) -> String {
     result
 }
 
+/// Дождаться читателей пайпов в пределах [`PIPE_DRAIN_GRACE`]. `false` — кто-то
+/// ещё держит пайп; недочитанных гасит падение их хэндлов.
+async fn drain_readers(readers: &mut [Option<crate::util::AbortOnDrop<()>>]) -> bool {
+    let all = async {
+        for slot in readers.iter_mut() {
+            if let Some(task) = slot.as_mut() {
+                let _ = task.await;
+                *slot = None;
+            }
+        }
+    };
+    tokio::time::timeout(PIPE_DRAIN_GRACE, all).await.is_ok()
+}
+
 /// Передний план: запустить, дождаться в пределах таймаута, вернуть вывод.
 /// Ровный сосед `run_background` и `run_interactive`.
 async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> ToolResult {
     let mut cmd = Command::new(shell.name);
     cmd.args(&argv);
+    // stdin не наследуется: в `--acp` это JSON-RPC вызывающего, в TUI —
+    // клавиатура. Команда, ждущая ввода, получает EOF, а не чужие байты.
+    cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // Without this, dropping `child` (e.g. this future being cancelled)
@@ -318,12 +343,19 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
     // it — the same leak class as the unbounded-hang bug this fix
     // targets, just via a different path.
     cmd.kill_on_drop(true);
+    // Своя группа: дерево команды гасится одним `kill(-pgid)`, и внуки
+    // (cargo → rustc, npm → node) не переживают оболочку.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return ToolResult::error(&format!("Failed to execute command: {e}")),
     };
     let pid = child.id().unwrap_or(0);
+    // Объявлено после `child`, значит падает раньше: отменённый ход гасит всё
+    // дерево до того, как `kill_on_drop` добьёт один корень.
+    let mut tree = background::ProcessTree::adopt(&child);
     debug_log::log_json(
         "shell.foreground.spawned",
         &json!({
@@ -335,9 +367,6 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
             "creation_flags_detached_process": false,
         }),
     );
-
-    // Track PID so Escape/Ctrl+C can kill the child process.
-    crate::app::FOREGROUND_CHILD_PID.store(pid, Ordering::SeqCst);
 
     // Incremental, capped readers: a foreground call with no timeout/cap
     // (the old `wait_with_output`) hangs the whole turn forever on a
@@ -351,29 +380,34 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
     let budget = Arc::new(AtomicUsize::new(0));
     let truncated = Arc::new(AtomicBool::new(false));
 
-    let stdout_task = child.stdout.take().map(|out| {
-        tokio::spawn(capped_pipe_reader(
-            out,
-            Arc::clone(&stdout_buf),
-            Arc::clone(&budget),
-            Arc::clone(&truncated),
-        ))
-    });
-    let stderr_task = child.stderr.take().map(|err| {
-        tokio::spawn(capped_pipe_reader(
-            err,
-            Arc::clone(&stderr_buf),
-            Arc::clone(&budget),
-            Arc::clone(&truncated),
-        ))
-    });
+    let reader = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+                  dest: &Arc<Mutex<Vec<u8>>>| {
+        pipe.map(|pipe| {
+            crate::util::AbortOnDrop::spawn(capped_pipe_reader(
+                pipe,
+                Arc::clone(dest),
+                Arc::clone(&budget),
+                Arc::clone(&truncated),
+            ))
+        })
+    };
+    let mut readers = [
+        reader(
+            child.stdout.take().map(|out| Box::new(out) as Box<_>),
+            &stdout_buf,
+        ),
+        reader(
+            child.stderr.take().map(|err| Box::new(err) as Box<_>),
+            &stderr_buf,
+        ),
+    ];
 
     let timed_out = tokio::select! {
         _ = child.wait() => false,
         _ = tokio::time::sleep(std::time::Duration::from_secs(FOREGROUND_TIMEOUT_SECS)) => true,
     };
 
-    let exit_status = if timed_out {
+    if timed_out {
         debug_log::log(
             "shell.foreground_timeout",
             format!(
@@ -385,27 +419,17 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
             "{} command timed out after {FOREGROUND_TIMEOUT_SECS}s (pid={pid}), killing process tree",
             shell.name
         );
-        if pid != 0
-            && let Err(e) = background::force_kill_pid(pid).await
-        {
-            tracing::warn!("Failed to kill timed-out {} pid={pid}: {e}", shell.name);
-        }
-        None
-    } else {
-        child.wait().await.ok()
-    };
-
-    // Let the readers observe EOF (the pipes close once the process
-    // exits or is killed) so the captured output is complete rather
-    // than a mid-flight snapshot.
-    if let Some(task) = stdout_task {
-        let _ = task.await;
+        tree.kill();
     }
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
+    let exit_status = child.wait().await.ok().filter(|_| !timed_out);
+    // Корень собран: его PID может достаться чужому процессу, бить по нему нельзя.
+    tree.release();
 
-    crate::app::FOREGROUND_CHILD_PID.store(0, Ordering::SeqCst);
+    // EOF приходит, только когда пайп закрыли все его держатели. Внук,
+    // запущенный командой в фон (`server &`, `start /b`), держит его сколько угодно.
+    // Держателя не убиваем: так держит пайп и нарочно запущенный `start
+    // notepad`. Просто перестаём читать — недочитанных гасит падение хэндлов.
+    let pipes_held = !drain_readers(&mut readers).await;
 
     // One decode per stream, on the complete buffer: this is the only
     // place that can tell UTF-16 child output from UTF-8.
@@ -417,6 +441,9 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
         // stderr would be invisible on success, silently hiding the
         // fact that output was dropped.
         stdout.push_str(FOREGROUND_TRUNCATION_MARKER);
+    }
+    if pipes_held {
+        stdout.push_str(PIPES_HELD_MARKER);
     }
     debug_log::log_json(
         "shell.foreground.output",

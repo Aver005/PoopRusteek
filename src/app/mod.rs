@@ -41,11 +41,9 @@ use events::{
     QuestionRequest, ToolApprovalRequest, View,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-/// PID of the foreground child process (if any), for killing on abort.
-pub static FOREGROUND_CHILD_PID: AtomicU32 = AtomicU32::new(0);
 static TERMINAL_RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn request_terminal_restore() {
@@ -54,26 +52,6 @@ pub fn request_terminal_restore() {
 
 fn consume_terminal_restore_request() -> bool {
     TERMINAL_RESTORE_REQUESTED.swap(false, Ordering::SeqCst)
-}
-
-pub fn kill_foreground_child() {
-    let pid = FOREGROUND_CHILD_PID.swap(0, Ordering::SeqCst);
-    if pid != 0 {
-        #[cfg(windows)]
-        {
-            // /T kills the entire process tree (child + grandchild processes).
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .spawn();
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .spawn();
-        }
-    }
 }
 
 /// Строка состояния для события — или `None`, если сказать нечего.
@@ -574,8 +552,6 @@ impl App {
             self.state.terminal_rows = rows;
         }
         let result = self.run_loop(&mut terminal).await;
-        // Kill any running foreground child before restoring terminal.
-        kill_foreground_child();
         crate::tui::restore(&mut terminal)?;
         // Abort every conversation's agent task so none keeps the runtime alive.
         for conv in self.state.conversations.iter_mut() {
@@ -639,6 +615,10 @@ impl App {
         let mut tick_interval = tokio::time::interval(tick_rate);
         let mut event_stream = EventStream::new();
         let mut burst = paste_burst::Burst::default();
+        // Один на весь цикл: созданный заново на каждой итерации, он терял
+        // сигнал, пришедший между итерациями.
+        let shutdown = crate::util::shutdown_signal();
+        tokio::pin!(shutdown);
 
         loop {
             let mut dirty = false;
@@ -662,9 +642,7 @@ impl App {
                         return Ok(());
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    // Kill any running foreground child before restoring terminal.
-                    kill_foreground_child();
+                () = &mut shutdown => {
                     let _ = self.state.background.shutdown_all().await;
                     return Ok(());
                 }
@@ -951,8 +929,7 @@ impl App {
     /// child, abort the agent task, deny its pending approvals, and reset the
     /// visible state. Shared by Esc and Ctrl+C.
     pub(crate) async fn cancel_focused_turn(&mut self) {
-        // Kill the running foreground child process first.
-        kill_foreground_child();
+        // Падение задачи хода гасит и дерево его команды (`ProcessTree`).
         if let Some(handle) = self.state.focused_mut().agent_task.take() {
             handle.abort();
         }
@@ -1091,7 +1068,6 @@ impl App {
 
     /// Cancel every conversation's in-flight turn (focused + all background).
     async fn cancel_all_turns(&mut self) {
-        kill_foreground_child();
         for conv in self.state.conversations.iter_mut() {
             if let Some(handle) = conv.agent_task.take() {
                 handle.abort();

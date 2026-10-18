@@ -21,13 +21,9 @@ pub use registry::{
 };
 pub use spawn::{spawn_background, spawn_interactive};
 pub use types::{DEFAULT_PERSISTENT_TTL_SECS, ProcessStatus};
-// `force_kill_pid` is `pub(crate)` on the item itself (see types.rs); this
-// re-export just makes it reachable as `background::force_kill_pid` from
-// sibling tool modules (e.g. shell.rs's foreground timeout path) without
-// widening its actual visibility past the crate.
-pub(crate) use types::force_kill_pid;
-// Same idea for `win_job`: any subprocess spawner in the crate (MCP stdio
-// transports included) must bind its children to the kill-on-close Job
-// Object, or a force-close of pooprusteek orphans them.
+// Дерево процессов команды переднего плана — см. `shell.rs`.
+pub(crate) use types::ProcessTree;
+// `win_job`: фоновые дети (и MCP stdio) привязываются к задаче kill-on-close,
+// иначе принудительное закрытие pooprusteek оставит их сиротами.
 #[cfg(windows)]
 pub(crate) use types::win_job;

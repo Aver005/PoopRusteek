@@ -293,9 +293,11 @@ async fn ask_the_user(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolO
         .event_tx
         .send(AppEvent::RequestQuestion(request.clone(), qs));
     ctx.emit_tool_started(&call.name);
-    match request.wait().await {
-        Some(answer) if !answer.is_empty() => ToolOutcome::ok(format!("User answered: {answer}")),
-        _ => ToolOutcome::failed("User cancelled the question"),
+    let answer = request.wait().await;
+    if answer.is_empty() {
+        ToolOutcome::failed("User cancelled the question")
+    } else {
+        ToolOutcome::ok(format!("User answered: {answer}"))
     }
 }
 

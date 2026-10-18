@@ -80,7 +80,9 @@ pub async fn spawn_background(
     // cannot corrupt the TUI's alternate screen buffer or console mode.
     #[cfg(windows)]
     {
-        command.as_std_mut().creation_flags(0x00000008);
+        command
+            .as_std_mut()
+            .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
     }
 
     // Put the child in its own process group (pgid == its pid) so

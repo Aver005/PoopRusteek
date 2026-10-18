@@ -113,10 +113,14 @@ pub(crate) fn is_running_status(status: &ProcessStatus) -> bool {
 /// `std::process::Command::status()` was a synchronous blocking syscall on
 /// those workers.
 pub(crate) async fn force_kill_pid(pid: u32) -> std::io::Result<()> {
+    // `kill -9 -0` на Unix — это собственная группа pooprusteek.
+    if pid == 0 {
+        return Err(std::io::Error::other("no pid to kill"));
+    }
     #[cfg(windows)]
     {
         // /T kills the entire process tree (child + grandchild processes).
-        let status = tokio::process::Command::new("taskkill")
+        let status = quiet_command("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .status()
             .await?;
@@ -136,14 +140,14 @@ pub(crate) async fn force_kill_pid(pid: u32) -> std::io::Result<()> {
         // dev"`) would orphan grandchildren (node/vite) that keep the port
         // bound. Fall back to a plain-pid kill if group-kill errors — e.g.
         // the process never got its own group, or already exited.
-        let group_status = tokio::process::Command::new("kill")
+        let group_status = quiet_command("kill")
             .args(["-9", &format!("-{pid}")])
             .status()
             .await?;
         if group_status.success() {
             return Ok(());
         }
-        let status = tokio::process::Command::new("kill")
+        let status = quiet_command("kill")
             .args(["-9", &pid.to_string()])
             .status()
             .await?;
@@ -153,6 +157,83 @@ pub(crate) async fn force_kill_pid(pid: u32) -> std::io::Result<()> {
             Err(std::io::Error::other(format!(
                 "kill -9 failed for pid={pid} with status {status}"
             )))
+        }
+    }
+}
+
+/// Служебная команда без наших потоков: «SUCCESS: …» от `taskkill` ложился
+/// перед JSON `exec --json`, в канал ACP и поверх кадра TUI.
+fn quiet_command(program: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // CREATE_NO_WINDOW: без мигающего окна консоли.
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    command
+}
+
+/// Дерево процессов одной команды переднего плана. Гасится синхронно и целиком:
+/// гард на отмену хода срабатывает раньше, чем `kill_on_drop` добьёт корень.
+pub(crate) struct ProcessTree {
+    pid: u32,
+    armed: bool,
+    #[cfg(windows)]
+    job: Option<win_job::CommandJob>,
+}
+
+impl ProcessTree {
+    /// Взять под надзор только что запущенный процесс. На Unix он обязан быть
+    /// лидером своей группы (`process_group(0)`).
+    pub(crate) fn adopt(child: &tokio::process::Child) -> Self {
+        // Только своя задача, без общей kill-on-close: запущенное командой
+        // нарочно (редактор, `Start-Process`) переживает выход pooprusteek.
+        #[cfg(windows)]
+        let job = child.raw_handle().and_then(win_job::CommandJob::adopt);
+        Self {
+            pid: child.id().unwrap_or(0),
+            armed: true,
+            #[cfg(windows)]
+            job,
+        }
+    }
+
+    /// Убить корень и всех потомков. Без ожидания и без вспомогательных процессов.
+    pub(crate) fn kill(&self) {
+        if self.pid == 0 {
+            return;
+        }
+        #[cfg(windows)]
+        match &self.job {
+            Some(job) => job.terminate(),
+            None => {
+                let pid = self.pid;
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = force_kill_pid(pid).await;
+                    });
+                }
+            }
+        }
+        // SAFETY: `kill` со знаком минус бьёт группу, лидер которой — наш ребёнок.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+
+    /// Команда закончилась сама — оставшихся потомков не трогаем.
+    pub(crate) fn release(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill();
         }
     }
 }
@@ -175,7 +256,7 @@ pub(crate) mod win_job {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
@@ -245,6 +326,48 @@ pub(crate) mod win_job {
     /// Assign a pipe-based child (whose OS process handle we own) to the job.
     pub(crate) fn assign_child_handle(handle: RawHandle) {
         assign(handle as HANDLE, "child-handle");
+    }
+
+    /// Своя задача одной команды: `TerminateJobObject` гасит всё дерево разом,
+    /// даже когда корень уже мёртв и `taskkill /T` его не найдёт.
+    pub(crate) struct CommandJob(usize);
+
+    impl CommandJob {
+        /// Задача без лимитов. Если процесс уже в чужой задаче (терминала,
+        /// IDE), пустая новая становится её дочерней (Windows 8+).
+        pub(crate) fn adopt(process: RawHandle) -> Option<Self> {
+            // SAFETY: null от CreateJobObjectW — документированный отказ;
+            // `process` — живой хэндл ребёнка на время вызова.
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() {
+                    return None;
+                }
+                if AssignProcessToJobObject(job, process as HANDLE) == 0 {
+                    crate::debug_log::log("shell.job.assign_failed", "per-command job");
+                    CloseHandle(job);
+                    return None;
+                }
+                Some(Self(job as usize))
+            }
+        }
+
+        pub(crate) fn terminate(&self) {
+            // SAFETY: хэндл наш и жив до `Drop`.
+            unsafe {
+                TerminateJobObject(self.0 as HANDLE, 1);
+            }
+        }
+    }
+
+    impl Drop for CommandJob {
+        fn drop(&mut self) {
+            // SAFETY: закрываем свой хэндл ровно один раз. Без KILL_ON_JOB_CLOSE
+            // процессы при этом не трогаются.
+            unsafe {
+                CloseHandle(self.0 as HANDLE);
+            }
+        }
     }
 
     /// Assign a process by pid (used for PTY children, where we only have the

@@ -71,7 +71,12 @@ pub async fn run_sub_agent(spec: SubAgentSpec) -> Result<String, String> {
         // Безголово: колбэка прогресса нет, стримить некуда.
         let outcome = collect_stream(&provider, request.clone(), |_| {}).await;
         match outcome.verdict() {
-            StreamVerdict::IdleTimeout => return Err("sub-agent stream timed out".to_string()),
+            StreamVerdict::IdleTimeout => {
+                return Err(format!(
+                    "sub-agent stream timed out ({})",
+                    crate::agent::stream::idle_timeout_message()
+                ));
+            }
             StreamVerdict::Failed(error) => return Err(error),
             // В отличие от главного цикла, обрыв без stop здесь не ошибка:
             // родителю важен только финальный текст. Обрезанный по лимиту —

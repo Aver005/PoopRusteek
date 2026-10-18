@@ -25,6 +25,18 @@ pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// foreground shell tool has the same kind of cap at 1 MiB).
 pub const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
+/// Сколько ждать задачу стрима после терминального куска: ответ уже целиком
+/// у нас, и шлюз, держащий соединение открытым, не должен вешать ход.
+const AFTER_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Текст для человека и модели: сколько молчал поток.
+pub fn idle_timeout_message() -> String {
+    format!(
+        "no data from the provider for {}s",
+        STREAM_IDLE_TIMEOUT.as_secs()
+    )
+}
+
 /// How the spawned `complete_stream` task ended.
 pub enum StreamEnd {
     /// No chunk arrived within [`STREAM_IDLE_TIMEOUT`]; the stream task was
@@ -104,12 +116,24 @@ impl StreamOutcome {
 pub async fn collect_stream(
     provider: &Arc<dyn LLMProvider>,
     request: CompletionRequest,
+    on_progress: impl FnMut(&str),
+) -> StreamOutcome {
+    collect(provider, request, on_progress, AFTER_STOP_GRACE).await
+}
+
+async fn collect(
+    provider: &Arc<dyn LLMProvider>,
+    request: CompletionRequest,
     mut on_progress: impl FnMut(&str),
+    after_stop_grace: Duration,
 ) -> StreamOutcome {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let stream_provider = Arc::clone(provider);
-    let stream_task =
-        tokio::spawn(async move { stream_provider.complete_stream(request, tx).await });
+    // Гард, а не голый хэндл: отменённый ход роняет этот future, и задача
+    // стрима умирает с ним, а не дочитывает ответ сиротой. Ранние `return` тоже.
+    let mut stream_task = crate::util::AbortOnDrop::spawn(async move {
+        stream_provider.complete_stream(request, tx).await
+    });
 
     let mut text = String::new();
     let mut got_stop = false;
@@ -121,7 +145,6 @@ pub async fn collect_stream(
     loop {
         match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
             Err(_) => {
-                stream_task.abort();
                 return StreamOutcome {
                     text,
                     got_stop,
@@ -135,7 +158,6 @@ pub async fn collect_stream(
                 if !chunk.content.is_empty() {
                     text.push_str(&chunk.content);
                     if text.len() > MAX_STREAM_BYTES {
-                        stream_task.abort();
                         return StreamOutcome {
                             text,
                             got_stop,
@@ -157,7 +179,6 @@ pub async fn collect_stream(
                         .sum::<usize>();
                     tool_calls.extend(chunk.tool_calls);
                     if tool_call_bytes > MAX_STREAM_BYTES {
-                        stream_task.abort();
                         // Вызовы выбрасываем: иначе ветка спасения в цикле
                         // взяла бы ровно тот аргумент, который мы только что
                         // признали безразмерным, и исполнила бы его.
@@ -187,10 +208,18 @@ pub async fn collect_stream(
 
     // A closed channel without a "stop" chunk usually means the provider
     // bailed mid-stream — the task's own result says how.
-    let end = match stream_task.await {
-        Ok(Ok(())) => StreamEnd::Completed,
-        Ok(Err(error)) => StreamEnd::ProviderError(error.to_string()),
-        Err(join_error) => StreamEnd::TaskFailed(join_error.to_string()),
+    // После stop ответ уже собран: зависшую задачу погасит гард.
+    let joined = if got_stop {
+        tokio::time::timeout(after_stop_grace, &mut stream_task)
+            .await
+            .ok()
+    } else {
+        Some((&mut stream_task).await)
+    };
+    let end = match joined {
+        None | Some(Ok(Ok(()))) => StreamEnd::Completed,
+        Some(Ok(Err(error))) => StreamEnd::ProviderError(error.to_string()),
+        Some(Err(join_error)) => StreamEnd::TaskFailed(join_error.to_string()),
     };
     StreamOutcome {
         text,
@@ -242,6 +271,56 @@ mod tests {
         assert_eq!(outcome.text, "partial");
         assert!(!outcome.got_stop);
         assert!(matches!(outcome.end, StreamEnd::Completed));
+    }
+
+    /// Шлёт целый ответ со stop и держит соединение открытым навсегда, как
+    /// шлюз, ждущий хвост usage.
+    struct HangsAfterStop;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for HangsAfterStop {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> crate::error::AppResult<crate::provider::CompletionResponse> {
+            unreachable!("collect_stream streams")
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+            tx: mpsc::UnboundedSender<crate::provider::CompletionChunk>,
+        ) -> crate::error::AppResult<()> {
+            let _ = tx.send(crate::provider::CompletionChunk {
+                content: "done".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".to_string()),
+            });
+            std::future::pending().await
+        }
+
+        fn model(&self) -> &str {
+            "hangs"
+        }
+
+        fn fork(&self) -> Arc<dyn LLMProvider> {
+            Arc::new(HangsAfterStop)
+        }
+    }
+
+    /// Ответ получен целиком — висящее после stop соединение не держит ход.
+    #[tokio::test]
+    async fn a_connection_left_open_after_stop_does_not_hang_the_step() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(HangsAfterStop);
+        let grace = Duration::from_millis(50);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect(&provider, request(), |_| {}, grace),
+        )
+        .await
+        .expect("collect_stream must not wait forever after a stop chunk");
+        assert_eq!(outcome.text, "done");
+        assert_eq!(outcome.verdict(), StreamVerdict::Ok);
     }
 
     #[tokio::test]

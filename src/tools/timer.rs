@@ -200,7 +200,10 @@ pub fn resolve_due<Tz: TimeZone>(
     at: Option<&str>,
 ) -> Result<DateTime<Utc>, String> {
     let due = match (after, at) {
-        (Some(after), None) => now.clone() + parse_delay(after)?,
+        (Some(after), None) => now
+            .clone()
+            .checked_add_signed(parse_delay(after)?)
+            .ok_or_else(too_far)?,
         (None, Some(at)) => parse_clock(now.clone(), at)?,
         (Some(_), Some(_)) => {
             return Err("Give either 'after' or 'at', not both.".to_string());
@@ -219,11 +222,17 @@ pub fn resolve_due<Tz: TimeZone>(
         ));
     }
     if left > Duration::seconds(MAX_HORIZON_SECS) {
-        return Err(
-            "Too far: timers are limited to 24 hours and do not survive a restart.".to_string(),
-        );
+        return Err(too_far());
     }
     Ok(due.with_timezone(&Utc))
+}
+
+/// Отказ за пределом горизонта — и для честного «48h», и для переполнения.
+fn too_far() -> String {
+    format!(
+        "Out of range: timers are limited to {} hours and do not survive a restart.",
+        MAX_HORIZON_SECS / 3600
+    )
 }
 
 /// `"45s"`, `"20m"`, `"2h"`, голое число — секунды.
@@ -236,11 +245,14 @@ fn parse_delay(spec: &str) -> Result<Duration, String> {
     let value: i64 = digits.trim().parse().map_err(|_| {
         format!("Cannot read delay '{spec}'. Use forms like \"45s\", \"20m\", \"2h\".")
     })?;
-    Ok(match unit {
-        'm' => Duration::minutes(value),
-        'h' => Duration::hours(value),
-        _ => Duration::seconds(value),
-    })
+    // `try_*`: модель вправе прислать «9999999999999h», и обычный
+    // конструктор chrono на таком числе паникует.
+    match unit {
+        'm' => Duration::try_minutes(value),
+        'h' => Duration::try_hours(value),
+        _ => Duration::try_seconds(value),
+    }
+    .ok_or_else(too_far)
 }
 
 /// `"18:30"` в часовом поясе `now`; прошедшее сегодня время — это завтра.
@@ -363,6 +375,18 @@ mod tests {
         assert!(resolve_due(now(), None, None).is_err());
         assert!(resolve_due(now(), Some("soon"), None).is_err());
         assert!(resolve_due(now(), None, Some("25:00")).is_err());
+    }
+
+    /// Раньше такое число роняло задачу агента паникой chrono.
+    #[test]
+    fn an_absurd_delay_is_refused_not_panicked_on() {
+        for spec in [
+            "9999999999999h",
+            "9223372036854775807m",
+            "-9223372036854775808s",
+        ] {
+            assert!(resolve_due(now(), Some(spec), None).is_err(), "spec {spec}");
+        }
     }
 
     #[test]

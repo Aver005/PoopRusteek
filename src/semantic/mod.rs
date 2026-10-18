@@ -42,11 +42,10 @@ use tokio::sync::mpsc;
 /// (corpus rebuild / history backfill run for seconds to minutes).
 const HINT_LOCK_BUDGET: Duration = Duration::from_millis(150);
 
-/// Readiness is implicit: `inner.embedder.is_some()` means embeddings are
-/// live. Before that (still initializing, init failed, or disabled by
-/// config) every matching entry point degrades gracefully — empty matches,
-/// lexical `tool_search` fallback — so no explicit phase tracking is
-/// needed.
+/// `inner.embedder.is_some()` means embeddings are live (mirrored lock-free
+/// in `SemanticService::ready`). Before that (still initializing, init
+/// failed, or disabled by config) every matching entry point degrades
+/// gracefully — empty matches, lexical `tool_search` fallback.
 #[derive(Default)]
 struct Inner {
     embedder: Option<Box<embedder::Embedder>>,
@@ -107,6 +106,9 @@ pub struct SemanticService {
     /// detected RAM at `start`, updated live by `/rag-limit`, and re-read by
     /// `spawn_init` so a reload keeps the current setting.
     embed_batch: AtomicUsize,
+    /// Зеркало `inner.embedder.is_some()` без замка: готовность спрашивают из
+    /// async-кода, а индексация держит `inner` секундами.
+    ready: AtomicBool,
 }
 
 impl SemanticService {
@@ -128,6 +130,7 @@ impl SemanticService {
             init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
             embed_batch: AtomicUsize::new(batch.unwrap_or(0)),
+            ready: AtomicBool::new(false),
         });
         if config.semantic.enabled {
             service.spawn_init(skills, event_tx);
@@ -171,6 +174,7 @@ impl SemanticService {
                     inner.embedder = Some(Box::new(emb));
                     inner.skills = Some(skill_corpus);
                     inner.history = Some(history_store);
+                    this_blocking.ready.store(true, Ordering::SeqCst);
                 }
                 this_blocking.rebuild_mcp_corpus();
                 this_blocking.backfill_history();
@@ -246,7 +250,12 @@ impl SemanticService {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.lock_inner().embedder.is_some()
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    /// Идёт загрузка модели или индексация истории: индекс занят надолго.
+    pub fn is_initializing(&self) -> bool {
+        self.init_running.load(Ordering::SeqCst)
     }
 
     /// `/rag reload` — drop the loaded model and every embedded corpus,
@@ -264,6 +273,7 @@ impl SemanticService {
         }
         {
             let mut inner = self.lock_inner();
+            self.ready.store(false, Ordering::SeqCst);
             inner.embedder = None;
             inner.skills = None;
             inner.mcp = None;
@@ -345,6 +355,7 @@ impl SemanticService {
             init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
             embed_batch: AtomicUsize::new(0),
+            ready: AtomicBool::new(false),
         })
     }
 
@@ -667,7 +678,20 @@ mod lock_tests {
             init_running: AtomicBool::new(false),
             mcp_deferred: AtomicBool::new(false),
             embed_batch: AtomicUsize::new(0),
+            ready: AtomicBool::new(false),
         })
+    }
+
+    /// Готовность спрашивают из async-кода: занятый индексацией замок не
+    /// должен блокировать воркер.
+    #[test]
+    fn readiness_is_answered_while_the_index_lock_is_held() {
+        let service = enabled_service_without_init();
+        service.ready.store(true, Ordering::SeqCst);
+        let _held = service.inner.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert!(service.is_ready());
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     /// A held index lock (corpus rebuild, history backfill) must degrade,

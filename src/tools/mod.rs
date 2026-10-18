@@ -251,6 +251,13 @@ pub fn ensure_regular_file(path: &std::path::Path, path_str: &str) -> Result<(),
     if metadata.is_dir() {
         return Err(format!("{path_str} is a directory, not a file"));
     }
+    // Канал, сокет, устройство: чтение такого висит или не кончается
+    // никогда, а поток чтения не отменить.
+    if !metadata.is_file() {
+        return Err(format!(
+            "{path_str} is not a regular file (pipe, socket or device)"
+        ));
+    }
     Ok(())
 }
 
@@ -281,6 +288,19 @@ pub trait Tool: Send + Sync {
 mod preview_tests {
     use super::*;
     use serde_json::json;
+
+    /// Канал читался бы вечно в неотменяемом потоке — его отвергаем сразу.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_not_read_as_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: путь — валидная C-строка, права обычные.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let refused = ensure_regular_file(&fifo, "pipe").unwrap_err();
+        assert!(refused.contains("not a regular file"), "{refused}");
+    }
 
     #[test]
     fn a_write_preview_keeps_real_line_breaks() {

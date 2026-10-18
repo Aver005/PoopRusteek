@@ -1,7 +1,7 @@
 use crate::app::conversation::ConversationId;
 use crate::provider::ChatMessage;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::watch;
 
 // The modal/view state machines (Onboarding/Picker/Confirm/Modal/Delete/
 // Question states + their key reducers) live in `app::view_state` since the
@@ -9,38 +9,49 @@ use tokio::sync::{Mutex, Notify};
 // keep resolving. This file keeps the cross-layer event vocabulary.
 pub use crate::app::view_state::*;
 
+/// Ячейка ответа, которого ход ждёт от человека (или от политики харнесса).
+/// `watch` хранит значение: ответ, пришедший раньше ожидания, не теряется.
+#[derive(Debug, Clone)]
+struct Reply<T>(Arc<watch::Sender<Option<T>>>);
+
+impl<T: Clone> Reply<T> {
+    fn new() -> Self {
+        Self(Arc::new(watch::Sender::new(None)))
+    }
+
+    async fn wait(&self) -> T {
+        let mut receiver = self.0.subscribe();
+        // Отправитель живёт в `self`, поэтому канал не закроется во время ожидания.
+        let value = receiver
+            .wait_for(Option::is_some)
+            .await
+            .expect("the sender is owned by self");
+        value.clone().expect("wait_for checked is_some")
+    }
+
+    fn resolve(&self, value: T) {
+        self.0.send_replace(Some(value));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QuestionRequest {
-    answer: Arc<Mutex<Option<String>>>,
-    notify: Arc<Notify>,
+    answer: Reply<String>,
 }
 
 impl QuestionRequest {
     pub fn new() -> Self {
         Self {
-            answer: Arc::new(Mutex::new(None)),
-            notify: Arc::new(Notify::new()),
+            answer: Reply::new(),
         }
     }
 
-    pub async fn wait(&self) -> Option<String> {
-        loop {
-            {
-                let answer = self.answer.lock().await;
-                if answer.is_some() {
-                    return answer.clone();
-                }
-            }
-            self.notify.notified().await;
-        }
+    pub async fn wait(&self) -> String {
+        self.answer.wait().await
     }
 
     pub async fn resolve(&self, value: String) {
-        {
-            let mut answer = self.answer.lock().await;
-            *answer = Some(value);
-        }
-        self.notify.notify_waiters();
+        self.answer.resolve(value);
     }
 }
 
@@ -346,8 +357,7 @@ pub struct ToolApprovalRequest {
     /// Белый список не действует: вызов в чужой разметке или с поправленным
     /// именем решает только человек.
     pub always_ask: bool,
-    decision: Arc<Mutex<Option<bool>>>,
-    notify: Arc<Notify>,
+    decision: Reply<bool>,
 }
 
 impl ToolApprovalRequest {
@@ -363,8 +373,7 @@ impl ToolApprovalRequest {
             arguments,
             scope,
             always_ask: false,
-            decision: Arc::new(Mutex::new(None)),
-            notify: Arc::new(Notify::new()),
+            decision: Reply::new(),
         }
     }
 
@@ -374,23 +383,11 @@ impl ToolApprovalRequest {
     }
 
     pub async fn wait(&self) -> bool {
-        loop {
-            {
-                let decision = self.decision.lock().await;
-                if let Some(value) = *decision {
-                    return value;
-                }
-            }
-            self.notify.notified().await;
-        }
+        self.decision.wait().await
     }
 
     pub async fn resolve(&self, value: bool) {
-        {
-            let mut decision = self.decision.lock().await;
-            *decision = Some(value);
-        }
-        self.notify.notify_waiters();
+        self.decision.resolve(value);
     }
 }
 
@@ -415,4 +412,37 @@ pub enum View {
     Search,
     /// `/themes` — the theme gallery + create wizard.
     Themes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ответ, пришедший раньше ожидания, не теряется — раньше на этом окне
+    /// ход мог повиснуть навсегда.
+    #[tokio::test]
+    async fn an_answer_given_before_the_wait_is_not_lost() {
+        let request =
+            ToolApprovalRequest::new(ConversationId::next(), "bash".into(), "{}".into(), None);
+        request.resolve(true).await;
+        let decided = tokio::time::timeout(std::time::Duration::from_secs(5), request.wait()).await;
+        assert_eq!(decided, Ok(true));
+    }
+
+    /// Ответ из другой задачи, пока ход уже ждёт.
+    #[tokio::test]
+    async fn an_answer_from_another_task_wakes_the_waiter() {
+        let question = QuestionRequest::new();
+        let waiter = {
+            let question = question.clone();
+            tokio::spawn(async move { question.wait().await })
+        };
+        tokio::task::yield_now().await;
+        question.resolve("да".to_string()).await;
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must wake")
+            .expect("waiter task");
+        assert_eq!(answer, "да");
+    }
 }

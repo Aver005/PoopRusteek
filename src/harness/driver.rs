@@ -663,8 +663,10 @@ async fn assemble(
 /// consults.
 async fn await_semantic(semantic: &Arc<SemanticService>, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
+    // Готов и не занят: пока идёт индексация истории, подсказка первого хода
+    // не дождётся замка индекса и уйдёт пустой.
     while Instant::now() < deadline {
-        if semantic.is_ready() {
+        if semantic.is_ready() && !semantic.is_initializing() {
             return true;
         }
         if !semantic.is_enabled() {
@@ -672,7 +674,7 @@ async fn await_semantic(semantic: &Arc<SemanticService>, budget: Duration) -> bo
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    semantic.is_ready()
+    semantic.is_ready() && !semantic.is_initializing()
 }
 
 /// `--attach` пути; относительные — от рабочей папки прогона, как в TUI.
@@ -733,6 +735,9 @@ async fn drive(
     // scenario quietly spend three times its declared timeout.
     let deadline = tokio::time::sleep(options.timeout);
     tokio::pin!(deadline);
+    // Один на весь прогон: заново на каждой итерации он терял сигнал.
+    let shutdown = crate::util::shutdown_signal();
+    tokio::pin!(shutdown);
 
     let accepts = |path: &std::path::Path| harness.provider.accepts_attachment(path);
     for prompt in &options.prompts {
@@ -777,6 +782,16 @@ async fn drive(
 
         while !pending.is_empty() {
             tokio::select! {
+                // Без этого Ctrl+C убивал бы процесс, а дерево команды хода
+                // (своя группа на Unix) оставалось бы жить.
+                () = &mut shutdown => {
+                    if error.is_none() {
+                        error = Some(format!("interrupted by a signal during turn {turns}"));
+                    }
+                    status = RunStatus::Failed;
+                    stopped = true;
+                    break;
+                }
                 () = &mut deadline => {
                     status = RunStatus::TimedOut;
                     error = Some(format!(

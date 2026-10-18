@@ -304,9 +304,80 @@ pub fn total_ram_bytes() -> Option<u64> {
     }
 }
 
+/// Просьба завершиться: Ctrl+C, а на Unix ещё SIGTERM и SIGHUP (закрыли
+/// терминал). Команды живут в своих группах и сами этот сигнал не получат.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut term), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+                _ = hangup.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Хэндл задачи, который гасит её, когда его роняют. Голый `JoinHandle` при
+/// падении отсоединяет задачу: отменённый ход оставлял жить свой HTTP-поток.
+pub struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    pub fn spawn<F>(future: F) -> Self
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        Self(tokio::spawn(future))
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Уроненный хэндл гасит задачу, а не оставляет её жить сиротой.
+    #[tokio::test]
+    async fn a_dropped_abort_on_drop_handle_stops_its_task() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = AbortOnDrop::spawn(async move {
+            let _keep = tx;
+            std::future::pending::<()>().await;
+        });
+        drop(task);
+        // Отправитель живёт внутри задачи: канал закрывается, только когда её снесли.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        assert!(matches!(closed, Ok(Err(_))), "задача пережила свой хэндл");
+    }
+
+    #[tokio::test]
+    async fn an_abort_on_drop_handle_yields_the_task_result() {
+        assert_eq!(AbortOnDrop::spawn(async { 7 }).await.unwrap(), 7);
+    }
 
     #[test]
     fn release_build_never_reads_source_assets() {
