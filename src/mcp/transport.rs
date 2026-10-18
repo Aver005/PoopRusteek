@@ -19,6 +19,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{Duration, Instant, timeout};
 
+// async-trait вешает `#[must_use]` на метод, чей `Pin<Box<dyn Future>>` и так
+// must_use; clippy 2026-09 считает это ошибкой. Код наш тут ни при чём.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn send_request(&mut self, request: &JsonRpcRequest) -> AppResult<JsonRpcResponse>;

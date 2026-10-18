@@ -254,6 +254,9 @@ pub fn ensure_regular_file(path: &std::path::Path, path_str: &str) -> Result<(),
     Ok(())
 }
 
+// async-trait вешает `#[must_use]` на метод, чей `Pin<Box<dyn Future>>` и так
+// must_use; clippy 2026-09 считает это ошибкой. Код наш тут ни при чём.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
