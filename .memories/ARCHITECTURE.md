@@ -65,7 +65,7 @@ key 'Enter' → handle_key (app/keys.rs)
   ├ input starts with '/' → CommandRegistry::execute → CommandResult
   └ else → expand @file mentions → focused_mut().messages.push(user) → send_to_agent (app/mod.rs)
               system_prompt::build(prompts, skills, tools, mcp, workspace)
-              AgentRuntime::spawn(TurnSpec{ conversation: focused_id, provider, messages, … auto_approve:false })
+              AgentRuntime::spawn(TurnSpec{ conversation: focused_id, provider, messages, … unattended:false }) → run_guarded
                 run_agent_loop → provider.complete_stream → SSE → CompletionChunk
                   → AppEvent::Agent{id, AgentEvent::Chunk(delta)} → on_agent_event → reduce::apply → render
                 parse_tool_calls → per tool:

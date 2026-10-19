@@ -103,9 +103,11 @@ internal `AppEvent` channel. `App` is a thin coordinator, not a god-object —
 behavior lives in cohesive sub-state structs and controllers it owns.
 `Conversations` is the multi-chat store: each `Conversation` owns its own
 messages, a **forked** provider/session, and its agent task, so concurrent
-turns never collide. `AgentRuntime::spawn(TurnSpec)` is the *only* place any
-turn (normal, sidechat, sub-agent) launches — it runs `run_agent_loop` in a
-spawned task. Every emitted event is tagged with a `ConversationId` so
+turns never collide. `app::runtime::run_guarded` is the *only* wrapper any
+turn runs through: `AgentRuntime::spawn(TurnSpec)` spawns it for normal and
+background turns, and the `task` sub-agent runs it inline inside the parent's
+future. It catches a panicking turn as `Failed` and tags the turn's background
+processes with its chat (`tools::background::with_owner`). Every emitted event is tagged with a `ConversationId` so
 background turns route into the right buffer instead of the focused one. The
 TUI render path reads the focused conversation's state and never mutates it.
 
@@ -140,9 +142,10 @@ Key subsystems added on top of that core:
   real `TurnSpec` with the human replaced by a policy. Two properties are
   load-bearing. (1) The trace is **the existing `debug_log`** in a new JSONL
   format, not a second telemetry stream — so it can never drift from the
-  runner's instrumentation. (2) `auto_approve` stays **false**: the runner
-  refuses sub-agents when it is on, so the driver answers
-  `RequestToolApproval` from an `ApprovePolicy` instead of bypassing it.
+  runner's instrumentation. (2) There is no approval bypass: the driver
+  answers every `RequestToolApproval` (sub-agents' too, tagged with `origin`)
+  from an `ApprovePolicy`. `TurnSpec.unattended` only removes what needs a
+  watching human (questions, timers, nested `task`) — tools still ask.
   `scenario`/`suite` repeat a prompt as child processes and report a pass
   *rate*; `mine` ranks normalised failure shapes; `mock-provider` serves
   scripted replies.
@@ -159,7 +162,7 @@ Key subsystems added on top of that core:
 8. **Update `.memories` (`STATE.md`, `BUGS.md`, `JOURNAL/`) as part of "done"** for any non-trivial change. Anchor documentation to function/struct names, not line numbers — line numbers drift on the next edit.
 9. **CPU-heavy work (ONNX embedding, PoW solving) runs on `tokio::task::spawn_blocking` only** — never on the event loop, never bare on an async worker. The `SemanticService` inner mutex is held across synchronous work only, never across an `.await`.
 10. **Never print to stdout/stderr while the app runs** — the TUI owns the terminal and `--acp` owns stdout for JSON-RPC. `tracing` goes to the data-dir log file (set up in `main.rs`); ad-hoc debugging goes through `debug_log`. This includes dependencies: fastembed's download progress bar is explicitly disabled for this reason.
-11. **The harness must never add instrumentation to the agent loop, and never set `auto_approve: true`** — telemetry goes through the existing `debug_log` call sites (a parallel stream drifts), and bypassing approval silently disables the `task` tool, making sub-agents untestable.
+11. **The harness must never add instrumentation to the agent loop, and never bypass tool approval** — telemetry goes through the existing `debug_log` call sites (a parallel stream drifts), and every tool call (sub-agents included) is answered by the run's `ApprovePolicy`; `TurnSpec.auto_approve` was removed for exactly this reason (it let `task` launder approval).
 12. **The semantic layer must degrade, never block features** — every entry point returns empty/falls back to lexical when the embedder is disabled, still initializing, or failed. Deferred MCP schemas are only allowed when semantic matching is enabled (`App::effective_mcp_schema_mode` forces `Full` otherwise); session files remain the source of truth for the history index (it is a wipeable cache).
 
 ## Conventions
