@@ -962,7 +962,7 @@ const OUTPUT_LIMIT_FEEDBACK: &str = "Your previous reply hit the output length l
 /// Correction message handed back to the model after it emitted a `<tool_use>`
 /// block that couldn't be parsed. Names each concrete problem and restates the
 /// exact required shape so the model can re-issue the call.
-fn malformed_tool_feedback(errors: &[String]) -> String {
+pub(crate) fn malformed_tool_feedback(errors: &[String]) -> String {
     format!(
         "Your previous message contained a tool call that could NOT be parsed, \
          so it was NOT executed:\n- {}\n\nRe-issue it using exactly this shape, \

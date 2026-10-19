@@ -29,10 +29,8 @@ use crate::error::{AppError, AppResult};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::time::Instant;
 
 use session::SessionState;
 
@@ -47,8 +45,8 @@ pub struct DeepseekProvider {
     rate_limit_ms: u64,
     rate_limit_per_minute: u32,
     max_retries: i32,
-    last_request: Mutex<Instant>,
-    request_history: Mutex<VecDeque<Instant>>,
+    /// Общий для форков: лимит у DeepSeek на аккаунт, а не на чат.
+    limiter: Arc<http::RateLimiter>,
     /// Общий для форков: загрузка файла к сессии не привязана.
     uploads: Arc<attachments::UploadCache>,
 }
@@ -70,10 +68,11 @@ impl DeepseekProvider {
     ) -> AppResult<Self> {
         // `read_timeout` (not `timeout`) so a stalled connection errors out
         // while a healthy long-lived SSE stream keeps flowing: it bounds the
-        // gap *between* bytes, not the whole request.
+        // gap *between* bytes, not the whole request. Короче сторожа простоя
+        // хода: тогда причину назовёт провайдер, а не «нет данных 120 с».
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(120))
+            .read_timeout(crate::provider::PROVIDER_READ_TIMEOUT)
             .build()?;
 
         let provider = Self {
@@ -87,8 +86,7 @@ impl DeepseekProvider {
             rate_limit_ms,
             rate_limit_per_minute,
             max_retries,
-            last_request: Mutex::new(Instant::now()),
-            request_history: Mutex::new(VecDeque::new()),
+            limiter: Arc::default(),
             uploads: Arc::default(),
         };
 
@@ -122,8 +120,7 @@ impl DeepseekProvider {
             rate_limit_ms: self.rate_limit_ms,
             rate_limit_per_minute: self.rate_limit_per_minute,
             max_retries: self.max_retries,
-            last_request: Mutex::new(Instant::now()),
-            request_history: Mutex::new(VecDeque::new()),
+            limiter: Arc::clone(&self.limiter),
             uploads: Arc::clone(&self.uploads),
         }
     }
@@ -148,20 +145,16 @@ impl DeepseekProvider {
         &self,
         request: &CompletionRequest,
         log_tag: &str,
+        own_wait: &OwnWait,
         mut on_text: impl FnMut(String) + Send,
     ) -> AppResult<Ending> {
-        let max_attempts = match self.max_retries {
-            -1 => usize::MAX,
-            // Even with retries disabled, one wait-and-retry is worth it: a
-            // rate limit is transient by definition, and the alternative is
-            // failing a turn the user asked for.
-            0 => 2,
-            n => (n as usize) + 1,
-        };
+        // Even with retries disabled, one wait-and-retry is worth it: a rate
+        // limit is transient by definition.
+        let max_attempts = http::attempts_for(self.max_retries).max(2);
         let mut attempt = 0usize;
         loop {
             match self
-                .drive_completion_once(request, log_tag, &mut on_text)
+                .drive_completion_once(request, log_tag, own_wait, &mut on_text)
                 .await
             {
                 Err(AppError::RateLimited(message)) if attempt + 1 < max_attempts => {
@@ -175,13 +168,9 @@ impl DeepseekProvider {
                         ),
                     );
                     tracing::warn!("rate limited, retry {attempt}/{max_attempts} in {wait:?}");
-                    tokio::time::sleep(wait).await;
+                    own_wait.during(tokio::time::sleep(wait)).await;
                 }
-                // Out of attempts: report it as a provider error so the agent
-                // loop treats it as a real failure rather than a retryable one.
-                Err(AppError::RateLimited(message)) => {
-                    return Err(AppError::Provider(message));
-                }
+                // Лимит остаётся лимитом и снаружи: `/serve` отдаёт его как 429.
                 other => return other,
             }
         }
@@ -193,11 +182,12 @@ impl DeepseekProvider {
         &self,
         request: &CompletionRequest,
         log_tag: &str,
+        own_wait: &OwnWait,
         on_text: &mut (impl FnMut(String) + Send),
     ) -> AppResult<Ending> {
         let mut reply_chars = 0usize;
         let result = self
-            .stream_completion_once(request, log_tag, on_text, &mut reply_chars)
+            .stream_completion_once(request, log_tag, own_wait, on_text, &mut reply_chars)
             .await;
         self.add_session_tokens(crate::context::budget_tokens_for_chars(reply_chars));
         result
@@ -207,12 +197,11 @@ impl DeepseekProvider {
         &self,
         request: &CompletionRequest,
         log_tag: &str,
+        own_wait: &OwnWait,
         on_text: &mut (impl FnMut(String) + Send),
         reply_chars: &mut usize,
     ) -> AppResult<Ending> {
-        let (response, session_id) = self
-            .send_request(request, &mut || on_text(String::new()))
-            .await?;
+        let (response, session_id) = own_wait.during(self.send_request(request)).await?;
         // Всё отданное наружу: продолжение начинается с его повтора.
         let mut delivered = String::new();
         let mut read = {
@@ -239,7 +228,10 @@ impl DeepseekProvider {
                 break;
             };
             continues += 1;
-            let response = match self.send_continue(&session_id, message_id).await {
+            let response = match own_wait
+                .during(self.send_continue(&session_id, message_id))
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     debug_log::log(
@@ -335,7 +327,12 @@ impl DeepseekProvider {
                 // closes cleanly; treating that EOF as a stop turned an
                 // explicit "rate limit reached" into an empty, silent success.
                 if let Some(stream_error) = &event.error {
-                    let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    // Повтор после лимита идёт с той же точки сессии: отметка
+                    // сдвинула бы родителя и пометила промпт отправленным.
+                    let retryable = stream_error.is_rate_limit() && text_bytes == 0;
+                    if !retryable {
+                        let _ = self.mark_session_after_success(&session_id, parent_message_id);
+                    }
                     debug_log::log(
                         &format!("completion.{log_tag}.provider_error"),
                         format!(
@@ -347,7 +344,7 @@ impl DeepseekProvider {
                     );
                     // Retryable only before any text reached the caller;
                     // otherwise a retry would duplicate what was streamed.
-                    if stream_error.is_rate_limit() && text_bytes == 0 {
+                    if retryable {
                         return Err(AppError::RateLimited(stream_error.message()));
                     }
                     return Err(AppError::Provider(stream_error.message()));
@@ -423,6 +420,56 @@ impl DeepseekProvider {
     }
 }
 
+/// Как часто слать пустой кусок, пока провайдер ждёт сам себя.
+const PULSE_EVERY: Duration = Duration::from_secs(20);
+
+/// Дольше этого пульс не держит ход: бесконечные повторы при
+/// `max_retries = -1` всё равно кончатся сторожем простоя.
+const PULSE_LIMIT: Duration = Duration::from_secs(600);
+
+/// Поднят, пока провайдер ждёт сам себя: сессия, PoW, файлы, ограничитель,
+/// пауза перед повтором. Чтение ответа сюда не входит — его стережёт сторож.
+#[derive(Default)]
+struct OwnWait(std::sync::atomic::AtomicBool);
+
+impl OwnWait {
+    async fn during<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        let out = work.await;
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    fn active(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Пустой кусок раз в [`PULSE_EVERY`], пока поднят `own_wait`, но не дольше
+/// [`PULSE_LIMIT`]. Кончается, только когда получателя больше нет.
+async fn pulse(tx: &tokio::sync::mpsc::UnboundedSender<CompletionChunk>, own_wait: &OwnWait) {
+    let mut tick = tokio::time::interval(PULSE_EVERY);
+    tick.tick().await;
+    let started = tokio::time::Instant::now();
+    loop {
+        tick.tick().await;
+        if tx.is_closed() {
+            return;
+        }
+        if !own_wait.active() || started.elapsed() >= PULSE_LIMIT {
+            continue;
+        }
+        let beat = CompletionChunk {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+        };
+        if tx.send(beat).is_err() {
+            return;
+        }
+    }
+}
+
 /// Сколько раз подряд просить сервер дописать ответ.
 const MAX_NATIVE_CONTINUES: u32 = 3;
 
@@ -476,7 +523,9 @@ impl LLMProvider for DeepseekProvider {
     async fn complete(&self, request: CompletionRequest) -> AppResult<CompletionResponse> {
         let mut content = String::new();
         let ending = self
-            .drive_completion(&request, "collect", |text| content.push_str(&text))
+            .drive_completion(&request, "collect", &OwnWait::default(), |text| {
+                content.push_str(&text)
+            })
             .await?;
         // Ошибки уже ушли наверх; остаётся штатный конец или обрыв по лимиту.
         Ok(CompletionResponse {
@@ -491,15 +540,20 @@ impl LLMProvider for DeepseekProvider {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
     ) -> AppResult<()> {
-        let ending = self
-            .drive_completion(&request, "stream", |text| {
-                let _ = tx.send(CompletionChunk {
-                    content: text,
-                    tool_calls: Vec::new(),
-                    finish_reason: None,
-                });
-            })
-            .await?;
+        let own_wait = OwnWait::default();
+        let drive = self.drive_completion(&request, "stream", &own_wait, |text| {
+            let _ = tx.send(CompletionChunk {
+                content: text,
+                tool_calls: Vec::new(),
+                finish_reason: None,
+            });
+        });
+        // Пульс бьёт только в наших ожиданиях: тишину в ответе ловит сторож.
+        let ending = tokio::select! {
+            biased;
+            ending = drive => ending?,
+            () = pulse(&tx, &own_wait) => return Ok(()),
+        };
         // A read error has already propagated above without a stop chunk,
         // which the runner treats as a failed turn.
         let _ = tx.send(CompletionChunk {
@@ -673,6 +727,14 @@ mod tests {
             client_version: None,
         };
         DeepseekProvider::new(&config, 0, 0, 0).expect("client builds")
+    }
+
+    /// Лимит у DeepSeek на аккаунт: форк обязан стоять в той же очереди.
+    #[test]
+    fn forks_share_one_rate_limiter() {
+        let parent = provider();
+        let fork = parent.fork_session();
+        assert!(Arc::ptr_eq(&parent.limiter, &fork.limiter));
     }
 
     /// Через настоящий `auth_headers`: тест поймает и выпавший вызов, и

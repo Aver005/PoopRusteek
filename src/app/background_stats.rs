@@ -62,12 +62,26 @@ impl BackgroundCounters {
         killed
     }
 
-    /// Before a new user turn, stop non-persistent processes; returns the count.
-    pub async fn cleanup_before_user_turn(&mut self) -> usize {
+    /// Перед новой репликой или по Esc — временные процессы этого чата;
+    /// возвращает, сколько их было. Чужие чаты не трогаются.
+    pub async fn cleanup_turn_of(
+        &mut self,
+        owner: crate::app::conversation::ConversationId,
+    ) -> usize {
         if self.total == 0 {
             return 0;
         }
-        let killed = crate::tools::background::shutdown_nonpersistent().await;
+        let killed = crate::tools::background::shutdown_nonpersistent_of(owner.0).await;
+        let _ = self.refresh_now().await;
+        killed
+    }
+
+    /// Все процессы чата — когда он сам остановлен или закрыт.
+    pub async fn shutdown_chat(
+        &mut self,
+        owner: crate::app::conversation::ConversationId,
+    ) -> usize {
+        let killed = crate::tools::background::shutdown_owned_by(owner.0).await;
         let _ = self.refresh_now().await;
         killed
     }

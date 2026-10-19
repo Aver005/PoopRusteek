@@ -193,6 +193,10 @@ pub enum AppEvent {
         prompt: String,
     },
 
+    /// Оборванная задача хода чата действительно завершилась: всё, что она
+    /// успела отправить, уже прошло через очередь раньше этого события.
+    TurnFenced(ConversationId),
+
     /// Result of a background remote-session fetch (started by `/load`).
     SessionFetched {
         conversation: ConversationId,
@@ -226,7 +230,7 @@ pub enum AppEvent {
 
     /// An OAuth authorization flow started from `/mcp auth` finished. On
     /// `Ok`, the token is already persisted and the handler kicks off a
-    /// `reconnect_server` for `server` itself — that reconnect's own
+    /// `mcp::manager::reconnect` for `server` itself — that reconnect's own
     /// `McpOperationDone` reports the final connect outcome.
     McpOAuthResult {
         server: String,

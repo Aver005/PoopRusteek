@@ -761,10 +761,24 @@ impl App {
                 conversation,
                 event,
             } => {
-                self.on_agent_event(conversation, event).await;
+                if self.is_fenced(conversation) {
+                    crate::debug_log::log("turn.fenced_event", format!("{event:?}"));
+                } else {
+                    self.on_agent_event(conversation, event).await;
+                }
+            }
+            AppEvent::TurnFenced(conversation) => {
+                if let Some(conv) = self.state.conversations.get_mut(conversation) {
+                    conv.fenced = false;
+                }
             }
             AppEvent::RequestToolApproval(request) => {
-                self.on_tool_approval_requested(request).await;
+                // Запрос оборванного хода: его некому ждать.
+                if self.is_fenced(request.conversation) {
+                    request.resolve(false).await;
+                } else {
+                    self.on_tool_approval_requested(request).await;
+                }
             }
             AppEvent::RequestQuestion(request, state) => {
                 self.on_question_requested(request, state);
@@ -904,25 +918,55 @@ impl App {
             self.state.status_message = message;
         }
 
+        let goal_end = end
+            .clone()
+            .filter(|_| self.state.goal.conversation == Some(target));
         match reduce::turn_tail(end, reduce::TurnOwner::classify(focused, background)) {
             reduce::TurnTail::None => {}
             reduce::TurnTail::Background(error) => self.finish_background(target, error),
-            reduce::TurnTail::Focused(end) => {
+            reduce::TurnTail::Focused(_) => {
                 self.record_gen_stats();
                 self.auto_save_session();
-                match end {
-                    reduce::TurnEnd::Done => self.maybe_advance_goal_cycle().await,
-                    // Ошибка посреди цикла оставила бы GOAL в «выполняется»,
-                    // когда ничего уже не выполняется.
-                    reduce::TurnEnd::Failed(error) if self.state.goal.is_running() => {
-                        self.cancel_goal_cycle(&format!(
-                            "⚠ Goal cycle stopped after an error: {error}. Use /goal to retry."
-                        ));
-                    }
-                    reduce::TurnEnd::Failed(_) => {}
-                }
             }
         }
+        // GOAL идёт по своему чату, а не по фокусу: смена чата его не клинит.
+        match goal_end {
+            Some(reduce::TurnEnd::Done) => self.maybe_advance_goal_cycle().await,
+            // Ошибка посреди цикла оставила бы GOAL в «выполняется»,
+            // когда ничего уже не выполняется.
+            Some(reduce::TurnEnd::Failed(error)) if self.state.goal.is_running() => {
+                self.cancel_goal_cycle(&format!(
+                    "⚠ Goal cycle stopped after an error: {error}. Use /goal to retry."
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    /// Оборвать задачу хода чата и выставить забор: события, что она успела
+    /// отправить, выбрасываются, пока не придёт `TurnFenced` после её конца.
+    pub(crate) fn abort_turn_of(&mut self, conversation: conversation::ConversationId) {
+        let Some(conv) = self.state.conversations.get_mut(conversation) else {
+            return;
+        };
+        let Some(handle) = conv.agent_task.take() else {
+            return;
+        };
+        handle.abort();
+        conv.fenced = true;
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            // Ждём саму задачу: её отправки встают в очередь раньше забора.
+            let _ = handle.await;
+            let _ = event_tx.send(AppEvent::TurnFenced(conversation));
+        });
+    }
+
+    fn is_fenced(&self, conversation: conversation::ConversationId) -> bool {
+        self.state
+            .conversations
+            .get(conversation)
+            .is_some_and(|conv| conv.fenced)
     }
 
     /// Cancel the focused conversation's in-flight turn: kill its foreground
@@ -930,12 +974,12 @@ impl App {
     /// visible state. Shared by Esc and Ctrl+C.
     pub(crate) async fn cancel_focused_turn(&mut self) {
         // Падение задачи хода гасит и дерево его команды (`ProcessTree`).
-        if let Some(handle) = self.state.focused_mut().agent_task.take() {
-            handle.abort();
-        }
         let conversation = self.state.conversations.focused_id();
+        self.abort_turn_of(conversation);
         self.purge_interactions_for(conversation).await;
-        let killed = self.state.background.shutdown_all().await;
+        // Только временные процессы этого чата: постоянные серверы и чужие
+        // чаты Esc больше не гасит.
+        let killed = self.state.background.cleanup_turn_of(conversation).await;
         self.state.focused_mut().generation.active = false;
         // The aborted task may have been a `/compact`: drop its claim here, or
         // the command stays refused for this chat forever.
@@ -1071,10 +1115,11 @@ impl App {
 
     /// Cancel every conversation's in-flight turn (focused + all background).
     async fn cancel_all_turns(&mut self) {
+        let ids: Vec<_> = self.state.conversations.iter().map(|c| c.id).collect();
+        for id in ids {
+            self.abort_turn_of(id);
+        }
         for conv in self.state.conversations.iter_mut() {
-            if let Some(handle) = conv.agent_task.take() {
-                handle.abort();
-            }
             conv.generation.active = false;
             conv.flush_deferred();
         }

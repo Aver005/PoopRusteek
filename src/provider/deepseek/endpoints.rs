@@ -71,7 +71,9 @@ impl DeepseekProvider {
         body: Value,
     ) -> AppResult<T> {
         let headers = self.auth_headers()?;
-        let response = self.send_json_request(action, url, &headers, &body).await?;
+        let response = self
+            .send_json_request(action, url, &headers, &body, super::http::Resend::Safe)
+            .await?;
         if !response.status().is_success() {
             return Err(Self::read_error_response(action, response, action).await);
         }
@@ -105,7 +107,9 @@ impl DeepseekProvider {
         body: Value,
         error_context: &str,
     ) -> AppResult<()> {
-        let response = self.send_json_request(action, url, &headers, &body).await?;
+        let response = self
+            .send_json_request(action, url, &headers, &body, super::http::Resend::Safe)
+            .await?;
         if !response.status().is_success() {
             return Err(Self::read_error_response(action, response, error_context).await);
         }

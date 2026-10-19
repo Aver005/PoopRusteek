@@ -18,8 +18,8 @@ pub(super) const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 // бюджеты к одному, сборка скажет, что разница была не случайной.
 const _: () = assert!(AUTH_TIMEOUT.as_secs() < PROTOCOL_TIMEOUT.as_secs());
 
-/// `read_timeout` равен общему бюджету: без него ответ, капающий байтами
-/// достаточно часто, висит сколько угодно, не упираясь в `timeout`.
+/// `timeout` — общий срок до конца тела ответа (так в документации reqwest);
+/// `read_timeout` лишь раньше ловит заглохшее соединение.
 pub(super) fn client(request_timeout: Duration) -> AppResult<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .cookie_store(true)

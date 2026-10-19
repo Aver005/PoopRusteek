@@ -18,8 +18,8 @@ pub(crate) const MAX_GOAL_ITERATIONS: u32 = 10;
 ///
 /// Goal mode drives a two-agent loop: `agent1` (the worker) attempts the goal,
 /// then an evaluator judges it; on failure the worker retries with feedback.
-/// Each agent gets swapped to a fresh session after repeated failures, which is
-/// why the per-agent failure counters and session ids live here.
+/// Оценщик получает свежую сессию после пяти провалов подряд — поэтому
+/// его счётчик и id живут здесь.
 #[derive(Debug, Clone, Default)]
 pub struct GoalState {
     pub mode: bool,
@@ -27,12 +27,18 @@ pub struct GoalState {
     pub prompt: String,
     pub text: String,
     pub iteration: u32,
-    pub agent1_failures: u32,
     pub agent2_failures: u32,
-    pub agent1_session_id: String,
     pub agent2_session_id: String,
     pub summary: String,
+    /// Чат цикла. Всё — ход работника, оценка, повтор — идёт в него, а не в
+    /// тот, что сейчас на экране: иначе смена чата клинила или уводила цикл.
+    pub conversation: Option<super::conversation::ConversationId>,
+    /// Сбоев оценки подряд: без счётчика сбой повторял работника бесконечно.
+    pub eval_failures: u32,
 }
+
+/// После скольких сбоев оценки подряд цикл останавливается.
+pub(crate) const MAX_EVAL_FAILURES: u32 = 3;
 
 /// What the imperative shell must surface after a verdict is applied.
 ///
@@ -50,17 +56,14 @@ pub(crate) enum GoalOutcome {
         iteration: u32,
         issues: String,
         feedback: String,
-        /// A fresh agent-1 (worker) session was started this round.
-        swapped_agent1: bool,
         /// A fresh agent-2 (evaluator) session was started this round.
         swapped_agent2: bool,
     },
 }
 
 impl GoalState {
-    /// Apply an evaluator verdict: advance failure counters, swap a stale
-    /// agent's session (worker after 3 failures, evaluator after 5), bump the
-    /// iteration, and set the next stage. Returns what the shell should do.
+    /// Применить вердикт: счётчик и смена сессии оценщика (после пяти
+    /// провалов), номер попытки, следующая стадия. Возвращает, что сделать.
     ///
     /// This is the goal loop's decision core, shared by the inline and
     /// event-driven verdict paths so the rules live in exactly one place.
@@ -100,20 +103,12 @@ impl GoalState {
 
         self.iteration += 1;
 
-        // Worker (agent 1): swap before counting this round's failure.
-        let swapped_agent1 = self.agent1_failures >= 3;
-        if swapped_agent1 {
-            self.agent1_session_id = crate::session::create_session_id();
-            self.agent1_failures = 0;
-        }
-        self.agent1_failures += 1;
         self.stage = GoalStage::RunAgent1;
 
         GoalOutcome::Retry {
             iteration,
             issues: verdict.issues,
             feedback,
-            swapped_agent1,
             swapped_agent2,
         }
     }
@@ -131,7 +126,6 @@ impl GoalState {
     pub(crate) fn activate(&mut self) {
         *self = GoalState {
             mode: true,
-            agent1_session_id: crate::session::create_session_id(),
             agent2_session_id: crate::session::create_session_id(),
             ..GoalState::default()
         };
@@ -151,14 +145,17 @@ impl GoalState {
 /// `SUCCESS` with no structured summary is treated as success.
 pub(crate) fn parse_goal_verdict(text: &str) -> GoalVerdict {
     let mut success = false;
+    let mut has_status = false;
     let mut summary = String::new();
     let mut issues = String::new();
     let mut feedback = String::new();
 
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.contains("**Status:**") {
-            success = trimmed.contains("SUCCESS");
+        if let Some((_, status)) = trimmed.split_once("**Status:**") {
+            // Слово целиком: «UNSUCCESSFUL» и «NOT SUCCESS» раньше были успехом.
+            has_status = true;
+            success = first_word(status) == "SUCCESS";
         } else if trimmed.contains("**Summary:**") {
             summary = trimmed
                 .split_once("**Summary:**")
@@ -183,9 +180,20 @@ pub(crate) fn parse_goal_verdict(text: &str) -> GoalVerdict {
         }
     }
 
-    // Fallback: unstructured replies that mention SUCCESS count as success.
-    if summary.is_empty() && text.contains("SUCCESS") {
-        success = true;
+    // Без строки статуса — успех, только если SUCCESS сказано словом и нигде
+    // нет отрицания: «criteria for SUCCESS not met» успехом не считается.
+    if !has_status {
+        let words: Vec<String> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .map(str::to_uppercase)
+            .collect();
+        let negated = words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "NOT" | "FAIL" | "FAILED" | "FAILURE" | "UNSUCCESSFUL"
+            )
+        });
+        success = !negated && words.iter().any(|word| word == "SUCCESS");
     }
 
     GoalVerdict {
@@ -196,9 +204,28 @@ pub(crate) fn parse_goal_verdict(text: &str) -> GoalVerdict {
     }
 }
 
+/// Первое слово значения без звёздочек и знаков: `**SUCCESS**.` → `SUCCESS`.
+fn first_word(value: &str) -> String {
+    value
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_uppercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Подстрока SUCCESS внутри UNSUCCESSFUL раньше давала «цель достигнута».
+    #[test]
+    fn a_negated_status_is_not_success() {
+        assert!(!parse_goal_verdict("**Status:** UNSUCCESSFUL").success);
+        assert!(!parse_goal_verdict("**Status:** NOT A SUCCESS").success);
+        assert!(parse_goal_verdict("**Status:** **SUCCESS**.").success);
+        assert!(!parse_goal_verdict("The criteria for SUCCESS were not met.").success);
+    }
 
     #[test]
     fn structured_success_with_summary() {
@@ -278,20 +305,18 @@ mod tests {
         let outcome = g.apply_verdict(verdict(false, "", "tests red", "fix tests"));
         assert_eq!(g.stage, GoalStage::RunAgent1);
         assert_eq!(g.iteration, 1);
-        assert_eq!(g.agent1_failures, 1);
         assert_eq!(g.agent2_failures, 1);
         match outcome {
             GoalOutcome::Retry {
                 iteration,
                 issues,
                 feedback,
-                swapped_agent1,
                 swapped_agent2,
             } => {
                 assert_eq!(iteration, 0); // pre-increment attempt number
                 assert_eq!(issues, "tests red");
                 assert_eq!(feedback, "fix tests");
-                assert!(!swapped_agent1 && !swapped_agent2);
+                assert!(!swapped_agent2);
             }
             _ => panic!("expected Retry"),
         }
@@ -321,22 +346,6 @@ mod tests {
         assert!(!g.agent2_session_id.is_empty());
         match outcome {
             GoalOutcome::Retry { swapped_agent2, .. } => assert!(swapped_agent2),
-            _ => panic!("expected Retry"),
-        }
-    }
-
-    #[test]
-    fn worker_swaps_when_already_at_three_failures() {
-        let mut g = GoalState {
-            agent1_failures: 3,
-            ..Default::default()
-        };
-        let outcome = g.apply_verdict(verdict(false, "", "", ""));
-        // Check is before increment: swap, reset to 0, then count this round → 1.
-        assert_eq!(g.agent1_failures, 1);
-        assert!(!g.agent1_session_id.is_empty());
-        match outcome {
-            GoalOutcome::Retry { swapped_agent1, .. } => assert!(swapped_agent1),
             _ => panic!("expected Retry"),
         }
     }
@@ -397,7 +406,7 @@ mod tests {
         assert_eq!(g.stage, GoalStage::Inactive);
         assert_eq!(g.iteration, 0);
         assert!(g.summary.is_empty());
-        assert!(!g.agent1_session_id.is_empty() && !g.agent2_session_id.is_empty());
+        assert!(!g.agent2_session_id.is_empty());
     }
 
     #[test]
@@ -418,6 +427,23 @@ mod tests {
 }
 
 impl App {
+    /// Чат цикла; до старта цикла — чат на экране.
+    fn goal_conversation(&self) -> super::conversation::ConversationId {
+        self.state
+            .goal
+            .conversation
+            .unwrap_or_else(|| self.state.conversations.focused_id())
+    }
+
+    /// Заметка цикла — в его чат, а не в тот, что сейчас на экране.
+    fn goal_note(&mut self, note: ChatMessage) {
+        let target = self.goal_conversation();
+        match self.state.conversations.get_mut(target) {
+            Some(conversation) => conversation.messages.push(note),
+            None => self.state.push_message(note),
+        }
+    }
+
     /// Abort any in-flight goal cycle and leave goal mode fully reset, so the
     /// user is never stuck behind a "cycle in progress" that isn't running.
     /// No-op when goal mode is off.
@@ -425,20 +451,22 @@ impl App {
         if !self.state.goal.mode {
             return;
         }
-        self.state
-            .focused_mut()
-            .messages
-            .push(ChatMessage::system(reason));
+        self.goal_note(ChatMessage::system(reason));
         self.state.goal.deactivate();
     }
 
-    /// Launch the goal evaluator as a detached task. The LLM round-trip (plus
-    /// PoW, rate-limit waits, and retries) runs off the event loop; the result
-    /// comes back as a `GoalEvaluationDone` event. Blocking here used to
-    /// freeze the whole TUI for the duration of the evaluation.
-    pub(crate) fn spawn_goal_evaluation(&mut self, agent_result: String) {
-        let provider = match &self.state.focused().provider {
-            Some(p) => Arc::clone(p),
+    /// Launch the goal evaluator as a detached task; the result comes back as
+    /// `GoalEvaluationDone`. На форке провайдера: на DeepSeek оценщик иначе
+    /// подменял серверную сессию работника, и тот терял всю историю.
+    pub(crate) fn spawn_goal_evaluation(&mut self, agent_result: String, tool_report: String) {
+        let target = self.goal_conversation();
+        let provider = match self
+            .state
+            .conversations
+            .get(target)
+            .and_then(|conversation| conversation.provider.as_ref())
+        {
+            Some(p) => p.fork(),
             None => {
                 self.cancel_goal_cycle(
                     "No provider configured for evaluation — goal cancelled. Set your token, then /goal to retry.",
@@ -448,9 +476,10 @@ impl App {
         };
 
         let system_prompt = self.prompts.goal_evaluator_prompt.clone();
+        // Не только самоотчёт: оценщик видит, что инструменты вернули на деле.
         let user_msg = format!(
-            "## Goal\n{}\n\n## Completed Work\n{}\n\n## Evaluation",
-            self.state.goal.text, agent_result
+            "## Goal\n{}\n\n## Completed Work\n{}\n\n## Tool results of that turn\n{}\n\n## Evaluation",
+            self.state.goal.text, agent_result, tool_report
         );
         let mut eval_messages = vec![
             ChatMessage::system(&system_prompt),
@@ -468,6 +497,7 @@ impl App {
 
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
+            let discard = crate::provider::SessionDiscard::new(Arc::clone(&provider));
             let outcome = match provider.complete(request).await {
                 Ok(response) => {
                     let verdict = parse_goal_verdict(&response.content);
@@ -480,6 +510,7 @@ impl App {
                 }
                 Err(e) => GoalEvalOutcome::Failed(e.to_string()),
             };
+            discard.now().await;
             let _ = event_tx.send(AppEvent::GoalEvaluationDone(outcome));
         });
     }
@@ -499,7 +530,14 @@ impl App {
                 eval_messages,
             } => (verdict, eval_messages),
             GoalEvalOutcome::Failed(e) => {
-                self.state.push_message(ChatMessage::ui_system(&format!(
+                self.state.goal.eval_failures += 1;
+                if self.state.goal.eval_failures >= MAX_EVAL_FAILURES {
+                    self.cancel_goal_cycle(&format!(
+                        "🛑 Goal evaluation failed {MAX_EVAL_FAILURES} times in a row ({e}) — stopping. Use /goal to retry."
+                    ));
+                    return;
+                }
+                self.goal_note(ChatMessage::ui_system(&format!(
                     "⚠ Evaluation failed: {e}. Retrying agent 1..."
                 )));
                 self.state.goal.stage = GoalStage::RunAgent1;
@@ -507,11 +545,18 @@ impl App {
                 return;
             }
         };
+        self.state.goal.eval_failures = 0;
 
         let save_eval_session = |this: &Self| {
-            let _ = crate::session::save_session(
+            let started_at = this
+                .state
+                .conversations
+                .get(this.goal_conversation())
+                .map(|conversation| conversation.session_started_at.clone())
+                .unwrap_or_default();
+            if let Err(error) = crate::session::save_session(
                 &this.state.goal.agent2_session_id,
-                &this.state.focused().session_started_at,
+                &started_at,
                 &eval_messages,
                 &this.config,
                 &this.state.workspace_path,
@@ -519,12 +564,14 @@ impl App {
                     tag: Some("__goal_system__".to_string()),
                     ..Default::default()
                 },
-            );
+            ) {
+                tracing::warn!("goal: could not save the evaluator transcript: {error}");
+            }
         };
 
         match self.state.goal.apply_verdict(verdict) {
             GoalOutcome::Succeeded { summary } => {
-                self.state.push_message(ChatMessage::ui_system(&format!(
+                self.goal_note(ChatMessage::ui_system(&format!(
                     "✅ Goal achieved!\n\n{summary}"
                 )));
                 save_eval_session(self);
@@ -539,25 +586,19 @@ impl App {
                 iteration,
                 issues,
                 feedback,
-                swapped_agent1,
                 swapped_agent2,
             } => {
                 if swapped_agent2 {
-                    self.state.push_message(ChatMessage::ui_system(
+                    self.goal_note(ChatMessage::ui_system(
                         "🔄 Swapping evaluator (agent 2) to new session after 5 failures.",
                     ));
                 }
                 // Save under the (possibly swapped) evaluator session id.
                 save_eval_session(self);
 
-                self.state.push_message(ChatMessage::ui_system(&format!(
+                self.goal_note(ChatMessage::ui_system(&format!(
                     "❌ Goal not achieved (attempt {iteration}).\nIssues: {issues}\nFeedback: {feedback}"
                 )));
-                if swapped_agent1 {
-                    self.state.push_message(ChatMessage::ui_system(
-                        "🔄 Swapping agent to new session after 3 failures.",
-                    ));
-                }
                 self.retry_agent1_with_feedback(&feedback).await;
             }
         }
@@ -575,12 +616,7 @@ impl App {
             &prompt,
             &format!("[Continuing goal cycle — attempt {iteration}]"),
         );
-        self.send_focused_turn(Some(message))
-            .await
-            .unwrap_or_else(|e| {
-                self.state
-                    .push_system(&format!("⚠ Failed to retry agent: {e}"));
-            });
+        self.send_goal_turn(message).await;
     }
 
     pub(crate) async fn retry_agent1_with_feedback(&mut self, feedback: &str) {
@@ -596,54 +632,83 @@ impl App {
             &prompt,
             &format!("[Goal retry — attempt {iteration}: applying evaluator feedback]"),
         );
-        self.send_focused_turn(Some(message))
-            .await
-            .unwrap_or_else(|e| {
-                self.state
-                    .push_system(&format!("⚠ Failed to retry agent: {e}"));
-            });
+        self.send_goal_turn(message).await;
+    }
+
+    /// Ход работника — в чат цикла, где бы ни был человек.
+    async fn send_goal_turn(&mut self, message: ChatMessage) {
+        let target = self.goal_conversation();
+        if let Err(e) = self.send_turn(target, Some(message)).await {
+            self.goal_note(ChatMessage::system(&format!(
+                "⚠ Failed to retry agent: {e}"
+            )));
+        }
     }
 }
 
 impl App {
-    /// GOAL-cycle transition run after every `AgentEvent::Done`: when agent 1
-    /// just finished, hand its output to the evaluator — or retry an empty
-    /// turn. Lives here so the whole goal state machine reads in one file;
-    /// `on_agent_event`'s `TurnTail::Focused` branch only calls this.
+    /// GOAL-cycle transition run after the goal chat's turn ends with `Done`:
+    /// hand the worker's output to the evaluator — or retry an empty turn.
     pub(crate) async fn maybe_advance_goal_cycle(&mut self) {
         if !(self.state.goal.mode && self.state.goal.stage == GoalStage::RunAgent1) {
             return;
         }
-        // Agent 1 finished — take the last assistant content for evaluation.
-        let agent_result = self
-            .state
-            .focused_mut()
+        let target = self.goal_conversation();
+        let Some(conversation) = self.state.conversations.get(target) else {
+            self.cancel_goal_cycle("The goal's chat is gone — goal cancelled.");
+            return;
+        };
+        let agent_result = conversation
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::provider::Role::Assistant)
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        let tool_report = last_turn_tool_report(&conversation.messages);
 
         if !agent_result.is_empty() {
             self.state.status_message = "Evaluating goal...".to_string();
             self.state.goal.stage = GoalStage::RunEvaluator;
-            self.state
-                .focused_mut()
-                .messages
-                .push(ChatMessage::ui_system(
-                    "🔍 Evaluating result against goal...",
-                ));
-            self.spawn_goal_evaluation(agent_result);
+            self.goal_note(ChatMessage::ui_system(
+                "🔍 Evaluating result against goal...",
+            ));
+            self.spawn_goal_evaluation(agent_result, tool_report);
         } else {
-            self.state
-                .focused_mut()
-                .messages
-                .push(ChatMessage::ui_system(
-                    "⚠ Agent produced no output. Retrying...",
-                ));
+            self.goal_note(ChatMessage::ui_system(
+                "⚠ Agent produced no output. Retrying...",
+            ));
             self.retry_agent1().await;
         }
+    }
+}
+
+/// Сколько вывода одного инструмента показать оценщику.
+const TOOL_REPORT_BYTES: usize = 300;
+
+/// Результаты инструментов последнего хода — с пометкой провала. Иначе
+/// оценщик судил по самоотчёту, и «тесты прошли» над упавшим `cargo test` проходило.
+fn last_turn_tool_report(messages: &[ChatMessage]) -> String {
+    let start = messages
+        .iter()
+        .rposition(|m| m.role == crate::provider::Role::User && !m.ui_only)
+        .map_or(0, |index| index + 1);
+    let lines: Vec<String> = messages[start..]
+        .iter()
+        .filter(|m| m.role == crate::provider::Role::Tool)
+        .map(|m| {
+            format!(
+                "- {}{}: {}",
+                m.name.as_deref().unwrap_or("tool"),
+                if m.tool_error { " (FAILED)" } else { "" },
+                crate::util::truncate_with_ellipsis(m.content.trim(), TOOL_REPORT_BYTES)
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        "(no tools were run)".to_string()
+    } else {
+        lines.join("\n")
     }
 }
 
@@ -696,8 +761,9 @@ impl App {
                 Ok(true)
             }
             GoalStage::WaitForGoal => {
-                // Second input = the goal.
+                // Second input = the goal. Цикл привязывается к этому чату.
                 self.state.goal.text = input.to_string();
+                self.state.goal.conversation = Some(self.state.conversations.focused_id());
                 let mut echo = ChatMessage::user(&format!("GOAL: {}", input));
                 echo.ui_only = true;
                 self.state.focused_mut().messages.push(echo);
@@ -725,6 +791,12 @@ impl App {
                 );
                 self.send_focused_turn(Some(message)).await?;
                 Ok(true)
+            }
+            // Цикл идёт в другом чате — здесь обычный ввод.
+            GoalStage::RunAgent1 | GoalStage::RunEvaluator
+                if self.state.goal.conversation != Some(self.state.conversations.focused_id()) =>
+            {
+                Ok(false)
             }
             GoalStage::RunAgent1 | GoalStage::RunEvaluator => {
                 // Block input while the goal cycle is active.

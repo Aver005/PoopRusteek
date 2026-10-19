@@ -5,7 +5,7 @@ use crate::agent::tools_step::{ToolExecContext, ToolOutcome};
 use crate::app::conversation::ConversationId;
 use crate::app::events::{AgentEvent, AgentResult, AppEvent};
 use crate::app::runtime::TurnSpec;
-use crate::provider::{ChatMessage, LLMProvider};
+use crate::provider::ChatMessage;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,9 +17,6 @@ pub const SUB_AGENT_MAX_STEPS: usize = 16;
 
 /// Сколько последней реплики суб-агента показать родителю при провале.
 const LAST_MESSAGE_BYTES: usize = 600;
-
-/// Сколько ждать удаления серверной сессии форка.
-const DISCARD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Что узнаёт ход без человека (суб-агент, фоновый чат): без этого он тратил
 /// шаги на `task`/`question`/`timer`, которые ему всегда отказывают.
@@ -44,7 +41,7 @@ async fn run(ctx: &ToolExecContext<'_>, label: &str, prompt: String) -> ToolOutc
     let conversation = ConversationId::next();
     let provider = ctx.provider.fork();
     // Форк одноразовый: его серверная сессия удаляется и при отмене.
-    let discard = DiscardOnDrop(Some(Arc::clone(&provider)));
+    let discard = crate::provider::SessionDiscard::new(Arc::clone(&provider));
     let max_steps = ctx.max_steps.min(SUB_AGENT_MAX_STEPS);
     crate::debug_log::log_json(
         "agent.sub_agent.started",
@@ -246,31 +243,6 @@ async fn relay(
         });
     }
     run
-}
-
-/// Удалить серверную сессию одноразового форка, чем бы ни кончился вызов.
-/// На обычном пути — с ожиданием: `exec` иначе выходил раньше удаления.
-struct DiscardOnDrop(Option<Arc<dyn LLMProvider>>);
-
-impl DiscardOnDrop {
-    async fn now(mut self) {
-        if let Some(provider) = self.0.take() {
-            let _ = tokio::time::timeout(DISCARD_GRACE, provider.discard_remote_session()).await;
-        }
-    }
-}
-
-impl Drop for DiscardOnDrop {
-    fn drop(&mut self) {
-        let Some(provider) = self.0.take() else {
-            return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = provider.discard_remote_session().await;
-            });
-        }
-    }
 }
 
 #[cfg(test)]

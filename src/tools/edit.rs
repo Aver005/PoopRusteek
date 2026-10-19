@@ -368,13 +368,6 @@ fn push_diff_side(out: &mut String, lines: &[&str], marker: char) {
     }
 }
 
-/// Точка входа для сквозного теста чекпоинтов: ему нужен настоящий путь
-/// записи инструмента, а не повтор его логики.
-#[cfg(test)]
-pub fn edit_for_test(path: &str, old: &str, new: &str) -> Result<String, String> {
-    edit_blocking(path, old, new, false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

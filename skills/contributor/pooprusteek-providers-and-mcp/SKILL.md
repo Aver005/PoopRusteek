@@ -46,9 +46,11 @@ surface + `fork()`), anchored to `file::function` names, see
 ## MCP (`src/mcp/`)
 
 External servers expose tools namespaced `mcp__{server}__{tool}`; the agent loop dispatches any
-call whose name starts with `mcp__` to `MCPManager::call_tool` (`agent/runner.rs`).
+call whose name starts with `mcp__` through `MCPManager::client_for` + `MCPClient::call_tool`
+(`agent/tools_step.rs`), outside the manager lock.
 
-- **Transports** (`transport.rs`): **stdio** (subprocess, JSON+`\n`, 60s/req; Windows auto-retries
+- **Transports** (`transport.rs`): **stdio** (subprocess, JSON+`\n`, 60s/req for write+read; a
+  failed or timed-out write closes the transport, so later calls fail fast; Windows auto-retries
   `.cmd`/`.bat` so `npx` resolves), **HTTP** (reqwest + cookie store, tracks `MCP-Session-Id`,
   SSE-fallback), **SSE** (`text/event-stream`, id-matched), **Dummy** (disabled servers).
   Protocol version `2024-11-05`; handshake `initialize` → `notifications/initialized` → `tools/list`.
@@ -57,13 +59,17 @@ call whose name starts with `mcp__` to `MCPManager::call_tool` (`agent/runner.rs
   Cursor → Opencode. `persist_config` writes only pooprusteek-owned servers (foreign servers get
   enable/disable overrides, never secret copying).
 - **Manager** (`manager.rs`): server lifecycle, per-server tool cache (default TTL 300s, override
-  `/mcp ttl`), `connect_all` concurrent, lock-free `client_for(name)` handles, `shutdown_all` on exit.
+  `/mcp ttl`), lock-free `client_for(name)` handles, `shutdown_all` on exit. `MCPManager` methods
+  are short state changes under the lock; `/mcp` operations are free functions over
+  `&Mutex<MCPManager>` (`startup_initialize`, `reload`, `reconnect`, `toggle`, `add`, `remove`):
+  short lock, connect/close without the lock, short merge. A merge or install applies only if the
+  entry still holds the same client (`Arc::ptr_eq`); a client that lost a race is closed.
 - **OAuth** (`oauth.rs` / `oauth_store.rs`, `/mcp auth`): a 401 during connect surfaces as
   `AuthRequired`; the flow does RFC 9728 protected-resource discovery → RFC 8414 / OIDC AS metadata
   → RFC 7591 **dynamic client registration** (no DCR support = hard error) → PKCE S256 → local
   loopback redirect → token exchange. Tokens live in the **OS keyring** (service `pooprusteek-mcp`),
   never in `mcp.json`; keyring calls run on `spawn_blocking`. `/mcp add` (JSON paste / wizard /
-  one-liner shorthand) converges on `add_new_server`.
+  one-liner shorthand) converges on `mcp::manager::add`.
 
 ## The load-bearing invariant
 

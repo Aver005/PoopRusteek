@@ -157,13 +157,11 @@ impl CompatProtocol for OpenAiProtocol {
         let chunk: ChatCompletionChunk = match serde_json::from_str(payload) {
             Ok(chunk) => chunk,
             Err(error) => {
-                // One malformed chunk shouldn't kill the stream, but it
-                // must not vanish silently either.
-                debug_log::log(
-                    "openai_compat.stream.parse",
-                    format!("skipping malformed chunk: {error}"),
+                return crate::provider::compat_client::unparsed_payload(
+                    "openai_compat",
+                    payload,
+                    &error.to_string(),
                 );
-                return SseFlow::Continue;
             }
         };
         let Some(choice) = chunk.choices.into_iter().next() else {

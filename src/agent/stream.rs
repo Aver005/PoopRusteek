@@ -27,13 +27,21 @@ pub const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
 /// Сколько ждать задачу стрима после терминального куска: ответ уже целиком
 /// у нас, и шлюз, держащий соединение открытым, не должен вешать ход.
-const AFTER_STOP_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const AFTER_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Текст для человека и модели: сколько молчал поток.
 pub fn idle_timeout_message() -> String {
     format!(
         "no data from the provider for {}s",
         STREAM_IDLE_TIMEOUT.as_secs()
+    )
+}
+
+/// Текст ошибки: поток перерос [`MAX_STREAM_BYTES`] и оборван.
+pub fn oversized_stream_message() -> String {
+    format!(
+        "stream exceeded {} MiB without finishing — aborted",
+        MAX_STREAM_BYTES / (1024 * 1024)
     )
 }
 
@@ -161,10 +169,7 @@ async fn collect(
                             got_stop,
                             tool_calls,
                             stop_reason,
-                            end: StreamEnd::ProviderError(format!(
-                                "stream exceeded {} MiB without finishing — aborted",
-                                MAX_STREAM_BYTES / (1024 * 1024)
-                            )),
+                            end: StreamEnd::ProviderError(oversized_stream_message()),
                         };
                     }
                     on_progress(&text);

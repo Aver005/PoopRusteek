@@ -28,10 +28,8 @@ impl App {
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = Default::default();
                 self.state.focused_mut().generation.active = false;
-                if let Some(handle) = self.state.focused_mut().agent_task.take() {
-                    handle.abort();
-                }
                 let aborted = self.state.conversations.focused_id();
+                self.abort_turn_of(aborted);
                 self.purge_interactions_for(aborted).await;
 
                 let count = s.messages.len();
@@ -238,6 +236,12 @@ impl App {
             .conversations
             .get(conversation)
             .and_then(|c| c.provider.clone());
+        if self.state.conversations.get(conversation).is_none() {
+            return;
+        }
+        // Поздние события оборванного хода не должны лечь в импорт.
+        self.abort_turn_of(conversation);
+        self.purge_interactions_for(conversation).await;
         let Some(conv) = self.state.conversations.get_mut(conversation) else {
             return;
         };
@@ -249,9 +253,6 @@ impl App {
         conv.tag = None;
         conv.broken = false;
         conv.generation.active = false;
-        if let Some(handle) = conv.agent_task.take() {
-            handle.abort();
-        }
         let count = conv.messages.len();
         let title = session::derive_title(&conv.messages);
         let snapshot = conv.messages.clone();

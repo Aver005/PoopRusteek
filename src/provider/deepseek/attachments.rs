@@ -96,22 +96,6 @@ impl UploadCache {
     }
 }
 
-/// Пока идёт долгий запрос (PoW, загрузка сотни МБ), раз в полминуты держать
-/// таймер простоя потока (120 с) пустым куском.
-async fn with_heartbeat<T>(
-    work: impl std::future::Future<Output = T>,
-    heartbeat: &mut (dyn FnMut() + Send),
-) -> T {
-    const EVERY: Duration = Duration::from_secs(30);
-    tokio::pin!(work);
-    loop {
-        tokio::select! {
-            done = &mut work => return done,
-            _ = tokio::time::sleep(EVERY) => heartbeat(),
-        }
-    }
-}
-
 /// Что значит очередной ответ `fetch_files`.
 #[derive(Debug, PartialEq, Eq)]
 enum Parse {
@@ -142,14 +126,10 @@ fn parse_state(file: &UploadedFile) -> Parse {
 impl DeepseekProvider {
     /// Приложить файлы хвоста. Неудача одного файла не роняет ход: сообщение
     /// с ним осталось бы в хвосте и валило бы каждую следующую отправку.
-    pub(super) async fn attach_files(
-        &self,
-        paths: &[String],
-        heartbeat: &mut (dyn FnMut() + Send),
-    ) -> Attached {
+    pub(super) async fn attach_files(&self, paths: &[String]) -> Attached {
         let mut attached = Attached::default();
         for raw in paths {
-            match self.attach_file(Path::new(raw), heartbeat).await {
+            match self.attach_file(Path::new(raw)).await {
                 Ok(file) => attached.ready.push(file),
                 Err(error) => {
                     debug_log::log("file.attach_failed", format!("{raw}: {error}"));
@@ -160,11 +140,7 @@ impl DeepseekProvider {
         attached
     }
 
-    async fn attach_file(
-        &self,
-        path: &Path,
-        heartbeat: &mut (dyn FnMut() + Send),
-    ) -> AppResult<ReadyFile> {
+    async fn attach_file(&self, path: &Path) -> AppResult<ReadyFile> {
         let canonical = tokio::fs::canonicalize(path).await.map_err(AppError::Io)?;
         let meta = tokio::fs::metadata(&canonical)
             .await
@@ -194,7 +170,7 @@ impl DeepseekProvider {
             );
             self.uploads.forget(&key);
         }
-        let uploaded = with_heartbeat(self.upload_file(&key.path), heartbeat).await?;
+        let uploaded = self.upload_file(&key.path).await?;
         debug_log::log(
             "file.uploaded",
             format!(
@@ -204,7 +180,7 @@ impl DeepseekProvider {
                 uploaded.status
             ),
         );
-        let ready = self.wait_parsed(uploaded.id, heartbeat).await?;
+        let ready = self.wait_parsed(uploaded.id).await?;
         self.uploads.put(key, ready.clone());
         Ok(ready)
     }
@@ -222,11 +198,7 @@ impl DeepseekProvider {
 
     /// Ждать `SUCCESS`. Отказ сервера уходит пользователю с причиной;
     /// незнакомый статус считаем промежуточным, но пишем в лог.
-    async fn wait_parsed(
-        &self,
-        id: String,
-        heartbeat: &mut (dyn FnMut() + Send),
-    ) -> AppResult<ReadyFile> {
+    async fn wait_parsed(&self, id: String) -> AppResult<ReadyFile> {
         let started = Instant::now();
         let mut errors = 0;
         loop {
@@ -264,8 +236,6 @@ impl DeepseekProvider {
                     PARSE_TIMEOUT.as_secs()
                 )));
             }
-            // Пустой кусок держит таймер простоя потока (120 с), пока сервер разбирает файл.
-            heartbeat();
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }

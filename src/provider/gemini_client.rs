@@ -11,7 +11,6 @@
 use super::compat_client::{CompatClient, CompatProtocol, SseFlow, envelope_error_message};
 use super::gemini_compat::{self, GenerateContentResponse};
 use super::{CompletionChunk, CompletionRequest, CompletionResponse};
-use crate::debug_log;
 use crate::error::AppResult;
 
 /// `LLMProvider` over the Google Generative Language API.
@@ -71,9 +70,20 @@ impl CompatProtocol for GeminiProtocol {
         state: &mut Self::StreamState,
         emit: &mut dyn FnMut(CompletionChunk),
     ) -> SseFlow {
-        let Ok(chunk) = serde_json::from_str::<GenerateContentResponse>(payload) else {
-            debug_log::log("gemini.stream.parse", "skipping malformed chunk");
-            return SseFlow::Continue;
+        // У ответа Gemini все поля необязательны: `{"error":…}` разобрался бы
+        // пустым куском, поэтому конверт ошибки проверяется первым.
+        if let Some(message) = crate::provider::compat_client::envelope_error_message(payload) {
+            return SseFlow::Fail(message);
+        }
+        let chunk = match serde_json::from_str::<GenerateContentResponse>(payload) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return crate::provider::compat_client::unparsed_payload(
+                    "gemini",
+                    payload,
+                    &error.to_string(),
+                );
+            }
         };
         let (text, calls, finish) = gemini_compat::extract_piece(&chunk);
         state.tool_calls.extend(calls);

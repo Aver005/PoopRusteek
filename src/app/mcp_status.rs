@@ -104,7 +104,7 @@ impl crate::app::App {
                 let mcp = std::sync::Arc::clone(&self.mcp);
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
-                    let message = match mcp.lock().await.reconnect_server(&server).await {
+                    let message = match crate::mcp::manager::reconnect(&mcp, &server).await {
                         Err(e) => format!("Reconnect after authorization failed: {e}"),
                         Ok(_) => format!("{server} authorized and reconnected"),
                     };

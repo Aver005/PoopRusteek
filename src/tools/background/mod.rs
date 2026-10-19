@@ -17,10 +17,10 @@ mod types;
 pub use registry::{
     expire_persistent_idle_processes, kill_process, process_snapshots, prune_finished_processes,
     prune_jobs, read_output, remove_process, running_process_counts, shutdown_all,
-    shutdown_nonpersistent, write_input,
+    shutdown_nonpersistent_of, shutdown_owned_by, write_input,
 };
 pub use spawn::{spawn_background, spawn_interactive};
-pub use types::{DEFAULT_PERSISTENT_TTL_SECS, ProcessStatus};
+pub use types::{DEFAULT_PERSISTENT_TTL_SECS, ProcessStatus, with_owner};
 // Дерево процессов команды переднего плана — см. `shell.rs`.
 pub(crate) use types::ProcessTree;
 // `win_job`: фоновые дети (и MCP stdio) привязываются к задаче kill-on-close,

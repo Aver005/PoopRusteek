@@ -78,6 +78,8 @@ impl DeepseekProvider {
                 CREATE_SESSION_URL,
                 &headers,
                 &body,
+                // Повтор после 5xx оставлял в аккаунте лишние пустые чаты.
+                super::http::Resend::ConnectOnly,
             )
             .await?;
 

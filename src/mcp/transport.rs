@@ -4,10 +4,11 @@
 //! "matching" part is the interesting bit for stdio and SSE, since both can
 //! interleave notifications and server-initiated requests with the actual
 //! response on the same stream (see `send_request` on `StdioTransport` and
-//! `parse_sse_stream`/`parse_sse_fallback` on `SseTransport`).
+//! `read_sse_response`/`sse_body_response`).
 
 use super::jsonrpc::{
-    JsonRpcRequest, JsonRpcResponse, ids_match, is_notification_or_request, take_sse_frame,
+    JsonRpcRequest, JsonRpcResponse, SseFrames, ids_match, is_notification_or_request,
+    response_in_frame, response_in_sse_body,
 };
 use crate::error::AppResult;
 use async_trait::async_trait;
@@ -17,7 +18,10 @@ use std::env;
 use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{Instant, timeout};
+
+/// Срок одного запроса к stdio-серверу: запись и чтение вместе.
+const STDIO_TIMEOUT: std::time::Duration = super::http::PROTOCOL_TIMEOUT;
 
 // async-trait вешает `#[must_use]` на метод, чей `Pin<Box<dyn Future>>` и так
 // must_use; clippy 2026-09 считает это ошибкой. Код наш тут ни при чём.
@@ -169,6 +173,32 @@ impl StdioTransport {
             reader,
         })
     }
+
+    /// Записать в stdin сервера к сроку. После сбоя в трубе остаётся обрывок
+    /// строки, и следующий запрос склеился бы с ним, поэтому транспорт закрывается.
+    async fn write_line(&mut self, data: &[u8], deadline: Instant) -> AppResult<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(crate::error::AppError::Mcp(
+                "MCP stdio transport is closed after a failed write; reconnect the server"
+                    .to_string(),
+            ));
+        };
+        let write = async {
+            stdin.write_all(data).await?;
+            stdin.flush().await
+        };
+        let error = match tokio::time::timeout_at(deadline, write).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => error.into(),
+            Err(_) => request_timed_out("the server stopped reading its input"),
+        };
+        self.stdin = None;
+        // Сервер, переставший читать ввод, сам может и не выйти.
+        if let Err(e) = self.child.start_kill() {
+            tracing::debug!("MCP stdio: kill after a failed write failed: {e}");
+        }
+        Err(error)
+    }
 }
 
 #[async_trait]
@@ -177,10 +207,10 @@ impl Transport for StdioTransport {
         let mut json = serde_json::to_string(request)?;
         json.push('\n');
 
-        if let Some(ref mut stdin) = self.stdin {
-            stdin.write_all(json.as_bytes()).await?;
-            stdin.flush().await?;
-        }
+        // Один срок на запись и чтение: сервер, переставший читать ввод, при
+        // большом вызове вешал запись навсегда — до начала отсчёта.
+        let deadline = Instant::now() + STDIO_TIMEOUT;
+        self.write_line(json.as_bytes(), deadline).await?;
 
         // A stdio server multiplexes everything onto stdout: our response,
         // plus any notifications (`notifications/progress`, log messages)
@@ -192,7 +222,6 @@ impl Transport for StdioTransport {
         // anything else. The 60s budget covers the *entire* wait, not each
         // individual line — a chatty-but-slow server can't reset the clock
         // by sending an endless stream of notifications.
-        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             // `Instant::duration_since` on `tokio::time::Instant` returns a
             // zero `Duration` (rather than panicking or requiring an
@@ -201,20 +230,14 @@ impl Transport for StdioTransport {
             // needed here once the deadline has passed.
             let remaining = deadline.duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(crate::error::AppError::Mcp(
-                    "MCP request timed out after 60s".to_string(),
-                ));
+                return Err(request_timed_out("no response"));
             }
 
             let mut line = String::new();
             let read = timeout(remaining, self.reader.read_line(&mut line)).await;
             let bytes_read = match read {
                 Ok(inner) => inner?,
-                Err(_) => {
-                    return Err(crate::error::AppError::Mcp(
-                        "MCP request timed out after 60s".to_string(),
-                    ));
-                }
+                Err(_) => return Err(request_timed_out("no response")),
             };
             if bytes_read == 0 {
                 return Err(crate::error::AppError::Mcp(
@@ -266,11 +289,7 @@ impl Transport for StdioTransport {
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> AppResult<()> {
-        if let Some(ref mut stdin) = self.stdin {
-            stdin.write_all(data).await?;
-            stdin.flush().await?;
-        }
-        Ok(())
+        self.write_line(data, Instant::now() + STDIO_TIMEOUT).await
     }
 
     async fn close(&mut self) -> AppResult<()> {
@@ -368,6 +387,10 @@ impl Transport for HttpTransport {
         }
         capture_session_id(&resp, &self.session_id, &self.url);
 
+        if is_event_stream(&resp) {
+            return read_sse_response(resp, request.id, &self.url, status).await;
+        }
+
         let body = resp.text().await.map_err(|e| {
             crate::error::AppError::Mcp(format!(
                 "Failed to read HTTP response body at {}: {e}",
@@ -393,14 +416,10 @@ impl Transport for HttpTransport {
                 request.id,
                 self.url
             );
-            return SseTransport::parse_sse_fallback(&body, request.id, &self.url, status).await;
+            return sse_body_response(&body, request.id, &self.url, status);
         }
 
-        let snippet = if body.len() > 200 {
-            crate::util::truncate_with_ellipsis(&body, 200)
-        } else {
-            body.clone()
-        };
+        let snippet = crate::util::truncate_with_ellipsis(&body, 200);
         Err(crate::error::AppError::Mcp(format!(
             "HTTP MCP decode error (status={status}, url={}): body: {snippet}",
             self.url
@@ -447,52 +466,6 @@ impl SseTransport {
             session_id: Mutex::new(None),
         })
     }
-
-    async fn parse_sse_stream(
-        resp: reqwest::Response,
-        request_id: u64,
-        url: &str,
-        status: reqwest::StatusCode,
-    ) -> AppResult<JsonRpcResponse> {
-        let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(json_str) = take_sse_frame(&mut buffer) {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
-                    continue;
-                };
-
-                if is_notification_or_request(&value) {
-                    tracing::debug!(
-                        "SSE notification/server-request while awaiting id={request_id}: {value}"
-                    );
-                    continue;
-                }
-
-                let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value) else {
-                    continue;
-                };
-
-                match &response.id {
-                    Some(id) if ids_match(request_id, id) => return Ok(response),
-                    other => {
-                        tracing::debug!(
-                            "SSE skipping non-matching id={:?} (waiting for id={request_id})",
-                            other
-                        );
-                    }
-                }
-            }
-        }
-
-        Err(crate::error::AppError::Mcp(format!(
-            "SSE stream ended without matching response for id={request_id} (status={status}, url={url})"
-        )))
-    }
 }
 
 #[async_trait]
@@ -519,26 +492,15 @@ impl Transport for SseTransport {
                 .text()
                 .await
                 .unwrap_or_else(|_| format!("(failed to read body, status={status})"));
-            let snippet = if body.len() > 200 {
-                crate::util::truncate_with_ellipsis(&body, 200)
-            } else {
-                body
-            };
+            let snippet = crate::util::truncate_with_ellipsis(&body, 200);
             return Err(crate::error::AppError::Mcp(format!(
                 "SSE transport error (status={status}, url={}): {snippet}",
                 self.url
             )));
         }
 
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        if content_type.contains("text/event-stream") {
-            Self::parse_sse_stream(resp, request.id, &self.url, status).await
+        if is_event_stream(&resp) {
+            read_sse_response(resp, request.id, &self.url, status).await
         } else {
             // Try JSON first; if it fails and body looks like SSE, try SSE parse
             let body = resp.text().await.map_err(|e| {
@@ -556,13 +518,9 @@ impl Transport for SseTransport {
                         tracing::debug!(
                             "SSE transport: non-SSE Content-Type but body looks like SSE, trying SSE parse"
                         );
-                        Self::parse_sse_fallback(&body, request.id, &self.url, status).await
+                        sse_body_response(&body, request.id, &self.url, status)
                     } else {
-                        let snippet = if body.len() > 200 {
-                            crate::util::truncate_with_ellipsis(&body, 200)
-                        } else {
-                            body
-                        };
+                        let snippet = crate::util::truncate_with_ellipsis(&body, 200);
                         Err(crate::error::AppError::Mcp(format!(
                             "SSE transport decode error (status={status}, url={}): {json_err} — body: {snippet}",
                             self.url
@@ -595,39 +553,55 @@ impl Transport for SseTransport {
     }
 }
 
-impl SseTransport {
-    async fn parse_sse_fallback(
-        body: &str,
-        request_id: u64,
-        url: &str,
-        status: reqwest::StatusCode,
-    ) -> AppResult<JsonRpcResponse> {
-        let mut buffer = body.to_string();
+/// Ответ пришёл потоком SSE (`text/event-stream`).
+fn is_event_stream(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|kind| kind.contains("text/event-stream"))
+}
 
-        while let Some(json_str) = take_sse_frame(&mut buffer) {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
-                continue;
-            };
-
-            if is_notification_or_request(&value) {
-                tracing::debug!(
-                    "SSE fallback: skipping notification/server-request while awaiting id={request_id}: {value}"
-                );
-                continue;
-            }
-
-            if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value)
-                && let Some(id) = &response.id
-                && ids_match(request_id, id)
-            {
-                return Ok(response);
-            }
+/// Читать поток SSE до ответа на `request_id`, а не до закрытия: сервер вправе
+/// держать поток открытым, и готовый ответ пропадал в тайм-ауте.
+async fn read_sse_response(
+    resp: reqwest::Response,
+    request_id: u64,
+    url: &str,
+    status: reqwest::StatusCode,
+) -> AppResult<JsonRpcResponse> {
+    let mut stream = resp.bytes_stream();
+    let mut frames = SseFrames::default();
+    while let Some(chunk) = stream.next().await {
+        let found = frames
+            .push_bytes(&chunk?)
+            .iter()
+            .find_map(|frame| response_in_frame(frame, request_id));
+        if let Some(response) = found {
+            return Ok(response);
         }
-
-        Err(crate::error::AppError::Mcp(format!(
-            "SSE fallback: no matching response for id={request_id} (status={status}, url={url})"
-        )))
     }
+    frames
+        .finish()
+        .and_then(|frame| response_in_frame(&frame, request_id))
+        .ok_or_else(|| {
+            crate::error::AppError::Mcp(format!(
+                "SSE stream ended without matching response for id={request_id} (status={status}, url={url})"
+            ))
+        })
+}
+
+/// Тело не `text/event-stream`, но похоже на SSE: искать ответ в нём целиком.
+fn sse_body_response(
+    body: &str,
+    request_id: u64,
+    url: &str,
+    status: reqwest::StatusCode,
+) -> AppResult<JsonRpcResponse> {
+    response_in_sse_body(body, request_id).ok_or_else(|| {
+        crate::error::AppError::Mcp(format!(
+            "SSE fallback: no matching response for id={request_id} (status={status}, url={url})"
+        ))
+    })
 }
 
 pub struct DummyTransport;
@@ -647,4 +621,12 @@ impl Transport for DummyTransport {
     async fn close(&mut self) -> AppResult<()> {
         Ok(())
     }
+}
+
+/// Срок запроса к MCP-серверу вышел. Сервер при этом мог продолжить работу.
+fn request_timed_out(why: &str) -> crate::error::AppError {
+    crate::error::AppError::Mcp(format!(
+        "MCP request timed out after {}s ({why}); the server may still be working on it",
+        STDIO_TIMEOUT.as_secs()
+    ))
 }

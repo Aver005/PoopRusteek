@@ -87,6 +87,19 @@ pub(crate) trait CompatProtocol: Send + Sync + 'static {
     fn parse_models(body: &[u8]) -> AppResult<Vec<String>>;
 }
 
+/// Кусок потока не разобрался: это ошибка в конверте `{"error": …}` — конец
+/// потока с её текстом, — или просто битый кусок, который пропускаем.
+pub(crate) fn unparsed_payload(tag: &str, payload: &str, error: &str) -> SseFlow {
+    if let Some(message) = envelope_error_message(payload) {
+        return SseFlow::Fail(message);
+    }
+    debug_log::log(
+        &format!("{tag}.stream.parse"),
+        format!("skipping malformed chunk: {error}"),
+    );
+    SseFlow::Continue
+}
+
 /// `{"error": {"message": …}}` — the error envelope Anthropic and Google
 /// happen to share, byte-identically parsed before this helper existed.
 pub(crate) fn envelope_error_message(body: &str) -> Option<String> {
@@ -165,11 +178,11 @@ pub(crate) struct CompatClient<P: CompatProtocol> {
 
 impl<P: CompatProtocol> CompatClient<P> {
     pub fn new(entry: &ProviderEntry) -> AppResult<Self> {
-        // Same envelope as the DeepSeek client: fail fast on dead endpoints,
-        // and let the agent loop's 120s idle guard own the stall policy.
+        // Same envelope as the DeepSeek client: fail fast on dead endpoints;
+        // a stalled read is the provider's error, named before the idle guard.
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(std::time::Duration::from_secs(120))
+            .read_timeout(crate::provider::PROVIDER_READ_TIMEOUT)
             .build()
             .map_err(AppError::Http)?;
         Ok(Self {
@@ -316,5 +329,26 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
             native_tools: self.native_tools,
             _protocol: PhantomData,
         })
+    }
+}
+
+#[cfg(test)]
+mod stream_error_tests {
+    use super::*;
+
+    /// Ошибка внутри потока раньше пропускалась как битый кусок, и её текст
+    /// оставался только в журнале.
+    #[test]
+    fn an_in_stream_error_ends_the_stream_with_its_text() {
+        let flow = unparsed_payload(
+            "openai_compat",
+            r#"{"error":{"message":"quota exceeded"}}"#,
+            "missing field",
+        );
+        assert!(matches!(flow, SseFlow::Fail(message) if message == "quota exceeded"));
+        assert!(matches!(
+            unparsed_payload("openai_compat", "{garbage", "eof"),
+            SseFlow::Continue
+        ));
     }
 }

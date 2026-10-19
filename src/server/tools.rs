@@ -49,6 +49,8 @@ pub(super) struct BridgedReply {
     pub reasoning: Option<String>,
     pub content: String,
     pub calls: Vec<WireToolCall>,
+    /// Вызовы, которые не разобрались: без них клиент получал разметку как ответ.
+    pub errors: Vec<String>,
 }
 
 impl ToolBridge {
@@ -101,6 +103,7 @@ impl ToolBridge {
             reasoning,
             content: content.trim().to_string(),
             calls: calls.iter().map(WireToolCall::from_call).collect(),
+            errors: Vec::new(),
         }
     }
 
@@ -167,6 +170,7 @@ impl ToolBridge {
             reasoning,
             content,
             calls,
+            errors: parsed.errors,
         }
     }
 

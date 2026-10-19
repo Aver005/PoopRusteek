@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AcpRequest {
     pub jsonrpc: String,
-    pub id: Option<u64>,
+    pub id: Option<serde_json::Value>,
     pub method: String,
     #[serde(default)]
     pub params: Option<serde_json::Value>,
@@ -12,7 +12,7 @@ pub struct AcpRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AcpResponse {
     pub jsonrpc: String,
-    pub id: Option<u64>,
+    pub id: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

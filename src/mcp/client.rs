@@ -37,19 +37,19 @@ impl MCPClient {
         cwd: Option<&str>,
     ) -> AppResult<Self> {
         let transport = StdioTransport::new(server_name, command, args, env, cwd).await?;
-        Ok(Self {
-            transport: Arc::new(Mutex::new(transport)),
-            server_name: server_name.to_string(),
-            next_id: AtomicU64::new(1),
-            failures_in_row: AtomicU32::new(0),
-        })
+        Ok(Self::from_transport(server_name, transport))
     }
 
     pub fn dummy(server_name: &str) -> Self {
+        Self::from_transport(server_name, super::transport::DummyTransport)
+    }
+
+    /// Клиент поверх готового транспорта; тесты подсовывают сюда свой.
+    pub(super) fn from_transport(server_name: &str, transport: impl Transport + 'static) -> Self {
         Self {
-            transport: Arc::new(Mutex::new(super::transport::DummyTransport)),
+            transport: Arc::new(Mutex::new(transport)),
             server_name: server_name.to_string(),
-            next_id: AtomicU64::new(0),
+            next_id: AtomicU64::new(1),
             failures_in_row: AtomicU32::new(0),
         }
     }
@@ -60,12 +60,7 @@ impl MCPClient {
         headers: HashMap<String, String>,
     ) -> AppResult<Self> {
         let transport = HttpTransport::new(url, headers)?;
-        Ok(Self {
-            transport: Arc::new(Mutex::new(transport)),
-            server_name: server_name.to_string(),
-            next_id: AtomicU64::new(1),
-            failures_in_row: AtomicU32::new(0),
-        })
+        Ok(Self::from_transport(server_name, transport))
     }
 
     pub async fn from_sse(
@@ -74,12 +69,7 @@ impl MCPClient {
         headers: HashMap<String, String>,
     ) -> AppResult<Self> {
         let transport = SseTransport::new(url, headers)?;
-        Ok(Self {
-            transport: Arc::new(Mutex::new(transport)),
-            server_name: server_name.to_string(),
-            next_id: AtomicU64::new(1),
-            failures_in_row: AtomicU32::new(0),
-        })
+        Ok(Self::from_transport(server_name, transport))
     }
 
     pub async fn initialize(&self) -> AppResult<ServerCapabilities> {

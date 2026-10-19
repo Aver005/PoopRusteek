@@ -108,6 +108,7 @@ impl App {
                 compact_mode: None,
                 compacting: None,
                 deferred: Vec::new(),
+                fenced: false,
             });
         Ok(())
     }
@@ -156,6 +157,7 @@ impl App {
         // Его запросы подтверждения уходят вместе с ним: иначе модалка висела
         // бы над задачей, которой нет, а «всегда» сохраняло бы правило зря.
         self.purge_interactions_for(target).await;
+        self.state.background.shutdown_chat(target).await;
         if let Some(mut conv) = self.state.conversations.remove(target) {
             self.drop_timers_of(target);
             if let Some(handle) = conv.agent_task.take() {
@@ -278,6 +280,7 @@ impl App {
             compact_mode: None,
             compacting: None,
             deferred: Vec::new(),
+            fenced: false,
         });
         self.state.scroll_offset = 0;
         self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();
@@ -465,18 +468,26 @@ impl App {
             // A provider that keeps history server-side still holds the old,
             // uncompacted branch. Rewriting the local copy changes nothing until
             // the server is made to forget it, so re-seed from the summary.
-            if outcome.is_ok() && provider.keeps_server_side_history() {
-                let _ = provider.reset().await;
-            }
+            // Сброс не удался — сервер помнит несжатую ветку; молча сказать
+            // «сжато» значило бы соврать о том, что увидит модель.
+            let reset_failed = match &outcome {
+                Ok(_) if provider.keeps_server_side_history() => {
+                    provider.reset().await.err().map(|error| error.to_string())
+                }
+                _ => None,
+            };
             let (messages, status) = match outcome {
                 Ok(done) => (
                     Some(done.messages),
                     format!(
-                        "Compacted with mode {}: ~{} tokens instead of ~{} ({} model call(s))",
+                        "Compacted with mode {}: ~{} tokens instead of ~{} ({} model call(s)){}",
                         mode.number(),
                         done.after_tokens,
                         done.before_tokens,
-                        done.calls
+                        done.calls,
+                        reset_failed.map_or_else(String::new, |error| format!(
+                            " — but the server session could not be reset ({error}), so the model still sees the old history"
+                        ))
                     ),
                 ),
                 Err(reason) => (None, reason),

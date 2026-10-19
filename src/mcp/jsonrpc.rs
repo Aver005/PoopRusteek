@@ -1,8 +1,9 @@
 //! JSON-RPC 2.0 message shapes used by every MCP transport, plus the pure
-//! helpers (`ids_match`, `is_notification_or_request`) that transports use
+//! helpers (`ids_match`, `is_notification_or_request`, `SseFrames`) that transports use
 //! to tell a real response to *our* request apart from a notification, a
 //! server-initiated request, or the response to some other in-flight call.
 
+use crate::provider::sse::{SseLineBuffer, sse_data_payload};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -101,23 +102,85 @@ pub fn is_notification_or_request(value: &Value) -> bool {
     value.get("method").is_some()
 }
 
-/// Снять из буфера первый целый SSE-кадр и склеить его строки `data:`.
-/// `None` — целого кадра ещё нет. Пустая строка — кадр без данных, вызывающий
-/// такой пропускает: `serde_json` на нём всё равно споткнётся.
-pub fn take_sse_frame(buffer: &mut String) -> Option<String> {
-    let event_end = buffer.find("\n\n")?;
-    let event = buffer[..event_end].to_string();
-    *buffer = buffer[event_end + 2..].to_string();
+/// Собирает кадры SSE из байтов потока: строки `data:` копятся, пустая строка
+/// закрывает кадр. Строки режет `SseLineBuffer`, поэтому UTF-8 не рвётся.
+#[derive(Default)]
+pub struct SseFrames {
+    lines: SseLineBuffer,
+    data: Vec<String>,
+    size: usize,
+}
 
-    let mut data_lines: Vec<String> = Vec::new();
-    for line in event.lines() {
-        if let Some(d) = line.strip_prefix("data: ") {
-            data_lines.push(d.to_string());
-        } else if line.trim() == "data:" {
-            data_lines.push(String::new());
+impl SseFrames {
+    /// Кадр без конца не должен расти без предела: сверх этого он выбрасывается.
+    const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+    /// Скормить кусок потока; вернуть данные кадров, которые он закрыл.
+    pub fn push_bytes(&mut self, chunk: &[u8]) -> Vec<String> {
+        let lines = self.lines.push_bytes(chunk);
+        lines
+            .iter()
+            .filter_map(|line| self.push_line(line))
+            .collect()
+    }
+
+    /// Конец потока: кадр, не закрытый пустой строкой, тоже отдать.
+    pub fn finish(mut self) -> Option<String> {
+        let tail = std::mem::take(&mut self.lines).finish();
+        if let Some(frame) = tail.and_then(|line| self.push_line(&line)) {
+            return Some(frame);
+        }
+        self.close_frame()
+    }
+
+    fn push_line(&mut self, line: &str) -> Option<String> {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            return self.close_frame();
+        }
+        if let Some(data) = sse_data_payload(line) {
+            self.size += data.len();
+            self.data.push(data.to_string());
+            if self.size > Self::MAX_FRAME {
+                tracing::warn!("SSE frame over {} bytes dropped", Self::MAX_FRAME);
+                self.data.clear();
+                self.size = 0;
+            }
+        }
+        None
+    }
+
+    fn close_frame(&mut self) -> Option<String> {
+        self.size = 0;
+        (!self.data.is_empty()).then(|| std::mem::take(&mut self.data).join("\n"))
+    }
+}
+
+/// Ответ на наш `request_id` в данных кадра. Уведомления, запросы сервера,
+/// чужие ответы и мусор — `None`.
+pub fn response_in_frame(frame: &str, request_id: u64) -> Option<JsonRpcResponse> {
+    let value: Value = serde_json::from_str(frame).ok()?;
+    if is_notification_or_request(&value) {
+        tracing::debug!("SSE notification/server-request while awaiting id={request_id}: {value}");
+        return None;
+    }
+    let response: JsonRpcResponse = serde_json::from_value(value).ok()?;
+    match &response.id {
+        Some(id) if ids_match(request_id, id) => Some(response),
+        other => {
+            tracing::debug!("SSE skipping non-matching id={other:?} (waiting for id={request_id})");
+            None
         }
     }
-    Some(data_lines.join("\n"))
+}
+
+/// Ответ на `request_id` в теле SSE, прочитанном целиком.
+pub fn response_in_sse_body(body: &str, request_id: u64) -> Option<JsonRpcResponse> {
+    let mut frames = SseFrames::default();
+    let mut all = frames.push_bytes(body.as_bytes());
+    all.extend(frames.finish());
+    all.iter()
+        .find_map(|frame| response_in_frame(frame, request_id))
 }
 
 #[cfg(test)]
@@ -125,29 +188,48 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn take_sse_frame_needs_a_blank_line_to_close_the_frame() {
-        let mut buffer = "data: {\"a\":1}".to_string();
-        assert_eq!(take_sse_frame(&mut buffer), None);
-        assert_eq!(buffer, "data: {\"a\":1}", "неполный кадр остаётся в буфере");
+    fn frames(chunks: &[&[u8]]) -> Vec<String> {
+        let mut reader = SseFrames::default();
+        let mut out: Vec<String> = chunks.iter().flat_map(|c| reader.push_bytes(c)).collect();
+        out.extend(reader.finish());
+        out
     }
 
     #[test]
-    fn take_sse_frame_joins_multiline_data_and_consumes_the_frame() {
-        let mut buffer = "event: message\ndata: {\"a\":1,\ndata: \"b\":2}\n\nrest".to_string();
-        assert_eq!(
-            take_sse_frame(&mut buffer).as_deref(),
-            Some("{\"a\":1,\n\"b\":2}"),
-            "строки data: склеиваются, прочие поля кадра отбрасываются"
-        );
-        assert_eq!(buffer, "rest");
+    fn sse_frames_need_a_blank_line_until_the_stream_ends() {
+        let mut reader = SseFrames::default();
+        assert!(reader.push_bytes(b"data: {\"a\":1}\n").is_empty());
+        assert_eq!(reader.finish().as_deref(), Some("{\"a\":1}"));
     }
 
     #[test]
-    fn take_sse_frame_returns_empty_for_a_frame_without_data() {
-        let mut buffer = ": keep-alive\n\n".to_string();
-        assert_eq!(take_sse_frame(&mut buffer).as_deref(), Some(""));
-        assert_eq!(buffer, "");
+    fn sse_frames_join_multiline_data_and_drop_other_fields() {
+        let got = frames(&[b"event: message\ndata: {\"a\":1,\ndata: \"b\":2}\n\nrest"]);
+        assert_eq!(got, vec!["{\"a\":1,\n\"b\":2}".to_string()]);
+    }
+
+    #[test]
+    fn sse_frames_skip_frames_without_data_and_accept_crlf() {
+        let got = frames(&[b": keep-alive\r\n\r\ndata: x\r\n\r\n"]);
+        assert_eq!(got, vec!["x".to_string()]);
+    }
+
+    /// Символ, разрезанный между кусками потока, собирается целым.
+    #[test]
+    fn sse_frames_keep_a_multibyte_char_split_across_chunks() {
+        let bytes = "data: \"привет\"\n\n".as_bytes();
+        let (a, b) = bytes.split_at(10);
+        assert_eq!(frames(&[a, b]), vec!["\"привет\"".to_string()]);
+    }
+
+    #[test]
+    fn response_in_sse_body_finds_our_id_past_notifications_and_others() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}";
+        let response = response_in_sse_body(body, 7).expect("ответ с id=7");
+        assert_eq!(response.result, Some(json!({"ok": true})));
+        assert!(response_in_sse_body(body, 8).is_none());
     }
 
     #[test]

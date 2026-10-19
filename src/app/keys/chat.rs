@@ -220,7 +220,8 @@ impl App {
             return Ok(SubmitOutcome::Continue);
         }
 
-        let killed = self.state.background.cleanup_before_user_turn().await;
+        let focused = self.state.conversations.focused_id();
+        let killed = self.state.background.cleanup_turn_of(focused).await;
         if killed > 0 {
             self.state.push_system(&format!(
                 "Cleaned {killed} ephemeral job(s) before the new turn."

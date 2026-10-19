@@ -50,7 +50,7 @@ impl App {
                 let mcp = Arc::clone(&self.mcp);
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
-                    mcp.lock().await.reload_all().await;
+                    crate::mcp::manager::reload(&mcp).await;
                     let _ = event_tx.send(events::AppEvent::McpOperationDone {
                         message: "MCP servers reloaded".to_string(),
                     });

@@ -6,7 +6,7 @@
 //! `MCPServerStatus::AuthRequired`. This module only produces a [`TokenSet`]
 //! — it never touches `MCPManager` state. The caller is responsible for
 //! persisting the result (`oauth_store::save`) and reconnecting the server
-//! through the existing `MCPManager::reconnect_server` path.
+//! through the existing `mcp::manager::reconnect` path.
 
 use crate::error::{AppError, AppResult};
 use base64::Engine as _;
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 /// Everything obtained from one completed authorization-code exchange.
@@ -280,23 +280,136 @@ fn authorization_url(
     Ok(url)
 }
 
-/// Wait for exactly one connection on the local loopback listener, parse the
-/// `GET /callback?...` request line, answer with a minimal "close this
-/// window" HTML page, and return the `code` query parameter after validating
-/// `state`. 5-minute timeout — long enough for a human to actually log in.
-async fn await_callback(listener: TcpListener, expected_state: &str) -> AppResult<String> {
-    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(300), listener.accept())
-        .await
-        .map_err(|_| {
-            AppError::Mcp("Timed out waiting for the OAuth callback (5 min)".to_string())
-        })??;
+/// Сколько ждать, пока человек войдёт в браузере.
+const CALLBACK_WAIT: Duration = Duration::from_secs(300);
 
-    let mut reader = BufReader::new(&mut stream);
+/// Сколько ждать запрос от одного соединения: браузерный preconnect-сокет
+/// открывается и молчит, и раньше он вешал вход навсегда.
+const CALLBACK_READ: Duration = Duration::from_secs(10);
+
+/// Предел на строку запроса с заголовками: больше локальному колбэку не нужно.
+const MAX_REQUEST_HEAD: u64 = 8 * 1024;
+
+/// Сколько соединений читать одновременно; остальные ждут в очереди `accept`.
+const MAX_PENDING_READS: usize = 16;
+
+/// Ждать `GET /callback?...` на локальном порту и вернуть `code`. Чужие
+/// соединения и колбэки с чужим `state` пропускаются, срок — на всё ожидание.
+async fn await_callback(listener: TcpListener, expected_state: &str) -> AppResult<String> {
+    let deadline = tokio::time::Instant::now() + CALLBACK_WAIT;
+    // Соединения читаются параллельно: молчащий preconnect не задерживает колбэк.
+    let mut reads = futures::stream::FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept(), if reads.len() < MAX_PENDING_READS => {
+                let (stream, _) = accepted?;
+                reads.push(read_request(stream, deadline));
+            }
+            Some((mut stream, path)) = futures::StreamExt::next(&mut reads) => {
+                // Молчащий или оборванный сокет — не колбэк, ждём дальше.
+                let Some(path) = path else { continue };
+                match classify_callback(&path, expected_state) {
+                    Callback::Other => respond(&mut stream, "404 Not Found", "").await,
+                    Callback::Stale => {
+                        respond(&mut stream, "400 Bad Request", STALE_PAGE).await;
+                    }
+                    Callback::Failed(error) => {
+                        respond(&mut stream, "400 Bad Request", FAILED_PAGE).await;
+                        return Err(error);
+                    }
+                    Callback::Code(code) => {
+                        respond(&mut stream, "200 OK", DONE_PAGE).await;
+                        return Ok(code);
+                    }
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(AppError::Mcp(
+                    "Timed out waiting for the OAuth callback (5 min)".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+const DONE_PAGE: &str =
+    "<html><body>Authorization complete \u{2014} you can close this window.</body></html>";
+const FAILED_PAGE: &str =
+    "<html><body>Authorization failed \u{2014} see the terminal for details.</body></html>";
+const STALE_PAGE: &str = "<html><body>This sign-in link is outdated. Use the newest one from the terminal.</body></html>";
+
+/// Что за запрос пришёл на локальный порт.
+#[derive(Debug)]
+enum Callback {
+    /// Не колбэк (favicon и прочее).
+    Other,
+    /// Колбэк с чужим `state`: старая вкладка или подделка. Ждём дальше.
+    Stale,
+    /// Наш колбэк, но вход не удался.
+    Failed(AppError),
+    Code(String),
+}
+
+/// Разобрать путь запроса. `Url`, а не ручное декодирование: многобайтный
+/// UTF-8 в `error_description` иначе рвётся по байтам.
+fn classify_callback(path: &str, expected_state: &str) -> Callback {
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1{path}")) else {
+        return Callback::Other;
+    };
+    if url.path() != "/callback" {
+        return Callback::Other;
+    }
+    let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    if params.get("state").map(String::as_str) != Some(expected_state) {
+        tracing::warn!("OAuth callback with an unexpected state ignored");
+        return Callback::Stale;
+    }
+    if let Some(err) = params.get("error") {
+        return Callback::Failed(AppError::Mcp(format!(
+            "Authorization server returned error: {err}"
+        )));
+    }
+    match params.get("code") {
+        Some(code) => Callback::Code(code.clone()),
+        None => Callback::Failed(AppError::Mcp(
+            "OAuth callback missing 'code' parameter".to_string(),
+        )),
+    }
+}
+
+/// Ответить браузеру по мере сил: код уже на руках, сбой записи ему не помеха.
+async fn respond(stream: &mut tokio::net::TcpStream, status: &str, html: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+        html.len(),
+    );
+    if let Err(e) = stream.write_all(response.as_bytes()).await {
+        tracing::debug!("OAuth callback reply failed: {e}");
+    }
+    let _ = stream.flush().await;
+}
+
+/// Прочитать путь запроса не дольше `CALLBACK_READ` и общего срока. `None` —
+/// сокет молчал, оборвался или прислал не HTTP.
+async fn read_request(
+    mut stream: tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+) -> (tokio::net::TcpStream, Option<String>) {
+    let read_deadline = deadline.min(tokio::time::Instant::now() + CALLBACK_READ);
+    let path = tokio::time::timeout_at(read_deadline, read_request_path(&mut stream)).await;
+    (stream, path.ok().and_then(Result::ok).flatten())
+}
+
+/// Путь из строки запроса; остальные заголовки дочитываются — клиент ждёт,
+/// что их прочтут, прежде чем считать запрос отправленным.
+async fn read_request_path(stream: &mut tokio::net::TcpStream) -> std::io::Result<Option<String>> {
+    let mut reader = BufReader::new(stream.take(MAX_REQUEST_HEAD));
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
-    // Drain the remaining request headers (up to the blank line) — we don't
-    // need them, but the client expects them read before it'll consider the
-    // request sent.
+    // Строка без конца — обрезана пределом или оборвана: путь в ней неполный.
+    if !request_line.ends_with('\n') {
+        return Ok(None);
+    }
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
@@ -304,42 +417,7 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> AppResul
             break;
         }
     }
-
-    let path = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| AppError::Mcp("Malformed OAuth callback request".to_string()))?;
-    // Parsed via `Url` (not hand-rolled percent-decoding) so multi-byte
-    // UTF-8 in e.g. `error_description` decodes correctly instead of being
-    // split byte-by-byte.
-    let full = Url::parse(&format!("http://127.0.0.1{path}"))
-        .map_err(|e| AppError::Mcp(format!("Malformed OAuth callback path: {e}")))?;
-    let params: HashMap<String, String> = full.query_pairs().into_owned().collect();
-
-    let html =
-        "<html><body>Authorization complete \u{2014} you can close this window.</body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html.len(),
-        html,
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
-
-    if let Some(err) = params.get("error") {
-        return Err(AppError::Mcp(format!(
-            "Authorization server returned error: {err}"
-        )));
-    }
-    if params.get("state").map(String::as_str) != Some(expected_state) {
-        return Err(AppError::Mcp(
-            "OAuth state mismatch (possible CSRF) \u{2014} aborting".to_string(),
-        ));
-    }
-    params
-        .get("code")
-        .cloned()
-        .ok_or_else(|| AppError::Mcp("OAuth callback missing 'code' parameter".to_string()))
+    Ok(request_line.split_whitespace().nth(1).map(str::to_string))
 }
 
 #[derive(Deserialize)]
@@ -627,5 +705,91 @@ mod tests {
             pairs.get("code_challenge_method").map(String::as_str),
             Some("S256")
         );
+    }
+
+    /// Слушатель на свободном порту и задача, ждущая колбэк со `state=good`.
+    async fn start_callback_wait() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<AppResult<String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let wait = tokio::spawn(async move { await_callback(listener, "good").await });
+        (addr, wait)
+    }
+
+    /// Отправить `GET path` и вернуть ответ сервера целиком.
+    async fn get(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.expect("read");
+        reply
+    }
+
+    /// Молчащий preconnect-сокет не задерживает настоящий колбэк.
+    #[tokio::test]
+    async fn a_silent_preconnect_does_not_delay_the_callback() {
+        let (addr, wait) = start_callback_wait().await;
+        let _silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+        // Раньше колбэк стоял за молчащим сокетом все `CALLBACK_READ` = 10 с.
+        let reply = get(addr, "/callback?code=abc&state=good");
+        let reply = tokio::time::timeout(Duration::from_secs(3), reply).await;
+
+        assert!(reply.expect("в срок").starts_with("HTTP/1.1 200"));
+        assert_eq!(wait.await.expect("join").expect("код"), "abc");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_path_gets_404_and_the_wait_goes_on() {
+        let (addr, wait) = start_callback_wait().await;
+
+        assert!(get(addr, "/favicon.ico").await.starts_with("HTTP/1.1 404"));
+        assert!(!wait.is_finished());
+        get(addr, "/callback?code=abc&state=good").await;
+
+        assert_eq!(wait.await.expect("join").expect("код"), "abc");
+    }
+
+    /// Колбэк со старым `state` не срывает вход и не показывает «успех».
+    #[tokio::test]
+    async fn a_stale_state_is_ignored_until_the_right_one_arrives() {
+        let (addr, wait) = start_callback_wait().await;
+
+        let stale = get(addr, "/callback?code=old&state=stale").await;
+        assert!(stale.starts_with("HTTP/1.1 400"), "{stale}");
+        assert!(!stale.contains("complete"));
+        assert!(!wait.is_finished());
+
+        get(addr, "/callback?code=new&state=good").await;
+        assert_eq!(wait.await.expect("join").expect("код"), "new");
+    }
+
+    #[tokio::test]
+    async fn an_error_with_the_right_state_fails_the_login() {
+        let (addr, wait) = start_callback_wait().await;
+
+        let reply = get(addr, "/callback?error=access_denied&state=good").await;
+
+        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+        assert!(wait.await.expect("join").is_err());
+    }
+
+    #[test]
+    fn classify_callback_checks_state_before_anything_else() {
+        assert!(matches!(
+            classify_callback("/callback?error=x&state=bad", "good"),
+            Callback::Stale
+        ));
+        assert!(matches!(
+            classify_callback("/callback?state=good", "good"),
+            Callback::Failed(_)
+        ));
+        assert!(matches!(
+            classify_callback("/callbackx?code=a&state=good", "good"),
+            Callback::Other
+        ));
     }
 }

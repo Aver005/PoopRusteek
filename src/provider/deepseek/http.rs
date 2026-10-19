@@ -12,9 +12,18 @@ use reqwest::{
 };
 use serde_json::{Value, json};
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 const DEEPSEEK_HOST: &str = "chat.deepseek.com";
+
+/// Ответ — HTML-страница: так WAF/капча отвечают вместо API, иногда с 200 OK.
+pub(super) fn is_html_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|kind| kind.to_ascii_lowercase().starts_with("text/html"))
+}
 
 /// Текст про «ответ не JSON». Отдельная функция, потому что это и есть весь
 /// смысл проверки — объяснить следующему человеку, что путь снесли; а склейка
@@ -186,59 +195,11 @@ impl DeepseekProvider {
         );
     }
 
-    /// Applies two independent, composable gates before letting a request
-    /// through: a minimum spacing between consecutive requests
-    /// (`rate_limit_ms`) and a cap on how many requests may fire within any
-    /// rolling 60s window (`rate_limit_per_minute`). Either can be 0 to
-    /// disable it; both can be active at once.
+    /// Подождать своей очереди у общего для всех форков ограничителя.
     pub(super) async fn enforce_rate_limit(&self) {
-        if self.rate_limit_ms > 0 {
-            let elapsed = self
-                .last_request
-                .lock()
-                .map(|last| last.elapsed())
-                .unwrap_or(Duration::from_secs(60));
-            let min_interval = Duration::from_millis(self.rate_limit_ms);
-            if elapsed < min_interval {
-                sleep(min_interval - elapsed).await;
-            }
-        }
-        let _ = self
-            .last_request
-            .lock()
-            .map(|mut last| *last = std::time::Instant::now());
-
-        if self.rate_limit_per_minute > 0 {
-            let window = Duration::from_secs(60);
-            loop {
-                let wait = {
-                    // Poison-safe like every other lock in the provider: a
-                    // panicked writer must degrade to "skip rate limiting",
-                    // not take down the whole TUI.
-                    let Ok(mut history) = self.request_history.lock() else {
-                        break;
-                    };
-                    let now = std::time::Instant::now();
-                    while let Some(&oldest) = history.front() {
-                        if now.duration_since(oldest) >= window {
-                            history.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    if history.len() < self.rate_limit_per_minute as usize {
-                        history.push_back(now);
-                        None
-                    } else {
-                        Some(window - now.duration_since(history[0]))
-                    }
-                };
-                match wait {
-                    None => break,
-                    Some(duration) => sleep(duration).await,
-                }
-            }
-        }
+        self.limiter
+            .wait(self.rate_limit_ms, self.rate_limit_per_minute)
+            .await;
     }
 
     /// Exponential backoff for retry loops: 1s, 2s, 4s… capped at 30s.
@@ -252,12 +213,21 @@ impl DeepseekProvider {
     /// Отложить следующую попытку: счётчик вперёд, отступ от нового счётчика,
     /// строка в журнал. Четыре ветки повтора делали это порознь, а порядок
     /// «сначала счётчик, потом отступ» здесь важен.
-    async fn back_off(action: &str, attempt: &mut usize, max_attempts: usize, reason: &str) {
+    async fn back_off(
+        action: &str,
+        attempt: &mut usize,
+        max_attempts: usize,
+        reason: &str,
+        wait: Duration,
+    ) {
         *attempt += 1;
         let n = *attempt;
-        let capped = Self::retry_backoff(n);
-        tracing::warn!("{action} {reason}, retry {n}/{max_attempts} in {capped:?}");
-        sleep(capped).await;
+        tracing::warn!("{action} {reason}, retry {n}/{max_attempts} in {wait:?}");
+        debug_log::log(
+            action,
+            format!("{reason}; retry {n} in {}ms", wait.as_millis()),
+        );
+        sleep(wait).await;
     }
 
     pub(super) async fn send_json_request(
@@ -266,27 +236,33 @@ impl DeepseekProvider {
         url: &str,
         headers: &HeaderMap,
         body: &Value,
+        resend: Resend,
     ) -> AppResult<Response> {
-        self.enforce_rate_limit().await;
+        self.send_with_retry(action, url, headers, Some(body), resend)
+            .await
+    }
 
-        let max_attempts = match self.max_retries {
-            -1 => usize::MAX,
-            0 => 1,
-            n => (n as usize) + 1,
-        };
-
+    /// Один запрос с повторами по политике `resend`; ограничитель — на каждой
+    /// попытке. 429 у безопасных запросов ждёт `Retry-After` и повторяется.
+    async fn send_with_retry(
+        &self,
+        action: &str,
+        url: &str,
+        headers: &HeaderMap,
+        body: Option<&Value>,
+        resend: Resend,
+    ) -> AppResult<Response> {
+        let max_attempts = attempts_for(self.max_retries);
         let mut attempt = 0;
         loop {
-            self.log_http_request(action, url, headers, body);
-
-            match self
-                .client
-                .post(url)
-                .headers(headers.clone())
-                .json(body)
-                .send()
-                .await
-            {
+            self.enforce_rate_limit().await;
+            self.log_http_request(action, url, headers, body.unwrap_or(&Value::Null));
+            let request = match body {
+                Some(body) => self.client.post(url).json(body),
+                None => self.client.get(url),
+            };
+            let last_try = attempt + 1 >= max_attempts;
+            match request.headers(headers.clone()).send().await {
                 Ok(response) => {
                     let status = response.status();
                     debug_log::log(
@@ -296,32 +272,47 @@ impl DeepseekProvider {
                             Self::headers_to_debug_json(response.headers())
                         ),
                     );
-
-                    if !status.is_server_error() || attempt + 1 >= max_attempts {
+                    let retry = match status {
+                        // Отправку с PoW повторяет вызывающий, с новым решением:
+                        // заголовок мог протухнуть, пока ждали `Retry-After`.
+                        reqwest::StatusCode::TOO_MANY_REQUESTS => resend == Resend::Safe,
+                        // 5xx от CloudFront бывает и после того, как сервер
+                        // принял сообщение: повтор задвоил бы его в сессии.
+                        _ if status.is_server_error() => resend == Resend::Safe,
+                        _ => false,
+                    };
+                    if !retry || last_try {
                         return Ok(response);
                     }
-
+                    let wait =
+                        retry_after(&response).unwrap_or_else(|| Self::retry_backoff(attempt + 1));
                     Self::back_off(
                         action,
                         &mut attempt,
                         max_attempts,
-                        &format!("server error {status}"),
+                        &format!("status {status}"),
+                        wait,
                     )
                     .await;
                 }
                 Err(error) => {
-                    if attempt + 1 >= max_attempts {
+                    // Без соединения запрос точно не ушёл — повтор безопасен
+                    // всегда. Иначе — только для запросов без последствий.
+                    let retry = error.is_connect() || resend == Resend::Safe;
+                    if !retry || last_try {
                         debug_log::log(
                             action,
                             format!("request failed before HTTP response: {error}"),
                         );
                         return Err(AppError::Http(error));
                     }
+                    let wait = Self::retry_backoff(attempt + 1);
                     Self::back_off(
                         action,
                         &mut attempt,
                         max_attempts,
                         &format!("connection error: {error}"),
+                        wait,
                     )
                     .await;
                 }
@@ -335,12 +326,24 @@ impl DeepseekProvider {
         label: &str,
     ) -> AppError {
         let status = response.status();
+        let html = is_html_response(&response);
         let text = response.text().await.unwrap_or_default();
         debug_log::log(
             action,
             format!("response error status={status} body={text}"),
         );
-        AppError::Provider(format!("{label}: {status} {text}"))
+        // Тело ошибки бывает страницей WAF в десятки КБ — в сообщение идёт суть.
+        let detail = if html {
+            "an HTML page (likely a WAF or captcha check — open chat.deepseek.com in the browser and log in again)".to_string()
+        } else {
+            crate::util::truncate_with_ellipsis(text.trim(), 300)
+        };
+        let message = format!("{label}: {status} {detail}");
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            AppError::RateLimited(message)
+        } else {
+            AppError::Provider(message)
+        }
     }
 
     /// Прочитать тело ответа как JSON, отличая «эндпоинта больше нет» от
@@ -398,55 +401,134 @@ impl DeepseekProvider {
         url: &str,
         headers: &HeaderMap,
     ) -> AppResult<Response> {
-        self.enforce_rate_limit().await;
+        self.send_with_retry(action, url, headers, None, Resend::Safe)
+            .await
+    }
+}
 
-        let max_attempts = match self.max_retries {
-            -1 => usize::MAX,
-            0 => 1,
-            n => (n as usize) + 1,
-        };
+/// Можно ли повторить запрос, если ответ не дошёл или сервер упал.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Resend {
+    /// Повтор ничего не меняет на сервере (список, проверка, PoW).
+    Safe,
+    /// Повтор задвоил бы сообщение или сессию: только при ошибке соединения.
+    ConnectOnly,
+}
 
-        let mut attempt = 0;
-        loop {
-            self.log_http_request(action, url, headers, &Value::Null);
+/// Сколько попыток даёт `max_retries`: `-1` — без предела, прочее
+/// отрицательное — опечатка, а не «бесконечно».
+pub(super) fn attempts_for(max_retries: i32) -> usize {
+    match max_retries {
+        -1 => usize::MAX,
+        n if n < 0 => 1,
+        n => n as usize + 1,
+    }
+}
 
-            match self.client.get(url).headers(headers.clone()).send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    debug_log::log(action, format!("response status={status}"));
+/// `Retry-After` в секундах, не дольше минуты.
+fn retry_after(response: &Response) -> Option<Duration> {
+    let seconds: u64 = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds.min(60)))
+}
 
-                    if !status.is_server_error() || attempt + 1 >= max_attempts {
-                        return Ok(response);
-                    }
+/// Общий для провайдера и всех его форков ограничитель частоты: лимит у
+/// DeepSeek на аккаунт, а не на чат.
+#[derive(Debug, Default)]
+pub(super) struct RateLimiter {
+    next_slot: std::sync::Mutex<Option<Instant>>,
+    history: std::sync::Mutex<std::collections::VecDeque<Instant>>,
+}
 
-                    Self::back_off(
-                        action,
-                        &mut attempt,
-                        max_attempts,
-                        &format!("server error {status}"),
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    if attempt + 1 >= max_attempts {
-                        return Err(AppError::Http(error));
-                    }
-                    Self::back_off(
-                        action,
-                        &mut attempt,
-                        max_attempts,
-                        &format!("connection error: {error}"),
-                    )
-                    .await;
-                }
+impl RateLimiter {
+    /// Два независимых условия: шаг между запросами (`spacing_ms`) и потолок
+    /// за скользящую минуту (`per_minute`). Ноль выключает условие.
+    async fn wait(&self, spacing_ms: u64, per_minute: u32) {
+        if spacing_ms > 0 {
+            // Слот занимается под замком: параллельные форки встают в очередь,
+            // а не просыпаются разом от одного и того же «последнего» запроса.
+            let spacing = Duration::from_millis(spacing_ms);
+            let slot = self.next_slot.lock().ok().map(|mut next| {
+                let at = next.map_or_else(Instant::now, |at| at.max(Instant::now()));
+                *next = Some(at + spacing);
+                at
+            });
+            if let Some(at) = slot {
+                tokio::time::sleep_until(at).await;
             }
+        }
+
+        if per_minute == 0 {
+            return;
+        }
+        let window = Duration::from_secs(60);
+        loop {
+            let wait = {
+                // Отравленный замок — без ограничения, а не паника всего TUI.
+                let Ok(mut history) = self.history.lock() else {
+                    return;
+                };
+                let now = Instant::now();
+                while let Some(&oldest) = history.front() {
+                    if now.duration_since(oldest) >= window {
+                        history.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if history.len() < per_minute as usize {
+                    history.push_back(now);
+                    return;
+                }
+                window - now.duration_since(history[0])
+            };
+            sleep(wait).await;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiRefusal, api_refusal, is_json_body, not_json_message};
+    use super::{
+        ApiRefusal, RateLimiter, api_refusal, attempts_for, is_json_body, not_json_message,
+    };
+
+    /// Параллельные запросы встают в очередь: третий ждёт два шага, а не один.
+    #[tokio::test]
+    async fn concurrent_waits_are_spaced_one_after_another() {
+        let limiter = RateLimiter::default();
+        let started = tokio::time::Instant::now();
+        tokio::join!(
+            limiter.wait(60, 0),
+            limiter.wait(60, 0),
+            limiter.wait(60, 0)
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(120));
+    }
+
+    /// Первый запрос не ждёт: шаг считается от предыдущего, а его нет.
+    #[tokio::test]
+    async fn first_wait_is_immediate() {
+        let limiter = RateLimiter::default();
+        let started = tokio::time::Instant::now();
+        limiter.wait(5_000, 0).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_000));
+    }
+
+    /// `-1` — без предела; прочее отрицательное — опечатка, а не бесконечность.
+    #[test]
+    fn max_retries_maps_to_attempts() {
+        assert_eq!(attempts_for(-1), usize::MAX);
+        assert_eq!(attempts_for(-5), 1);
+        assert_eq!(attempts_for(0), 1);
+        assert_eq!(attempts_for(3), 4);
+    }
 
     /// Текст объяснения — единственная польза этой проверки, и он уже однажды
     /// приехал с провалами по 18 пробелов из многострочного литерала.

@@ -74,6 +74,8 @@ impl ServerContext {
         // give them a generous read timeout, fail fast on dead endpoints.
         let http_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            // Пакет эмбеддингов на CPU бывает долгим: срок щедрее, чем у чата.
+            .read_timeout(std::time::Duration::from_secs(300))
             .build()
             .unwrap_or_default();
         Self {

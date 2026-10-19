@@ -84,6 +84,9 @@ pub struct Conversation {
     /// Заметки, пришедшие посреди хода (итог фонового суб-агента). Встают в
     /// историю на конце хода: внутри него DeepSeek их не отправил бы никогда.
     pub deferred: Vec<ChatMessage>,
+    /// Ход оборван, а его события ещё в очереди: до `AppEvent::TurnFenced`
+    /// они выбрасываются, иначе легли бы в новую историю (загруженную сессию).
+    pub fenced: bool,
 }
 
 impl Conversation {
@@ -107,6 +110,7 @@ impl Conversation {
             compact_mode: None,
             compacting: None,
             deferred: Vec::new(),
+            fenced: false,
         }
     }
 
@@ -120,7 +124,10 @@ impl Conversation {
     /// Историей сейчас владеет ход или компакция: писать в неё нельзя.
     /// Один признак на всех — их было пять разных.
     pub fn is_busy(&self) -> bool {
-        self.agent_task.is_some() || self.compacting.is_some() || self.generation.active
+        self.agent_task.is_some()
+            || self.compacting.is_some()
+            || self.generation.active
+            || self.fenced
     }
 
     /// Положить заметку в историю — сейчас или, если чат занят, на конце хода.

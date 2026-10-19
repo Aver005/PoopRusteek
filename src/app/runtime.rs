@@ -120,6 +120,8 @@ pub(crate) async fn run_guarded(
 ) {
     let conversation = spec.conversation;
     let turn = crate::agent::runner::run_agent_loop(spec, tools, mcp, semantic, event_tx.clone());
+    // Фоновые процессы хода помечены его чатом — так их гасят точечно.
+    let turn = crate::tools::background::with_owner(conversation.0, turn);
     if let Err(panic) = AssertUnwindSafe(turn).catch_unwind().await {
         let reason = panic_text(panic.as_ref());
         tracing::error!("agent task panicked: {reason}");

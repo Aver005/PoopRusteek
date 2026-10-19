@@ -59,6 +59,27 @@ pub struct BackgroundHandle {
     pub(crate) interactive: bool,
     pub(crate) persistent: bool,
     pub(crate) ttl_secs: Option<u64>,
+    /// Чат, ход которого запустил процесс: Esc в одном чате не трогает чужие.
+    pub(crate) owner: Option<u64>,
+}
+
+tokio::task_local! {
+    /// Чат текущего хода. Ставит обёртка запуска хода; слой инструментов о
+    /// приложении ничего не знает, ему просто сказано «это процессы чата N».
+    static OWNER: u64;
+}
+
+/// Выполнить ход от имени чата `owner`. Вложенный вызов (суб-агент внутри
+/// хода родителя) наследует владельца: его процессы — процессы родителя.
+pub async fn with_owner<F: std::future::Future>(owner: u64, future: F) -> F::Output {
+    match current_owner() {
+        Some(_) => future.await,
+        None => OWNER.scope(owner, future).await,
+    }
+}
+
+pub(crate) fn current_owner() -> Option<u64> {
+    OWNER.try_with(|owner| *owner).ok()
 }
 
 impl BackgroundHandle {
@@ -457,6 +478,7 @@ mod tests {
             interactive: false,
             persistent: false,
             ttl_secs: None,
+            owner: None,
         }
     }
 

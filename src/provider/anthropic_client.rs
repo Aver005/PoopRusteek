@@ -79,22 +79,22 @@ impl CompatProtocol for AnthropicProtocol {
             }
             StreamEvent::ToolStart { index, id, name } => {
                 state.start_tool(index, id, name);
-                SseFlow::Continue
+                heartbeat(emit)
             }
             StreamEvent::ToolDelta {
                 index,
                 partial_json,
             } => {
                 state.append_tool_json(index, &partial_json);
-                SseFlow::Continue
+                heartbeat(emit)
             }
             StreamEvent::ToolStop { index } => {
                 state.finish_tool(index);
-                SseFlow::Continue
+                heartbeat(emit)
             }
             StreamEvent::Finish(stop_reason) => {
                 state.set_finish_reason(stop_reason);
-                SseFlow::Continue
+                heartbeat(emit)
             }
             StreamEvent::Done => {
                 // Терминальный чанк: причина остановки — из message_delta,
@@ -109,12 +109,42 @@ impl CompatProtocol for AnthropicProtocol {
                 SseFlow::Done
             }
             StreamEvent::Error(message) => SseFlow::Fail(message),
-            StreamEvent::Ignore => SseFlow::Continue,
+            // ping, thinking: поток жив, хоть текста и нет.
+            StreamEvent::Ignore => heartbeat(emit),
         }
     }
 
     fn parse_models(body: &[u8]) -> AppResult<Vec<String>> {
         let page: anthropic_compat::ModelsPage = serde_json::from_slice(body)?;
         Ok(page.data.into_iter().map(|model| model.id).collect())
+    }
+}
+
+/// Пустой кусок: поток жив. Большой родной `write` льётся аргументами дольше
+/// сторожа простоя, и без этого здоровый поток убивался посередине.
+fn heartbeat(emit: &mut dyn FnMut(CompletionChunk)) -> SseFlow {
+    emit(CompletionChunk {
+        content: String::new(),
+        tool_calls: Vec::new(),
+        finish_reason: None,
+    });
+    SseFlow::Continue
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    /// Аргументы родного вызова льются минутами без текста — каждый кадр
+    /// обязан держать сторож простоя.
+    #[test]
+    fn a_tool_argument_delta_still_shows_the_stream_is_alive() {
+        let mut beats = 0;
+        let flow = heartbeat(&mut |chunk: CompletionChunk| {
+            assert!(chunk.content.is_empty() && chunk.finish_reason.is_none());
+            beats += 1;
+        });
+        assert!(matches!(flow, SseFlow::Continue));
+        assert_eq!(beats, 1);
     }
 }

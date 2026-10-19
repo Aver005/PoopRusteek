@@ -3,6 +3,10 @@
 //! text chunk plus an optional `parent_message_id` update.
 
 use super::DeepseekProvider;
+use super::http::Resend;
+
+/// Сколько ждать решения PoW. Обычно это десятки миллисекунд.
+const POW_SOLVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 use super::http::{ApiRefusal, api_refusal};
 use crate::debug_log;
 use crate::error::{AppError, AppResult};
@@ -76,7 +80,13 @@ impl DeepseekProvider {
         let body = json!({ "target_path": target_path });
         let headers = self.auth_headers()?;
         let response = self
-            .send_json_request("pow.challenge.request", CREATE_POW_URL, &headers, &body)
+            .send_json_request(
+                "pow.challenge.request",
+                CREATE_POW_URL,
+                &headers,
+                &body,
+                Resend::Safe,
+            )
             .await?;
 
         let status = response.status();
@@ -123,8 +133,16 @@ impl DeepseekProvider {
         // The solve is a synchronous CPU-bound wasm hash loop (tens to
         // hundreds of ms) — run it on the blocking pool so it can't stall
         // the async workers that drive the UI and other conversations.
-        let solution = tokio::task::spawn_blocking(move || super::pow::solve_pow(&challenge))
+        // Срок: сложность назначает сервер, а поток решения не отменить.
+        let solve = tokio::task::spawn_blocking(move || super::pow::solve_pow(&challenge));
+        let solution = tokio::time::timeout(POW_SOLVE_LIMIT, solve)
             .await
+            .map_err(|_| {
+                AppError::Provider(format!(
+                    "the PoW challenge was not solved within {}s",
+                    POW_SOLVE_LIMIT.as_secs()
+                ))
+            })?
             .map_err(|e| AppError::Provider(crate::util::join_error_text("the PoW solver", &e)))?
             .ok_or_else(|| AppError::Provider("Failed to solve PoW challenge".to_string()))?;
         debug_log::log_json("pow.challenge.solution", &solution);
@@ -145,7 +163,13 @@ impl DeepseekProvider {
             "fallback_to_resume": true,
         });
         let response = self
-            .send_json_request("completion.continue", CONTINUE_URL, &headers, &body)
+            .send_json_request(
+                "completion.continue",
+                CONTINUE_URL,
+                &headers,
+                &body,
+                Resend::ConnectOnly,
+            )
             .await?;
         if !response.status().is_success() {
             return Err(Self::read_error_response(
@@ -198,7 +222,6 @@ impl DeepseekProvider {
     pub(super) async fn send_request(
         &self,
         request: &CompletionRequest,
-        heartbeat: &mut (dyn FnMut() + Send),
     ) -> AppResult<(Response, String)> {
         let (system_prompt, mut non_system_messages) =
             prompt::split_system_prompt(&request.messages);
@@ -212,10 +235,7 @@ impl DeepseekProvider {
         let delivery = self.session()?.plan_system_delivery(&system_prompt);
         let delivery_trace = format!("{delivery:?}");
         let attached = self
-            .attach_files(
-                &attachment_paths(prompt::tail(&non_system_messages)),
-                heartbeat,
-            )
+            .attach_files(&attachment_paths(prompt::tail(&non_system_messages)))
             .await;
         if let Some(note) = attached.failure_note() {
             non_system_messages.push(ChatMessage::system(&note));
@@ -250,7 +270,13 @@ impl DeepseekProvider {
         let headers = self.pow_headers(COMPLETION_URL).await?;
 
         let response = self
-            .send_json_request("completion.request", COMPLETION_URL, &headers, &body)
+            .send_json_request(
+                "completion.request",
+                COMPLETION_URL,
+                &headers,
+                &body,
+                Resend::ConnectOnly,
+            )
             .await?;
 
         let status = response.status();
@@ -266,6 +292,16 @@ impl DeepseekProvider {
         // пропускает как незнакомую, и ход кончался пустым «успехом».
         if super::http::is_json_response(&response) {
             return Err(Self::read_completion_refusal(response).await);
+        }
+        // Страница WAF/капчи с 200 OK читалась бы как пустой ответ модели — и
+        // ещё два PoW+POST впустую.
+        if super::http::is_html_response(&response) {
+            return Err(Self::read_error_response(
+                "completion.request",
+                response,
+                "Chat completion was blocked",
+            )
+            .await);
         }
         self.add_session_tokens(prompt_tokens);
 
@@ -679,7 +715,12 @@ fn new_fragments(event: &Value) -> Option<Vec<Fragment>> {
 pub(super) struct ThinkRouter {
     thinking: bool,
     held: String,
+    /// Рассуждение переросло потолок: дальше оно не копится.
+    clipped: bool,
 }
+
+/// Потолок накопленного рассуждения — тот же, что у всего потока хода.
+const MAX_HELD_BYTES: usize = crate::agent::stream::MAX_STREAM_BYTES;
 
 impl ThinkRouter {
     /// Текст события для вызывающего; пустой, пока копится рассуждение.
@@ -688,7 +729,7 @@ impl ThinkRouter {
         for fragment in &event.fragments {
             if fragment.think {
                 self.thinking = true;
-                self.held.push_str(&fragment.content);
+                self.hold(&fragment.content);
             } else {
                 self.release(&mut out);
                 out.push_str(&fragment.content);
@@ -696,7 +737,7 @@ impl ThinkRouter {
         }
         if let Some(text) = &event.text {
             if self.thinking {
-                self.held.push_str(text);
+                self.hold(text);
             } else {
                 out.push_str(text);
             }
@@ -704,11 +745,23 @@ impl ThinkRouter {
         out
     }
 
+    /// Копить рассуждение, но не дальше [`MAX_HELD_BYTES`]: зациклившаяся
+    /// модель иначе съела бы память, ничего не отдав наружу.
+    fn hold(&mut self, text: &str) {
+        let room = MAX_HELD_BYTES.saturating_sub(self.held.len());
+        let kept = crate::util::truncate_at_char_boundary(text, room);
+        self.held.push_str(kept);
+        if kept.len() < text.len() && !std::mem::replace(&mut self.clipped, true) {
+            self.held.push_str("\n[reasoning cut: too long]");
+        }
+    }
+
     fn release(&mut self, out: &mut String) {
         if !std::mem::take(&mut self.thinking) {
             return;
         }
         // Закрывающий тег или `<tool_use>` внутри рассуждения рвали бы блок.
+        self.clipped = false;
         let held = std::mem::take(&mut self.held)
             .replace("</think", "</ think")
             .replace("<tool_use>", "< tool_use>");
@@ -721,6 +774,7 @@ impl ThinkRouter {
     /// ответ, как до разделения: потерять ответ хуже.
     pub(super) fn finish(&mut self) -> String {
         self.thinking = false;
+        self.clipped = false;
         std::mem::take(&mut self.held)
     }
 }
@@ -1016,6 +1070,25 @@ mod tests {
             out,
             "<thinking>ab < tool_use> </ thinking></thinking>\n\nHi there"
         );
+    }
+
+    /// Зациклившееся рассуждение не копится без конца: потолок и одна пометка.
+    #[test]
+    fn runaway_reasoning_is_clipped_once() {
+        let mut think = ThinkRouter::default();
+        let start =
+            r#"data: {"v":{"response":{"fragments":[{"id":1,"type":"THINK","content":""}]}}}"#;
+        let more =
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"xxxxxxxxxxxxxxxx"}"#;
+        let start = process_stream_line(start).expect("start event");
+        let more = process_stream_line(more).expect("append event");
+        think.route(&start);
+        for _ in 0..(super::MAX_HELD_BYTES / 16 + 10) {
+            assert!(think.route(&more).is_empty());
+        }
+        let out = think.finish();
+        assert!(out.len() <= super::MAX_HELD_BYTES + 64);
+        assert_eq!(out.matches("[reasoning cut: too long]").count(), 1);
     }
 
     /// Ответа так и не было — накопленное отдаётся ответом, а не теряется.

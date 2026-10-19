@@ -37,10 +37,6 @@ pub enum ResolvedModel {
 }
 
 impl ResolvedModel {
-    pub fn is_deepseek(&self) -> bool {
-        matches!(self, ResolvedModel::Deepseek { .. })
-    }
-
     /// The model string the internal `CompletionRequest` should carry.
     pub fn internal_model(&self) -> &str {
         match self {
@@ -246,16 +242,14 @@ mod tests {
             }
         );
         // Case-insensitive, and reachable under the reserved prefix too.
-        assert!(
-            resolve_model("DeepSeek-Reasoner", true, &[], &none())
-                .unwrap()
-                .is_deepseek()
-        );
-        assert!(
-            resolve_model("deepseek/deepseek-chat", true, &[], &none())
-                .unwrap()
-                .is_deepseek()
-        );
+        assert!(matches!(
+            resolve_model("DeepSeek-Reasoner", true, &[], &none()).unwrap(),
+            ResolvedModel::Deepseek { .. }
+        ));
+        assert!(matches!(
+            resolve_model("deepseek/deepseek-chat", true, &[], &none()).unwrap(),
+            ResolvedModel::Deepseek { .. }
+        ));
         // Without a token the built-in backend does not exist.
         assert!(resolve_model("deepseek-chat", false, &[], &none()).is_err());
     }
@@ -349,7 +343,7 @@ mod tests {
     fn an_unlisted_search_variant_resolves_to_deepseek() {
         let resolved =
             resolve_model("deepseek/deepseek-expert-search", true, &[], &none()).unwrap();
-        assert!(resolved.is_deepseek());
+        assert!(matches!(resolved, ResolvedModel::Deepseek { .. }));
         assert_eq!(resolved.internal_model(), "deepseek-expert-search");
         assert!(resolve_model("deepseek/deepseek-coder", true, &[], &none()).is_err());
     }

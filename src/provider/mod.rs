@@ -2,6 +2,10 @@ pub mod anthropic_client;
 pub mod anthropic_compat;
 pub(crate) mod compat_client;
 pub mod deepseek;
+
+/// Сколько провайдер ждёт следующего байта ответа. Строго короче сторожа
+/// простоя хода (`agent::stream::STREAM_IDLE_TIMEOUT`), чтобы причину назвал он.
+pub const PROVIDER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 #[cfg(test)]
 pub mod fake;
 pub mod gemini_client;
@@ -450,6 +454,46 @@ pub trait LLMProvider: Send + Sync {
         _parent_message_id: Option<i64>,
     ) -> crate::error::AppResult<()> {
         Ok(())
+    }
+}
+
+/// Удалить серверную сессию одноразового форка, чем бы ни кончилась работа:
+/// на обычном пути — дождавшись (со сроком), при отмене — в фоне из `Drop`.
+pub struct SessionDiscard(Option<std::sync::Arc<dyn LLMProvider>>);
+
+impl SessionDiscard {
+    /// Сколько ждать удаления на обычном пути.
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn new(provider: std::sync::Arc<dyn LLMProvider>) -> Self {
+        Self(Some(provider))
+    }
+
+    pub async fn now(mut self) {
+        if let Some(provider) = self.0.take() {
+            match tokio::time::timeout(Self::GRACE, discard_logged(provider)).await {
+                Ok(()) => {}
+                Err(_) => tracing::debug!("remote session discard took over {:?}", Self::GRACE),
+            }
+        }
+    }
+}
+
+impl Drop for SessionDiscard {
+    fn drop(&mut self) {
+        let Some(provider) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(discard_logged(provider));
+        }
+    }
+}
+
+/// Сбой удаления не мешает работе, но след в журнале нужен.
+async fn discard_logged(provider: std::sync::Arc<dyn LLMProvider>) {
+    if let Err(error) = provider.discard_remote_session().await {
+        tracing::debug!("remote session discard failed: {error}");
     }
 }
 

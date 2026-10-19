@@ -12,8 +12,12 @@ use super::catalog::{self, ResolvedModel};
 use super::http::{ApiBody, LogDetail, ServerContext, full_body, json_response};
 use super::tools::{BridgedReply, ToolBridge, flatten_history};
 use crate::agent::continuation::continue_cut_off;
-use crate::agent::stream::{STREAM_IDLE_TIMEOUT, StreamVerdict, collect_stream};
+use crate::agent::stream::{
+    AFTER_STOP_GRACE, MAX_STREAM_BYTES, STREAM_IDLE_TIMEOUT, StreamVerdict, collect_stream,
+    idle_timeout_message, oversized_stream_message,
+};
 use crate::config::ProviderProtocol;
+use crate::error::AppError;
 use crate::provider::openai_compat::{
     self, ChatCompletionRequest, ChatCompletionResponse, Choice, CompletionMeta, ErrorResponse,
     MessageContent, ReasoningStreamSplitter, WireToolCall,
@@ -100,11 +104,19 @@ fn resolve_backend(model_id: &str, context: &ServerContext) -> BackendResult {
     .map_err(|message| Box::new(model_not_found(message)))?;
 
     let provider: Arc<dyn LLMProvider> = match &resolved {
-        ResolvedModel::Deepseek { .. } => context
-            .deepseek
-            .clone()
-            .expect("resolve_model only yields Deepseek when the backend exists")
-            .fork(),
+        ResolvedModel::Deepseek { .. } => match &context.deepseek {
+            Some(deepseek) => deepseek.fork(),
+            // Ответ 503, а не паника в задаче соединения.
+            None => {
+                return Err(Box::new(
+                    UpstreamError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "the DeepSeek backend is not available".to_string(),
+                    )
+                    .response(),
+                ));
+            }
+        },
         ResolvedModel::Entry { entry } => {
             crate::provider::build_entry_provider(entry).map_err(|error| {
                 Box::new(json_response(
@@ -196,12 +208,11 @@ async fn chat_completions(
     let meta = CompletionMeta::generate(&public_model);
     let streaming = internal.stream;
     let with_tools = bridge.is_some();
-    let is_deepseek = resolved.is_deepseek();
     let mut response = match (bridge, streaming) {
-        (Some(bridge), true) => tool_stream(provider, is_deepseek, internal, bridge, meta),
-        (Some(bridge), false) => tool_blocking(provider, is_deepseek, internal, bridge, meta).await,
-        (None, true) => stream_completion(provider, is_deepseek, internal, meta),
-        (None, false) => blocking_completion(provider, is_deepseek, internal, meta).await,
+        (Some(bridge), true) => tool_stream(provider, internal, bridge, meta),
+        (Some(bridge), false) => tool_blocking(provider, internal, bridge, meta).await,
+        (None, true) => stream_completion(provider, internal, meta),
+        (None, false) => blocking_completion(provider, internal, meta).await,
     };
     // Enriches the proxy access log; free otherwise.
     response.extensions_mut().insert(LogDetail(format!(
@@ -217,73 +228,175 @@ async fn chat_completions(
 /// инструментами копится: клиент не должен оборвать его по простою.
 const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Ответ с инструментами целиком. Стрим копится, потому что вызов виден только
-/// в готовом ответе; на промптовом пути оборванный лимитом вызов дописывается.
-/// Непустой `request.tools` — родной протокол (его ставит только `declare`).
+/// Пустой SSE-комментарий для [`KEEPALIVE`].
+const KEEPALIVE_FRAME: &[u8] = b": keep-alive\n\n";
+
+/// Последний кадр удачного стрима.
+const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
+
+/// Ошибка апстрима и её HTTP-код: клиент должен отличать «подожди» (429),
+/// «не дождались» (504) и «апстрим сломан» (502) — всё было 500.
+struct UpstreamError {
+    status: StatusCode,
+    message: String,
+}
+
+impl UpstreamError {
+    fn new(status: StatusCode, message: String) -> Self {
+        Self { status, message }
+    }
+
+    fn from_app(error: &AppError) -> Self {
+        // URL апстрима бывает с ключом в адресе — клиенту `/serve` он не нужен.
+        let mut message = error.to_string();
+        if let AppError::Http(http) = error
+            && let Some(url) = http.url()
+        {
+            message = message.replace(url.as_str(), "<upstream>");
+        }
+        let status = match error {
+            AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
+            AppError::Http(http) if http.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        Self::new(status, message)
+    }
+
+    fn idle() -> Self {
+        Self::new(StatusCode::GATEWAY_TIMEOUT, idle_timeout_message())
+    }
+
+    /// Поток закрылся без конца ответа — это обрыв, а не «stop».
+    fn closed_early() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream closed the stream before finishing the reply".to_string(),
+        )
+    }
+
+    fn task_failed(what: &str, join_error: &tokio::task::JoinError) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::util::join_error_text(what, join_error),
+        )
+    }
+
+    fn from_verdict(verdict: StreamVerdict) -> Option<Self> {
+        match verdict {
+            StreamVerdict::IdleTimeout => Some(Self::idle()),
+            StreamVerdict::Failed(error) => Some(Self::new(StatusCode::BAD_GATEWAY, error)),
+            StreamVerdict::ClosedWithoutStop => Some(Self::closed_early()),
+            StreamVerdict::Ok | StreamVerdict::Finished(_) => None,
+        }
+    }
+
+    /// Тело в духе OpenAI: по `rate_limit_error` клиенты решают, повторять ли.
+    fn body(&self) -> ErrorResponse {
+        if self.status != StatusCode::TOO_MANY_REQUESTS {
+            return ErrorResponse::server_error(self.message.clone());
+        }
+        ErrorResponse {
+            error: openai_compat::ErrorBody {
+                message: self.message.clone(),
+                kind: "rate_limit_error".to_string(),
+                code: Some("rate_limit_exceeded".to_string()),
+            },
+        }
+    }
+
+    fn response(&self) -> Response<ApiBody> {
+        json_response(self.status, &self.body())
+    }
+
+    /// Та же ошибка кадром SSE: статус 200 уже ушёл клиенту.
+    fn frame(&self) -> Bytes {
+        sse_data(&self.body())
+    }
+}
+
+/// Ответ с инструментами целиком: вызов виден только в готовом ответе.
+/// Оборванный лимитом вызов дописывается, неразобранный — переспрашивается раз.
 async fn run_tool_completion(
     provider: &Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: &CompletionRequest,
     bridge: &ToolBridge,
-) -> Result<(BridgedReply, String), String> {
+) -> Result<(BridgedReply, String), UpstreamError> {
+    // Гард: клиент ушёл — задачу гасят, а серверная сессия всё равно удаляется.
+    let discard = crate::provider::SessionDiscard::new(Arc::clone(provider));
+    let mut result = tool_attempt(provider, request, bridge).await;
+    if let Ok((reply, _, raw)) = &result
+        && reply.calls.is_empty()
+        && !reply.errors.is_empty()
+    {
+        let mut retry = request.clone();
+        retry.messages.push(ChatMessage::assistant(raw));
+        retry.messages.push(ChatMessage::user(
+            &crate::agent::runner::malformed_tool_feedback(&reply.errors),
+        ));
+        // Переспрос сорвался — первый ответ всё же лучше, чем ничего.
+        match tool_attempt(provider, &retry, bridge).await {
+            Ok(second) => result = Ok(second),
+            Err(error) => tracing::debug!("server: tool retry failed: {}", error.message),
+        }
+    }
+    discard.now().await;
+    result.map(|(reply, finish, _)| (reply, finish))
+}
+
+/// Один запрос ответа с инструментами: разобранный ответ, причина конца и
+/// сырой текст (для переспроса).
+async fn tool_attempt(
+    provider: &Arc<dyn LLMProvider>,
+    request: &CompletionRequest,
+    bridge: &ToolBridge,
+) -> Result<(BridgedReply, String, String), UpstreamError> {
     let outcome = collect_stream(provider, request.clone(), |_| {}).await;
-    let result = match outcome.verdict() {
-        StreamVerdict::IdleTimeout => Err(format!(
-            "upstream produced no data for {}s",
-            STREAM_IDLE_TIMEOUT.as_secs()
-        )),
-        StreamVerdict::Failed(error) => Err(error),
-        _ if !request.tools.is_empty() => {
-            let reply = ToolBridge::native_reply(&outcome.text, &outcome.tool_calls);
-            let finish = if reply.calls.is_empty() {
-                outcome.stop_reason.unwrap_or_else(|| "stop".to_string())
-            } else {
-                "tool_calls".to_string()
-            };
-            Ok((reply, finish))
+    if let Some(error) = UpstreamError::from_verdict(outcome.verdict()) {
+        return Err(error);
+    }
+    if !request.tools.is_empty() {
+        let reply = ToolBridge::native_reply(&outcome.text, &outcome.tool_calls);
+        let finish = if reply.calls.is_empty() {
+            outcome.stop_reason.unwrap_or_else(|| "stop".to_string())
+        } else {
+            "tool_calls".to_string()
+        };
+        return Ok((reply, finish, outcome.text));
+    }
+    let stop = outcome.stop_reason.clone();
+    let continued = continue_cut_off(
+        provider,
+        request,
+        outcome.text,
+        |text| bridge.cut_at(text, request),
+        |_| {},
+    )
+    .await;
+    let reply = bridge.parse(&continued.text, request);
+    let finish = match (&continued.failure, reply.calls.is_empty()) {
+        (_, false) => "tool_calls".to_string(),
+        // Вызов так и остался оборванным — клиент должен знать, что ответ неполон.
+        (Some(failure), true) => {
+            tracing::debug!("server: tool reply left cut off: {failure}");
+            "length".to_string()
         }
-        _ => {
-            let stop = outcome.stop_reason.clone();
-            let continued = continue_cut_off(
-                provider,
-                request,
-                outcome.text,
-                |text| bridge.cut_at(text, request),
-                |_| {},
-            )
-            .await;
-            if let Some(failure) = &continued.failure {
-                tracing::debug!("server: tool reply left cut off: {failure}");
-            }
-            let reply = bridge.parse(&continued.text, request);
-            let finish = if reply.calls.is_empty() {
-                stop.unwrap_or_else(|| "stop".to_string())
-            } else {
-                "tool_calls".to_string()
-            };
-            Ok((reply, finish))
-        }
+        (None, true) => stop.unwrap_or_else(|| "stop".to_string()),
     };
-    discard_deepseek_session(is_deepseek, provider).await;
-    result
+    Ok((reply, finish, continued.text))
 }
 
 async fn tool_blocking(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     bridge: ToolBridge,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    match run_tool_completion(&provider, is_deepseek, &request, &bridge).await {
+    match run_tool_completion(&provider, &request, &bridge).await {
         Ok((reply, finish)) => json_response(
             StatusCode::OK,
             &tool_response(&request, reply, finish, &meta),
         ),
-        Err(error) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorResponse::server_error(error),
-        ),
+        Err(error) => error.response(),
     }
 }
 
@@ -329,25 +442,20 @@ fn tool_response(
 /// Стрим с инструментами: пока ответ копится — keep-alive, затем готовые кадры.
 fn tool_stream(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     bridge: ToolBridge,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
     sse_stream_response(move |body_tx| async move {
-        let mut work = tokio::spawn(async move {
-            run_tool_completion(&provider, is_deepseek, &request, &bridge).await
+        // Гард: ушедший клиент гасит и задачу ответа, а не оставляет её сиротой.
+        let mut work = crate::util::AbortOnDrop::spawn(async move {
+            run_tool_completion(&provider, &request, &bridge).await
         });
         let joined = loop {
             match tokio::time::timeout(KEEPALIVE, &mut work).await {
                 Ok(joined) => break joined,
                 Err(_elapsed) => {
-                    if body_tx
-                        .send(Bytes::from_static(b": keep-alive\n\n"))
-                        .is_err()
-                    {
-                        // Клиент ушёл — ответ больше никому не нужен.
-                        work.abort();
+                    if body_tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() {
                         return;
                     }
                 }
@@ -355,10 +463,10 @@ fn tool_stream(
         };
         let frames = match joined {
             Ok(Ok((reply, finish))) => tool_frames(reply, &finish, &meta),
-            Ok(Err(error)) => vec![sse_data(&ErrorResponse::server_error(error))],
-            Err(join_error) => vec![sse_data(&ErrorResponse::server_error(format!(
-                "completion task failed: {join_error}"
-            )))],
+            Ok(Err(error)) => vec![error.frame()],
+            Err(join_error) => {
+                vec![UpstreamError::task_failed("the completion task", &join_error).frame()]
+            }
         };
         for frame in frames {
             let _ = body_tx.send(frame);
@@ -390,13 +498,12 @@ fn tool_frames(reply: BridgedReply, finish: &str, meta: &CompletionMeta) -> Vec<
         frames.push(sse_data(&chunk));
     }
     frames.push(sse_data(&openai_compat::final_chunk(finish, meta)));
-    frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
+    frames.push(Bytes::from_static(DONE_FRAME));
     frames
 }
 
 async fn blocking_completion(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
@@ -405,7 +512,7 @@ async fn blocking_completion(
         .iter()
         .map(|message| message.content.clone())
         .collect();
-    let response = match run_blocking_completion(&provider, is_deepseek, request).await {
+    let response = match run_blocking_completion(&provider, request).await {
         Ok(response) => response,
         Err(error_response) => return *error_response,
     };
@@ -417,23 +524,17 @@ async fn blocking_completion(
     )
 }
 
-/// Run a blocking completion and discard the per-request DeepSeek session;
-/// errors come back as a ready-to-return 500. Success-payload shaping is
-/// each dialect's own business — this is the half `blocking_completion`
-/// and `legacy_blocking` used to duplicate.
+/// Обычный ответ и удаление одноразовой серверной сессии; ошибка — готовый
+/// ответ с кодом из [`UpstreamError`]. Общая половина чата и legacy.
 async fn run_blocking_completion(
     provider: &Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
 ) -> Result<CompletionResponse, Box<Response<ApiBody>>> {
+    // Гард: hyper роняет future, если клиент ушёл, — сессия всё равно удаляется.
+    let discard = crate::provider::SessionDiscard::new(Arc::clone(provider));
     let result = provider.complete(request).await;
-    discard_deepseek_session(is_deepseek, provider).await;
-    result.map_err(|error| {
-        Box::new(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorResponse::server_error(error.to_string()),
-        ))
-    })
+    discard.now().await;
+    result.map_err(|error| Box::new(UpstreamError::from_app(&error).response()))
 }
 
 /// Streaming path: respond immediately with an SSE body fed by a bridge
@@ -442,11 +543,10 @@ async fn run_blocking_completion(
 /// proxies use.
 fn stream_completion(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    sse_stream_response(move |body_tx| bridge_stream(provider, is_deepseek, request, meta, body_tx))
+    sse_stream_response(move |body_tx| bridge_stream(provider, request, meta, body_tx))
 }
 
 /// Respond immediately with an SSE body fed by a detached bridge task —
@@ -477,14 +577,12 @@ where
 /// polluting the answer (see openai_compat::split_reasoning).
 async fn bridge_stream(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) {
     drive_sse_bridge(
         provider,
-        is_deepseek,
         request,
         body_tx,
         |reasoning, content, is_first| {
@@ -509,53 +607,38 @@ async fn bridge_stream(
     .await;
 }
 
-/// Idle backstop for the SSE bridges: provider-side read timeouts are a
-/// convention (every current provider configures 120s), not a guarantee —
-/// a silently stalled upstream must not pin a bridge task (and its client
-/// connection) forever. Mirrors the agent loop's idle guard in
-/// `agent/stream.rs`.
-const UPSTREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Everything both SSE bridges share: spawn the upstream completion into a
-/// chunk channel, pump chunks through the reasoning splitter, and handle
-/// client hang-up, the idle backstop, the upstream post-mortem, and the
-/// trailing `data: [DONE]`; the per-request DeepSeek session is discarded
-/// on every exit path. The dialects contribute only frame shaping:
-/// `delta_frame` renders one split delta (`None` = nothing to emit yet),
-/// `tail_frame` renders the splitter's flushed remainder (chat emits it as
-/// a delta, legacy returns `None` and folds it into its final frame), and
-/// `final_frame` renders the success terminator. `is_first` stays true
-/// until a delta has been sent — the chat dialect's first frame announces
-/// the assistant role.
+/// Общий насос обоих SSE-мостов; диалекты дают только кадры: дельту (`None` —
+/// пока нечего слать), удержанный хвост и финальный кадр.
 async fn drive_sse_bridge(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     mut delta_frame: impl FnMut(&str, &str, bool) -> Option<Bytes> + Send,
     tail_frame: impl FnOnce(&str, &str, bool) -> Option<Bytes> + Send,
     final_frame: impl FnOnce(&str, &str) -> Bytes + Send,
 ) {
+    let discard = crate::provider::SessionDiscard::new(Arc::clone(&provider));
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
-    let upstream = {
+    // Гард: ушедший клиент гасит и задачу апстрима, а не оставляет её сиротой.
+    let mut upstream = {
         let provider = Arc::clone(&provider);
-        tokio::spawn(async move { provider.complete_stream(request, chunk_tx).await })
+        crate::util::AbortOnDrop::spawn(
+            async move { provider.complete_stream(request, chunk_tx).await },
+        )
     };
 
     let mut splitter = ReasoningStreamSplitter::new();
     let mut finish_reason: Option<String> = None;
     let mut sent_any = false;
     let mut aborted = false;
+    let mut received = 0usize;
+    let mut last_sent = tokio::time::Instant::now();
     loop {
-        let chunk = match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, chunk_rx.recv()).await {
+        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, chunk_rx.recv()).await {
             Ok(Some(chunk)) => chunk,
-            Ok(None) => break, // upstream closed its sender — post-mortem below
+            Ok(None) => break, // апстрим закрыл канал — разбор ниже
             Err(_elapsed) => {
-                upstream.abort();
-                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(format!(
-                    "upstream produced no data for {}s; stream aborted",
-                    UPSTREAM_IDLE_TIMEOUT.as_secs()
-                ))));
+                let _ = body_tx.send(UpstreamError::idle().frame());
                 aborted = true;
                 break;
             }
@@ -563,18 +646,42 @@ async fn drive_sse_bridge(
         if chunk.finish_reason.is_some() {
             finish_reason = chunk.finish_reason.clone();
         }
-        if chunk.content.is_empty() {
-            continue;
-        }
-        let (reasoning, content) = splitter.push(&chunk.content);
-        let Some(frame) = delta_frame(&reasoning, &content, !sent_any) else {
-            continue;
-        };
-        sent_any = true;
-        if body_tx.send(frame).is_err() {
-            // Client hung up — stop paying for tokens nobody reads.
-            upstream.abort();
+        received += chunk.content.len();
+        if received > MAX_STREAM_BYTES {
+            let error = UpstreamError::new(StatusCode::BAD_GATEWAY, oversized_stream_message());
+            let _ = body_tx.send(error.frame());
             aborted = true;
+            break;
+        }
+        // Пустой кусок или удержанный сплиттером хвост — кадра пока нет.
+        let frame = if chunk.content.is_empty() {
+            None
+        } else {
+            let (reasoning, content) = splitter.push(&chunk.content);
+            delta_frame(&reasoning, &content, !sent_any)
+        };
+        let sent = match frame {
+            Some(frame) => {
+                sent_any = true;
+                Some(body_tx.send(frame))
+            }
+            // Апстрим думает: комментарий держит соединение, иначе клиент
+            // рвал его по своему сроку простоя, не увидев ни байта.
+            None if last_sent.elapsed() >= KEEPALIVE => {
+                Some(body_tx.send(Bytes::from_static(KEEPALIVE_FRAME)))
+            }
+            None => None,
+        };
+        match sent {
+            // Клиент ушёл — не платим за токены, которые никто не прочтёт.
+            Some(Err(_)) => {
+                aborted = true;
+                break;
+            }
+            Some(Ok(())) => last_sent = tokio::time::Instant::now(),
+            None => {}
+        }
+        if finish_reason.is_some() {
             break;
         }
     }
@@ -584,42 +691,56 @@ async fn drive_sse_bridge(
         if let Some(frame) = tail_frame(&reasoning, &content, !sent_any) {
             let _ = body_tx.send(frame);
         }
-        match upstream.await {
-            Ok(Ok(())) => {
-                let reason = finish_reason.as_deref().unwrap_or("stop");
+        // После финиша ответ уже весь: шлюз, держащий соединение, не держит нас.
+        let joined = match &finish_reason {
+            Some(_) => tokio::time::timeout(AFTER_STOP_GRACE, &mut upstream)
+                .await
+                .unwrap_or(Ok(Ok(()))),
+            None => (&mut upstream).await,
+        };
+        let failure = upstream_failure(joined);
+        match finish_reason.as_deref() {
+            // Причина конца пришла — ответ целый, поздняя ошибка его не портит.
+            Some(reason) => {
+                if let Some(failure) = failure {
+                    tracing::debug!(
+                        "server: upstream failed after finishing: {}",
+                        failure.message
+                    );
+                }
                 let _ = body_tx.send(final_frame(&content, reason));
-                let _ = body_tx.send(Bytes::from_static(b"data: [DONE]\n\n"));
+                let _ = body_tx.send(Bytes::from_static(DONE_FRAME));
             }
-            Ok(Err(error)) => {
-                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(error.to_string())));
-            }
-            Err(join_error) => {
-                let _ = body_tx.send(sse_data(&ErrorResponse::server_error(format!(
-                    "completion task failed: {join_error}"
-                ))));
+            None => {
+                let failure = failure.unwrap_or_else(UpstreamError::closed_early);
+                let _ = body_tx.send(failure.frame());
             }
         }
     }
 
-    discard_deepseek_session(is_deepseek, &provider).await;
+    // Сначала гасим апстрим: иначе он жжёт токены, пока сессию удаляют.
+    drop(upstream);
+    discard.now().await;
+}
+
+/// Чем кончилась задача апстрима: `None` — штатно.
+fn upstream_failure(
+    joined: Result<crate::error::AppResult<()>, tokio::task::JoinError>,
+) -> Option<UpstreamError> {
+    match joined {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(UpstreamError::from_app(&error)),
+        Err(join_error) => Some(UpstreamError::task_failed(
+            "the upstream stream",
+            &join_error,
+        )),
+    }
 }
 
 /// One SSE `data:` frame.
 fn sse_data(payload: &impl Serialize) -> Bytes {
     let json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
     Bytes::from(format!("data: {json}\n\n"))
-}
-
-/// Server completions are one-shot: a DeepSeek fork leaves a remote chat
-/// session behind, and nothing will ever continue it — delete it so API
-/// traffic doesn't pile junk chats onto the user's account. Best-effort.
-async fn discard_deepseek_session(is_deepseek: bool, provider: &Arc<dyn LLMProvider>) {
-    if !is_deepseek {
-        return;
-    }
-    if let Err(error) = provider.discard_remote_session().await {
-        tracing::debug!("server: failed to discard ephemeral DeepSeek session: {error}");
-    }
 }
 
 // ── Legacy `/v1/completions` (deprecated OpenAI text-completion) ────────
@@ -696,9 +817,9 @@ async fn legacy_completions(
     let streaming = internal.stream;
 
     let mut response = if streaming {
-        legacy_stream(provider, resolved.is_deepseek(), internal, meta)
+        legacy_stream(provider, internal, meta)
     } else {
-        legacy_blocking(provider, resolved.is_deepseek(), &prompt, internal, meta).await
+        legacy_blocking(provider, &prompt, internal, meta).await
     };
     response.extensions_mut().insert(LogDetail(format!(
         "legacy model={public_model} → {}{}",
@@ -720,12 +841,11 @@ fn legacy_choice(text: &str, finish_reason: Option<&str>) -> serde_json::Value {
 
 async fn legacy_blocking(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     prompt: &str,
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    let response = match run_blocking_completion(&provider, is_deepseek, request).await {
+    let response = match run_blocking_completion(&provider, request).await {
         Ok(response) => response,
         Err(error_response) => return *error_response,
     };
@@ -749,13 +869,10 @@ async fn legacy_blocking(
 
 fn legacy_stream(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    sse_stream_response(move |body_tx| {
-        bridge_legacy_stream(provider, is_deepseek, request, meta, body_tx)
-    })
+    sse_stream_response(move |body_tx| bridge_legacy_stream(provider, request, meta, body_tx))
 }
 
 /// Legacy `text_completion` frame shaping over [`drive_sse_bridge`].
@@ -764,7 +881,6 @@ fn legacy_stream(
 /// rides in the final frame together with the finish reason.
 async fn bridge_legacy_stream(
     provider: Arc<dyn LLMProvider>,
-    is_deepseek: bool,
     request: CompletionRequest,
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
@@ -780,7 +896,6 @@ async fn bridge_legacy_stream(
     };
     drive_sse_bridge(
         provider,
-        is_deepseek,
         request,
         body_tx,
         |_reasoning, content, _is_first| {
@@ -868,24 +983,30 @@ async fn passthrough(
         upstream = upstream.bearer_auth(key);
     }
 
+    // Код и текст без URL — как у чата; имя записи подсказывает, кто сломан.
+    let failed = |error: reqwest::Error| {
+        let mut failure = UpstreamError::from_app(&AppError::Http(error));
+        failure.message = format!(
+            "upstream '{}' {path_suffix} request failed: {}",
+            entry.name, failure.message
+        );
+        failure.response()
+    };
     match upstream.send().await {
         Ok(response) => {
             let status =
                 StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let upstream_bytes = response.bytes().await.unwrap_or_default();
-            Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(full_body(upstream_bytes))
-                .expect("static response parts are valid")
+            // Оборванное тело — ошибка, а не 200 с пустотой.
+            match response.bytes().await {
+                Ok(upstream_bytes) => Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(full_body(upstream_bytes))
+                    .expect("static response parts are valid"),
+                Err(error) => failed(error),
+            }
         }
-        Err(error) => json_response(
-            StatusCode::BAD_GATEWAY,
-            &ErrorResponse::server_error(format!(
-                "upstream '{}' {path_suffix} request failed: {error}",
-                entry.name
-            )),
-        ),
+        Err(error) => failed(error),
     }
 }
 
@@ -1310,5 +1431,209 @@ mod tests {
             .expect("embeddings request");
         assert_eq!(response.status(), 404);
         handle.request_shutdown();
+    }
+
+    use super::UpstreamError;
+    use crate::error::{AppError, AppResult};
+    use crate::provider::{
+        ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, LLMProvider,
+    };
+    use hyper::StatusCode;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_rate_limit_is_429_with_a_rate_limit_error_body() {
+        let error = UpstreamError::from_app(&AppError::RateLimited("slow down".to_string()));
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        let body = error.body();
+        assert_eq!(body.error.kind, "rate_limit_error");
+        assert_eq!(body.error.code.as_deref(), Some("rate_limit_exceeded"));
+    }
+
+    #[test]
+    fn any_other_upstream_failure_is_502_server_error() {
+        let error = UpstreamError::from_app(&AppError::Provider("boom".to_string()));
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.body().error.kind, "server_error");
+    }
+
+    /// Таймаут — 504, а URL апстрима (с ключом в запросе) клиенту не уходит.
+    #[tokio::test]
+    async fn an_upstream_timeout_is_504_without_the_url() {
+        // Принимает соединение и молчит: клиент упрётся в свой таймаут.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent upstream");
+        let addr = listener.local_addr().expect("silent upstream addr");
+        let error = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/models?key=secret"))
+            .timeout(Duration::from_millis(50))
+            .send()
+            .await
+            .expect_err("a silent upstream must time out");
+        let mapped = UpstreamError::from_app(&AppError::Http(error));
+        assert_eq!(mapped.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(!mapped.message.contains("secret"), "{}", mapped.message);
+        assert!(mapped.message.contains("<upstream>"), "{}", mapped.message);
+        drop(listener);
+    }
+
+    /// Чем кончается сценарный апстрим после своих кусков.
+    enum ScriptEnd {
+        Close,
+        Fail(fn() -> AppError),
+        /// Держит канал открытым, пока тест не отпустит.
+        HoldUntil(Arc<tokio::sync::Notify>),
+    }
+
+    /// Апстрим по сценарию: куски `(текст, причина конца)`, затем `end`.
+    struct Scripted {
+        chunks: Vec<(&'static str, Option<&'static str>)>,
+        end: ScriptEnd,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for Scripted {
+        async fn complete(&self, _request: CompletionRequest) -> AppResult<CompletionResponse> {
+            unreachable!("the bridge streams")
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
+        ) -> AppResult<()> {
+            for (content, finish) in &self.chunks {
+                let _ = tx.send(CompletionChunk {
+                    content: content.to_string(),
+                    tool_calls: Vec::new(),
+                    finish_reason: finish.map(str::to_string),
+                });
+            }
+            match &self.end {
+                ScriptEnd::Close => Ok(()),
+                ScriptEnd::Fail(error) => Err(error()),
+                ScriptEnd::HoldUntil(release) => {
+                    release.notified().await;
+                    Ok(())
+                }
+            }
+        }
+
+        fn model(&self) -> &str {
+            "scripted"
+        }
+
+        fn fork(&self) -> Arc<dyn LLMProvider> {
+            unreachable!("the bridge never forks")
+        }
+    }
+
+    /// Чат-мост над сценарием; кадры читаются по мере прихода.
+    fn start_bridge(provider: Scripted) -> tokio::sync::mpsc::UnboundedReceiver<Bytes> {
+        let (body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = CompletionRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            model: "scripted".to_string(),
+            temperature: 0.0,
+            max_tokens: 64,
+            stream: true,
+        };
+        let meta = crate::provider::openai_compat::CompletionMeta::generate("m");
+        tokio::spawn(super::bridge_stream(
+            Arc::new(provider),
+            request,
+            meta,
+            body_tx,
+        ));
+        body_rx
+    }
+
+    /// Следующий кадр; `None` — мост закончил.
+    async fn next_frame(
+        body_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    ) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(5), body_rx.recv())
+            .await
+            .expect("the bridge stalled")
+            .map(|frame| String::from_utf8(frame.to_vec()).expect("utf-8 frame"))
+    }
+
+    async fn all_frames(mut body_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>) -> Vec<String> {
+        let mut frames = Vec::new();
+        while let Some(frame) = next_frame(&mut body_rx).await {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    fn frame_json(frame: &str) -> serde_json::Value {
+        let payload = frame
+            .strip_prefix("data: ")
+            .expect("a data frame")
+            .trim_end();
+        serde_json::from_str(payload).expect("frame json")
+    }
+
+    /// Весь ответ удержан сплиттером, апстрим не закрывает канал: хвост и
+    /// финал всё равно уходят сразу после причины конца, а не по простою.
+    #[tokio::test]
+    async fn a_finish_with_a_held_back_tail_flushes_it_and_ends_the_stream() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut body_rx = start_bridge(Scripted {
+            chunks: vec![("<thi", Some("stop"))],
+            end: ScriptEnd::HoldUntil(Arc::clone(&release)),
+        });
+        let tail = next_frame(&mut body_rx).await.expect("the tail frame");
+        assert_eq!(frame_json(&tail)["choices"][0]["delta"]["content"], "<thi");
+        release.notify_one();
+        let rest = all_frames(body_rx).await;
+        assert_eq!(rest.len(), 2, "{rest:?}");
+        assert_eq!(frame_json(&rest[0])["choices"][0]["finish_reason"], "stop");
+        assert_eq!(rest[1], "data: [DONE]\n\n");
+    }
+
+    /// Ошибка после причины конца не портит уже целый ответ.
+    #[tokio::test]
+    async fn an_error_after_the_finish_still_ends_with_done() {
+        let frames = all_frames(start_bridge(Scripted {
+            chunks: vec![("Hi", Some("stop"))],
+            end: ScriptEnd::Fail(|| AppError::Provider("connection reset".to_string())),
+        }))
+        .await;
+        assert_eq!(
+            frame_json(&frames[0])["choices"][0]["delta"]["content"],
+            "Hi"
+        );
+        assert_eq!(frames.last().map(String::as_str), Some("data: [DONE]\n\n"));
+        assert!(frames.iter().all(|frame| !frame.contains("\"error\"")));
+    }
+
+    #[tokio::test]
+    async fn a_stream_closed_without_a_finish_ends_with_an_error_frame() {
+        let frames = all_frames(start_bridge(Scripted {
+            chunks: vec![("Hi", None)],
+            end: ScriptEnd::Close,
+        }))
+        .await;
+        let last = frame_json(frames.last().expect("frames"));
+        assert_eq!(last["error"]["type"], "server_error");
+        let message = last["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("before finishing"), "{message}");
+        assert!(frames.iter().all(|frame| !frame.contains("[DONE]")));
+    }
+
+    /// Лимит посреди стрима — кадр `rate_limit_error`: клиент поймёт, что ждать.
+    #[tokio::test]
+    async fn a_rate_limit_mid_stream_is_a_rate_limit_error_frame() {
+        let frames = all_frames(start_bridge(Scripted {
+            chunks: Vec::new(),
+            end: ScriptEnd::Fail(|| AppError::RateLimited("slow down".to_string())),
+        }))
+        .await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frame_json(&frames[0])["error"]["type"], "rate_limit_error");
     }
 }

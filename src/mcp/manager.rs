@@ -13,6 +13,8 @@
 //!   `Foreign` (discovered from another tool's config). `persist_config`
 //!   uses this to avoid writing foreign servers' full config — including
 //!   their `env` secrets — into our own file; see its doc comment.
+//! - Методы `MCPManager` — только состояние под замком, без сетевых `await`.
+//!   Операции `/mcp` с I/O — свободные функции внизу файла (`reload`, `add`…).
 
 use super::client::MCPClient;
 use super::config::{load_mcp_config, load_overrides, load_own_enabled_map, save_mcp_config};
@@ -118,9 +120,43 @@ struct MCPServerEntry {
     source: ServerSource,
 }
 
-/// A read-only snapshot of a server's `ServerCache` entry, cloned out before
-/// fanning connections out concurrently (see `connect_all`) so `connect_one`
-/// never needs to borrow `MCPManager` itself.
+impl MCPServerEntry {
+    fn new(
+        client: Arc<MCPClient>,
+        config: MCPServerConfig,
+        source: ServerSource,
+        status: MCPServerStatus,
+    ) -> Self {
+        Self {
+            client,
+            config,
+            enabled: !matches!(status, MCPServerStatus::Disabled),
+            status,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            source,
+        }
+    }
+
+    /// Включённый сервер с готовым клиентом, ждёт подключения.
+    fn pending(client: Arc<MCPClient>, config: MCPServerConfig, source: ServerSource) -> Self {
+        Self::new(client, config, source, MCPServerStatus::Pending)
+    }
+
+    /// Выключенный сервер: вместо клиента заглушка.
+    fn disabled(name: &str, config: MCPServerConfig, source: ServerSource) -> Self {
+        let client = Arc::new(MCPClient::dummy(name));
+        Self::new(client, config, source, MCPServerStatus::Disabled)
+    }
+
+    /// Включённый сервер, клиент которого не собрался: видно в `/mcp`, можно `r`.
+    fn failed(name: &str, config: MCPServerConfig, source: ServerSource, error: String) -> Self {
+        let client = Arc::new(MCPClient::dummy(name));
+        Self::new(client, config, source, MCPServerStatus::Error(error))
+    }
+}
+
+/// Снимок кэша сервера, взятый под замком: `connect_one` идёт без менеджера.
 struct CachedSnapshot {
     tools: Vec<MCPTool>,
     resources: Vec<MCPResource>,
@@ -128,24 +164,21 @@ struct CachedSnapshot {
     age_secs: u64,
 }
 
-/// Result of connecting (or failing to connect) one server, produced by
-/// `connect_one` and merged back into `MCPManager` state by `connect_all`.
+/// Итог `connect_one` для одного сервера; сливается `apply_connect_outcome`.
 struct ConnectOutcome {
     name: String,
+    /// Клиент, который подключали: итог чужого клиента не сливается.
+    client: Arc<MCPClient>,
     status: MCPServerStatus,
     tools: Vec<MCPTool>,
     resources: Vec<MCPResource>,
     tool_entries: Vec<(String, String, String)>,
-    /// True if `tools`/`resources` came from `cached` rather than a fresh
-    /// `list_tools`/`list_resources` call — tells `connect_all` whether it
-    /// still needs to insert a (fresh) `ServerCache` entry.
+    /// Инструменты взяты из кэша, а не свежим `list_tools` — кэш не обновлять.
     used_cache: bool,
 }
 
-/// Initialize + handshake + (list-tools-or-use-cache) for one server. A free
-/// function (not an `MCPManager` method) so `connect_all` can run many of
-/// these concurrently via `futures::future::join_all` — see its doc comment
-/// for why that requires *not* taking `&mut self` here.
+/// Handshake и список инструментов (или кэш) для одного сервера. Не метод:
+/// идёт без замка менеджера, и `join_all` гоняет много таких сразу.
 async fn connect_one(
     name: String,
     client: Arc<MCPClient>,
@@ -154,6 +187,7 @@ async fn connect_one(
 ) -> ConnectOutcome {
     let empty = |status: MCPServerStatus| ConnectOutcome {
         name: name.clone(),
+        client: Arc::clone(&client),
         status,
         tools: Vec::new(),
         resources: Vec::new(),
@@ -185,6 +219,7 @@ async fn connect_one(
             );
             return ConnectOutcome {
                 name,
+                client,
                 status: MCPServerStatus::Connected,
                 tools: cache.tools,
                 resources: cache.resources,
@@ -230,6 +265,7 @@ async fn connect_one(
     tracing::info!("MCP '{name}' connected with {} tools", tools.len());
     ConnectOutcome {
         name,
+        client,
         status: MCPServerStatus::Connected,
         tools,
         resources,
@@ -252,36 +288,7 @@ impl MCPManager {
         self.cache_ttl = ttl;
     }
 
-    /// Re-discover and reconnect every server from disk.
-    ///
-    /// Every existing client is explicitly `close()`d before being dropped
-    /// (child process killed for stdio; no-op for HTTP/SSE) — previously
-    /// `self.servers.clear()` just dropped every `MCPServerEntry`, and
-    /// nothing had ever called `Transport::close()`, so every stdio child
-    /// process leaked as an orphan on each reload.
-    pub async fn reload_all(&mut self) {
-        self.cache.clear();
-        self.tool_name_map.clear();
-        self.close_all_clients().await;
-        self.servers.clear();
-
-        let configs = load_mcp_config();
-        let own_enabled = load_own_enabled_map();
-        let foreign_overrides = load_overrides();
-
-        for (name, config) in configs {
-            let (enabled, source) =
-                resolve_enabled_and_source(&name, &own_enabled, &foreign_overrides);
-            self.add_server(name, config, enabled, source).await;
-        }
-
-        self.connect_all().await;
-    }
-
-    /// Close every server's transport (kills stdio child processes) without
-    /// touching `self.servers` itself. Shared by `reload_all` (which then
-    /// clears the map) and `shutdown_all` (which the app should call on
-    /// exit — see that method's doc comment).
+    /// Закрыть транспорты всех серверов (у stdio — убить процесс).
     async fn close_all_clients(&self) {
         for (name, entry) in &self.servers {
             if let Err(e) = entry.client.close().await {
@@ -290,118 +297,9 @@ impl MCPManager {
         }
     }
 
-    /// Close every managed server's transport. Not wired into any
-    /// app-lifecycle hook by this change — the app's exit path should call
-    /// this before dropping its `Arc<Mutex<MCPManager>>` so stdio child
-    /// processes don't leak as orphans when the app quits normally. See the
-    /// final summary for exactly where that call belongs.
+    /// Погасить все серверы — на выходе из приложения и в конце `exec`.
     pub async fn shutdown_all(&mut self) {
         self.close_all_clients().await;
-    }
-
-    async fn add_server(
-        &mut self,
-        name: String,
-        config: MCPServerConfig,
-        enabled: bool,
-        source: ServerSource,
-    ) {
-        if !enabled {
-            let entry = MCPServerEntry {
-                client: Arc::new(MCPClient::dummy(&name)),
-                config,
-                status: MCPServerStatus::Disabled,
-                tools: Vec::new(),
-                resources: Vec::new(),
-                enabled: false,
-                source,
-            };
-            self.servers.insert(name, entry);
-            return;
-        }
-        let client = match build_client(&name, &config).await {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!("Failed to create MCP client for '{name}': {e}");
-                None
-            }
-        };
-
-        if let Some(client) = client {
-            self.servers.insert(
-                name,
-                MCPServerEntry {
-                    client: Arc::new(client),
-                    config,
-                    status: MCPServerStatus::Pending,
-                    tools: Vec::new(),
-                    resources: Vec::new(),
-                    enabled: true,
-                    source,
-                },
-            );
-        }
-    }
-
-    /// Connect every server concurrently.
-    ///
-    /// Previously this awaited `connect_server` one server at a time, so N
-    /// slow servers meant roughly N times the wait before *any* of them was
-    /// usable — a single slow-to-start server head-of-line-blocked every
-    /// other one. `connect_one` (a free function, not a method) does the
-    /// actual work against just an `Arc<MCPClient>` and a cache snapshot —
-    /// deliberately not against `&mut self` — so `join_all` can run all of
-    /// them at once without needing N simultaneous mutable borrows of
-    /// `self` (which isn't possible in safe Rust). Each server's outcome is
-    /// applied back into `self.servers`/`self.tool_name_map`/`self.cache`
-    /// afterward, in a plain non-async loop — cheap, and avoids any
-    /// interleaving of the merge step itself. One server's connection
-    /// failure can't affect another's: each `connect_one` call is
-    /// independently awaited and independently caught inside itself (see
-    /// its own error handling), so a panic-free failure in one is just a
-    /// `ConnectOutcome` with an `Error` status, not a short-circuit of the
-    /// whole `join_all`.
-    async fn connect_all(&mut self) {
-        // Collect owned inputs for every server *before* awaiting anything —
-        // `connect_one` takes only owned values (`Arc<MCPClient>` clone +
-        // an owned `CachedSnapshot`), so this loop only ever holds a shared
-        // borrow of `self`, and that borrow is fully released by the time
-        // `.collect()` returns, well before `join_all` runs or
-        // `apply_connect_outcome` needs `&mut self`.
-        let inputs: Vec<(String, Arc<MCPClient>, Option<CachedSnapshot>)> = self
-            .servers
-            .iter()
-            .map(|(name, entry)| {
-                (
-                    name.clone(),
-                    Arc::clone(&entry.client),
-                    self.cache_snapshot(name),
-                )
-            })
-            .collect();
-        let cache_ttl = self.cache_ttl;
-
-        let jobs = inputs
-            .into_iter()
-            .map(|(name, client, cached)| connect_one(name, client, cached, cache_ttl));
-        let outcomes = futures::future::join_all(jobs).await;
-
-        for outcome in outcomes {
-            self.apply_connect_outcome(outcome);
-        }
-    }
-
-    /// Connect a single server by name — used by `toggle_server` and
-    /// `reconnect_server`, which each need to (re)connect just the one
-    /// server they're acting on rather than every server via `connect_all`.
-    async fn connect_server(&mut self, name: &str) {
-        let Some(entry) = self.servers.get(name) else {
-            return;
-        };
-        let client = Arc::clone(&entry.client);
-        let cached = self.cache_snapshot(name);
-        let outcome = connect_one(name.to_string(), client, cached, self.cache_ttl).await;
-        self.apply_connect_outcome(outcome);
     }
 
     /// Clone a read-only snapshot of `name`'s cache entry, if any and not
@@ -416,27 +314,19 @@ impl MCPManager {
         })
     }
 
-    /// Merge one `connect_one` result back into manager state: tool name
-    /// map, tool-list cache (only for a freshly-fetched, non-cached,
-    /// successful connect), and the server's own status/tools/resources.
+    /// Слить итог `connect_one`: карта инструментов, кэш (только свежий удачный
+    /// список) и состояние сервера. Чужой итог отбрасывается — см. `owns`.
     fn apply_connect_outcome(&mut self, outcome: ConnectOutcome) {
-        // The server can vanish or be disabled between a lock-free connect
-        // and this merge (`startup_initialize` phases 3→4 race a user's
-        // /mcp remove or toggle) — applying a stale outcome would resurrect
-        // it. Callers that connect under one continuous lock hold
-        // (`connect_all`, `connect_server`) can't hit either branch.
-        match self.servers.get(&outcome.name) {
-            Some(entry) if entry.enabled => {}
-            _ => return,
+        // Пока шло подключение без замка, сервер могли удалить, выключить или
+        // переподключить: слить такой итог значило бы воскресить старый клиент.
+        if !self.owns(&outcome.name, &outcome.client) {
+            return;
         }
-        // A cache-served outcome and a fresh successful connect both carry
-        // usable tool entries; a failed connect maps nothing.
         if outcome.used_cache || matches!(outcome.status, MCPServerStatus::Connected) {
             for (full_name, server_name, tool_name) in &outcome.tool_entries {
                 self.tool_name_map
                     .insert(full_name.clone(), (server_name.clone(), tool_name.clone()));
             }
-            // Only a fresh fetch (re)fills the cache — see doc comment above.
             if !outcome.used_cache {
                 self.cache.insert(
                     outcome.name.clone(),
@@ -455,6 +345,67 @@ impl MCPManager {
             entry.tools = outcome.tools;
             entry.resources = outcome.resources;
         }
+    }
+
+    /// Сервер `name` включён и стоит на клиенте `client`, а не на чужом.
+    fn owns(&self, name: &str, client: &Arc<MCPClient>) -> bool {
+        self.servers
+            .get(name)
+            .is_some_and(|entry| entry.enabled && Arc::ptr_eq(&entry.client, client))
+    }
+
+    /// Убрать инструменты сервера из карты имён.
+    fn forget_tools(&mut self, name: &str) {
+        self.tool_name_map.retain(|_, (server, _)| server != name);
+    }
+
+    /// Включить сервер и пометить `Pending`; вернуть конфиг и старый клиент,
+    /// чтобы собрать новый без замка.
+    fn begin_connect(&mut self, name: &str) -> AppResult<(MCPServerConfig, Arc<MCPClient>)> {
+        let entry = self.servers.get_mut(name).ok_or_else(|| not_found(name))?;
+        entry.enabled = true;
+        entry.status = MCPServerStatus::Pending;
+        entry.tools.clear();
+        entry.resources.clear();
+        let taken = (entry.config.clone(), Arc::clone(&entry.client));
+        self.forget_tools(name);
+        Ok(taken)
+    }
+
+    /// Выключить сервер: заглушка вместо клиента; вернуть старый клиент.
+    fn disable(&mut self, name: &str) -> AppResult<Arc<MCPClient>> {
+        let entry = self.servers.get_mut(name).ok_or_else(|| not_found(name))?;
+        entry.enabled = false;
+        entry.status = MCPServerStatus::Disabled;
+        entry.tools.clear();
+        entry.resources.clear();
+        let old = std::mem::replace(&mut entry.client, Arc::new(MCPClient::dummy(name)));
+        self.forget_tools(name);
+        Ok(old)
+    }
+
+    /// Переключить сервер одним шагом под замком: два быстрых нажатия дают
+    /// «выкл, вкл», а не два включения.
+    fn flip(&mut self, name: &str) -> AppResult<Flip> {
+        let enabled = self
+            .servers
+            .get(name)
+            .ok_or_else(|| not_found(name))?
+            .enabled;
+        if enabled {
+            self.disable(name).map(Flip::Disabled)
+        } else {
+            let (config, old) = self.begin_connect(name)?;
+            Ok(Flip::Enabling(config, old))
+        }
+    }
+
+    /// Забрать запись сервера целиком; клиент закрывает вызывающий.
+    fn take_server(&mut self, name: &str) -> AppResult<Arc<MCPClient>> {
+        let entry = self.servers.remove(name).ok_or_else(|| not_found(name))?;
+        self.forget_tools(name);
+        self.cache.remove(name);
+        Ok(entry.client)
     }
 
     /// Хэндл клиента для вызова инструмента без замка менеджера (замок через
@@ -566,124 +517,6 @@ impl MCPManager {
         self.servers.contains_key(name)
     }
 
-    /// Add one new user-supplied server (from `/mcp add`'s paste-JSON,
-    /// wizard, or quick inline syntax) as `ServerSource::Own`: connects it
-    /// immediately and persists to `mcp.json`. Rejects a duplicate name
-    /// outright rather than silently overwriting an existing server.
-    ///
-    /// Returns the server's status right after connecting — lets the
-    /// caller report something more useful than "added" (e.g. "added, but
-    /// requires authorization" or "added, but failed to connect: ...")
-    /// without a second round trip through `get_servers_info`.
-    pub async fn add_new_server(
-        &mut self,
-        name: String,
-        config: MCPServerConfig,
-    ) -> AppResult<MCPServerStatus> {
-        if self.servers.contains_key(&name) {
-            return Err(crate::error::AppError::Mcp(format!(
-                "Server '{name}' already exists"
-            )));
-        }
-        self.add_server(name.clone(), config, true, ServerSource::Own)
-            .await;
-        if !self.servers.contains_key(&name) {
-            // `add_server` silently no-ops when `build_client` fails (bad
-            // stdio command, malformed URL, ...) — surface that here instead
-            // of reporting success for a server that was never actually added.
-            return Err(crate::error::AppError::Mcp(format!(
-                "Failed to create a client for '{name}'"
-            )));
-        }
-        self.connect_server(&name).await;
-        self.persist_config().await;
-        Ok(self
-            .servers
-            .get(&name)
-            .map(|e| e.status.clone())
-            .unwrap_or(MCPServerStatus::Pending))
-    }
-
-    pub async fn toggle_server(&mut self, name: &str) -> AppResult<()> {
-        let enabled = self.servers.get(name).map(|e| !e.enabled).unwrap_or(true);
-        if let Some(entry) = self.servers.get_mut(name) {
-            let config = entry.config.clone();
-            entry.enabled = enabled;
-            if enabled {
-                // Recreate client and connect. The old client (a
-                // `DummyTransport` if we're re-enabling a previously
-                // disabled server, or a live one if toggling on twice in a
-                // row without a reload) is replaced below — close it first
-                // so a live stdio child doesn't leak.
-                let old_client = Arc::clone(&entry.client);
-                let client = build_client(name, &config).await?;
-                if let Err(e) = old_client.close().await {
-                    tracing::debug!("MCP '{name}' close before replace failed (best-effort): {e}");
-                }
-                entry.client = Arc::new(client);
-                entry.status = MCPServerStatus::Pending;
-                self.connect_server(name).await;
-            } else {
-                entry.status = MCPServerStatus::Disabled;
-                entry.tools.clear();
-                entry.resources.clear();
-                // Close the live client before swapping in the dummy —
-                // previously this just dropped the `MCPClient`, which for
-                // stdio leaked the child process (no `Drop` impl ever
-                // called `Transport::close()`, and `kill_on_drop` alone
-                // only fires if the whole process tree is torn down, not on
-                // a graceful drop-and-replace like this).
-                let old_client = Arc::clone(&entry.client);
-                if let Err(e) = old_client.close().await {
-                    tracing::debug!("MCP '{name}' close on disable failed (best-effort): {e}");
-                }
-                entry.client = Arc::new(MCPClient::dummy(name));
-                self.tool_name_map.retain(|_, (s, _)| s != name);
-            }
-        }
-        self.persist_config().await;
-        Ok(())
-    }
-
-    pub async fn reconnect_server(&mut self, name: &str) -> AppResult<()> {
-        let config = self.servers.get(name).map(|e| e.config.clone());
-        let Some(config) = config else {
-            return Err(crate::error::AppError::Mcp(format!(
-                "Server '{name}' not found"
-            )));
-        };
-        let old_client = self.servers.get(name).map(|e| Arc::clone(&e.client));
-        let client = build_client(name, &config).await?;
-        if let Some(old_client) = old_client
-            && let Err(e) = old_client.close().await
-        {
-            tracing::debug!("MCP '{name}' close before reconnect failed (best-effort): {e}");
-        }
-        // remove old tool mappings
-        self.tool_name_map.retain(|_, (s, _)| s != name);
-        if let Some(entry) = self.servers.get_mut(name) {
-            entry.client = Arc::new(client);
-            entry.enabled = true;
-            entry.status = MCPServerStatus::Pending;
-            entry.tools.clear();
-            entry.resources.clear();
-        }
-        self.connect_server(name).await;
-        self.persist_config().await;
-        Ok(())
-    }
-
-    pub async fn remove_server(&mut self, name: &str) -> AppResult<()> {
-        self.tool_name_map.retain(|_, (s, _)| s != name);
-        if let Some(entry) = self.servers.remove(name)
-            && let Err(e) = entry.client.close().await
-        {
-            tracing::debug!("MCP '{name}' close on remove failed (best-effort): {e}");
-        }
-        self.persist_config().await;
-        Ok(())
-    }
-
     /// Persist enabled/disabled state (and, for our own servers, full
     /// config) to `mcp.json`.
     ///
@@ -698,7 +531,7 @@ impl MCPManager {
     /// from e.g. Claude Desktop's config (command, args, and any secrets in
     /// its `env` map) ended up duplicated into our own file the moment the
     /// user toggled *any* server in the UI, foreign or not.
-    async fn persist_config(&self) {
+    fn persist_config(&self) {
         let mut own_servers = HashMap::new();
         let mut foreign_overrides = HashMap::new();
         for (name, entry) in &self.servers {
@@ -717,31 +550,41 @@ impl MCPManager {
     }
 }
 
-/// Startup discovery + connect that never holds the manager lock across I/O.
-///
-/// `reload_all` (an explicit user action) runs under the caller's lock for
-/// its whole duration; doing that at startup would freeze the UI in
-/// disguise — the first frame now renders before any server has connected,
-/// and event-loop paths (`system_prompt::build`, the /mcp view, the
-/// resource picker) take `lock().await` on the manager. So this runs in
-/// four phases and only ever locks for short, await-free merges:
-///
-/// 1. **no lock** — discover configs and build every enabled server's
-///    client *concurrently* (`build_client` needs no manager state;
-///    previously each `add_server` was awaited serially, so stdio spawns
-///    and OAuth keyring lookups stacked per server);
-/// 2. **short lock** — insert the entries (`Pending`/`Disabled`) so the
-///    /mcp view can list them immediately, and snapshot connect inputs;
-/// 3. **no lock** — run every `connect_one` concurrently (same job shape
-///    as `connect_all`);
-/// 4. **short lock** — merge the outcomes via `apply_connect_outcome`,
-///    which skips servers the user removed/disabled meanwhile.
+pub struct FullMCPTool {
+    pub full_name: String,
+    pub tool: MCPTool,
+}
+
+/// Итог `MCPManager::flip`: что доделать уже без замка.
+enum Flip {
+    /// Сервер выключен; старый клиент надо закрыть.
+    Disabled(Arc<MCPClient>),
+    /// Сервер включён; собрать клиент по конфигу вместо старого.
+    Enabling(MCPServerConfig, Arc<MCPClient>),
+}
+
+fn not_found(name: &str) -> crate::error::AppError {
+    crate::error::AppError::Mcp(format!("Server '{name}' not found"))
+}
+
+/// Закрыть клиент, ошибку только записать в лог: закрытие — по мере сил.
+async fn close_quietly(client: &MCPClient, name: &str) {
+    if let Err(e) = client.close().await {
+        tracing::debug!("MCP '{name}' close failed (best-effort): {e}");
+    }
+}
+
+// ─── Операции `/mcp`: короткий замок, сеть без замка, короткий замок ──────
+// Замок менеджера ждёт и цикл событий, поэтому закрытие и подключение — вне его.
+
+/// Найти серверы в конфигах и подключить в четыре фазы: сборка и подключение
+/// без замка, вставка записей и слияние итогов — короткими замками без `await`.
 pub async fn startup_initialize(mcp: &tokio::sync::Mutex<MCPManager>) {
     let configs = load_mcp_config();
     let own_enabled = load_own_enabled_map();
     let foreign_overrides = load_overrides();
 
-    // Phase 1: build all clients concurrently, off the lock.
+    // Фаза 1: клиенты собираются параллельно, без замка.
     let jobs: Vec<_> = configs
         .into_iter()
         .map(|(name, config)| {
@@ -749,90 +592,210 @@ pub async fn startup_initialize(mcp: &tokio::sync::Mutex<MCPManager>) {
                 resolve_enabled_and_source(&name, &own_enabled, &foreign_overrides);
             async move {
                 let client = if enabled {
-                    match build_client(&name, &config).await {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            tracing::warn!("Failed to create MCP client for '{name}': {e}");
-                            None
-                        }
-                    }
+                    Some(build_client(&name, &config).await)
                 } else {
                     None
                 };
-                (name, config, enabled, source, client)
+                (name, config, source, client)
             }
         })
         .collect();
     let built = futures::future::join_all(jobs).await;
 
-    // Phase 2: insert entries and collect connect inputs in one short,
-    // await-free lock hold.
-    let (inputs, cache_ttl) = {
+    // Фаза 2: записи (`/mcp` видит их сразу) и входы для подключения.
+    let (inputs, cache_ttl, unused) = {
         let mut manager = mcp.lock().await;
         let mut inputs = Vec::new();
-        for (name, config, enabled, source, client) in built {
-            if !enabled {
-                // Mirrors `add_server`'s disabled arm.
-                manager.servers.insert(
-                    name.clone(),
-                    MCPServerEntry {
-                        client: Arc::new(MCPClient::dummy(&name)),
-                        config,
-                        status: MCPServerStatus::Disabled,
-                        tools: Vec::new(),
-                        resources: Vec::new(),
-                        enabled: false,
-                        source,
-                    },
-                );
+        let mut unused = Vec::new();
+        for (name, config, source, client) in built {
+            // Сервер успел добавить `/mcp add` или другой `reload`: его запись
+            // свежее, наш клиент лишний.
+            if manager.has_server(&name) {
+                unused.extend(client.and_then(Result::ok).map(|c| (name, Arc::new(c))));
                 continue;
             }
-            // Mirrors `add_server`'s build-failure arm: silently skipped
-            // (already logged in phase 1).
-            let Some(client) = client else { continue };
-            let client = Arc::new(client);
-            manager.servers.insert(
-                name.clone(),
-                MCPServerEntry {
-                    client: Arc::clone(&client),
-                    config,
-                    status: MCPServerStatus::Pending,
-                    tools: Vec::new(),
-                    resources: Vec::new(),
-                    enabled: true,
-                    source,
-                },
-            );
-            let cached = manager.cache_snapshot(&name);
-            inputs.push((name, client, cached));
+            let entry = match client {
+                None => MCPServerEntry::disabled(&name, config, source),
+                Some(Err(error)) => {
+                    tracing::warn!("Failed to create MCP client for '{name}': {error}");
+                    MCPServerEntry::failed(&name, config, source, error.to_string())
+                }
+                Some(Ok(client)) => {
+                    let client = Arc::new(client);
+                    let cached = manager.cache_snapshot(&name);
+                    inputs.push((name.clone(), Arc::clone(&client), cached));
+                    MCPServerEntry::pending(client, config, source)
+                }
+            };
+            manager.servers.insert(name, entry);
         }
-        (inputs, manager.cache_ttl)
+        (inputs, manager.cache_ttl, unused)
     };
+    futures::future::join_all(unused.iter().map(|(name, c)| close_quietly(c, name))).await;
 
-    // Phase 3: connect everything concurrently, no lock held.
+    // Фаза 3: все подключения параллельно, без замка.
     let jobs = inputs
         .into_iter()
         .map(|(name, client, cached)| connect_one(name, client, cached, cache_ttl));
     let outcomes = futures::future::join_all(jobs).await;
 
-    // Phase 4: merge.
+    // Фаза 4: слияние; удалённые и переподключённые за это время пропускаются.
     let mut manager = mcp.lock().await;
     for outcome in outcomes {
         manager.apply_connect_outcome(outcome);
     }
 }
 
-/// Build a fresh `MCPClient` for `config`, dispatching to the right
-/// transport constructor. Shared by `add_server` (initial connect),
-/// `toggle_server` (re-enabling), and `reconnect_server` — previously each
-/// duplicated the `Http`/`Sse` arms verbatim, which is exactly the kind of
-/// duplication that made it easy to fix a bug in one copy and miss the
-/// others.
-///
-/// For `Http`/`Sse`, merges in a stored OAuth `Authorization: Bearer` header
-/// (`oauth_store::with_bearer_header`) if `/mcp auth` has ever completed a
-/// flow for this server — best-effort and a no-op when there's no stored
-/// token, so this is safe to call unconditionally for every server.
+/// Перечитать конфиг и переподключить все серверы.
+pub async fn reload(mcp: &tokio::sync::Mutex<MCPManager>) {
+    let old: Vec<(String, Arc<MCPClient>)> = {
+        let mut manager = mcp.lock().await;
+        manager.cache.clear();
+        manager.tool_name_map.clear();
+        manager
+            .servers
+            .drain()
+            .map(|(name, entry)| (name, entry.client))
+            .collect()
+    };
+    futures::future::join_all(old.iter().map(|(name, c)| close_quietly(c, name))).await;
+    startup_initialize(mcp).await;
+}
+
+/// Переподключить один сервер (и включить, если был выключен).
+pub async fn reconnect(mcp: &tokio::sync::Mutex<MCPManager>, name: &str) -> AppResult<()> {
+    let (config, old) = {
+        let mut manager = mcp.lock().await;
+        let taken = manager.begin_connect(name)?;
+        manager.persist_config();
+        taken
+    };
+    rebuild(mcp, name, config, old).await
+}
+
+/// Включить или выключить сервер; вернуть, включён ли он теперь.
+pub async fn toggle(mcp: &tokio::sync::Mutex<MCPManager>, name: &str) -> AppResult<bool> {
+    let flip = {
+        let mut manager = mcp.lock().await;
+        let flip = manager.flip(name)?;
+        manager.persist_config();
+        flip
+    };
+    match flip {
+        Flip::Disabled(old) => {
+            close_quietly(&old, name).await;
+            Ok(false)
+        }
+        Flip::Enabling(config, old) => rebuild(mcp, name, config, old).await.map(|()| true),
+    }
+}
+
+/// Удалить сервер из менеджера и конфига; клиент закрывается уже без замка.
+pub async fn remove(mcp: &tokio::sync::Mutex<MCPManager>, name: &str) -> AppResult<()> {
+    let client = {
+        let mut manager = mcp.lock().await;
+        let client = manager.take_server(name)?;
+        manager.persist_config();
+        client
+    };
+    close_quietly(&client, name).await;
+    Ok(())
+}
+
+/// Добавить свой сервер (из `/mcp add`) и подключить; вернуть его состояние.
+pub async fn add(
+    mcp: &tokio::sync::Mutex<MCPManager>,
+    name: String,
+    config: MCPServerConfig,
+) -> AppResult<MCPServerStatus> {
+    let duplicate = || crate::error::AppError::Mcp(format!("Server '{name}' already exists"));
+    if mcp.lock().await.has_server(&name) {
+        return Err(duplicate());
+    }
+    let client = Arc::new(build_client(&name, &config).await.map_err(|error| {
+        crate::error::AppError::Mcp(format!("Failed to create a client for '{name}': {error}"))
+    })?);
+    let inserted = {
+        let mut manager = mcp.lock().await;
+        let free = !manager.has_server(&name);
+        if free {
+            let entry = MCPServerEntry::pending(Arc::clone(&client), config, ServerSource::Own);
+            manager.servers.insert(name.clone(), entry);
+            // Сразу на диск: параллельный `reload` перечитает конфиг и не потеряет сервер.
+            manager.persist_config();
+        }
+        free
+    };
+    if !inserted {
+        close_quietly(&client, &name).await;
+        return Err(duplicate());
+    }
+    connect_installed(mcp, &name, Arc::clone(&client), &client).await;
+    Ok(mcp
+        .lock()
+        .await
+        .servers
+        .get(&name)
+        .map(|entry| entry.status.clone())
+        .unwrap_or(MCPServerStatus::Pending))
+}
+
+/// Закрыть старый клиент, собрать новый по `config` и подключить без замка.
+/// Не собрался — `Error` в записи, если её не успел перехватить другой вызов.
+async fn rebuild(
+    mcp: &tokio::sync::Mutex<MCPManager>,
+    name: &str,
+    config: MCPServerConfig,
+    old: Arc<MCPClient>,
+) -> AppResult<()> {
+    close_quietly(&old, name).await;
+    match build_client(name, &config).await {
+        Ok(client) => {
+            connect_installed(mcp, name, Arc::new(client), &old).await;
+            Ok(())
+        }
+        Err(error) => {
+            let mut manager = mcp.lock().await;
+            if manager.owns(name, &old)
+                && let Some(entry) = manager.servers.get_mut(name)
+            {
+                entry.status = MCPServerStatus::Error(error.to_string());
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Поставить новый клиент вместо `previous`, подключить без замка и слить итог.
+/// Сервер успели удалить, выключить или переподключить — наш клиент закрывается.
+async fn connect_installed(
+    mcp: &tokio::sync::Mutex<MCPManager>,
+    name: &str,
+    client: Arc<MCPClient>,
+    previous: &Arc<MCPClient>,
+) {
+    let cache_ttl = {
+        let mut manager = mcp.lock().await;
+        let ttl = manager.cache_ttl;
+        match manager.servers.get_mut(name) {
+            Some(entry) if entry.enabled && Arc::ptr_eq(&entry.client, previous) => {
+                entry.client = Arc::clone(&client);
+                Some(ttl)
+            }
+            _ => None,
+        }
+    };
+    let Some(cache_ttl) = cache_ttl else {
+        close_quietly(&client, name).await;
+        return;
+    };
+    // Кэш не берём: переподключают, когда хотят свежий список инструментов.
+    let outcome = connect_one(name.to_string(), client, None, cache_ttl).await;
+    mcp.lock().await.apply_connect_outcome(outcome);
+}
+
+/// Собрать `MCPClient` под транспорт из `config`. Для `Http`/`Sse` подмешать
+/// сохранённый `/mcp auth` заголовок `Authorization` (нет токена — без него).
 async fn build_client(name: &str, config: &MCPServerConfig) -> AppResult<MCPClient> {
     match config {
         MCPServerConfig::Stdio {
@@ -850,11 +813,6 @@ async fn build_client(name: &str, config: &MCPServerConfig) -> AppResult<MCPClie
             MCPClient::from_sse(name, url, headers).await
         }
     }
-}
-
-pub struct FullMCPTool {
-    pub full_name: String,
-    pub tool: MCPTool,
 }
 
 #[cfg(test)]
@@ -920,5 +878,186 @@ mod tests {
         let (enabled, source) = resolve_enabled_and_source("shared-name", &own, &foreign);
         assert!(enabled);
         assert_eq!(source, ServerSource::Own);
+    }
+
+    /// Транспорт без сервера: запросы падают, `close` отмечается во флаге.
+    struct Offline(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl crate::mcp::transport::Transport for Offline {
+        async fn send_request(
+            &mut self,
+            _request: &crate::mcp::jsonrpc::JsonRpcRequest,
+        ) -> AppResult<crate::mcp::jsonrpc::JsonRpcResponse> {
+            Err(crate::error::AppError::Mcp("offline".to_string()))
+        }
+        async fn send_raw(&mut self, _data: &[u8]) -> AppResult<()> {
+            Err(crate::error::AppError::Mcp("offline".to_string()))
+        }
+        async fn close(&mut self) -> AppResult<()> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Клиент и флаг «его закрыли».
+    fn offline_client() -> (Arc<MCPClient>, Arc<std::sync::atomic::AtomicBool>) {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = MCPClient::from_transport("srv", Offline(Arc::clone(&closed)));
+        (Arc::new(client), closed)
+    }
+
+    fn config() -> MCPServerConfig {
+        MCPServerConfig::Stdio {
+            command: "never-run".to_string(),
+            args: Vec::new(),
+            env: None,
+            cwd: None,
+        }
+    }
+
+    fn manager_with(entry: MCPServerEntry) -> tokio::sync::Mutex<MCPManager> {
+        let mut manager = MCPManager::new();
+        manager.servers.insert("srv".to_string(), entry);
+        tokio::sync::Mutex::new(manager)
+    }
+
+    fn is_closed(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Запись всё ещё на `previous` — наш клиент встаёт и его итог сливается.
+    #[tokio::test]
+    async fn connect_installed_installs_and_merges_its_own_client() {
+        let previous = Arc::new(MCPClient::dummy("srv"));
+        let mcp = manager_with(MCPServerEntry::pending(
+            Arc::clone(&previous),
+            config(),
+            ServerSource::Own,
+        ));
+        let (ours, closed) = offline_client();
+
+        connect_installed(&mcp, "srv", Arc::clone(&ours), &previous).await;
+
+        let manager = mcp.lock().await;
+        let entry = &manager.servers["srv"];
+        assert!(Arc::ptr_eq(&entry.client, &ours));
+        assert!(matches!(entry.status, MCPServerStatus::Error(_)));
+        assert!(!is_closed(&closed));
+    }
+
+    /// Другой вызов уже поставил свой клиент: наш закрыт, чужое не тронуто.
+    #[tokio::test]
+    async fn connect_installed_closes_its_client_when_the_entry_was_replaced() {
+        let newer = Arc::new(MCPClient::dummy("srv"));
+        let mut entry = MCPServerEntry::pending(Arc::clone(&newer), config(), ServerSource::Own);
+        entry.status = MCPServerStatus::Connected;
+        let mcp = manager_with(entry);
+        let (ours, closed) = offline_client();
+        let previous = Arc::new(MCPClient::dummy("srv"));
+
+        connect_installed(&mcp, "srv", ours, &previous).await;
+
+        assert!(is_closed(&closed));
+        let manager = mcp.lock().await;
+        let entry = &manager.servers["srv"];
+        assert!(Arc::ptr_eq(&entry.client, &newer));
+        assert_eq!(entry.status, MCPServerStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn connect_installed_closes_its_client_when_the_server_was_disabled() {
+        let mcp = manager_with(MCPServerEntry::disabled("srv", config(), ServerSource::Own));
+        let previous = Arc::clone(&mcp.lock().await.servers["srv"].client);
+        let (ours, closed) = offline_client();
+
+        connect_installed(&mcp, "srv", ours, &previous).await;
+
+        assert!(is_closed(&closed));
+        let manager = mcp.lock().await;
+        let entry = &manager.servers["srv"];
+        assert!(Arc::ptr_eq(&entry.client, &previous));
+        assert_eq!(entry.status, MCPServerStatus::Disabled);
+    }
+
+    #[tokio::test]
+    async fn connect_installed_closes_its_client_when_the_server_was_removed() {
+        let mcp = tokio::sync::Mutex::new(MCPManager::new());
+        let (ours, closed) = offline_client();
+        let previous = Arc::new(MCPClient::dummy("srv"));
+
+        connect_installed(&mcp, "srv", ours, &previous).await;
+
+        assert!(is_closed(&closed));
+        assert!(!mcp.lock().await.has_server("srv"));
+    }
+
+    /// Итог клиента, которого в записи уже нет, не перетирает свежее состояние.
+    #[test]
+    fn an_outcome_of_a_replaced_client_is_not_merged() {
+        let installed = Arc::new(MCPClient::dummy("srv"));
+        let mut manager = MCPManager::new();
+        manager.servers.insert(
+            "srv".to_string(),
+            MCPServerEntry::pending(installed, config(), ServerSource::Own),
+        );
+
+        manager.apply_connect_outcome(ConnectOutcome {
+            name: "srv".to_string(),
+            client: Arc::new(MCPClient::dummy("srv")),
+            status: MCPServerStatus::Connected,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            tool_entries: vec![("mcp__srv__t".into(), "srv".into(), "t".into())],
+            used_cache: false,
+        });
+
+        assert_eq!(manager.servers["srv"].status, MCPServerStatus::Pending);
+        assert!(manager.tool_name_map.is_empty());
+        assert!(manager.cache.is_empty());
+    }
+
+    /// Два переключения подряд — «выкл, вкл», а не два включения.
+    #[test]
+    fn flip_decides_and_changes_in_one_step() {
+        let mut manager = MCPManager::new();
+        let (client, _) = offline_client();
+        manager.servers.insert(
+            "srv".to_string(),
+            MCPServerEntry::pending(Arc::clone(&client), config(), ServerSource::Own),
+        );
+
+        let Ok(Flip::Disabled(old)) = manager.flip("srv") else {
+            panic!("включённый сервер должен выключиться");
+        };
+        assert!(Arc::ptr_eq(&old, &client));
+        assert_eq!(manager.servers["srv"].status, MCPServerStatus::Disabled);
+
+        assert!(matches!(manager.flip("srv"), Ok(Flip::Enabling(..))));
+        let entry = &manager.servers["srv"];
+        assert!(entry.enabled);
+        assert_eq!(entry.status, MCPServerStatus::Pending);
+
+        assert!(manager.flip("nope").is_err());
+    }
+
+    #[test]
+    fn take_server_drops_the_entry_and_its_tools() {
+        let mut manager = MCPManager::new();
+        let (client, _) = offline_client();
+        manager.servers.insert(
+            "srv".to_string(),
+            MCPServerEntry::pending(Arc::clone(&client), config(), ServerSource::Own),
+        );
+        manager
+            .tool_name_map
+            .insert("mcp__srv__t".into(), ("srv".into(), "t".into()));
+
+        let taken = manager.take_server("srv").expect("сервер есть");
+
+        assert!(Arc::ptr_eq(&taken, &client));
+        assert!(!manager.has_server("srv"));
+        assert!(manager.tool_name_map.is_empty());
+        assert!(manager.take_server("srv").is_err());
     }
 }

@@ -82,12 +82,11 @@ impl App {
                     let mcp = Arc::clone(&self.mcp);
                     let event_tx = self.event_tx.clone();
                     tokio::spawn(async move {
-                        let message = match mcp.lock().await.toggle_server(&name).await {
+                        let message = match crate::mcp::manager::toggle(&mcp, &name).await {
                             Err(e) => format!("Toggle failed: {e}"),
-                            Ok(_) => format!(
-                                "{name} {}",
-                                if was_enabled { "disabled" } else { "enabled" },
-                            ),
+                            Ok(enabled) => {
+                                format!("{name} {}", if enabled { "enabled" } else { "disabled" },)
+                            }
                         };
                         let _ = event_tx.send(events::AppEvent::McpOperationDone { message });
                     });
@@ -107,7 +106,7 @@ impl App {
                     let mcp = Arc::clone(&self.mcp);
                     let event_tx = self.event_tx.clone();
                     tokio::spawn(async move {
-                        let message = match mcp.lock().await.reconnect_server(&name).await {
+                        let message = match crate::mcp::manager::reconnect(&mcp, &name).await {
                             Err(e) => format!("Reconnect failed: {e}"),
                             Ok(_) => format!("{name} reconnected"),
                         };
@@ -132,7 +131,7 @@ impl App {
                     let mcp = Arc::clone(&self.mcp);
                     let event_tx = self.event_tx.clone();
                     tokio::spawn(async move {
-                        let message = match mcp.lock().await.remove_server(&name).await {
+                        let message = match crate::mcp::manager::remove(&mcp, &name).await {
                             Err(e) => format!("Remove failed: {e}"),
                             Ok(_) => format!("{name} removed"),
                         };
@@ -221,7 +220,7 @@ impl App {
         Ok(false)
     }
 
-    /// Send `entries` to `MCPManager::add_new_server` one at a time, off the
+    /// Send `entries` to `mcp::manager::add` one at a time, off the
     /// event loop (each add connects a fresh client, which can take a
     /// while). Reuses `AppEvent::McpOperationDone` for the result — same
     /// handling as reload/toggle/reconnect (refreshes the cached server
@@ -232,7 +231,7 @@ impl App {
         tokio::spawn(async move {
             let mut lines = Vec::with_capacity(entries.len());
             for (name, config) in entries {
-                let outcome = mcp.lock().await.add_new_server(name.clone(), config).await;
+                let outcome = crate::mcp::manager::add(&mcp, name.clone(), config).await;
                 lines.push(match outcome {
                     Ok(status) => format!("{name}: added ({})", mcp_add::status_label(&status)),
                     Err(e) => format!("{name}: {e}"),
