@@ -48,6 +48,8 @@ pub struct FakeProvider {
     /// терминальная причина, — ровно так, как это делает настоящий протокол.
     /// Отдаются один раз, иначе ход не смог бы закончиться.
     tool_calls: Mutex<Vec<crate::provider::ToolCall>>,
+    /// Сценарий для первого форка — так тест ведёт суб-агента.
+    fork_responses: Mutex<Option<Vec<String>>>,
 }
 
 impl FakeProvider {
@@ -63,6 +65,7 @@ impl FakeProvider {
             responses: Mutex::new(responses.into_iter().collect()),
             chunk_count: 1,
             abrupt_eof_remaining: Mutex::new(0),
+            fork_responses: Mutex::new(None),
             server_side_history: false,
             session_tokens: None,
             seen_requests: Mutex::new(Vec::new()),
@@ -111,6 +114,12 @@ impl FakeProvider {
     /// Имена инструментов, объявленных полем `tools` в запросе `n`.
     pub fn declared_tools(&self, n: usize) -> Option<Vec<String>> {
         self.seen_tools.lock().unwrap().get(n).cloned()
+    }
+
+    /// Ответы первого форка (суб-агента).
+    pub fn forks_with(self, responses: Vec<String>) -> Self {
+        *self.fork_responses.lock().unwrap() = Some(responses);
+        self
     }
 
     pub fn server_side_history(mut self) -> Self {
@@ -235,7 +244,8 @@ impl LLMProvider for FakeProvider {
     fn fork(&self) -> std::sync::Arc<dyn LLMProvider> {
         // A fork starts empty — tests script it independently of the parent —
         // but keeps the parent's wire behaviour.
-        let fork = FakeProvider::with_responses(Vec::new());
+        let scripted = self.fork_responses.lock().unwrap().take();
+        let fork = FakeProvider::with_responses(scripted.unwrap_or_default());
         std::sync::Arc::new(if self.server_side_history {
             fork.server_side_history()
         } else {

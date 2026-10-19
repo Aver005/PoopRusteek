@@ -71,7 +71,7 @@ pub struct ParseCtx<'a> {
     pub catalog: &'a ToolCatalog,
     /// Выводы инструментов беседы: чужая разметка, взятая оттуда, не исполняется.
     pub tool_outputs: Vec<&'a str>,
-    /// Подтвердить некому: `auto_approve` или суб-агент.
+    /// Подтвердить некому: ход без человека (фоновый чат, суб-агент).
     pub unattended: bool,
 }
 

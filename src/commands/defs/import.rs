@@ -61,6 +61,7 @@ impl Command for ImportCommand {
             }
 
             state.focused_mut().messages = messages;
+            state.focused_mut().deferred.clear();
             state.focused_mut().session_id = session_id.clone();
             // Without this, the very next auto-save (on the user's first reply in
             // this session) would silently overwrite the file's tag back to

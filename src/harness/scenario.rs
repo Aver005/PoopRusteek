@@ -104,7 +104,7 @@ fn default_approve() -> String {
 }
 
 fn default_timeout() -> u64 {
-    300
+    600
 }
 
 fn default_semantic() -> String {
@@ -733,12 +733,13 @@ async fn execute(
             if index > 0 && !spacing.is_zero() {
                 tokio::time::sleep(spacing).await;
             }
-            let child = ChildRun {
+            let mut child = ChildRun {
                 trace_path: &trace_path,
-                resume: resume.as_deref(),
+                resume,
                 globals: &globals,
+                scratch: scratch.as_deref(),
             };
-            let outcome = run_repeat(&scenario, &child).await;
+            let outcome = run_repeat(&scenario, &mut child).await;
             (index, trace_path, scratch, outcome)
         }));
     }
@@ -780,8 +781,10 @@ async fn execute(
 struct ChildRun<'a> {
     trace_path: &'a Path,
     /// Session id planted for this repeat from `session_template`.
-    resume: Option<&'a str>,
+    resume: Option<String>,
     globals: &'a GlobalFlags,
+    /// Своя копия шаблона рабочей папки, если сценарий её просит.
+    scratch: Option<&'a Path>,
 }
 
 /// Copy a session fixture into the data dir under a fresh id and return it.
@@ -872,7 +875,7 @@ fn exec_args(scenario: &Scenario, child: &ChildRun) -> Vec<std::ffi::OsString> {
     if scenario.save_session {
         args.push("--save-session".into());
     }
-    if let Some(id) = child.resume {
+    if let Some(id) = &child.resume {
         push_flag(&mut args, "--resume", id);
     }
 
@@ -913,9 +916,22 @@ struct Repeat {
 /// процессе, и защитить серию он не может устройством. Прогон, убитый
 /// лимитом, ничего не измерил, поэтому он пересдаётся, а не засчитывается
 /// провалом — иначе «3 из 6» читается как нестабильность агента.
-async fn run_repeat(scenario: &Scenario, child: &ChildRun<'_>) -> AppResult<Repeat> {
+async fn run_repeat(scenario: &Scenario, child: &mut ChildRun<'_>) -> AppResult<Repeat> {
     let mut rate_limited_retries = 0;
     loop {
+        // Не вышло начать с чистого листа — провал этого повтора, а не серии.
+        if rate_limited_retries > 0
+            && let Err(error) = reset_for_retry(scenario, child)
+        {
+            return Ok(Repeat {
+                outcome: child_failed(
+                    RunStatus::SetupFailed,
+                    child.trace_path,
+                    format!("could not reset for a rate-limit retry: {error}"),
+                ),
+                rate_limited_retries,
+            });
+        }
         let outcome = spawn_run(scenario, child).await?;
         if !is_rate_limited(&outcome) {
             return Ok(Repeat {
@@ -932,6 +948,35 @@ async fn run_repeat(scenario: &Scenario, child: &ChildRun<'_>) -> AppResult<Repe
         rate_limited_retries += 1;
         tokio::time::sleep(*backoff).await;
     }
+}
+
+/// Пересдача начинается с чистого листа: та же трасса дописывалась бы (seq
+/// с нуля перемешивал записи двух попыток), папка и сессия несли бы след первой.
+fn reset_for_retry(scenario: &Scenario, child: &mut ChildRun<'_>) -> AppResult<()> {
+    match std::fs::remove_file(child.trace_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(AppError::Custom(format!(
+                "{}: {error}",
+                child.trace_path.display()
+            )));
+        }
+    }
+    if let (Some(template), Some(scratch)) = (&scenario.workspace_template, child.scratch) {
+        match std::fs::remove_dir_all(scratch) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Custom(format!("{}: {error}", scratch.display())));
+            }
+        }
+        copy_tree(template, scratch)?;
+    }
+    if let Some(template) = &scenario.session_template {
+        child.resume = Some(plant_session(template)?);
+    }
+    Ok(())
 }
 
 /// Провайдер придушил запрос? Совпадение по его собственному коду причины
@@ -969,14 +1014,17 @@ async fn spawn_run(scenario: &Scenario, child: &ChildRun<'_>) -> AppResult<RunOu
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             return Ok(child_failed(
+                RunStatus::SetupFailed,
                 trace_path,
                 format!("exec child i/o error: {error}"),
             ));
         }
+        // Ребёнок пережил свой же срок — это зависание, а не ошибка настройки.
         Err(_) => {
             return Ok(child_failed(
+                RunStatus::TimedOut,
                 trace_path,
-                format!("exec child killed after {}s", grace.as_secs()),
+                format!("exec child hung and was killed after {}s", grace.as_secs()),
             ));
         }
     };
@@ -984,12 +1032,15 @@ async fn spawn_run(scenario: &Scenario, child: &ChildRun<'_>) -> AppResult<RunOu
     let stdout = crate::util::decode_process_output(&output.stdout);
     match serde_json::from_str::<RunOutcome>(stdout.trim()) {
         Ok(outcome) => Ok(outcome),
+        // Код выхода говорит, что случилось: паника (101), чужой сбой.
         Err(error) => {
             let stderr = crate::util::decode_process_output(&output.stderr);
             Ok(child_failed(
+                RunStatus::Failed,
                 trace_path,
                 format!(
-                    "unreadable exec output ({error}); stderr: {}",
+                    "exec child exited with {} and unreadable output ({error}); stderr: {}",
+                    output.status,
                     crate::util::truncate_with_ellipsis(stderr.trim(), 500)
                 ),
             ))
@@ -997,21 +1048,12 @@ async fn spawn_run(scenario: &Scenario, child: &ChildRun<'_>) -> AppResult<RunOu
     }
 }
 
-/// A child that never reported an outcome is recorded as a setup failure so
-/// the repeat still appears in the report instead of vanishing.
-fn child_failed(trace_path: &Path, error: String) -> RunOutcome {
+/// A child that never reported an outcome still appears in the report, under
+/// the status that matches what happened to it.
+fn child_failed(status: RunStatus, trace_path: &Path, error: String) -> RunOutcome {
     RunOutcome {
-        status: RunStatus::SetupFailed,
-        trace_path: trace_path.to_path_buf(),
-        duration_ms: 0,
-        turns: 0,
-        final_text: String::new(),
-        tools: Vec::new(),
-        sub_agents: 0,
-        questions: Vec::new(),
         error: Some(error),
-        session_id: None,
-        semantic_ready: false,
+        ..RunOutcome::bare(status, trace_path.to_path_buf())
     }
 }
 
@@ -1093,6 +1135,7 @@ mod tests {
             trace_path: Path::new("t.jsonl"),
             resume: None,
             globals: &GLOBALS,
+            scratch: None,
         }
     }
 
@@ -1104,8 +1147,6 @@ mod tests {
 
     fn outcome(status: RunStatus, text: &str) -> RunOutcome {
         RunOutcome {
-            status,
-            trace_path: PathBuf::from("t.jsonl"),
             duration_ms: 10,
             turns: 1,
             final_text: text.to_string(),
@@ -1113,12 +1154,10 @@ mod tests {
                 name: "bash".into(),
                 approved: true,
                 ok: true,
+                conversation: 1,
+                error: None,
             }],
-            sub_agents: 0,
-            questions: Vec::new(),
-            error: None,
-            session_id: None,
-            semantic_ready: false,
+            ..RunOutcome::bare(status, PathBuf::from("t.jsonl"))
         }
     }
 
@@ -1354,25 +1393,13 @@ mod tests {
         let scenario = Scenario::from_toml("name = \"x\"\nprompt = \"y\"\n", "t.toml").unwrap();
         assert_eq!(scenario.approve, "all");
         assert_eq!(scenario.semantic, "off");
-        assert_eq!(scenario.timeout, 300);
+        assert_eq!(scenario.timeout, 600);
         assert!(!scenario.mcp);
         assert_eq!(scenario.expect.min_pass_rate(), 1.0);
     }
 
     fn setup_failed_outcome() -> RunOutcome {
-        RunOutcome {
-            status: RunStatus::SetupFailed,
-            trace_path: PathBuf::from("t.jsonl"),
-            duration_ms: 0,
-            turns: 0,
-            final_text: String::new(),
-            tools: Vec::new(),
-            sub_agents: 0,
-            questions: Vec::new(),
-            error: Some("no provider configured".into()),
-            session_id: None,
-            semantic_ready: false,
-        }
+        RunOutcome::setup_failed(PathBuf::from("t.jsonl"), "no provider configured")
     }
 
     /// The regression this guard exists for: a token-less config reported
@@ -1686,8 +1713,9 @@ prompt = \"y\"
         };
         let child = ChildRun {
             trace_path: Path::new("t.jsonl"),
-            resume: Some("2026-09-06T00-00-00-000Z-abc123"),
+            resume: Some("2026-09-06T00-00-00-000Z-abc123".to_string()),
             globals: &globals,
+            scratch: None,
         };
         let rendered = rendered(exec_args(&scenario, &child));
 

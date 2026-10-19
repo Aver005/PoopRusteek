@@ -28,15 +28,50 @@ pub struct TurnSpec {
     pub max_tokens: u32,
     pub max_steps: usize,
     pub max_tools_per_step: usize,
-    /// Background turns (sidechats / sub-agents) auto-approve tools so they
-    /// never block on an approval modal.
-    pub auto_approve: bool,
+    /// За ходом не следит человек: вопросы, таймеры, вложенные `task` и вызовы
+    /// в чужой разметке отклоняются.
+    pub unattended: bool,
     /// Chars kept per tool result before it enters the history (rung 0 of
     /// the compaction ladder). `0` = uncapped.
     pub tool_output_limit: usize,
     /// Rung 1: window settings and spill directory for clearing old tool
     /// bodies. A default `ContextSpec` keeps the ladder off.
     pub context: crate::context::ContextSpec,
+}
+
+impl TurnSpec {
+    /// Фоновый ход без человека (`/btw`, фоновый `task`) — один рецепт для TUI
+    /// и харнесса: шагов не больше потолка, в промпте — рассказ о положении.
+    pub fn background(
+        conversation: ConversationId,
+        provider: Arc<dyn LLMProvider>,
+        prompt: &str,
+        system_prompt: &str,
+        config: &crate::config::Config,
+        context: crate::context::ContextSpec,
+    ) -> Self {
+        let max_steps = config
+            .agent
+            .max_steps_per_turn
+            .clamp(1, crate::agent::SUB_AGENT_MAX_STEPS);
+        Self {
+            conversation,
+            provider,
+            messages: vec![ChatMessage::user(prompt)],
+            system_prompt: format!(
+                "{system_prompt}\n\n{}",
+                crate::agent::sub_agent::unattended_note(max_steps)
+            ),
+            model: config.provider.model.clone(),
+            temperature: config.provider.temperature,
+            max_tokens: config.provider.max_tokens,
+            max_steps,
+            max_tools_per_step: config.agent.max_tools_per_step.max(1),
+            unattended: true,
+            tool_output_limit: config.context.tool_output_limit as usize,
+            context: context.with_output_cap(config.provider.max_tokens),
+        }
+    }
 }
 
 /// Owns the dependencies for running agent turns and centralizes spawning.
@@ -62,33 +97,41 @@ impl AgentRuntime {
         }
     }
 
-    /// Запустить ход в своей задаче; хэндл нужен для отмены. Паника хода
-    /// становится `Failed`: без него TUI крутил «Thinking» вечно.
+    /// Запустить ход в своей задаче; хэндл нужен для отмены.
     pub fn spawn(&self, spec: TurnSpec) -> JoinHandle<()> {
-        let conversation = spec.conversation;
-        let event_tx = self.event_tx.clone();
-        let turn = crate::agent::runner::run_agent_loop(
+        tokio::spawn(run_guarded(
             spec,
             Arc::clone(&self.tools),
             Arc::clone(&self.mcp),
             Arc::clone(&self.semantic),
             self.event_tx.clone(),
-        );
-        tokio::spawn(async move {
-            if let Err(panic) = AssertUnwindSafe(turn).catch_unwind().await {
-                let reason = panic_text(panic.as_ref());
-                tracing::error!("agent task panicked: {reason}");
-                crate::debug_log::log("agent.panic", &reason);
-                // Текст паники — только в журналы: в истории он ушёл бы модели.
-                let _ = event_tx.send(AppEvent::Agent {
-                    conversation,
-                    event: AgentEvent::Failed(
-                        "Internal error: the agent task crashed (details are in the log). Tool calls made before the crash were kept."
-                            .to_string(),
-                    ),
-                });
-            }
-        })
+        ))
+    }
+}
+
+/// Единственная обёртка над `run_agent_loop`: и для `spawn`, и для суб-агента
+/// `task`, который идёт внутри future родителя. Паника хода становится `Failed`.
+pub(crate) async fn run_guarded(
+    spec: TurnSpec,
+    tools: Arc<ToolRegistry>,
+    mcp: Arc<tokio::sync::Mutex<MCPManager>>,
+    semantic: Arc<crate::semantic::SemanticService>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let conversation = spec.conversation;
+    let turn = crate::agent::runner::run_agent_loop(spec, tools, mcp, semantic, event_tx.clone());
+    if let Err(panic) = AssertUnwindSafe(turn).catch_unwind().await {
+        let reason = panic_text(panic.as_ref());
+        tracing::error!("agent task panicked: {reason}");
+        crate::debug_log::log("agent.panic", &reason);
+        // Текст паники — только в журналы: в истории он ушёл бы модели.
+        let _ = event_tx.send(AppEvent::Agent {
+            conversation,
+            event: AgentEvent::Failed(
+                "Internal error: the agent task crashed (details are in the log). Tool calls made before the crash were kept."
+                    .to_string(),
+            ),
+        });
     }
 }
 
@@ -152,7 +195,7 @@ mod tests {
             max_tokens: 128,
             max_steps: 4,
             max_tools_per_step: 4,
-            auto_approve: false,
+            unattended: false,
             tool_output_limit: 0,
             context: crate::context::ContextSpec::default(),
         });

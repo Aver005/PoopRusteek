@@ -8,10 +8,8 @@
 //! same system prompt, same `AgentRuntime::spawn` — with the human replaced
 //! by a policy. Two details make it faithful rather than a shortcut:
 //!
-//! - `auto_approve` stays **false**. Approvals are answered from
-//!   [`ApprovePolicy`] instead of being bypassed, so the real approval path
-//!   is exercised, denial is testable, and the `task` tool still works
-//!   (`runner` refuses sub-agents when `auto_approve` is on).
+//! - Подтверждения отвечает [`ApprovePolicy`], а не обход: у каждого хода,
+//!   фонового и суб-агента тоже, проверяется настоящий путь и отказ.
 //! - Sub-agents requested via `AppEvent::SpawnSubAgent` are actually
 //!   spawned and waited for, so a turn's full tree is in the trace.
 //!
@@ -36,7 +34,7 @@ use crate::semantic::SemanticService;
 use crate::skills::discovery::discover_all_skills;
 use crate::tools::registry::ToolRegistry;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -44,7 +42,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Marks where one user turn ends and the next begins in the trace.
-const TURN_STARTED: &str = "harness.turn.started";
+pub(crate) const TURN_STARTED: &str = "harness.turn.started";
 
 /// How the driver answers `RequestToolApproval`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,11 +95,14 @@ impl ApprovePolicy {
         tool: &str,
         scope: Option<&crate::whitelist::Scope>,
         whitelist: &crate::whitelist::Whitelist,
+        always_ask: bool,
     ) -> bool {
         match self {
             Self::All => true,
             Self::None => false,
-            Self::Whitelist => whitelist.allows(tool, scope),
+            // Как в TUI: вызов в чужой разметке или с поправленным именем
+            // белый список не одобряет — только человек, которого здесь нет.
+            Self::Whitelist => !always_ask && whitelist.allows(tool, scope),
             Self::Except(denied) => !denied.iter().any(|name| name == tool),
         }
     }
@@ -251,6 +252,32 @@ pub struct ToolInvocation {
     pub approved: bool,
     /// `false` for a tool whose result came back flagged as an error.
     pub ok: bool,
+    /// Чей это вызов: корневой ход, фоновый суб-агент. У суб-агента `task`
+    /// имя вида `label › tool`, а чат — родительский.
+    #[serde(default)]
+    pub conversation: u64,
+    /// Выжимка ошибки или причина отказа.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Ответ на `question`, выбранный за вызывающего.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnsweredQuestion {
+    pub question: String,
+    pub options: Vec<String>,
+    pub answer: String,
+    /// `flag` — из `--answer`, `default` — первый вариант, `none` — пустой ответ.
+    pub source: String,
+}
+
+/// Чем кончился фоновый суб-агент (`task` с `background=true`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubAgentResult {
+    pub label: String,
+    /// `completed` | `failed` | `stopped`.
+    pub status: String,
+    pub text: String,
 }
 
 /// Machine-readable result of one run. Printed by `exec` and consumed by
@@ -273,6 +300,14 @@ pub struct RunOutcome {
     pub session_id: Option<String>,
     /// `true` when the semantic layer was ready by the time the turn ran.
     pub semantic_ready: bool,
+    /// Что вызывающему стоит знать при любом статусе: ответ обрезан лимитом,
+    /// сессия не сохранилась, фоновые суб-агенты остановлены по сроку.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub answered: Vec<AnsweredQuestion>,
+    #[serde(default)]
+    pub sub_agent_results: Vec<SubAgentResult>,
 }
 
 fn one_turn() -> usize {
@@ -280,9 +315,10 @@ fn one_turn() -> usize {
 }
 
 impl RunOutcome {
-    fn setup_failed(trace_path: PathBuf, error: impl Into<String>) -> Self {
+    /// Пустой вердикт с данным статусом — основа для всех остальных.
+    pub fn bare(status: RunStatus, trace_path: PathBuf) -> Self {
         Self {
-            status: RunStatus::SetupFailed,
+            status,
             trace_path,
             duration_ms: 0,
             turns: 0,
@@ -290,9 +326,19 @@ impl RunOutcome {
             tools: Vec::new(),
             sub_agents: 0,
             questions: Vec::new(),
-            error: Some(error.into()),
+            error: None,
             session_id: None,
             semantic_ready: false,
+            warnings: Vec::new(),
+            answered: Vec::new(),
+            sub_agent_results: Vec::new(),
+        }
+    }
+
+    pub fn setup_failed(trace_path: PathBuf, error: impl Into<String>) -> Self {
+        Self {
+            error: Some(error.into()),
+            ..Self::bare(RunStatus::SetupFailed, trace_path)
         }
     }
 }
@@ -300,6 +346,8 @@ impl RunOutcome {
 /// Deps a turn runs against, assembled the way `App::new` assembles them.
 struct Harness {
     runtime: AgentRuntime,
+    /// Чтобы погасить серверы в конце прогона: их процессы иначе переживали `exec`.
+    mcp: Arc<tokio::sync::Mutex<MCPManager>>,
     provider: Arc<dyn LLMProvider>,
     system_prompt: String,
     semantic_ready: bool,
@@ -307,30 +355,122 @@ struct Harness {
     attachments: Vec<crate::provider::AttachedFile>,
 }
 
-/// Run one turn to completion. Errors are returned as a `SetupFailed`
-/// outcome rather than an `Err` whenever the run itself produced a verdict —
-/// `Err` is reserved for "could not even open the trace".
-pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<RunOutcome> {
-    // Absolutize the trace path *before* the chdir below. A relative path
-    // resolved afterwards would land inside the workspace under test — which
-    // both hides the trace and contaminates the very directory the turn is
-    // measured against (the agent sees the harness's own scratch files).
-    options.trace_path = absolutize(&options.trace_path)?;
+/// Run every turn to completion and return the verdict. Never an `Err`:
+/// whatever went wrong — a bad workspace, an unwritable trace, a setup that
+/// outlived the budget — is a `SetupFailed` / `TimedOut` verdict on stdout.
+pub async fn exec(mut config: Config, mut options: ExecOptions) -> RunOutcome {
+    let started = Instant::now();
+    // Один срок на весь прогон, от старта: подготовка (MCP, индекс, проверка
+    // сессии) раньше шла вне его и могла длиться дольше `--timeout`.
+    // `checked_add`: огромный `--timeout` раньше просто ждал вечно, а не падал.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(options.timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(u64::from(u32::MAX)));
+    if let Err(error) = prepare_trace(&mut options) {
+        return finished(
+            RunOutcome::setup_failed(options.trace_path.clone(), error),
+            started,
+        );
+    }
+    if let Err(error) = check_provider(&config, &options) {
+        return finished(
+            RunOutcome::setup_failed(options.trace_path.clone(), error),
+            started,
+        );
+    }
+    apply_overrides(&mut config, &mut options);
+    log_run_started(&config, &options);
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let setup = async {
+        // Сессию поднимаем раньше провайдера: неизвестный id — отказ до первого
+        // хода, а не тихий прогон с нуля, который судить нечем.
+        let resumed = load_resumed(&config, &options)?;
+        let harness = assemble(&config, &options, &workspace(), event_tx.clone()).await?;
+        if let Some(session) = &resumed {
+            adopt_remote_session(&harness.provider, session).await;
+        }
+        Ok::<_, AppError>((resumed, harness))
+    };
+    let (resumed, harness) = match tokio::time::timeout_at(deadline, setup).await {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => {
+            return finished(
+                RunOutcome::setup_failed(options.trace_path.clone(), error.to_string()),
+                started,
+            );
+        }
+        Err(_) => {
+            let outcome = RunOutcome {
+                error: Some(format!(
+                    "run exceeded {}s before the first turn (connecting MCP servers, waiting for the semantic index, or checking the resumed session)",
+                    options.timeout.as_secs()
+                )),
+                ..RunOutcome::bare(RunStatus::TimedOut, options.trace_path.clone())
+            };
+            return finished(outcome, started);
+        }
+    };
+
+    let mut outcome = drive(
+        &config,
+        &options,
+        resumed.as_ref(),
+        &harness,
+        (event_tx, event_rx),
+        deadline,
+    )
+    .await;
+    outcome.semantic_ready = harness.semantic_ready;
+    shut_down(&harness, &options).await;
+    finished(outcome, started)
+}
+
+/// Записать вердикт в трассу, проставив длительность.
+fn finished(mut outcome: RunOutcome, started: Instant) -> RunOutcome {
+    outcome.duration_ms = started.elapsed().as_millis() as u64;
+    debug_log::log_json(action::RUN_FINISHED, &outcome);
+    outcome
+}
+
+/// Трасса и рабочая папка. Путь трассы — абсолютный до смены папки: иначе он
+/// лёг бы внутрь проверяемой папки и агент увидел бы файлы харнесса.
+fn prepare_trace(options: &mut ExecOptions) -> Result<(), String> {
+    options.trace_path = absolutize(&options.trace_path).map_err(|e| e.to_string())?;
     if let Some(parent) = options.trace_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| AppError::Custom(format!("{}: {e}", parent.display())))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-
+    debug_log::configure(options.trace_path.clone(), debug_log::Format::Jsonl);
+    debug_log::init(true).map_err(|e| format!("cannot open the trace: {e}"))?;
     if let Some(workspace) = &options.workspace {
         std::env::set_current_dir(workspace)
-            .map_err(|e| AppError::Custom(format!("workspace {}: {e}", workspace.display())))?;
+            .map_err(|e| format!("workspace {}: {e}", workspace.display()))?;
     }
+    Ok(())
+}
 
-    debug_log::configure(options.trace_path.clone(), debug_log::Format::Jsonl);
-    debug_log::init(true)?;
+/// `--provider` с опечаткой раньше молча шёл на встроенный DeepSeek.
+fn check_provider(config: &Config, options: &ExecOptions) -> Result<(), String> {
+    let Some(name) = &options.provider else {
+        return Ok(());
+    };
+    if name == "deepseek" || config.providers.iter().any(|entry| &entry.name == name) {
+        return Ok(());
+    }
+    let known: Vec<&str> = std::iter::once("deepseek")
+        .chain(config.providers.iter().map(|entry| entry.name.as_str()))
+        .collect();
+    Err(format!(
+        "unknown provider '{name}' (configured: {})",
+        known.join(", ")
+    ))
+}
 
+/// Флаги прогона поверх конфига.
+fn apply_overrides(config: &mut Config, options: &mut ExecOptions) {
     if let Some(name) = &options.provider {
         config.active_provider = Some(name.clone());
     }
@@ -349,11 +489,15 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
         config.semantic.enabled = false;
     }
     options.context.apply(&mut config.context);
+}
 
-    let workspace = std::env::current_dir()
+fn workspace() -> String {
+    std::env::current_dir()
         .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
+fn log_run_started(config: &Config, options: &ExecOptions) {
     debug_log::log_json(
         action::RUN_STARTED,
         &serde_json::json!({
@@ -361,7 +505,7 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
             "prompt": options.prompts.first().cloned().unwrap_or_default(),
             "prompts": options.prompts,
             "turns": options.prompts.len(),
-            "workspace": workspace,
+            "workspace": workspace(),
             "model": config.active_model(),
             "provider": config.active_provider.clone().unwrap_or_else(|| "deepseek".into()),
             "approve": format!("{:?}", options.approve),
@@ -381,44 +525,20 @@ pub async fn exec(mut config: Config, mut options: ExecOptions) -> AppResult<Run
             },
         }),
     );
+}
 
-    let started = Instant::now();
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    // Сессию поднимаем раньше провайдера: неизвестный id — отказ до первого
-    // хода, а не тихий прогон с нуля, который судить нечем.
-    let resumed = match load_resumed(&config, &options) {
-        Ok(session) => session,
-        Err(error) => {
-            let outcome = RunOutcome::setup_failed(options.trace_path.clone(), error.to_string());
-            finish(&outcome);
-            return Ok(outcome);
-        }
-    };
-    let harness = match assemble(&config, &options, &workspace, event_tx.clone()).await {
-        Ok(harness) => harness,
-        Err(error) => {
-            let outcome = RunOutcome::setup_failed(options.trace_path.clone(), error.to_string());
-            finish(&outcome);
-            return Ok(outcome);
-        }
-    };
-    if let Some(session) = &resumed {
-        adopt_remote_session(&harness.provider, session).await;
+/// Погасить фоновые задачи и MCP-серверы прогона — со сроком: выход не должен
+/// зависеть от того, как быстро умирает чужой процесс.
+async fn shut_down(harness: &Harness, options: &ExecOptions) {
+    let grace = Duration::from_secs(5);
+    let _ = tokio::time::timeout(grace, crate::tools::background::shutdown_all()).await;
+    if options.mcp {
+        let mcp = Arc::clone(&harness.mcp);
+        let _ = tokio::time::timeout(grace, async move {
+            mcp.lock().await.shutdown_all().await;
+        })
+        .await;
     }
-
-    let mut outcome = drive(
-        &config,
-        &options,
-        resumed.as_ref(),
-        &harness,
-        event_tx,
-        event_rx,
-        started,
-    )
-    .await;
-    outcome.semantic_ready = harness.semantic_ready;
-    finish(&outcome);
-    Ok(outcome)
 }
 
 /// Join a relative path onto the current directory without touching the
@@ -528,10 +648,6 @@ fn log_resume(
             "detail": detail,
         }),
     );
-}
-
-fn finish(outcome: &RunOutcome) {
-    debug_log::log_json(action::RUN_FINISHED, outcome);
 }
 
 /// Build provider, tools, skills, semantic service and system prompt.
@@ -650,7 +766,8 @@ async fn assemble(
     }
 
     Ok(Harness {
-        runtime: AgentRuntime::new(tools, mcp, semantic, event_tx),
+        runtime: AgentRuntime::new(tools, Arc::clone(&mcp), semantic, event_tx),
+        mcp,
         provider,
         system_prompt,
         semantic_ready,
@@ -689,6 +806,206 @@ fn attached_files(
         .collect()
 }
 
+/// Что прогон узнаёт по ходу событий; из этого собирается вердикт.
+struct Verdict {
+    status: RunStatus,
+    error: Option<String>,
+    final_text: String,
+    tools: Vec<ToolInvocation>,
+    /// Инструменты, запущенные в чате и ещё не вернувшие результат: стек, потому
+    /// что вызов суб-агента идёт внутри вызова `task` того же чата.
+    in_flight: HashMap<ConversationId, Vec<usize>>,
+    questions: Vec<String>,
+    answered: Vec<AnsweredQuestion>,
+    sub_agents: usize,
+    /// Фоновые суб-агенты: чат → имя.
+    background: HashMap<ConversationId, String>,
+    /// Их форки: серверные сессии удаляются в конце прогона, как в TUI.
+    forks: Vec<Arc<dyn LLMProvider>>,
+    /// Последняя непустая реплика каждого фонового агента — для итога при провале.
+    last_texts: HashMap<ConversationId, String>,
+    sub_agent_results: Vec<SubAgentResult>,
+    warnings: Vec<String>,
+}
+
+impl Verdict {
+    fn new() -> Self {
+        Self {
+            status: RunStatus::Completed,
+            error: None,
+            final_text: String::new(),
+            tools: Vec::new(),
+            in_flight: HashMap::new(),
+            questions: Vec::new(),
+            answered: Vec::new(),
+            sub_agents: 0,
+            background: HashMap::new(),
+            forks: Vec::new(),
+            last_texts: HashMap::new(),
+            sub_agent_results: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Учёт инструментов — по их собственным событиям, а не по запросам
+    /// подтверждения: иначе `todo`, `task` и ход суб-агента не попадали в список.
+    fn on_tool_event(&mut self, conversation: ConversationId, event: &AgentEvent) {
+        match event {
+            AgentEvent::ToolStarted { name } => {
+                self.tools.push(ToolInvocation {
+                    name: name.clone(),
+                    approved: true,
+                    ok: true,
+                    conversation: conversation.0,
+                    error: None,
+                });
+                let index = self.tools.len() - 1;
+                self.in_flight.entry(conversation).or_default().push(index);
+            }
+            AgentEvent::ToolDone { .. } => {
+                self.finish_tool(conversation);
+            }
+            // Ошибка без запущенного инструмента — это отказ (его записал
+            // `on_approval`) или неисполнимый вызов: приписывать её некому.
+            AgentEvent::ToolError { error } => {
+                if let Some(index) = self.finish_tool(conversation) {
+                    self.tools[index].ok = false;
+                    self.tools[index].error = Some(error.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_tool(&mut self, conversation: ConversationId) -> Option<usize> {
+        self.in_flight.get_mut(&conversation)?.pop()
+    }
+
+    /// Ход чата кончился, а его инструменты так и не вернулись — это не `ok`.
+    fn close_in_flight(&mut self, conversation: ConversationId, why: &str) {
+        for index in self.in_flight.remove(&conversation).unwrap_or_default() {
+            self.tools[index].ok = false;
+            self.tools[index].error = Some(why.to_string());
+        }
+    }
+
+    fn remember_text(&mut self, conversation: ConversationId, event: &AgentEvent) {
+        if let AgentEvent::EndAssistantMessage { text, .. } = event
+            && !text.trim().is_empty()
+            && self.background.contains_key(&conversation)
+        {
+            self.last_texts.insert(conversation, text.clone());
+        }
+    }
+
+    fn on_approval(&mut self, request: &ToolApprovalRequest, approved: bool) {
+        if !approved {
+            self.tools.push(ToolInvocation {
+                name: request.tool_name.clone(),
+                approved: false,
+                ok: false,
+                conversation: request.conversation.0,
+                error: Some("denied by the --approve policy".to_string()),
+            });
+        }
+    }
+
+    /// Фоновый суб-агент закончил. Его провал — не провал прогона: корень
+    /// мог справиться и без него.
+    /// Возвращает заметку для истории корня — ту же, что кладёт TUI.
+    fn on_background_end(
+        &mut self,
+        conversation: ConversationId,
+        event: &AgentEvent,
+    ) -> Option<String> {
+        let label = self.background.remove(&conversation)?;
+        let (status, end) = match event {
+            AgentEvent::Done(result) if result.text.trim().is_empty() => ("completed", None),
+            AgentEvent::Done(result) => ("completed", Some(Ok(result.text.as_str()))),
+            AgentEvent::Failed(reason) => ("failed", Some(Err(reason.as_str()))),
+            _ => return None,
+        };
+        self.close_in_flight(
+            conversation,
+            "the agent's turn ended before this tool finished",
+        );
+        let last_text = self.last_texts.remove(&conversation).unwrap_or_default();
+        let ran: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|tool| tool.conversation == conversation.0 && tool.ok)
+            .map(|tool| tool.name.clone())
+            .collect();
+        let report = crate::agent::sub_agent::report(&label, end, &last_text, &ran);
+        self.sub_agent_results.push(SubAgentResult {
+            label: label.clone(),
+            status: status.to_string(),
+            text: report.clone(),
+        });
+        Some(crate::agent::sub_agent::background_block(
+            "🤖 sub-agent",
+            &label,
+            &report,
+        ))
+    }
+
+    /// Срок вышел. Если корень уже закончил, ждали только фоновых — их итог
+    /// не делает прогон «тайм-аутом».
+    fn on_deadline(
+        &mut self,
+        root_active: bool,
+        still_active: usize,
+        budget: Duration,
+        turn: String,
+    ) {
+        if root_active {
+            let message = format!("run exceeded {}s during turn {turn}", budget.as_secs());
+            self.error = Some(match self.error.take() {
+                Some(earlier) => format!("{message}; before that: {earlier}"),
+                None => message,
+            });
+            self.status = RunStatus::TimedOut;
+        } else {
+            self.warnings.push(format!(
+                "{still_active} background sub-agent(s) were still running at the {}s deadline and were stopped",
+                budget.as_secs()
+            ));
+        }
+        let open: Vec<ConversationId> = self.in_flight.keys().copied().collect();
+        for conversation in open {
+            self.close_in_flight(conversation, "stopped by the run's deadline");
+        }
+        for label in self.background.drain().map(|(_, label)| label) {
+            self.sub_agent_results.push(SubAgentResult {
+                label,
+                status: "stopped".to_string(),
+                text: String::new(),
+            });
+        }
+    }
+
+    fn into_outcome(
+        self,
+        options: &ExecOptions,
+        turns: usize,
+        session_id: Option<String>,
+    ) -> RunOutcome {
+        RunOutcome {
+            turns,
+            final_text: self.final_text,
+            tools: self.tools,
+            sub_agents: self.sub_agents,
+            questions: self.questions,
+            error: self.error,
+            session_id,
+            warnings: self.warnings,
+            answered: self.answered,
+            sub_agent_results: self.sub_agent_results,
+            ..RunOutcome::bare(self.status, options.trace_path.clone())
+        }
+    }
+}
+
 /// Drive every turn in order, servicing each one's events until its whole
 /// conversation tree is done. One history, one provider session, one budget:
 /// the turns are a conversation, not a batch of independent runs.
@@ -697,9 +1014,11 @@ async fn drive(
     options: &ExecOptions,
     resumed: Option<&crate::session::Session>,
     harness: &Harness,
-    event_tx: mpsc::UnboundedSender<AppEvent>,
-    mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
-    started: Instant,
+    (event_tx, mut event_rx): (
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ),
+    deadline: tokio::time::Instant,
 ) -> RunOutcome {
     let whitelist = crate::whitelist::load().whitelist;
     let root = ConversationId::next();
@@ -722,18 +1041,14 @@ async fn drive(
     // each turn's `ContextSpec` is built, exactly as `App` reads its own
     // `provider_context_window`: a window learned during turn 1 governs turn 2.
     let mut provider_window = 0u32;
-
-    let mut tools: Vec<ToolInvocation> = Vec::new();
-    let mut questions = Vec::new();
-    let mut sub_agents = 0usize;
-    let mut final_text = String::new();
-    let mut error = None;
-    let mut status = RunStatus::Completed;
+    let mut verdict = Verdict::new();
     let mut turns = 0usize;
+    // Срок выстрелил: ни одного хода больше не начинать.
+    let mut budget_spent = false;
+    // Хоть один ход корня оборван извне: серверной ветке верить нельзя.
+    let mut was_interrupted = false;
 
-    // One budget for the whole run. Arming it per turn would let a three-turn
-    // scenario quietly spend three times its declared timeout.
-    let deadline = tokio::time::sleep(options.timeout);
+    let deadline = tokio::time::sleep_until(deadline);
     tokio::pin!(deadline);
     // Один на весь прогон: заново на каждой итерации он терял сигнал.
     let shutdown = crate::util::shutdown_signal();
@@ -742,6 +1057,8 @@ async fn drive(
     let accepts = |path: &std::path::Path| harness.provider.accepts_attachment(path);
     for prompt in &options.prompts {
         turns += 1;
+        // Ответ прошлого хода — не ответ этого: при провале вернули бы его.
+        verdict.final_text.clear();
         let first = if turns == 1 {
             &harness.attachments[..]
         } else {
@@ -750,6 +1067,7 @@ async fn drive(
         history.messages.push(crate::app::attachments::user_message(
             prompt, prompt, first, first, &accepts,
         ));
+        let turn_start = history.messages.len();
         debug_log::log_json(
             TURN_STARTED,
             &serde_json::json!({
@@ -757,20 +1075,30 @@ async fn drive(
                 "of": options.prompts.len(),
                 "prompt": prompt,
                 "history_messages": history.messages.len(),
+                // По нему метрики отделяют корень от суб-агентов.
+                "conversation": root.0,
             }),
         );
 
+        // Как `App::send_turn`: ход начат — заметки фоновых агентов ждут его конца.
+        reduce::apply(&mut history, &AgentEvent::Started);
         let root_handle = harness.runtime.spawn(TurnSpec {
             conversation: root,
             provider: Arc::clone(&harness.provider),
-            messages: history.messages.clone(),
+            // Как в TUI: заметки только для глаз человека модели не уходят.
+            messages: history
+                .messages
+                .iter()
+                .filter(|message| !message.ui_only)
+                .cloned()
+                .collect(),
             system_prompt: harness.system_prompt.clone(),
             model: config.provider.model.clone(),
             temperature: config.provider.temperature,
             max_tokens: config.provider.max_tokens,
             max_steps: config.agent.max_steps_per_turn.max(1),
             max_tools_per_step: config.agent.max_tools_per_step.max(1),
-            auto_approve: false,
+            unattended: false,
             tool_output_limit: config.context.tool_output_limit as usize,
             context: crate::context::ContextSpec::new(&config.context, provider_window, &run_id)
                 .with_output_cap(config.provider.max_tokens),
@@ -778,35 +1106,44 @@ async fn drive(
 
         let mut pending: HashSet<ConversationId> = HashSet::from([root]);
         let mut handles = vec![root_handle];
-        let mut stopped = false;
+        // Почему ход корня остановлен извне — сигнал, срок, закрытый канал.
+        let mut interrupted: Option<String> = None;
 
         while !pending.is_empty() {
             tokio::select! {
                 // Без этого Ctrl+C убивал бы процесс, а дерево команды хода
                 // (своя группа на Unix) оставалось бы жить.
                 () = &mut shutdown => {
-                    if error.is_none() {
-                        error = Some(format!("interrupted by a signal during turn {turns}"));
+                    let reason = format!("interrupted by a signal during turn {turns}");
+                    verdict.error.get_or_insert_with(|| reason.clone());
+                    verdict.status = RunStatus::Failed;
+                    // Корень уже ответил — его ход не «оборван».
+                    if pending.contains(&root) {
+                        interrupted = Some(reason);
                     }
-                    status = RunStatus::Failed;
-                    stopped = true;
                     break;
                 }
                 () = &mut deadline => {
-                    status = RunStatus::TimedOut;
-                    error = Some(format!(
-                        "run exceeded {}s during turn {}/{} with {} conversation(s) still active",
-                        options.timeout.as_secs(),
-                        turns,
-                        options.prompts.len(),
-                        pending.len()
-                    ));
-                    stopped = true;
+                    let root_active = pending.contains(&root);
+                    verdict.on_deadline(
+                        root_active,
+                        pending.len(),
+                        options.timeout,
+                        format!("{turns}/{}", options.prompts.len()),
+                    );
+                    if root_active {
+                        interrupted = Some(format!("the run's {}s budget ran out", options.timeout.as_secs()));
+                    }
+                    // Бюджет кончился: следующий ход не начинаем.
+                    budget_spent = true;
                     break;
                 }
                 event = event_rx.recv() => {
                     let Some(event) = event else {
-                        stopped = true;
+                        let reason = "the event channel closed".to_string();
+                        verdict.error.get_or_insert_with(|| reason.clone());
+                        verdict.status = RunStatus::Failed;
+                        interrupted = Some(reason);
                         break;
                     };
                     match event {
@@ -820,58 +1157,63 @@ async fn drive(
                                 reduce::turn_end(&agent_event)
                             };
                             trace_agent_event(conversation, &agent_event);
-                            if let AgentEvent::ToolError { .. } = &agent_event
-                                && let Some(last) = tools.last_mut()
-                            {
-                                last.ok = false;
+                            verdict.on_tool_event(conversation, &agent_event);
+                            verdict.remember_text(conversation, &agent_event);
+                            if end.is_none() {
+                                continue;
                             }
-                            match end {
-                                Some(reduce::TurnEnd::Done) => {
-                                    if conversation == root
-                                        && let AgentEvent::Done(result) = agent_event
-                                    {
-                                        final_text = result.text;
-                                    }
-                                    pending.remove(&conversation);
+                            pending.remove(&conversation);
+                            if conversation != root {
+                                // Итог — в историю корня, как в TUI: иначе следующий
+                                // ход и `--resume` расходились бы с ним.
+                                if let Some(note) = verdict.on_background_end(conversation, &agent_event) {
+                                    history.deliver_note(ChatMessage::system(&note));
                                 }
-                                Some(reduce::TurnEnd::Failed(message)) => {
-                                    if error.is_none() {
-                                        error = Some(message);
-                                        status = RunStatus::Failed;
+                                continue;
+                            }
+                            match agent_event {
+                                AgentEvent::Done(result) => {
+                                    if let Some(note) = result.truncated {
+                                        verdict.warnings.push(format!("the final answer is incomplete: {note}"));
                                     }
-                                    pending.remove(&conversation);
+                                    verdict.final_text = result.text;
                                 }
-                                None => {}
+                                AgentEvent::Failed(message) => {
+                                    verdict.close_in_flight(root, "the turn failed before this tool finished");
+                                    verdict.error.get_or_insert(message);
+                                    verdict.status = RunStatus::Failed;
+                                }
+                                _ => {}
                             }
                         }
                         AppEvent::RequestToolApproval(request) => {
-                            let approved =
-                            options
-                                .approve
-                                .decide(&request.tool_name, request.scope.as_ref(), &whitelist);
+                            let approved = options.approve.decide(
+                                &request.tool_name,
+                                request.scope.as_ref(),
+                                &whitelist,
+                                request.always_ask,
+                            );
                             record_approval(&request, approved);
-                            tools.push(ToolInvocation {
-                                name: request.tool_name.clone(),
-                                approved,
-                                ok: approved,
-                            });
+                            verdict.on_approval(&request, approved);
                             tokio::spawn(async move { request.resolve(approved).await });
                         }
                         AppEvent::RequestQuestion(request, state) => {
-                            let answer = answer_for(options, &state);
-                            questions.push(state.question.clone());
+                            let answered = answer_for(options, &state);
                             debug_log::log_json(
                                 action::QUESTION,
                                 &serde_json::json!({
                                     "question": state.question,
                                     "options": state.options,
-                                    "answered": answer,
+                                    "answered": answered.answer,
+                                    "source": answered.source,
                                 }),
                             );
-                            record_question(&request, answer);
+                            verdict.questions.push(state.question.clone());
+                            record_question(&request, answered.answer.clone());
+                            verdict.answered.push(answered);
                         }
                         AppEvent::SpawnSubAgent { parent, label, prompt } => {
-                            sub_agents += 1;
+                            verdict.sub_agents += 1;
                             let id = ConversationId::next();
                             debug_log::log_json(
                                 action::SUB_AGENT,
@@ -883,26 +1225,18 @@ async fn drive(
                                 }),
                             );
                             pending.insert(id);
-                            handles.push(harness.runtime.spawn(TurnSpec {
-                                conversation: id,
-                                provider: harness.provider.fork(),
-                                messages: vec![ChatMessage::user(&prompt)],
-                                system_prompt: harness.system_prompt.clone(),
-                                model: config.provider.model.clone(),
-                                temperature: config.provider.temperature,
-                                max_tokens: config.provider.max_tokens,
-                                // Same clamp the TUI applies to background turns.
-                                max_steps: config.agent.max_steps_per_turn.clamp(1, 8),
-                                max_tools_per_step: config.agent.max_tools_per_step.max(1),
-                                auto_approve: true,
-                                tool_output_limit: config.context.tool_output_limit as usize,
-                                context: crate::context::ContextSpec::new(
-                                    &config.context,
-                                    provider_window,
-                                    &run_id,
-                                )
-                                .with_output_cap(config.provider.max_tokens),
-                            }));
+                            verdict.background.insert(id, label);
+                            let fork = harness.provider.fork();
+                            verdict.forks.push(Arc::clone(&fork));
+                            // Тот же рецепт, что у TUI: иначе харнесс мерил бы другой промпт.
+                            handles.push(harness.runtime.spawn(TurnSpec::background(
+                                id,
+                                fork,
+                                &prompt,
+                                &harness.system_prompt,
+                                config,
+                                crate::context::ContextSpec::new(&config.context, provider_window, &run_id),
+                            )));
                         }
                         AppEvent::ContextWindowLearned(window) => {
                             provider_window = window;
@@ -922,34 +1256,65 @@ async fn drive(
         for handle in handles {
             handle.abort();
         }
+        if let Some(reason) = interrupted {
+            verdict.close_in_flight(root, &reason);
+            close_unfinished_turn(&mut history, &mut verdict, turn_start, &reason);
+            was_interrupted = true;
+        }
         // A turn that timed out, errored, or lost its event channel leaves a
         // half-written history; running the next prompt on top of it would
         // measure nothing useful.
-        if stopped || status != RunStatus::Completed {
+        if verdict.status != RunStatus::Completed || budget_spent {
             break;
         }
     }
 
     drop(event_tx);
+    // Разом и с одним сроком: по очереди десяток зависших форков съел бы
+    // запас сценария на завершение ребёнка.
+    let forks = std::mem::take(&mut verdict.forks);
+    let discards =
+        futures::future::join_all(forks.iter().map(|fork| fork.discard_remote_session()));
+    let _ = tokio::time::timeout(Duration::from_secs(5), discards).await;
 
     let session_id = if options.saves_session() {
-        persist(config, &history, &harness.provider)
+        match persist(config, &history, &harness.provider, was_interrupted) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                verdict.warnings.push(format!(
+                    "the session could not be saved, so --resume will not work: {error}"
+                ));
+                None
+            }
+        }
     } else {
         None
     };
+    verdict.into_outcome(options, turns, session_id)
+}
 
-    RunOutcome {
-        status,
-        trace_path: options.trace_path.clone(),
-        duration_ms: started.elapsed().as_millis() as u64,
-        turns,
-        final_text,
-        tools,
-        sub_agents,
-        questions,
-        error,
-        session_id,
-        semantic_ready: false,
+/// Ход корня оборван извне. Закрыть его, как TUI закрывает проваленный: без
+/// этого сессия сохранялась с вызовами без результатов, и `--resume` ломался.
+fn close_unfinished_turn(
+    history: &mut Conversation,
+    verdict: &mut Verdict,
+    turn_start: usize,
+    reason: &str,
+) {
+    reduce::apply(history, &AgentEvent::Failed(reason.to_string()));
+    // Серверная ветка могла уйти вперёд локальной копии — продолжать её нельзя.
+    history.broken = true;
+    if let Some(partial) = history.messages[turn_start.min(history.messages.len())..]
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == crate::provider::Role::Assistant && !message.content.trim().is_empty()
+        })
+    {
+        verdict.final_text = partial.content.clone();
+        verdict
+            .warnings
+            .push("final_text is the partial reply of a turn that did not finish".to_string());
     }
 }
 
@@ -976,7 +1341,7 @@ fn trace_agent_event(conversation: ConversationId, event: &AgentEvent) {
         ),
         AgentEvent::ToolError { error } => debug_log::log_json(
             action::TOOL_RESULT,
-            &serde_json::json!({ "ok": false, "error": error }),
+            &serde_json::json!({ "conversation": conversation.0, "ok": false, "error": error }),
         ),
         AgentEvent::ToolOutputCleared {
             cleared,
@@ -1009,10 +1374,17 @@ fn record_question(request: &QuestionRequest, answer: String) {
     tokio::spawn(async move { request.resolve(answer).await });
 }
 
-fn answer_for(options: &ExecOptions, state: &QuestionState) -> String {
-    match &options.answer {
-        Some(answer) => answer.clone(),
-        None => state.options.first().cloned().unwrap_or_default(),
+fn answer_for(options: &ExecOptions, state: &QuestionState) -> AnsweredQuestion {
+    let (answer, source) = match (&options.answer, state.options.first()) {
+        (Some(answer), _) => (answer.clone(), "flag"),
+        (None, Some(first)) => (first.clone(), "default"),
+        (None, None) => (String::new(), "none"),
+    };
+    AnsweredQuestion {
+        question: state.question.clone(),
+        options: state.options.clone(),
+        answer,
+        source: source.to_string(),
     }
 }
 
@@ -1030,14 +1402,17 @@ fn persist(
     config: &Config,
     conversation: &Conversation,
     provider: &Arc<dyn LLMProvider>,
-) -> Option<String> {
+    interrupted: bool,
+) -> Result<String, String> {
     let workspace = std::env::current_dir()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_default();
     let remote = crate::session::RemoteLink::from_identity(provider.session_identity());
     let meta = crate::session::SessionMeta {
         tag: conversation.tag.clone(),
-        broken: !remote.is_established() && conversation.broken,
+        // Оборванный ход: живая связь не значит, что ветка сервера совпадает с
+        // локальной историей, — следующий `--resume` перескажет её заново.
+        broken: conversation.broken && (interrupted || !remote.is_established()),
         remote,
     };
     match crate::session::save_session(
@@ -1048,10 +1423,10 @@ fn persist(
         &workspace,
         &meta,
     ) {
-        Ok(()) => Some(conversation.session_id.clone()),
+        Ok(()) => Ok(conversation.session_id.clone()),
         Err(error) => {
             tracing::warn!("harness: could not save session: {error}");
-            None
+            Err(error.to_string())
         }
     }
 }
@@ -1083,13 +1458,15 @@ mod tests {
     fn policies_decide_per_tool() {
         use crate::whitelist::{Rule, Whitelist};
         let whitelist = Whitelist::from_rules(vec![Rule::tool("bash")]);
-        assert!(ApprovePolicy::All.decide("write", None, &whitelist));
-        assert!(!ApprovePolicy::None.decide("bash", None, &whitelist));
-        assert!(ApprovePolicy::Whitelist.decide("bash", None, &whitelist));
-        assert!(!ApprovePolicy::Whitelist.decide("write", None, &whitelist));
+        assert!(ApprovePolicy::All.decide("write", None, &whitelist, false));
+        assert!(!ApprovePolicy::None.decide("bash", None, &whitelist, false));
+        assert!(ApprovePolicy::Whitelist.decide("bash", None, &whitelist, false));
+        assert!(!ApprovePolicy::Whitelist.decide("write", None, &whitelist, false));
         let except = ApprovePolicy::Except(vec!["bash".to_string()]);
-        assert!(!except.decide("bash", None, &whitelist));
-        assert!(except.decide("powershell", None, &whitelist));
+        assert!(!except.decide("bash", None, &whitelist, false));
+        assert!(except.decide("powershell", None, &whitelist, false));
+        // Чужая разметка или поправленное имя: белый список не решает — как в TUI.
+        assert!(!ApprovePolicy::Whitelist.decide("bash", None, &whitelist, true));
     }
 
     /// Политика `whitelist` в сценариях должна уважать область правила, иначе
@@ -1102,9 +1479,9 @@ mod tests {
             crate::whitelist::Scope::Command(vec!["cargo".into(), "test".into()]),
         )]);
         let allowed = crate::whitelist::Scope::Command(vec!["cargo".into(), "test".into()]);
-        assert!(ApprovePolicy::Whitelist.decide("bash", Some(&allowed), &whitelist));
+        assert!(ApprovePolicy::Whitelist.decide("bash", Some(&allowed), &whitelist, false));
         let other = crate::whitelist::Scope::Command(vec!["rm".into(), "-rf".into()]);
-        assert!(!ApprovePolicy::Whitelist.decide("bash", Some(&other), &whitelist));
+        assert!(!ApprovePolicy::Whitelist.decide("bash", Some(&other), &whitelist, false));
     }
 
     #[test]
@@ -1123,12 +1500,24 @@ mod tests {
     fn canned_answer_wins_over_first_option() {
         let state = QuestionState::new("q".into(), vec!["a".into(), "b".into()], false);
         let mut options = probe_options();
-        assert_eq!(answer_for(&options, &state), "a");
+        let picked = answer_for(&options, &state);
+        assert_eq!(
+            (picked.answer.as_str(), picked.source.as_str()),
+            ("a", "default")
+        );
         options.answer = Some("custom".into());
-        assert_eq!(answer_for(&options, &state), "custom");
+        let picked = answer_for(&options, &state);
+        assert_eq!(
+            (picked.answer.as_str(), picked.source.as_str()),
+            ("custom", "flag")
+        );
         let empty = QuestionState::new("q".into(), Vec::new(), false);
         options.answer = None;
-        assert_eq!(answer_for(&options, &empty), "");
+        let picked = answer_for(&options, &empty);
+        assert_eq!(
+            (picked.answer.as_str(), picked.source.as_str()),
+            ("", "none")
+        );
     }
 
     #[test]
@@ -1163,6 +1552,64 @@ mod tests {
         let spec = crate::context::ContextSpec::new(&config.context, 0, "run")
             .with_output_cap(config.provider.max_tokens);
         assert_eq!(spec.budget().usable(), Some(11_000));
+    }
+
+    /// Вызов суб-агента идёт внутри вызова `task` того же чата: его конец не
+    /// должен закрывать сам `task`.
+    #[test]
+    fn a_nested_sub_agent_call_does_not_close_the_task_call() {
+        let mut verdict = Verdict::new();
+        let root = ConversationId::next();
+        let started = |name: &str| AgentEvent::ToolStarted {
+            name: name.to_string(),
+        };
+        verdict.on_tool_event(root, &started("task"));
+        verdict.on_tool_event(root, &started("look › bash"));
+        verdict.on_tool_event(
+            root,
+            &AgentEvent::ToolError {
+                error: "exit 1".to_string(),
+            },
+        );
+        verdict.on_tool_event(
+            root,
+            &AgentEvent::ToolDone {
+                result: "ok".to_string(),
+            },
+        );
+        assert!(verdict.tools[0].ok, "task itself succeeded");
+        assert!(!verdict.tools[1].ok, "the nested call failed");
+        assert_eq!(verdict.tools[1].error.as_deref(), Some("exit 1"));
+    }
+
+    /// Корень закончил, ждали только фоновых — это не «тайм-аут прогона».
+    #[test]
+    fn a_deadline_after_the_root_finished_is_a_warning() {
+        let mut verdict = Verdict::new();
+        verdict.on_deadline(false, 1, Duration::from_secs(10), "1/1".to_string());
+        assert_eq!(verdict.status, RunStatus::Completed);
+        assert_eq!(verdict.warnings.len(), 1);
+        let mut verdict = Verdict::new();
+        verdict.error = Some("provider said no".to_string());
+        verdict.on_deadline(true, 1, Duration::from_secs(10), "1/1".to_string());
+        assert_eq!(verdict.status, RunStatus::TimedOut);
+        assert!(verdict.error.unwrap().contains("provider said no"));
+    }
+
+    /// Опечатка в `--provider` раньше молча шла на DeepSeek.
+    #[test]
+    fn an_unknown_provider_is_a_setup_failure() {
+        let options = ExecOptions {
+            provider: Some("deepsek".to_string()),
+            ..probe_options()
+        };
+        let refused = check_provider(&Config::default(), &options).unwrap_err();
+        assert!(refused.contains("unknown provider 'deepsek'"), "{refused}");
+        let fine = ExecOptions {
+            provider: Some("deepseek".to_string()),
+            ..probe_options()
+        };
+        assert!(check_provider(&Config::default(), &fine).is_ok());
     }
 
     fn probe_options() -> ExecOptions {
@@ -1207,9 +1654,8 @@ mod tests {
             &options,
             None,
             &harness,
-            event_tx,
-            event_rx,
-            Instant::now(),
+            (event_tx, event_rx),
+            tokio::time::Instant::now() + options.timeout,
         )
         .await;
 
@@ -1250,9 +1696,8 @@ mod tests {
             &options,
             None,
             &harness,
-            event_tx,
-            event_rx,
-            Instant::now(),
+            (event_tx, event_rx),
+            tokio::time::Instant::now() + options.timeout,
         )
         .await;
 
@@ -1261,16 +1706,19 @@ mod tests {
         assert!(fake.request(1).is_none(), "a second turn was sent");
     }
 
-    /// Инвариант 11: корневой ход идёт с `auto_approve: false`. При `true`
-    /// инструмент `task` отвечает отказом, и суб-агенты нечем проверить.
+    /// Корневой ход прогона не `unattended`: иначе `task` отвечал бы отказом,
+    /// и суб-агенты нечем было бы проверить.
     /// Фоновый вызов — потому что только он идёт через `SpawnSubAgent`.
     #[tokio::test]
     async fn the_root_turn_can_still_spawn_a_sub_agent() {
         let call = r#"<tool_use><name>task</name><arguments>{"description":"probe","prompt":"go","background":true}</arguments></tool_use>"#;
-        let fake = Arc::new(crate::provider::fake::FakeProvider::with_responses(vec![
-            call.to_string(),
-            "done".to_string(),
-        ]));
+        let fake = Arc::new(
+            crate::provider::fake::FakeProvider::with_responses(vec![
+                call.to_string(),
+                "done".to_string(),
+            ])
+            .forks_with(vec!["probe finished".to_string()]),
+        );
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let harness = probe_harness(Arc::clone(&fake) as Arc<dyn LLMProvider>, event_tx.clone());
         let options = ExecOptions {
@@ -1284,16 +1732,22 @@ mod tests {
             &options,
             None,
             &harness,
-            event_tx,
-            event_rx,
-            Instant::now(),
+            (event_tx, event_rx),
+            tokio::time::Instant::now() + options.timeout,
         )
         .await;
 
         assert_eq!(
             outcome.sub_agents, 1,
-            "the root turn must keep auto_approve false, or `task` is refused"
+            "the root turn must not be unattended, or `task` is refused"
         );
+        // Итог фонового агента — в вердикте, а не только в трассе.
+        let result = outcome
+            .sub_agent_results
+            .first()
+            .expect("the background result");
+        assert_eq!(result.status, "completed");
+        assert!(result.text.contains("probe finished"), "{}", result.text);
     }
 
     fn probe_config() -> Config {
@@ -1312,7 +1766,8 @@ mod tests {
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let semantic = SemanticService::start(&config, Vec::new(), event_tx.clone());
         Harness {
-            runtime: AgentRuntime::new(tools, mcp, semantic, event_tx),
+            runtime: AgentRuntime::new(tools, Arc::clone(&mcp), semantic, event_tx),
+            mcp,
             provider,
             system_prompt: "You are a test.".to_string(),
             semantic_ready: false,
@@ -1395,9 +1850,8 @@ mod tests {
             &options,
             Some(&resumed),
             &harness,
-            event_tx,
-            event_rx,
-            Instant::now(),
+            (event_tx, event_rx),
+            tokio::time::Instant::now() + options.timeout,
         )
         .await;
 

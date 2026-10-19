@@ -1,7 +1,6 @@
 //! Исполнение вызовов инструментов одного шага. Отделено от `runner.rs`:
 //! цикл меняется от политики повторов, а это — от новых мета-инструментов.
 
-use crate::agent::sub_agent::SubAgentSpec;
 use crate::agent::tool_parser::ParsedToolCall;
 use crate::agent::trace::{StepTrace, ToolResultTrace};
 use crate::app::conversation::ConversationId;
@@ -25,14 +24,14 @@ pub(crate) struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn ok(text: impl Into<String>) -> Self {
+    pub(super) fn ok(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             is_error: false,
         }
     }
 
-    fn failed(text: impl Into<String>) -> Self {
+    pub(super) fn failed(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             is_error: true,
@@ -139,9 +138,12 @@ pub(super) struct ToolExecContext<'turn> {
     pub(super) max_tokens: u32,
     pub(super) max_steps: usize,
     pub(super) max_tools_per_step: usize,
-    pub(super) auto_approve: bool,
+    pub(super) unattended: bool,
     pub(super) tool_output_limit: usize,
     pub(super) event_tx: &'turn mpsc::UnboundedSender<AppEvent>,
+    /// Суб-агенту `task` — тот же индекс подсказок и та же лестница компакции.
+    pub(super) semantic: &'turn Arc<crate::semantic::SemanticService>,
+    pub(super) context: &'turn crate::context::ContextSpec,
 }
 
 impl ToolExecContext<'_> {
@@ -177,10 +179,10 @@ async fn execute_tool_call(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> T
         return refusal;
     }
     // Чужая разметка не обходит подтверждение и у особых инструментов:
-    // `task` иначе запустил бы суб-агента, который исполняет всё без человека.
+    // `task` и `timer` иначе обошли бы проверку разметки.
     if call.origin.needs_person() && matches!(call.name.as_str(), TASK_TOOL_NAME | TIMER_TOOL_NAME)
     {
-        if ctx.auto_approve {
+        if ctx.unattended {
             return ToolOutcome::failed(UNATTENDED_FOREIGN_CALL);
         }
         if !ask_person(&call, ctx, true).await {
@@ -190,10 +192,7 @@ async fn execute_tool_call(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> T
     match call.name.as_str() {
         QUESTION_TOOL_NAME => ask_the_user(&call, ctx).await,
         TASK_TOOL_NAME => spawn_task(&call, ctx).await,
-        TIMER_TOOL_NAME => {
-            ctx.emit_tool_started(TIMER_TOOL_NAME);
-            manage_timer(&call, ctx)
-        }
+        TIMER_TOOL_NAME => manage_timer(&call, ctx),
         _ => run_generic_tool(call, ctx).await,
     }
 }
@@ -201,9 +200,11 @@ async fn execute_tool_call(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> T
 /// `timer`: отложенная задача этой беседы. Фоновому ходу отказ — беседа
 /// суб-агента исчезает вместе с его ответом, её таймер осиротеет.
 fn manage_timer(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
-    if ctx.auto_approve {
+    if ctx.unattended {
         return ToolOutcome::failed("Timers are not available to background agents.");
     }
+    // «Пошёл» — только для правда запущенного: отказ сводка не считает.
+    ctx.emit_tool_started(TIMER_TOOL_NAME);
     let timers = ctx.tools.timers();
     let owner = ctx.conversation.0;
     let now = chrono::Local::now();
@@ -284,7 +285,7 @@ fn read_timer_id(call: &ParsedToolCall) -> Option<u64> {
 
 /// `question`: спросить человека. В фоновом ходе отвечать некому.
 async fn ask_the_user(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
-    if ctx.auto_approve {
+    if ctx.unattended {
         return ToolOutcome::failed("Cannot ask the user from a background agent.");
     }
     let question_text = call.arguments["question"]
@@ -315,9 +316,9 @@ async fn ask_the_user(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolO
 }
 
 /// `task`: запустить суб-агента. Глубина ограничена единицей — вложенных
-/// суб-агентов нет, поэтому фоновому ходу здесь отказ.
+/// суб-агентов нет, поэтому ходу без человека здесь отказ.
 async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome {
-    if ctx.auto_approve {
+    if ctx.unattended {
         return ToolOutcome::failed(
             "Sub-agents are not available here: this is already a background or sub-agent run.",
         );
@@ -327,11 +328,12 @@ async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOut
         .unwrap_or("")
         .trim()
         .to_string();
+    // Подпись пишет модель, а показывается она в модалке и строке состояния.
     let label = call.arguments["description"]
         .as_str()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("sub-agent task")
-        .to_string();
+        .map(|text| crate::util::one_line_label(text, 60))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "sub-agent task".to_string());
     let background = call.arguments["background"].as_bool().unwrap_or(false);
     if prompt.is_empty() {
         return ToolOutcome::failed("The 'task' tool requires a non-empty 'prompt'.");
@@ -342,34 +344,12 @@ async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOut
             label: label.clone(),
             prompt,
         });
-        return ToolOutcome::ok(format!("Started background sub-agent: {label}"));
+        return ToolOutcome::ok(format!(
+            "Started background sub-agent: {label}. Its result will be added to this conversation when it finishes; you are not woken up for it."
+        ));
     }
     ctx.emit_tool_started(TASK_TOOL_NAME);
-    let sub_provider = ctx.provider.fork();
-    let session_cleanup = Arc::clone(&sub_provider);
-    let outcome = match crate::agent::sub_agent::run_sub_agent(SubAgentSpec {
-        provider: sub_provider,
-        tools: Arc::clone(ctx.tools),
-        mcp: Arc::clone(ctx.mcp),
-        system_prompt: ctx.system_prompt.to_string(),
-        user_prompt: prompt,
-        model: ctx.model.to_string(),
-        temperature: ctx.temperature,
-        max_tokens: ctx.max_tokens,
-        max_steps: ctx.max_steps.min(8),
-        max_tools_per_step: ctx.max_tools_per_step,
-        tool_output_limit: ctx.tool_output_limit,
-    })
-    .await
-    {
-        Ok(text) => ToolOutcome::ok(text),
-        Err(e) => ToolOutcome::failed(format!("Sub-agent failed: {e}")),
-    };
-    // Форк одноразовый — снести его серверную сессию, чтобы не копилась.
-    tokio::spawn(async move {
-        let _ = session_cleanup.discard_remote_session().await;
-    });
-    outcome
+    crate::agent::sub_agent::run_task(ctx, &label, prompt).await
 }
 
 /// Обычный инструмент: аппрув, затем диспетчер (builtin или MCP).
@@ -384,10 +364,10 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
             .get(&call.name)
             .is_none_or(|tool| tool.requires_approval());
     // Обычно такой вызов без человека отвергает ещё разбор; дошёл — отказ.
-    if person && ctx.auto_approve {
+    if person && ctx.unattended {
         return ToolOutcome::failed(UNATTENDED_FOREIGN_CALL);
     }
-    if !(ctx.auto_approve || !needs_approval || ask_person(&call, ctx, person).await) {
+    if needs_approval && !ask_person(&call, ctx, person).await {
         return ToolOutcome::failed(DENIED_BY_USER);
     }
     ctx.emit_tool_started(&call.name);
@@ -417,8 +397,7 @@ async fn ask_person(call: &ParsedToolCall, ctx: &ToolExecContext<'_>, always: bo
 }
 
 /// Явный `tool_result` для вызова, срезанного лимитом шага.
-/// Обоим циклам нужен одинаковый текст.
-pub(crate) fn tool_skip_message(max_tools_per_step: usize, total_calls: usize) -> String {
+fn tool_skip_message(max_tools_per_step: usize, total_calls: usize) -> String {
     format!(
         "Skipped: per-step tool-call limit of {max_tools_per_step} reached \
         ({total_calls} calls requested). Re-issue this call next step if still needed."
@@ -427,7 +406,7 @@ pub(crate) fn tool_skip_message(max_tools_per_step: usize, total_calls: usize) -
 
 /// Обычный вызов. MCP-клиент достаётся под коротким локом и вызывается уже
 /// на своём хэндле: лок через сетевой `await` однажды заморозил весь UI.
-pub(crate) async fn dispatch_generic_tool(
+async fn dispatch_generic_tool(
     tools: &ToolRegistry,
     mcp: &tokio::sync::Mutex<MCPManager>,
     name: &str,

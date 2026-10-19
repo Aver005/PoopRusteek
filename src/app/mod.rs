@@ -953,6 +953,9 @@ impl App {
             // и его результатом: без этого история осталась бы с вызовом,
             // на который никто не ответил.
             focused.settle_unanswered_tool_calls();
+            // Заметки — после результатов: между вызовом и его ответом строгие
+            // эндпоинты (OpenAI, Anthropic) не принимают ничего.
+            focused.flush_deferred();
         }
         if self.state.goal.is_running() {
             self.cancel_goal_cycle("⏹ Goal cycle cancelled. Use /goal to start a new one.");
@@ -1019,7 +1022,7 @@ impl App {
             max_tokens: self.config.provider.max_tokens,
             max_steps: self.config.agent.max_steps_per_turn.max(1),
             max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
-            auto_approve: false, // turn with a human behind it: interactive approval
+            unattended: false,
             tool_output_limit: self.config.context.tool_output_limit as usize,
             context: crate::context::ContextSpec::new(
                 &self.config.context,
@@ -1073,6 +1076,7 @@ impl App {
                 handle.abort();
             }
             conv.generation.active = false;
+            conv.flush_deferred();
         }
         if let Some(req) = self.state.pending_tool_approval.take() {
             req.resolve(false).await;

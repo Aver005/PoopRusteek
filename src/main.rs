@@ -81,10 +81,35 @@ enum Command {
     Harness(harness::Command),
 }
 
+/// Ошибка аргументов — это `setup_failed` (код 3). Код 2 от clap совпадал с
+/// `timed_out`, а `exec --json` оставался без JSON.
+fn exit_on_usage_error(error: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        error.exit();
+    }
+    // `args_os`: не-Unicode аргумент не должен ронять и сам отчёт об ошибке.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.iter().any(|arg| arg == "exec") && argv.iter().any(|arg| arg == "--json") {
+        let outcome = harness::driver::RunOutcome::setup_failed(
+            std::path::PathBuf::new(),
+            error.to_string().trim().to_string(),
+        );
+        if let Ok(json) = serde_json::to_string_pretty(&outcome) {
+            println!("{json}");
+        }
+    }
+    let _ = error.print();
+    std::process::exit(3);
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let args = Args::parse();
+    let args = Args::try_parse().unwrap_or_else(|error| exit_on_usage_error(error));
     update::register_running_instance();
 
     // Раньше всех: и журнал, и хранилище откатов читают `Config::data_dir()`
@@ -108,7 +133,11 @@ fn main() -> Result<()> {
     let headless = args.acp || args.proxy || (args.serve && args.uiless) || args.command.is_some();
     logging::setup(!headless);
 
-    debug_log::init(args.debug_log)?;
+    // Подкоманды харнесса пишут трассу сами (`exec --trace`); общий `--debug-log`
+    // открыл бы журнал раньше, и трасса ушла бы не в тот файл.
+    if args.command.is_none() {
+        debug_log::init(args.debug_log)?;
+    }
     let config: Config = match config::load_from_optional(args.config.as_deref()) {
         Ok(c) => c,
         // A config that cannot be read is fatal for anything non-interactive:

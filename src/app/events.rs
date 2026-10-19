@@ -114,12 +114,7 @@ pub enum AgentEvent {
         name: String,
     },
     ToolDone {
-        // Every receiver currently ignores this (matched out with `..`) — the
-        // status line shows a generic "Tool finished" rather than a preview.
-        #[expect(
-            dead_code,
-            reason = "tool-result preview not surfaced by any receiver yet"
-        )]
+        /// Выжимка результата; суб-агент пересылает её родителю.
         result: String,
     },
     ToolError {
@@ -318,20 +313,15 @@ pub enum AppEvent {
     },
 }
 
-// Populated at the `AgentEvent::Done` send site but every current receiver
-// discards the payload (`AgentEvent::Done(_)`); goal-mode independently
-// re-derives the same text by scanning the message list instead of reading
-// this. Kept for future use rather than deleted in this pass. `allow`, not
-// `expect`: under `cargo test` the fields count as read (test-only paths),
-// so an `expect` is unfulfilled in that build.
-#[allow(
-    dead_code,
-    reason = "AgentEvent::Done payload not read by any current receiver"
-)]
+/// Итог хода: ответ, сделанные вызовы и пометка, если ответ обрезан лимитом.
+/// Читают суб-агент `task` и харнесс.
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     pub text: String,
+    // `allow`: в тестах поле читается, и `expect` там не сработал бы.
+    #[allow(dead_code, reason = "сделанные вызовы хода; читают тесты раннера")]
     pub tool_calls: Vec<ToolCallInfo>,
+    pub truncated: Option<String>,
 }
 
 #[expect(
@@ -357,6 +347,8 @@ pub struct ToolApprovalRequest {
     /// Белый список не действует: вызов в чужой разметке или с поправленным
     /// именем решает только человек.
     pub always_ask: bool,
+    /// Кто спрашивает, если не ход на экране: суб-агент, фоновый чат.
+    pub origin: Option<String>,
     decision: Reply<bool>,
 }
 
@@ -373,6 +365,7 @@ impl ToolApprovalRequest {
             arguments,
             scope,
             always_ask: false,
+            origin: None,
             decision: Reply::new(),
         }
     }

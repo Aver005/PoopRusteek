@@ -81,6 +81,9 @@ pub struct Conversation {
     /// Rung 3 in flight: how many messages the compaction task snapshotted.
     /// `None` when idle — set for the whole run, cleared on every exit path.
     pub compacting: Option<usize>,
+    /// Заметки, пришедшие посреди хода (итог фонового суб-агента). Встают в
+    /// историю на конце хода: внутри него DeepSeek их не отправил бы никогда.
+    pub deferred: Vec<ChatMessage>,
 }
 
 impl Conversation {
@@ -103,6 +106,30 @@ impl Conversation {
             context_used: 0,
             compact_mode: None,
             compacting: None,
+            deferred: Vec::new(),
+        }
+    }
+
+    /// Отложенные заметки — в историю. Зовут все места, где ход кончается
+    /// или обрывается: иначе итог суб-агента застревал бы до следующего хода.
+    pub fn flush_deferred(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred);
+        self.messages.extend(deferred);
+    }
+
+    /// Историей сейчас владеет ход или компакция: писать в неё нельзя.
+    /// Один признак на всех — их было пять разных.
+    pub fn is_busy(&self) -> bool {
+        self.agent_task.is_some() || self.compacting.is_some() || self.generation.active
+    }
+
+    /// Положить заметку в историю — сейчас или, если чат занят, на конце хода.
+    /// Заметка только для экрана модели не уходит — ждать ей незачем.
+    pub fn deliver_note(&mut self, note: ChatMessage) {
+        if self.is_busy() && !note.ui_only {
+            self.deferred.push(note);
+        } else {
+            self.messages.push(note);
         }
     }
 
@@ -267,6 +294,8 @@ impl Conversation {
         let base = self.compacting.take()?;
         self.generation.active = false;
         self.agent_task = None;
+        // После снимка: склейка сохраняет всё, что пришло после него.
+        self.flush_deferred();
         Some(base)
     }
 

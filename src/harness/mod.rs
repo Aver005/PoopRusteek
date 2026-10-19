@@ -110,8 +110,9 @@ pub struct ExecArgs {
     #[arg(long)]
     pub max_steps: Option<usize>,
 
-    /// Wall-clock budget in seconds; the turn is aborted past it.
-    #[arg(long, default_value_t = 300)]
+    /// Wall-clock budget in seconds for the whole run, setup included. Longer
+    /// than a single shell command's own 300s limit, so that one can fire first.
+    #[arg(long, default_value_t = 600)]
     pub timeout: u64,
 
     /// Semantic layer: `off`, `background`, or `ready[:seconds]` to wait for
@@ -274,15 +275,26 @@ pub async fn run(command: Command, config: Config, globals: GlobalFlags) -> AppR
 }
 
 async fn exec(args: ExecArgs, config: Config) -> AppResult<i32> {
+    let trace_path = args.trace.clone().unwrap_or_else(default_trace_path);
+    // Плохой флаг — тот же вердикт `setup_failed` в JSON, а не трассировка
+    // ошибки и код 1, который вызывающий прочёл бы как провал хода.
+    let semantic = match parse_semantic(&args.semantic) {
+        Ok(semantic) => semantic,
+        Err(error) => {
+            let outcome = driver::RunOutcome::setup_failed(trace_path, error.to_string());
+            print_outcome(&outcome, args.json)?;
+            return Ok(outcome.status.exit_code());
+        }
+    };
     let options = ExecOptions {
         prompts: args.prompts,
         workspace: args.workspace,
-        trace_path: args.trace.unwrap_or_else(default_trace_path),
+        trace_path,
         approve: args.approve,
         answer: args.answer,
         max_steps: args.max_steps,
         timeout: Duration::from_secs(args.timeout),
-        semantic: parse_semantic(&args.semantic)?,
+        semantic,
         mcp: args.mcp,
         provider: args.provider,
         model: args.model,
@@ -299,13 +311,18 @@ async fn exec(args: ExecArgs, config: Config) -> AppResult<i32> {
         },
     };
 
-    let outcome = driver::exec(config, options).await?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&outcome)?);
-    } else {
-        println!("{}", report::render_run(&outcome));
-    }
+    let outcome = driver::exec(config, options).await;
+    print_outcome(&outcome, args.json)?;
     Ok(outcome.status.exit_code())
+}
+
+fn print_outcome(outcome: &driver::RunOutcome, json: bool) -> AppResult<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(outcome)?);
+    } else {
+        println!("{}", report::render_run(outcome));
+    }
+    Ok(())
 }
 
 /// `off` | `background` | `ready` | `ready:<seconds>`

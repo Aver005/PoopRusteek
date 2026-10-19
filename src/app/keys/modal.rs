@@ -62,6 +62,7 @@ impl App {
             Modal::ToolApproval {
                 tool_name,
                 arguments,
+                origin,
                 scroll_offset,
                 grant,
                 scope,
@@ -89,7 +90,6 @@ impl App {
                         if let Some(request) = self.state.pending_tool_approval.take() {
                             request.resolve(true).await;
                         }
-                        self.state.focused_mut().generation.active = true;
                         self.state.status_message = format!("Running {}", tool_name);
                         self.present_next_interaction().await;
                     }
@@ -97,7 +97,6 @@ impl App {
                         if let Some(request) = self.state.pending_tool_approval.take() {
                             request.resolve(false).await;
                         }
-                        self.state.focused_mut().generation.active = true;
                         self.state.status_message = format!("Denied {}", tool_name);
                         self.present_next_interaction().await;
                     }
@@ -105,6 +104,7 @@ impl App {
                         self.state.modal = Some(Modal::ToolApproval {
                             tool_name,
                             arguments,
+                            origin,
                             scroll_offset,
                             grant: grant.next(scope.is_some()),
                             scope,
@@ -114,6 +114,7 @@ impl App {
                         self.state.modal = Some(Modal::ToolApproval {
                             tool_name,
                             arguments,
+                            origin,
                             scroll_offset: scroll_offset.saturating_sub(3),
                             grant,
                             scope,
@@ -127,6 +128,7 @@ impl App {
                         self.state.modal = Some(Modal::ToolApproval {
                             tool_name,
                             arguments,
+                            origin,
                             scroll_offset: (scroll_offset + 3).min(max_scroll),
                             grant,
                             scope,
@@ -136,6 +138,7 @@ impl App {
                         self.state.modal = Some(Modal::ToolApproval {
                             tool_name,
                             arguments,
+                            origin,
                             scroll_offset,
                             grant,
                             scope,
@@ -211,7 +214,6 @@ impl App {
                     if let Some(request) = self.state.pending_question.take() {
                         request.resolve(answer).await;
                     }
-                    self.state.focused_mut().generation.active = true;
                     self.state.status_message = "Answer received".to_string();
                     self.present_next_interaction().await;
                 } else {
@@ -295,7 +297,7 @@ impl App {
                     .and_then(|item| item.value.parse::<u64>().ok())
                     .map(conversation::ConversationId);
                 if let Some(target) = target {
-                    self.stop_background(target);
+                    self.stop_background(target).await;
                 }
             }
             events::PickerKind::Models => {

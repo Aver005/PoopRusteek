@@ -61,7 +61,12 @@ impl RunMetrics {
             ..Self::default()
         };
 
-        for record in &trace.records {
+        // Только корневой ход: шаги суб-агента `task` и фоновых ходов идут той же
+        // трассой, и без фильтра их работа считалась бы работой корня.
+        let root = root_conversation(trace);
+        for record in trace.records.iter().filter(|record| {
+            root.is_none() || record_conversation(record).is_none_or(|c| Some(c) == root)
+        }) {
             match record.action.as_str() {
                 "agent.step.start" => metrics.steps += 1,
                 "agent.step.salvaged" => metrics.salvaged_streams += 1,
@@ -128,6 +133,22 @@ impl RunMetrics {
     }
 }
 
+/// Чат корневого хода — его пишет драйвер в начале каждого хода. Старые
+/// трассы без этого поля читаются целиком, как раньше.
+fn root_conversation(trace: &Trace) -> Option<u64> {
+    trace
+        .by_action(crate::harness::driver::TURN_STARTED)
+        .next()?
+        .number("conversation")
+}
+
+/// Чат записи: поле JSON или `conversation=N` в строке сообщения.
+fn record_conversation(record: &crate::harness::trace::TraceRecord) -> Option<u64> {
+    record
+        .number("conversation")
+        .or_else(|| message_field(record, "conversation")?.parse().ok())
+}
+
 /// The `status` the driver recorded when the run finished, if the trace has
 /// that record at all (an aborted or killed child may not).
 fn driver_status(trace: &Trace) -> Option<&str> {
@@ -176,6 +197,26 @@ mod tests {
 
     fn trace_of(lines: &[&str]) -> Trace {
         Trace::parse(&lines.join("\n"))
+    }
+
+    /// Шаги суб-агента идут той же трассой, но работа корня — только его.
+    #[test]
+    fn only_the_root_conversation_is_counted() {
+        let trace = trace_of(&[
+            r#"{"seq":0,"ts":"t","action":"harness.turn.started","data":{"turn":1,"conversation":1}}"#,
+            r#"{"seq":1,"ts":"t","action":"agent.step.start","message":"conversation=1 step=1/6"}"#,
+            r#"{"seq":2,"ts":"t","action":"agent.tool.call.payload","data":{"conversation":1,"tool_name":"task"}}"#,
+            r#"{"seq":3,"ts":"t","action":"agent.step.start","message":"conversation=7 step=1/16"}"#,
+            r#"{"seq":4,"ts":"t","action":"agent.tool.call.payload","data":{"conversation":7,"tool_name":"bash"}}"#,
+            r#"{"seq":5,"ts":"t","action":"agent.turn.done","message":"conversation=7 status=done"}"#,
+        ]);
+        let metrics = RunMetrics::from_trace(&trace);
+        assert_eq!(metrics.steps, 1);
+        assert_eq!(metrics.tool_calls, 1);
+        assert!(metrics.tools_used.contains_key("task"));
+        assert!(!metrics.tools_used.contains_key("bash"));
+        // Конец суб-агента — не конец корня.
+        assert_eq!(metrics.turn_end, TurnEnd::Unknown);
     }
 
     #[test]

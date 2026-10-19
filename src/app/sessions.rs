@@ -16,6 +16,8 @@ impl App {
         match session::load_local(session_id, &self.config) {
             Ok(s) => {
                 self.state.focused_mut().messages = s.messages.clone();
+                // Заметки старого чата в загруженную сессию не попадают.
+                self.state.focused_mut().deferred.clear();
                 self.state.attached_files.clear();
                 self.state.focused_mut().session_id = s.id.clone();
                 self.state.focused_mut().tag = s.tag.clone();
@@ -29,6 +31,8 @@ impl App {
                 if let Some(handle) = self.state.focused_mut().agent_task.take() {
                     handle.abort();
                 }
+                let aborted = self.state.conversations.focused_id();
+                self.purge_interactions_for(aborted).await;
 
                 let count = s.messages.len();
                 self.state.status_message =
@@ -238,6 +242,7 @@ impl App {
             return;
         };
         conv.messages = messages;
+        conv.deferred.clear();
         conv.session_id = session_id.to_string();
         // A freshly imported remote session has no known-broken history and
         // (see the save below) no locally-confirmed provider identity yet.

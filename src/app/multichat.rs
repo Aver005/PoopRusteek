@@ -40,9 +40,8 @@ fn conversation_title(messages: &[ChatMessage]) -> String {
 }
 
 impl App {
-    /// Spawn an isolated background agent (sidechat or sub-agent): a forked
-    /// session that streams on its own task with auto-approved tools and
-    /// reports back to `parent` when done.
+    /// Фоновый ход (`/btw`, суб-агент) на форке провайдера родителя. Его
+    /// инструменты подтверждаются как обычно; итог уходит в родительский чат.
     pub(crate) async fn spawn_background_agent(
         &mut self,
         kind: conversation::ConversationKind,
@@ -50,14 +49,22 @@ impl App {
         title: String,
         prompt: String,
     ) -> AppResult<()> {
-        let provider = match self.state.focused().provider.as_ref() {
-            Some(p) => p.fork(),
-            None => {
-                self.state.focused_mut().messages.push(ChatMessage::system(
-                    "No provider configured. Set your DeepSeek token in config.",
-                ));
-                return Ok(());
-            }
+        // Провайдер того чата, что запросил: у параллельных чатов он бывает свой.
+        let parent_provider = self
+            .state
+            .conversations
+            .get(parent)
+            .and_then(|conv| conv.provider.as_ref())
+            .or(self.state.focused().provider.as_ref())
+            .map(|provider| provider.fork());
+        let Some(provider) = parent_provider else {
+            self.note_to(
+                parent,
+                ChatMessage::system(&format!(
+                    "⚠ Background agent '{title}' could not start: no provider is configured."
+                )),
+            );
+            return Ok(());
         };
 
         let id = conversation::ConversationId::next();
@@ -69,25 +76,18 @@ impl App {
         let mut generation = generation::GenerationState::default();
         generation.begin(std::time::Instant::now());
 
-        let handle = self.runtime.spawn(super::runtime::TurnSpec {
-            conversation: id,
-            provider: Arc::clone(&provider),
-            messages: messages.clone(),
-            system_prompt,
-            model: self.config.provider.model.clone(),
-            temperature: self.config.provider.temperature,
-            max_tokens: self.config.provider.max_tokens,
-            max_steps: self.config.agent.max_steps_per_turn.clamp(1, 8),
-            max_tools_per_step: self.config.agent.max_tools_per_step.max(1),
-            auto_approve: true, // background: auto-approve, never block on a modal
-            tool_output_limit: self.config.context.tool_output_limit as usize,
-            context: crate::context::ContextSpec::new(
+        let handle = self.runtime.spawn(super::runtime::TurnSpec::background(
+            id,
+            Arc::clone(&provider),
+            &prompt,
+            &system_prompt,
+            &self.config,
+            crate::context::ContextSpec::new(
                 &self.config.context,
                 self.state.provider_context_window,
                 &session_id,
-            )
-            .with_output_cap(self.config.provider.max_tokens),
-        });
+            ),
+        ));
 
         self.state
             .conversations
@@ -107,6 +107,7 @@ impl App {
                 context_used: 0,
                 compact_mode: None,
                 compacting: None,
+                deferred: Vec::new(),
             });
         Ok(())
     }
@@ -143,17 +144,18 @@ impl App {
             prompt,
         )
         .await?;
-        self.state
-            .focused_mut()
-            .messages
-            .push(ChatMessage::system(&format!(
-                "🤖 sub-agent started — {label}"
-            )));
+        self.note_to(
+            parent,
+            ChatMessage::ui_system(&format!("🤖 sub-agent started — {label}")),
+        );
         Ok(())
     }
 
     /// Stop a running background conversation (sidechat / sub-agent) by id.
-    pub(crate) fn stop_background(&mut self, target: conversation::ConversationId) {
+    pub(crate) async fn stop_background(&mut self, target: conversation::ConversationId) {
+        // Его запросы подтверждения уходят вместе с ним: иначе модалка висела
+        // бы над задачей, которой нет, а «всегда» сохраняло бы правило зря.
+        self.purge_interactions_for(target).await;
         if let Some(mut conv) = self.state.conversations.remove(target) {
             self.drop_timers_of(target);
             if let Some(handle) = conv.agent_task.take() {
@@ -165,16 +167,32 @@ impl App {
             } else {
                 conv.title
             };
-            self.state
-                .focused_mut()
-                .messages
-                .push(ChatMessage::system(&format!("⏹ Stopped: {title}")));
+            // Родитель должен знать, что порученное ему не сделают.
+            let parent = conv
+                .parent
+                .unwrap_or_else(|| self.state.conversations.focused_id());
+            self.note_to(
+                parent,
+                ChatMessage::system(&format!(
+                    "⏹ Background agent '{title}' was stopped by the user before it finished."
+                )),
+            );
         }
     }
 
-    /// Apply an agent event that targets a non-focused conversation. Streaming
-    /// events mutate that conversation; terminal events finalize sidechats /
-    /// sub-agents (which flush their result) while parked sessions just stop.
+    /// Заметка в чат `target`, отложенная до конца его хода. Нет такого чата —
+    /// только строкой на экране: в чужую историю она не идёт.
+    fn note_to(&mut self, target: conversation::ConversationId, note: ChatMessage) {
+        match self.state.conversations.get_mut(target) {
+            Some(conv) => conv.deliver_note(note),
+            None => self
+                .state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::ui_system(&note.content)),
+        }
+    }
+
     /// Remove a finished sidechat / sub-agent and flush its result (answer or
     /// error) into the chat that spawned it (or the focused chat).
     pub(crate) fn finish_background(
@@ -191,43 +209,48 @@ impl App {
             conversation::ConversationKind::SubAgent => "🤖 sub-agent",
             _ => "◈ btw",
         };
-        let block = if let Some(err) = error {
-            format!("{label} — {}\n\n⚠ {err}", conv.title)
-        } else {
-            let answer = conv
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == Role::Assistant)
-                .map(|m| m.content.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "(no answer)".to_string());
-            format!("{label} — {}\n\n{answer}", conv.title)
+        // Тот же итог, что у `task`: ответ и что сделано, или провал и последняя реплика.
+        let last_text = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && !m.content.trim().is_empty())
+            .map(|m| m.content.trim().to_string())
+            .unwrap_or_default();
+        let ran: Vec<String> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool && !m.tool_error)
+            .filter_map(|m| m.name.clone())
+            .collect();
+        let end = match &error {
+            Some(error) => Some(Err(error.as_str())),
+            None if !last_text.is_empty() => Some(Ok(last_text.as_str())),
+            None => None,
         };
+        let block = crate::agent::sub_agent::background_block(
+            label,
+            &conv.title,
+            &crate::agent::sub_agent::report(&conv.title, end, &last_text, &ran),
+        );
 
-        // Deliver into the chat that spawned it; if the user has switched away,
-        // drop the result there and just notify the focused chat.
+        // В чат, который его запустил. Тот закрыт — только строкой на экране:
+        // в историю чужого чата итог не идёт.
         let focused_id = self.state.conversations.focused_id();
-        if let Some(pid) = conv.parent
-            && pid != focused_id
-            && let Some(pconv) = self.state.conversations.get_mut(pid)
-        {
-            pconv.messages.push(ChatMessage::system(&block));
+        let parent = conv.parent.unwrap_or(focused_id);
+        if parent != focused_id && self.state.conversations.get(parent).is_some() {
             self.state
                 .focused_mut()
                 .messages
-                .push(ChatMessage::system(&format!(
+                .push(ChatMessage::ui_system(&format!(
                     "{label} finished in another chat — {}",
                     conv.title
                 )));
-            return;
         }
-
-        self.state
-            .focused_mut()
-            .messages
-            .push(ChatMessage::system(&block));
-        self.auto_save_session();
+        self.note_to(parent, ChatMessage::system(&block));
+        if parent == focused_id {
+            self.auto_save_session();
+        }
     }
 
     /// Open a fresh parallel session and focus it; the current one keeps
@@ -254,6 +277,7 @@ impl App {
             context_used: 0,
             compact_mode: None,
             compacting: None,
+            deferred: Vec::new(),
         });
         self.state.scroll_offset = 0;
         self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();

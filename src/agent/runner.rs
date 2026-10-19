@@ -18,12 +18,8 @@ use crate::tools::registry::ToolRegistry;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Drive one agent turn described by `spec`. Every event it emits is tagged
-/// with the spec's conversation id so the app routes it to the right
-/// conversation (focused or background). When `spec.auto_approve` is set
-/// (background sidechats / sub-agents, where no user is watching) tool calls
-/// run without an approval prompt and `question` calls are declined instead
-/// of blocking.
+/// Провести один ход. События помечены чатом хода, чтобы приложение несло их
+/// куда нужно. Ход без человека отклоняет `question`, `timer` и вложенный `task`.
 pub async fn run_agent_loop(
     spec: TurnSpec,
     tools: Arc<ToolRegistry>,
@@ -41,7 +37,7 @@ pub async fn run_agent_loop(
         max_tokens,
         max_steps,
         max_tools_per_step,
-        auto_approve,
+        unattended,
         tool_output_limit,
         context,
     } = spec;
@@ -72,9 +68,11 @@ pub async fn run_agent_loop(
         max_tokens,
         max_steps,
         max_tools_per_step,
-        auto_approve,
+        unattended,
         tool_output_limit,
         event_tx: &event_tx,
+        semantic: &semantic,
+        context: &context,
     };
 
     for step in 0..max_steps {
@@ -115,7 +113,7 @@ pub async fn run_agent_loop(
         let parse_ctx = ParseCtx {
             catalog: &catalog,
             tool_outputs: tool_outputs(&messages),
-            unattended: auto_approve,
+            unattended,
         };
 
         let raw = if continuable && native_calls.is_empty() {
@@ -158,8 +156,8 @@ pub async fn run_agent_loop(
             raw
         };
         // Модели тоже: иначе она не знает, что её ответ обрезан.
-        if let Some(notice) = truncated {
-            ctx.emit(AgentEvent::Message(ChatMessage::system(&notice)));
+        if let Some(notice) = &truncated {
+            ctx.emit(AgentEvent::Message(ChatMessage::system(notice)));
         }
 
         let ParsedReply {
@@ -221,6 +219,7 @@ pub async fn run_agent_loop(
                     ctx.emit(AgentEvent::Done(AgentResult {
                         text,
                         tool_calls: collected_tool_calls,
+                        truncated,
                     }));
                     return;
                 }
@@ -272,7 +271,7 @@ const TURN_FAILURE_REASON_BYTES: usize = 400;
 
 /// Провал хода со списком того, что он успел сделать: без списка повтор
 /// запроса ложится поверх уже изменённых файлов. Читают и человек, и модель.
-pub(crate) fn turn_failure(reason: &str, done: &[ToolCallInfo]) -> String {
+fn turn_failure(reason: &str, done: &[ToolCallInfo]) -> String {
     // Причина бывает длинной (тело ответа, битые вызовы) — список важнее.
     let reason = crate::util::truncate_with_ellipsis(reason, TURN_FAILURE_REASON_BYTES);
     if done.is_empty() {
@@ -911,7 +910,7 @@ async fn stream_step(
 
 /// Инструменты хода для провайдера с родным протоколом: встроенные и все MCP.
 /// Пусто — инструменты описаны текстом в системном промпте.
-pub(crate) async fn native_tool_definitions(
+async fn native_tool_definitions(
     provider: &Arc<dyn LLMProvider>,
     tools: &ToolRegistry,
     mcp: &tokio::sync::Mutex<MCPManager>,
@@ -930,10 +929,8 @@ pub(crate) async fn native_tool_definitions(
     definitions
 }
 
-/// Build one step's completion request: system prompt first, then the
-/// running history. Shared by the main and sub-agent loops (the two copies
-/// had already been flagged as drift-prone).
-pub(crate) fn build_step_request(
+/// Запрос шага: системный промпт, затем история.
+fn build_step_request(
     system_prompt: &str,
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
@@ -957,16 +954,15 @@ pub(crate) fn build_step_request(
 /// Nudge sent back after an empty reply. Deliberately concrete about the two
 /// acceptable shapes of a turn, since the failure is the model producing
 /// neither.
-pub(crate) const EMPTY_RESPONSE_FEEDBACK: &str = "Your last reply was completely empty. Answer the request now: either write the text of the answer, or emit a tool call in the documented <tool_use> form. Do not reply with nothing.";
+const EMPTY_RESPONSE_FEEDBACK: &str = "Your last reply was completely empty. Answer the request now: either write the text of the answer, or emit a tool call in the documented <tool_use> form. Do not reply with nothing.";
 
 /// Вызов не влез в лимит вывода даже с дозапросами.
-pub(crate) const OUTPUT_LIMIT_FEEDBACK: &str = "Your previous reply hit the output length limit in the middle of a tool call, so the call was cut off and NOT executed. Re-send it in smaller pieces: write a large file in several parts (create it with the first part, then add the rest with edits), or split the work into several smaller calls.";
+const OUTPUT_LIMIT_FEEDBACK: &str = "Your previous reply hit the output length limit in the middle of a tool call, so the call was cut off and NOT executed. Re-send it in smaller pieces: write a large file in several parts (create it with the first part, then add the rest with edits), or split the work into several smaller calls.";
 
 /// Correction message handed back to the model after it emitted a `<tool_use>`
 /// block that couldn't be parsed. Names each concrete problem and restates the
-/// exact required shape so the model can re-issue the call. Shared by the
-/// main and sub-agent loops.
-pub(crate) fn malformed_tool_feedback(errors: &[String]) -> String {
+/// exact required shape so the model can re-issue the call.
+fn malformed_tool_feedback(errors: &[String]) -> String {
     format!(
         "Your previous message contained a tool call that could NOT be parsed, \
          so it was NOT executed:\n- {}\n\nRe-issue it using exactly this shape, \
@@ -989,14 +985,14 @@ pub(crate) fn tool_outputs(messages: &[ChatMessage]) -> Vec<&str> {
 }
 
 /// Неразобранная разметка одной строкой — для заметки рядом с вызовами.
-pub(crate) fn unparsed_markup(snippet: &str) -> String {
+fn unparsed_markup(snippet: &str) -> String {
     format!(
         "markup that mentions a tool could not be read as a call: «{}»",
         snippet.split_whitespace().collect::<Vec<_>>().join(" ")
     )
 }
 
-pub(crate) fn unparsed_markup_feedback(snippet: &str) -> String {
+fn unparsed_markup_feedback(snippet: &str) -> String {
     format!(
         "Your previous reply seems to contain a tool call in a format this agent cannot read, \
          so nothing was run:\n{snippet}\n\nIf you meant to call a tool, re-send the call as \
@@ -1007,7 +1003,7 @@ pub(crate) fn unparsed_markup_feedback(snippet: &str) -> String {
 
 /// Заметка модели, когда рядом с выполненными вызовами были битые. Системная,
 /// а не от пользователя: в хвосте DeepSeek она идёт как `### NOTE`.
-pub(crate) fn beside_calls_note(errors: &[String], handled: &[String]) -> String {
+fn beside_calls_note(errors: &[String], handled: &[String]) -> String {
     format!(
         "Some tool calls in your previous message could NOT be parsed and were NOT run:\n- {}\n\n\
          The other calls from that message were handled — their results are above, do not \
@@ -1046,7 +1042,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: false,
+                unattended: false,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1118,7 +1114,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: false,
+                unattended: false,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1238,6 +1234,28 @@ mod tests {
         );
     }
 
+    /// Провести ход, одобряя каждый запрос подтверждения, как человек, и
+    /// вернуть все его события. Автоодобрения в самом ходе больше нет.
+    async fn run_approving(spec: TurnSpec) -> Vec<AppEvent> {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let turn = tokio::spawn(run_agent_loop(
+            spec,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
+            SemanticService::disabled(),
+            event_tx,
+        ));
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let AppEvent::RequestToolApproval(request) = &event {
+                request.resolve(true).await;
+            }
+            events.push(event);
+        }
+        turn.await.expect("the turn task");
+        events
+    }
+
     /// Run one turn and collect its terminal events.
     async fn drive_turn(
         provider: Arc<dyn LLMProvider>,
@@ -1256,7 +1274,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1357,7 +1375,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1412,7 +1430,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1478,7 +1496,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1529,7 +1547,7 @@ mod tests {
                     max_tokens: 128,
                     max_steps: 2,
                     max_tools_per_step: 4,
-                    auto_approve: true,
+                    unattended: true,
                     tool_output_limit: 0,
                     context: crate::context::ContextSpec::default(),
                 },
@@ -1562,34 +1580,26 @@ mod tests {
                     provider_state: None,
                 }]),
         );
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let cid = ConversationId::next();
-        run_agent_loop(
-            TurnSpec {
-                conversation: cid,
-                provider,
-                messages: vec![ChatMessage::user("read the manifest")],
-                system_prompt: "system".to_string(),
-                model: "fake".to_string(),
-                temperature: 0.0,
-                max_tokens: 128,
-                max_steps: 4,
-                max_tools_per_step: 4,
-                auto_approve: true,
-                tool_output_limit: 0,
-                context: crate::context::ContextSpec::default(),
-            },
-            Arc::new(ToolRegistry::new()),
-            Arc::new(tokio::sync::Mutex::new(MCPManager::new())),
-            SemanticService::disabled(),
-            event_tx,
-        )
+        let events = run_approving(TurnSpec {
+            conversation: ConversationId::next(),
+            provider,
+            messages: vec![ChatMessage::user("read the manifest")],
+            system_prompt: "system".to_string(),
+            model: "fake".to_string(),
+            temperature: 0.0,
+            max_tokens: 128,
+            max_steps: 4,
+            max_tools_per_step: 4,
+            unattended: true,
+            tool_output_limit: 0,
+            context: crate::context::ContextSpec::default(),
+        })
         .await;
 
         let mut notices = Vec::new();
         let mut ended_with = Vec::new();
         let mut ran_tools = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
+        for event in events {
             match event {
                 AppEvent::Agent {
                     event: AgentEvent::Message(message),
@@ -1651,7 +1661,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1689,6 +1699,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::tools::Tool for LoudTool {
+        // Тестам важно другое; подтверждение проверяют тесты суб-агента.
+        fn requires_approval(&self) -> bool {
+            false
+        }
         fn definition(&self) -> crate::tools::ToolDefinition {
             crate::tools::ToolDefinition {
                 name: "loud".to_string(),
@@ -1731,7 +1745,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 500,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1806,7 +1820,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 500,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1857,7 +1871,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 500,
                 context: crate::context::ContextSpec::default(),
             },
@@ -1893,6 +1907,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::tools::Tool for HugeTool {
+        // Тестам важно другое; подтверждение проверяют тесты суб-агента.
+        fn requires_approval(&self) -> bool {
+            false
+        }
         fn definition(&self) -> crate::tools::ToolDefinition {
             crate::tools::ToolDefinition {
                 name: "huge".to_string(),
@@ -1935,7 +1953,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 5,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2017,7 +2035,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 5,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2095,7 +2113,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 5,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2175,7 +2193,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 1,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2283,7 +2301,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 1,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2362,7 +2380,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 1,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2445,7 +2463,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 1,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2534,7 +2552,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 5,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2597,7 +2615,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 1,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2650,7 +2668,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 1,
                 max_tools_per_step: 4,
-                auto_approve: true,
+                unattended: true,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec {
                     auto_compact: true,
@@ -2791,7 +2809,7 @@ mod tests {
         provider: Arc<dyn LLMProvider>,
         tools: Arc<ToolRegistry>,
         conversation: ConversationId,
-        auto_approve: bool,
+        unattended: bool,
     ) {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         run_agent_loop(
@@ -2805,7 +2823,7 @@ mod tests {
                 max_tokens: 128,
                 max_steps: 4,
                 max_tools_per_step: 4,
-                auto_approve,
+                unattended,
                 tool_output_limit: 0,
                 context: crate::context::ContextSpec::default(),
             },

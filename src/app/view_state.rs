@@ -667,6 +667,8 @@ pub enum Modal {
     ToolApproval {
         tool_name: String,
         arguments: String,
+        /// Кто спрашивает, если не ход на экране.
+        origin: Option<String>,
         scroll_offset: usize,
         /// Что человек разрешает, если жмёт «да»: только этот вызов, эту
         /// область или инструмент целиком.

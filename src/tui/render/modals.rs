@@ -23,6 +23,7 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
         Modal::ToolApproval {
             tool_name,
             arguments,
+            origin,
             scroll_offset,
             grant,
             scope,
@@ -32,6 +33,7 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
             ToolApprovalView {
                 tool_name,
                 arguments,
+                origin: origin.as_deref(),
                 scroll_offset: *scroll_offset,
                 grant: *grant,
                 scope: scope.as_ref(),
@@ -54,6 +56,7 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
 struct ToolApprovalView<'a> {
     tool_name: &'a str,
     arguments: &'a str,
+    origin: Option<&'a str>,
     scroll_offset: usize,
     grant: crate::app::view_state::Grant,
     scope: Option<&'a crate::whitelist::Scope>,
@@ -63,6 +66,7 @@ fn render_tool_approval(frame: &mut Frame, area: Rect, view: ToolApprovalView<'_
     let ToolApprovalView {
         tool_name,
         arguments,
+        origin,
         scroll_offset,
         grant,
         scope,
@@ -77,7 +81,8 @@ fn render_tool_approval(frame: &mut Frame, area: Rect, view: ToolApprovalView<'_
     // Плюс строка на каждый вариант разрешения — их два или три, и обрезать
     // их снизу нельзя: именно там человек видит, что именно он разрешает.
     let grants = crate::app::view_state::Grant::all(scope.is_some()).len();
-    let popup_height = (content_height + 7 + grants).min(max_height as usize) as u16;
+    let popup_height = (content_height + 7 + grants + usize::from(origin.is_some()))
+        .min(max_height as usize) as u16;
     let popup_area = center_popup(area, popup_width, popup_height);
 
     let block = modal_block(" \u{26A0} Tool Call ", theme.warning, theme);
@@ -99,6 +104,14 @@ fn render_tool_approval(frame: &mut Frame, area: Rect, view: ToolApprovalView<'_
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    // Кто спрашивает — своей строкой, вне аргументов: подпись из текста модели
+    // не должна рисовать в модалке поддельные аргументы.
+    if let Some(origin) = origin {
+        all_lines.push(Line::from(vec![
+            Span::styled("    From: ", Style::default().fg(theme.text_dim)),
+            Span::styled(origin.to_string(), Style::default().fg(theme.warning)),
+        ]));
+    }
     all_lines.push(Line::from(""));
 
     // Arguments header

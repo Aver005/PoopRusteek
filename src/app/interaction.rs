@@ -9,20 +9,27 @@ use super::{App, conversation};
 impl App {
     /// Запрос на подтверждение инструмента: разрешить сразу, поставить в
     /// очередь или показать.
-    pub(super) async fn on_tool_approval_requested(&mut self, request: ToolApprovalRequest) {
+    pub(super) async fn on_tool_approval_requested(&mut self, mut request: ToolApprovalRequest) {
         // Называем правило, а не просто «auto-approved»: с областями человеку
         // важно видеть, какое именно разрешение сработало.
-        if !request.always_ask
-            && let Some(rule) = self
-                .state
-                .approved_tools
-                .matching(&request.tool_name, request.scope.as_ref())
-        {
-            let shown = rule.describe();
+        if let Some(shown) = self.whitelisted(&request) {
             request.resolve(true).await;
-            self.state.focused_mut().generation.active = true;
             self.state.status_message = format!("Running {shown} (auto-approved)");
             return;
+        }
+        // Спрашивает не чат на экране — модалка обязана это сказать.
+        if request.origin.is_none() && request.conversation != self.state.conversations.focused_id()
+        {
+            request.origin = self
+                .state
+                .conversations
+                .get(request.conversation)
+                .map(|conv| {
+                    format!(
+                        "background chat «{}»",
+                        crate::util::one_line_label(&conv.title, 60)
+                    )
+                });
         }
         if self.slot_is_busy() {
             self.state
@@ -50,6 +57,18 @@ impl App {
         self.present_question(request, state);
     }
 
+    /// Правило белого списка, которое разрешает этот запрос. Вызов в чужой
+    /// разметке или с поправленным именем решает только человек.
+    fn whitelisted(&self, request: &ToolApprovalRequest) -> Option<String> {
+        if request.always_ask {
+            return None;
+        }
+        self.state
+            .approved_tools
+            .matching(&request.tool_name, request.scope.as_ref())
+            .map(|rule| rule.describe())
+    }
+
     /// Занят ли экран чем-то, что ждёт ответа человека.
     fn slot_is_busy(&self) -> bool {
         self.state.modal.is_some()
@@ -57,13 +76,14 @@ impl App {
             || self.state.pending_question.is_some()
     }
 
-    /// Показать запрос подтверждения: модалка плюс текущий слот.
+    /// Показать запрос подтверждения: модалка плюс текущий слот. Флаг занятости
+    /// не трогаем: ход, ждущий человека, всё ещё идёт — и он не обязательно фокусный.
     fn present_tool_approval(&mut self, request: ToolApprovalRequest) {
-        self.state.focused_mut().generation.active = false;
         self.state.status_message = format!("Approve tool {}?", request.tool_name);
         self.state.modal = Some(Modal::ToolApproval {
             tool_name: request.tool_name.clone(),
             arguments: request.arguments.clone(),
+            origin: request.origin.clone(),
             scroll_offset: 0,
             grant: super::events::Grant::default(),
             scope: request.scope.clone(),
@@ -75,7 +95,6 @@ impl App {
     fn present_question(&mut self, request: QuestionRequest, state: QuestionState) {
         self.state.pending_question = Some(request);
         self.state.modal = Some(Modal::Question(state));
-        self.state.focused_mut().generation.active = false;
         self.state.status_message = "Question pending...".to_string();
     }
 
@@ -85,11 +104,7 @@ impl App {
         while let Some(next) = self.state.pending_interactions.pop_front() {
             match next {
                 PendingInteraction::Approval(request) => {
-                    if self
-                        .state
-                        .approved_tools
-                        .allows(&request.tool_name, request.scope.as_ref())
-                    {
+                    if self.whitelisted(&request).is_some() {
                         request.resolve(true).await;
                         continue;
                     }

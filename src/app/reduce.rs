@@ -129,6 +129,7 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
         }
         AgentEvent::Done(_) => {
             conversation.finish_turn("FINISHED");
+            conversation.flush_deferred();
             turn_end(event)
         }
         AgentEvent::Failed(reason) => {
@@ -138,6 +139,7 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
             conversation
                 .messages
                 .push(crate::provider::ChatMessage::system(&failure_note(reason)));
+            conversation.flush_deferred();
             turn_end(event)
         }
         // Ход инструмента и сброс серверной сессии историю не трогают:
@@ -210,6 +212,7 @@ mod tests {
             &AgentEvent::Done(AgentResult {
                 text: String::new(),
                 tool_calls: Vec::new(),
+                truncated: None,
             }),
         );
         assert_eq!(end, Some(TurnEnd::Done));
@@ -243,6 +246,33 @@ mod tests {
         assert!(!last.ui_only, "заметка должна дойти до модели");
         assert!(last.content.contains("сеть отвалилась"), "{}", last.content);
         assert!(last.content.contains("incomplete"), "{}", last.content);
+    }
+
+    /// Итог фонового суб-агента посреди хода раньше вставал внутрь хода, и
+    /// DeepSeek (шлёт хвост после последнего ответа) его не видел никогда.
+    #[test]
+    fn a_note_arriving_mid_turn_lands_after_the_turn() {
+        let mut conv = conversation();
+        apply(&mut conv, &AgentEvent::Started);
+        apply(&mut conv, &AgentEvent::BeginAssistantMessage);
+        conv.deliver_note(ChatMessage::system("sub-agent result"));
+        apply(&mut conv, &AgentEvent::Chunk("answer".to_string()));
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| m.content != "sub-agent result")
+        );
+        apply(
+            &mut conv,
+            &AgentEvent::Done(AgentResult {
+                text: "answer".to_string(),
+                tool_calls: Vec::new(),
+                truncated: None,
+            }),
+        );
+        let last = conv.messages.last().expect("the note");
+        assert_eq!(last.content, "sub-agent result");
+        assert_eq!(conv.messages[conv.messages.len() - 2].content, "answer");
     }
 
     /// Тело ответа WAF не должно ехать в каждый следующий запрос целиком.

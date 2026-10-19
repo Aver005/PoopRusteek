@@ -241,12 +241,10 @@ pub fn render_run(outcome: &RunOutcome) -> String {
         let names: Vec<String> = outcome
             .tools
             .iter()
-            .map(|tool| {
-                if tool.approved {
-                    tool.name.clone()
-                } else {
-                    format!("{}(denied)", tool.name)
-                }
+            .map(|tool| match (tool.approved, tool.ok) {
+                (false, _) => format!("{}(denied)", tool.name),
+                (true, false) => format!("{}(failed)", tool.name),
+                (true, true) => tool.name.clone(),
             })
             .collect();
         lines.push(format!("  tools:      {}", names.join(", ")));
@@ -254,8 +252,21 @@ pub fn render_run(outcome: &RunOutcome) -> String {
     if outcome.sub_agents > 0 {
         lines.push(format!("  sub-agents: {}", outcome.sub_agents));
     }
-    if !outcome.questions.is_empty() {
-        lines.push(format!("  questions:  {}", outcome.questions.len()));
+    for result in &outcome.sub_agent_results {
+        lines.push(format!(
+            "  sub-agent:  {} — {}",
+            result.label, result.status
+        ));
+    }
+    // Ответ на вопрос выбран за вызывающего — он должен видеть, какой.
+    for answered in &outcome.answered {
+        lines.push(format!(
+            "  question:   {} → «{}» ({})",
+            answered.question, answered.answer, answered.source
+        ));
+    }
+    for warning in &outcome.warnings {
+        lines.push(format!("  warning:    {warning}"));
     }
     if let Some(session) = &outcome.session_id {
         lines.push(format!("  session:    {session}"));
@@ -440,17 +451,9 @@ mod tests {
             workspace: None,
             rate_limited_retries: 0,
             outcome: RunOutcome {
-                status: RunStatus::Completed,
-                trace_path: PathBuf::from("t.jsonl"),
                 duration_ms: 1000,
                 turns: 1,
-                final_text: String::new(),
-                tools: Vec::new(),
-                sub_agents: 0,
-                questions: Vec::new(),
-                error: None,
-                session_id: None,
-                semantic_ready: false,
+                ..RunOutcome::bare(RunStatus::Completed, PathBuf::from("t.jsonl"))
             },
             metrics,
             failures: Vec::new(),

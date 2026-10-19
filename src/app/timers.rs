@@ -76,9 +76,7 @@ impl App {
             let owner = ConversationId(timer.owner);
             let target = self.state.conversations.get(owner);
             let alive = target.is_some();
-            let busy = target
-                .map(|c| c.generation.active || c.compacting.is_some())
-                .unwrap_or(false);
+            let busy = target.is_some_and(|c| c.is_busy());
 
             match route(&timer, alive, busy) {
                 Delivery::Defer => timers.defer(timer, now + Duration::seconds(DEFER_STEP_SECS)),

@@ -304,6 +304,32 @@ pub fn total_ram_bytes() -> Option<u64> {
     }
 }
 
+/// Подпись из текста модели для экрана: одна строка, без управляющих символов,
+/// не длиннее `max_chars`. Иначе подпись рисовала бы в модалке что угодно.
+pub fn one_line_label(text: &str, max_chars: usize) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    // Управляющие, bidi и нулевой ширины: иначе подпись переставляла бы текст.
+    let clean: String = line
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{FEFF}'
+                )
+        })
+        .collect();
+    if clean.chars().count() <= max_chars {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
 /// Просьба завершиться: Ctrl+C, а на Unix ещё SIGTERM и SIGHUP (закрыли
 /// терминал). Команды живут в своих группах и сами этот сигнал не получат.
 pub async fn shutdown_signal() {
