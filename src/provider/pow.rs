@@ -262,46 +262,44 @@ fn resolve_wasm_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Фикстура повторяет форму настоящего challenge: без сети и токена.
+    /// Настоящий challenge сервера от 2026-11-06, срок истёк, подпись заменена.
+    /// Ответ `REAL_ANSWER` сервер принял: выдуманный challenge решения не имеет.
     fn fixture(difficulty: &str) -> PowChallengeData {
         PowChallengeData {
             algorithm: "DeepSeekHashV1".to_string(),
-            challenge: "0c1a1f2e3d4b5a69788796a5b4c3d2e1".to_string(),
+            challenge: "94dde891b5194abb18cb9231a20a0739c513ea9ead898cc0d24144081979ef81"
+                .to_string(),
             difficulty: difficulty.to_string(),
-            salt: "9f8e7d6c5b4a39281706f5e4d3c2b1a0".to_string(),
+            salt: "92c82ac4b447dfee7c8c".to_string(),
             signature: "fixture-signature".to_string(),
-            target_path: "/chat/completion".to_string(),
-            expire_at: 1_762_345_678,
+            target_path: "/api/v0/chat/completion".to_string(),
+            expire_at: 1_793_982_788_658,
         }
     }
 
-    /// Встроенный wasm грузится, экспорты на месте, память читается: любой
-    /// сбой инициализации или смены ABI даёт None на первом же вызове.
-    #[test]
-    fn embedded_wasm_runtime_instantiates() {
-        let runtime = get_wasm_runtime().expect("встроенный wasm должен грузиться");
-        assert!(!runtime.source.is_empty());
+    const REAL_ANSWER: u64 = 79_277;
 
-        // Тот же вызов, что делает приложение: строка кодируется, солвер
-        // пишет статус и ответ в память. Готового ответа быть не обязано.
-        let outcome = runtime.solve(&fixture("100000").challenge, "salt_1_", 100_000.0);
-        assert_eq!(
-            outcome,
-            Ok(None),
-            "wasm_solve на фикстуре не даёт ответа: {outcome:?}"
-        );
+    #[test]
+    fn real_challenge_gets_the_answer_the_server_accepted() {
+        let solution = solve_pow(&fixture("144000")).expect("солвер обязан найти ответ");
+        assert_eq!(solution.answer, REAL_ANSWER);
     }
 
-    /// Эталон текущего wasm: для фикстуры ответа нет. Тест ловит и смену ABI,
-    /// и появление решения там, где раньше его не было.
     #[test]
-    fn unsolvable_fixture_stays_unsolved() {
-        let challenge = fixture("100000");
-        assert!(solve_pow(&challenge).is_none(), "эталон изменился");
-        assert!(
-            solve_pow(&challenge).is_none(),
-            "ответ должен быть стабилен"
-        );
+    fn a_changed_challenge_or_salt_has_no_answer() {
+        let mut changed_challenge = fixture("144000");
+        changed_challenge.challenge.replace_range(0..1, "0");
+        assert!(solve_pow(&changed_challenge).is_none());
+
+        let mut changed_salt = fixture("144000");
+        changed_salt.salt.replace_range(0..1, "0");
+        assert!(solve_pow(&changed_salt).is_none());
+    }
+
+    /// Поиск ограничен сложностью: ниже ответа он не должен его находить.
+    #[test]
+    fn difficulty_below_the_answer_finds_nothing() {
+        assert!(solve_pow(&fixture("1000")).is_none());
     }
 
     /// Неверные входы отвергаются до запуска wasm.
