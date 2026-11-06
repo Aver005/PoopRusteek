@@ -794,7 +794,16 @@ fn an_account_whose_secret_cannot_be_resolved_is_unavailable_not_fatal() {
     );
     let decision = engine.decide(&query());
     assert_eq!(target(&decision), Some("b"));
-    assert_eq!(skip_of(&decision, "a"), Some(&SkipReason::Unavailable));
+    // Причина видна в решении: не «недоступен», а что именно не прочиталось.
+    assert!(
+        matches!(
+            skip_of(&decision, "a"),
+            Some(SkipReason::InvalidConfig { message })
+                if message.contains("POOPRUSTEEK_SURELY_UNSET_VARIABLE")
+        ),
+        "{:?}",
+        skip_of(&decision, "a")
+    );
 }
 
 /// При `enabled = false` провайдер собирается ровно так, как до шлюза.

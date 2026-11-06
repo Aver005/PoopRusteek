@@ -1106,4 +1106,31 @@ base_url = "http://localhost:1/v1"
         assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), LEGACY);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Запись без модели (мастер позволяет её пропустить) переезжает в аккаунты целиком.
+    #[test]
+    fn a_provider_without_a_model_is_mirrored_into_accounts_not_lost() {
+        let text = "[[providers]]\nname = \"lmstudio\"\nbase_url = \"http://localhost:1234/v1\"\n";
+        let (dir, path) = setup("nomodel", text);
+        let (_, store) = store();
+        let report = run(&path, &store).unwrap();
+        assert!(report.gateway_added, "{report:?}");
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            migrated.contains("[[providers]]"),
+            "the old entry stays: {migrated}"
+        );
+        let config = super::super::parse(&migrated).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].id.as_str(), "lmstudio");
+        assert!(
+            config.accounts[0].model.is_none(),
+            "the empty model stays empty"
+        );
+        assert!(
+            !config.gateway.enabled,
+            "the old way of working is unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

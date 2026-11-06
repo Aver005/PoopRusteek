@@ -97,6 +97,7 @@ impl StoreResolver {
         kind: &RefKind,
         reference: &str,
         account: &AccountId,
+        host: Option<&str>,
     ) -> SecretResult<()> {
         let from_project = self.trust.project_accounts.contains(account);
         if from_project && !kind.allowed_in_project_layer() {
@@ -112,7 +113,7 @@ impl StoreResolver {
         if !from_project && !has_bindings {
             return Ok(());
         }
-        let Some(host) = self.trust.hosts.get(account) else {
+        let Some(host) = host else {
             // Аккаунт пользователя без адреса идёт на штатный хост провайдера. Проектный без
             // адреса подтвердить нечем: чужой репозиторий мог бы жечь квоту, поэтому отказ.
             return if from_project {
@@ -131,7 +132,7 @@ impl StoreResolver {
         } else {
             Err(SecretError::HostNotTrusted {
                 name: reference.to_string(),
-                host: host.clone(),
+                host: host.to_string(),
             })
         }
     }
@@ -158,8 +159,37 @@ impl StoreResolver {
     }
 }
 
-impl SecretResolver for StoreResolver {
-    fn resolve(&self, reference: &SecretRef, account: &AccountId) -> Result<Secret, SecretError> {
+impl StoreResolver {
+    /// Для адаптера аккаунта: адрес берётся из самого аккаунта, а не из снимка конфига при старте.
+    /// Правка `base_url` в панели не должна оставить ключ привязанным к старому хосту.
+    pub fn resolve_for_account(
+        &self,
+        reference: &SecretRef,
+        account: &crate::gateway::types::Account,
+    ) -> Result<Secret, SecretError> {
+        let host = match account.base_url.as_deref() {
+            None => None,
+            Some(url) => {
+                Some(
+                    TrustContext::origin_of(url).ok_or_else(|| SecretError::Refused {
+                        name: reference.as_str().chars().take(24).collect(),
+                        reason: format!(
+                            "account '{}' has a base_url that is not a valid address",
+                            account.id
+                        ),
+                    })?,
+                )
+            }
+        };
+        self.resolve_at(reference, &account.id, host.as_deref())
+    }
+
+    fn resolve_at(
+        &self,
+        reference: &SecretRef,
+        account: &AccountId,
+        host: Option<&str>,
+    ) -> Result<Secret, SecretError> {
         let kind = RefKind::from_ref(reference).map_err(|reason| SecretError::Refused {
             name: reference.as_str().chars().take(24).collect(),
             reason,
@@ -169,7 +199,7 @@ impl SecretResolver for StoreResolver {
                 name: account.to_string(),
             });
         }
-        self.check_trust(&kind, reference.as_str(), account)?;
+        self.check_trust(&kind, reference.as_str(), account, host)?;
         if let Some(hit) = self
             .cache
             .lock()
@@ -184,6 +214,62 @@ impl SecretResolver for StoreResolver {
             cache.insert(reference.as_str().to_string(), secret.clone());
         }
         Ok(secret)
+    }
+}
+
+impl SecretResolver for StoreResolver {
+    fn resolve(&self, reference: &SecretRef, account: &AccountId) -> Result<Secret, SecretError> {
+        let host = self.trust.hosts.get(account).cloned();
+        self.resolve_at(reference, account, host.as_deref())
+    }
+}
+
+/// Движок шлюза просит секрет тем же именем. Блокирует (хранилище, `cmd:`, файл): сборка
+/// движка идёт на `spawn_blocking`, не на цикле событий.
+impl crate::gateway::engine::SecretResolver for StoreResolver {
+    fn resolve(
+        &self,
+        reference: &SecretRef,
+        account: &AccountId,
+    ) -> Result<crate::gateway::engine::Secret, crate::gateway::engine::SecretError> {
+        SecretResolver::resolve(self, reference, account)
+            .map(into_engine)
+            .or_else(|error| none_is_empty(error, account))
+            .map_err(|error| refused(error, account))
+    }
+
+    fn resolve_for(
+        &self,
+        reference: &SecretRef,
+        account: &crate::gateway::types::Account,
+    ) -> Result<crate::gateway::engine::Secret, crate::gateway::engine::SecretError> {
+        self.resolve_for_account(reference, account)
+            .map(into_engine)
+            .or_else(|error| none_is_empty(error, &account.id))
+            .map_err(|error| refused(error, &account.id))
+    }
+}
+
+fn into_engine(secret: Secret) -> crate::gateway::engine::Secret {
+    crate::gateway::engine::Secret::new(secret.expose().to_string())
+}
+
+/// `none` у движка — пустой секрет, как у заглушки: «ключ не нужен», а не ошибка.
+fn none_is_empty(
+    error: SecretError,
+    _account: &AccountId,
+) -> Result<crate::gateway::engine::Secret, SecretError> {
+    match error {
+        SecretError::NotNeeded { .. } => Ok(crate::gateway::engine::Secret::new(String::new())),
+        other => Err(other),
+    }
+}
+
+/// Текст ошибки называет секрет и причину, значения в нём нет.
+fn refused(error: SecretError, account: &AccountId) -> crate::gateway::engine::SecretError {
+    crate::gateway::engine::SecretError::Refused {
+        account: account.to_string(),
+        message: error.to_string(),
     }
 }
 

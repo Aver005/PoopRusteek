@@ -176,6 +176,8 @@ pub struct App {
     provider_window_epoch: Arc<AtomicU64>,
     /// Шлюз аккаунтов и маршрутов. Выключенный не вмешивается в сборку провайдера.
     gateway: crate::gateway::handle::GatewayHandle,
+    /// Пока движок собирается на `spawn_blocking`, `gateway` — ждущая ручка, а здесь её хозяин.
+    pending_gateway: Option<Arc<crate::gateway::pending::PendingGateway>>,
 }
 
 /// Строка статуса при старте, если конфиг включённого шлюза содержит ошибки.
@@ -197,6 +199,38 @@ fn gateway_startup_note(gateway: &crate::gateway::handle::GatewayHandle) -> Opti
         first.path,
         first.message
     ))
+}
+
+/// Шлюз для запуска. Выключенный готов сразу и ничего не читает; включённый собирается
+/// на `spawn_blocking` (секреты: хранилище, `cmd:`, файлы), результат приходит `GatewayBuilt`.
+/// Пока он не готов, ввод и панели живы, а запрос ждёт готовности.
+fn start_gateway(
+    config: &Config,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> (
+    crate::gateway::handle::GatewayHandle,
+    Option<Arc<crate::gateway::pending::PendingGateway>>,
+) {
+    let settings = crate::gateway::engine::gateway_config(config);
+    if !settings.gateway.enabled {
+        let deps = crate::gateway::engine::EngineDeps::for_config(config);
+        return (crate::gateway::engine::build_gateway(settings, deps), None);
+    }
+    let pending = crate::gateway::pending::PendingGateway::new(settings.clone());
+    let config = config.clone();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let built = tokio::task::spawn_blocking(move || {
+            let deps = crate::gateway::engine::EngineDeps::for_config(&config);
+            crate::gateway::engine::build_gateway(settings, deps)
+        })
+        .await
+        .map_err(|error| error.to_string());
+        let _ = tx.send(AppEvent::GatewayBuilt(events::BuiltGateway(built)));
+    });
+    let handle: crate::gateway::handle::GatewayHandle =
+        Arc::new(crate::gateway::pending::PendingHandle(Arc::clone(&pending)));
+    (handle, Some(pending))
 }
 
 /// Передать события шлюза в цикл приложения. Задача кончается вместе со шлюзом.
@@ -459,10 +493,7 @@ impl App {
             });
         });
 
-        let gateway = crate::gateway::engine::build_gateway(
-            crate::gateway::engine::gateway_config(&config),
-            crate::gateway::engine::EngineDeps::for_config(&config),
-        );
+        let (gateway, pending_gateway) = start_gateway(&config, &event_tx);
         spawn_gateway_events(&gateway, event_tx.clone());
         let provider: Option<Arc<dyn LLMProvider>> =
             crate::gateway::handle::main_provider(&config, Some(&gateway));
@@ -533,6 +564,8 @@ impl App {
         // Ошибки конфига шлюза: приложение запускается, а отключённые аккаунты названы.
         if let Some(note) = gateway_startup_note(&gateway) {
             state.status_message = note;
+        } else if pending_gateway.is_some() {
+            state.status_message = "Starting the gateway…".to_string();
         }
 
         // Semantic matcher: background init (first run downloads the
@@ -622,6 +655,7 @@ impl App {
             update_in_flight,
             provider_window_epoch,
             gateway,
+            pending_gateway,
         })
     }
 
@@ -970,6 +1004,7 @@ impl App {
                 self.on_provider_models_refreshed(summary, failed);
             }
             AppEvent::Gateway(event) => self.on_gateway_event(event),
+            AppEvent::GatewayBuilt(built) => self.on_gateway_built(built),
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
@@ -978,6 +1013,28 @@ impl App {
     }
 
     /// Событие шлюза. Экран аккаунтов читает снимок сам; здесь только строка статуса.
+    /// Движок собран: ждущие запросы продолжаются, дальше все берут провайдеров прямо у него.
+    fn on_gateway_built(&mut self, built: events::BuiltGateway) {
+        let Some(pending) = self.pending_gateway.take() else {
+            return;
+        };
+        match built.0 {
+            Ok(gateway) => {
+                pending.fulfil(Arc::clone(&gateway));
+                self.gateway = gateway;
+                self.provider_models.set_gateway(self.gateway.clone());
+                self.state.status_message =
+                    gateway_startup_note(&self.gateway).unwrap_or_else(|| "Gateway ready".into());
+            }
+            Err(reason) => {
+                pending.fail(reason.clone());
+                let message = format!("The gateway failed to start: {reason}");
+                self.state.push_ui_system(&message);
+                self.state.status_message = message;
+            }
+        }
+    }
+
     fn on_gateway_event(&mut self, event: crate::gateway::handle::GatewayEvent) {
         use crate::gateway::handle::GatewayEvent;
         if let GatewayEvent::FallbackTaken {
@@ -1282,6 +1339,8 @@ impl App {
             crate::gateway::engine::gateway_config(&self.config),
             crate::gateway::engine::EngineDeps::for_config(&self.config),
         );
+        // Сборка, которая шла в этот момент, больше не нужна: конфиг стёрт.
+        self.pending_gateway = None;
         self.provider_models.set_gateway(self.gateway.clone());
         self.state.approved_tools = crate::whitelist::Whitelist::default();
         self.state.input.history.clear();
@@ -1687,5 +1746,61 @@ mod window_tests {
         assert_eq!(gateway_startup_note(&healthy), None);
         let off: GatewayHandle = Arc::new(crate::gateway::handle::DisabledGateway::new());
         assert_eq!(gateway_startup_note(&off), None);
+    }
+}
+
+#[cfg(test)]
+mod gateway_start_tests {
+    use super::*;
+
+    /// Секрет читается медленно (`cmd:` ждёт), а запуск не ждёт: ручка отдаётся сразу, ввод и
+    /// панели живы, движок приходит событием.
+    #[tokio::test]
+    async fn a_slow_secret_never_stalls_startup_and_the_engine_arrives_as_an_event() {
+        let slow = if cfg!(windows) {
+            r#"cmd:["cmd","/C","ping -n 3 127.0.0.1 > nul && echo slow-key"]"#
+        } else {
+            r#"cmd:["sh","-c","sleep 2; echo slow-key"]"#
+        };
+        let config = crate::config::parse(&format!(
+            "[gateway]\nenabled = true\n[[accounts]]\nid = \"a\"\nprovider = \"custom\"\nbase_url = \"http://127.0.0.1:1/v1\"\nsecret = '{slow}'\nmodel = \"m\"\n[[routes]]\nid = \"main\"\nsteps = [{{ account = \"a\" }}]\n[roles]\nmain = \"main\"\n"
+        ))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let (handle, pending) = start_gateway(&config, &tx);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "startup must not wait for the secret, took {:?}",
+            started.elapsed()
+        );
+        assert!(pending.is_some() && handle.is_enabled());
+        assert!(handle.snapshot().problems[0].message.contains("starting"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the engine must arrive")
+            .expect("channel open");
+        let AppEvent::GatewayBuilt(built) = event else {
+            panic!("expected GatewayBuilt, got {event:?}");
+        };
+        let engine = built.0.expect("built");
+        assert_eq!(
+            engine.snapshot().accounts.len(),
+            1,
+            "the secret was resolved off the loop"
+        );
+    }
+
+    /// Выключенный шлюз готов сразу и ничего не читает: прежний путь.
+    #[tokio::test]
+    async fn a_disabled_gateway_is_ready_at_once_and_reads_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (handle, pending) = start_gateway(&Config::default(), &tx);
+        assert!(pending.is_none() && !handle.is_enabled());
+        assert!(
+            rx.try_recv().is_err(),
+            "no build event for a disabled gateway"
+        );
     }
 }

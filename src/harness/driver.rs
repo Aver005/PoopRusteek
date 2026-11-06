@@ -653,58 +653,41 @@ fn log_resume(
     );
 }
 
-static EXPLICIT_CONFIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Запомнить, что прогон идёт с `--config`: только тогда харнесс читает настройки шлюза из файла.
-pub fn note_explicit_config(explicit: bool) {
-    EXPLICIT_CONFIG.store(explicit, std::sync::atomic::Ordering::Relaxed);
+/// Шлюз прогона: `[gateway]`, `[[accounts]]`, `[[routes]]`, `[roles]` самого конфига (`--config`).
+/// Сборка читает секреты (`env:`, файлы, `cmd:`), поэтому идёт на `spawn_blocking`.
+async fn harness_gateway(config: &Config) -> AppResult<crate::gateway::handle::GatewayHandle> {
+    let settings = crate::gateway::engine::gateway_config(config);
+    check_gateway_config(&settings)?;
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::gateway::engine::build_gateway(
+            settings,
+            crate::gateway::engine::EngineDeps::for_config(&config),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Custom(format!("gateway build: {e}")))
 }
 
-/// Файл настроек шлюза для прогона. Только вместе с `--config`: забытая переменная не должна
-/// менять рабочий запуск.
-fn gateway_file(explicit_config: bool, var: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    var.filter(|_| explicit_config).map(PathBuf::from)
-}
-
-/// Шлюз прогона. TODO(SECRETS): убрать `POOPRUSTEEK_GATEWAY_TOML`, когда `[gateway]` будет в `Config`.
-fn harness_gateway(config: &Config) -> AppResult<crate::gateway::handle::GatewayHandle> {
-    let path = gateway_file(
-        EXPLICIT_CONFIG.load(std::sync::atomic::Ordering::Relaxed),
-        std::env::var_os("POOPRUSTEEK_GATEWAY_TOML"),
-    );
-    gateway_from_file(config, path.as_deref())
-}
-
-fn gateway_from_file(
-    config: &Config,
-    path: Option<&std::path::Path>,
-) -> AppResult<crate::gateway::handle::GatewayHandle> {
-    let mut settings = crate::gateway::engine::gateway_config(config);
-    if let Some(path) = path {
-        let shown = path.display().to_string();
-        let text =
-            std::fs::read_to_string(path).map_err(|e| AppError::Custom(format!("{shown}: {e}")))?;
-        // Только `message()`: полный текст ошибки TOML печатает строку исходника.
-        settings = toml::from_str(&text)
-            .map_err(|e| AppError::Custom(format!("{shown}: gateway config: {}", e.message())))?;
-        // Прогон на сломанном конфиге ничего не доказывает: отказ до первого хода.
-        let errors: Vec<String> = settings
-            .validate()
-            .into_iter()
-            .filter(|p| p.severity == crate::gateway::types::Severity::Error)
-            .map(|p| format!("{}: {}", p.path, p.message))
-            .collect();
-        if !errors.is_empty() {
-            return Err(AppError::Custom(format!(
-                "{shown}: invalid gateway config: {}",
-                errors.join("; ")
-            )));
-        }
+/// Прогон на сломанном конфиге ничего не доказывает: отказ до первого хода.
+fn check_gateway_config(settings: &crate::gateway::types::GatewayConfig) -> AppResult<()> {
+    if !settings.gateway.enabled {
+        return Ok(());
     }
-    Ok(crate::gateway::engine::build_gateway(
-        settings,
-        crate::gateway::engine::EngineDeps::for_config(config),
-    ))
+    let errors: Vec<String> = settings
+        .validate()
+        .into_iter()
+        .filter(|p| p.severity == crate::gateway::types::Severity::Error)
+        .map(|p| format!("{}: {}", p.path, p.message))
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Custom(format!(
+            "invalid gateway config: {}",
+            errors.join("; ")
+        )))
+    }
 }
 
 /// Build provider, tools, skills, semantic service and system prompt.
@@ -717,7 +700,7 @@ async fn assemble(
     // Пропавший `--attach` — отказ до сборки провайдера и ожидания индекса.
     let attachments =
         attached_files(options, std::path::Path::new(workspace)).map_err(AppError::Custom)?;
-    let gateway = harness_gateway(config)?;
+    let gateway = harness_gateway(config).await?;
     let provider =
         crate::gateway::handle::main_provider(config, Some(&gateway)).ok_or_else(|| {
             AppError::Custom(
@@ -1962,59 +1945,62 @@ mod tests {
     // ── Шлюз в прогоне ──────────────────────────────────────────────────
 
     #[test]
-    fn the_gateway_variable_means_nothing_without_an_explicit_config() {
-        let var = Some(std::ffi::OsString::from("gateway.toml"));
-        assert_eq!(
-            gateway_file(false, var.clone()),
-            None,
-            "a forgotten variable is ignored"
-        );
-        assert_eq!(gateway_file(true, var), Some(PathBuf::from("gateway.toml")));
-        assert_eq!(gateway_file(true, None), None);
+    fn a_broken_gateway_config_is_refused_before_the_first_turn() {
+        let broken: crate::gateway::types::GatewayConfig = toml::from_str(
+            "[gateway]
+enabled = true
+[[accounts]]
+id = \"a\"
+provider = \"custom\"
+base_url = \"http://h/v1\"
+secret = \"none\"
+[accounts.limits]
+max_concurrency = 0
+",
+        )
+        .unwrap();
+        let error = check_gateway_config(&broken).unwrap_err().to_string();
+        assert!(error.contains("max_concurrency"), "{error}");
+
+        let good: crate::gateway::types::GatewayConfig = toml::from_str(
+            "[gateway]
+enabled = true
+[[accounts]]
+id = \"a\"
+provider = \"custom\"
+base_url = \"http://h/v1\"
+secret = \"none\"
+model = \"m\"
+",
+        )
+        .unwrap();
+        assert!(check_gateway_config(&good).is_ok());
+        // Выключенный шлюз не проверяется: прежнее поведение.
+        let mut off = broken;
+        off.gateway.enabled = false;
+        assert!(check_gateway_config(&off).is_ok());
     }
 
-    #[test]
-    fn a_gateway_file_is_validated_before_the_first_turn() {
-        let dir = crate::gateway::clock::scratch_dir("harness-gateway");
-        let bad = dir.join("bad.toml");
-        std::fs::write(
-            &bad,
-            "[gateway]\nenabled = true\n[[accounts]]\nid = \"a\"\nprovider = \"custom\"\nbase_url = \"http://h/v1\"\nsecret = \"none\"\n[accounts.limits]\nmax_concurrency = 0\n",
-        )
-        .unwrap();
-        let config = Config::default();
-        let error = gateway_from_file(&config, Some(&bad))
-            .err()
-            .expect("refused");
-        assert!(error.to_string().contains("max_concurrency"), "{error}");
-
-        let secret = dir.join("secret.toml");
-        std::fs::write(
-            &secret,
-            "[[accounts]]\nid = \"a\"\nprovider = \"openai\"\nsecret = \"sk-live-abc123\"\n",
-        )
-        .unwrap();
-        let leaked = gateway_from_file(&config, Some(&secret))
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            !leaked.contains("abc123"),
-            "a secret value never reaches the message: {leaked}"
+    #[tokio::test]
+    async fn the_gateway_of_a_run_comes_from_the_config_itself() {
+        let off = harness_gateway(&Config::default()).await.unwrap();
+        assert!(!off.is_enabled());
+        let mut config = Config::default();
+        config.gateway.enabled = true;
+        config.accounts.push(
+            toml::from_str(
+                "id = \"a\"
+provider = \"custom\"
+base_url = \"http://127.0.0.1:1/v1\"
+secret = \"none\"
+model = \"m\"
+",
+            )
+            .unwrap(),
         );
-
-        let good = dir.join("good.toml");
-        std::fs::write(
-            &good,
-            "[gateway]\nenabled = true\n[[accounts]]\nid = \"a\"\nprovider = \"custom\"\nbase_url = \"http://h/v1\"\nsecret = \"none\"\nmodel = \"m\"\n",
-        )
-        .unwrap();
-        assert!(
-            gateway_from_file(&config, Some(&good))
-                .unwrap()
-                .is_enabled()
-        );
-        assert!(!gateway_from_file(&config, None).unwrap().is_enabled());
+        let on = harness_gateway(&config).await.unwrap();
+        assert!(on.is_enabled());
+        assert_eq!(on.snapshot().accounts.len(), 1);
     }
 
     fn history_with_native_calls() -> Vec<crate::provider::ChatMessage> {

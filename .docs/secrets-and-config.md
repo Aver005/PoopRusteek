@@ -160,5 +160,16 @@
 - `Config` получил `gateway`, `accounts`, `routes`, `roles`, `secrets`, `trust` и служебное `source`. `[[providers]]`
   остаются читаемыми **и пишутся**, пока `/providers` не переведён на аккаунты (GW-TUI): иначе `/providers add`
   терял бы запись.
+- `gateway::engine::gateway_config(&Config)` отдаёт движку настоящие `[gateway]`, `[[accounts]]`, `[[routes]]`,
+  `[roles]` слитого конфига; заблокированное (недоверенный проект до `pooprusteek trust`, схема новее) туда не попадает.
+  Секреты аккаунтов движок берёт у `StoreResolver` (`EngineDeps::for_config`), а не у заглушки `EnvOnlyResolver`
+  (она осталась тестам). Адаптер просит `resolve_for(reference, account)`: привязка секрета к хосту сверяется с
+  **текущим** `base_url` аккаунта. Не прошёл адаптер — причина (`secret ... is not trusted for host ...`) стоит в
+  `Decision` как `SkipReason::InvalidConfig`.
+- Сборка движка читает секреты (хранилище, `cmd:`, файлы) и потому идёт на `spawn_blocking`: приложение стартует с
+  `PendingHandle`, по готовности приходит `AppEvent::GatewayBuilt`. Пока сборка идёт, панели отвечают из конфига
+  (`Why::Starting`, `ResolveError::Starting`), а запрос, отправленный в этот момент, ждёт готовности. Выключенный
+  шлюз готов сразу и ничего не читает.
+- Харнесс берёт шлюз из самого файла `--config`; переменной `POOPRUSTEEK_GATEWAY_TOML` больше нет.
 - `Config::startup_problem()`: конфиг не загружен как есть или токен не прочитался — онбординг не открывать.
 - `CommandResult::Detached(Box<dyn FnOnce() -> String + Send>)`: работа вне цикла событий, результат — в чат.

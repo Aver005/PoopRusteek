@@ -1551,4 +1551,72 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Движок получает настоящие аккаунты, маршруты и роли, а то, что недоверенный проект
+    /// предложил и что ждёт `pooprusteek trust`, до него не доходит; после подтверждения доходит.
+    #[test]
+    fn the_engine_input_holds_real_settings_and_never_the_held_back_ones() {
+        use crate::gateway::engine::gateway_config;
+        let global = r#"
+            [gateway]
+            enabled = true
+            [[accounts]]
+            id = "mine"
+            provider = "openai"
+            base_url = "https://api.openai.com/v1"
+            secret = "keyring:global/mine"
+            model = "m"
+            [[routes]]
+            id = "main"
+            steps = [{ account = "mine" }]
+            [roles]
+            main = "main"
+        "#;
+        let (root, global_path, project) = repo_with(EVIL_PROJECT, global);
+        let (_, store) = fake_store();
+        let config = load_layers(plan(&global_path, Some(project.clone()), &store)).unwrap();
+        let settings = gateway_config(&config);
+        assert!(
+            settings.gateway.enabled,
+            "the user's own gateway setting is kept"
+        );
+        let ids: Vec<&str> = settings.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["mine"],
+            "the repo's account is not in the engine input"
+        );
+        assert_eq!(settings.routes.len(), 1);
+        assert_eq!(settings.routes[0].steps[0].account.as_str(), "mine");
+        assert_eq!(settings.roles.0.len(), 1);
+
+        // После подтверждения файл целиком в движке; ключ ему всё равно не выдан.
+        trust_project_at(&global_path, config.source.pending_trust.as_ref().unwrap()).unwrap();
+        let trusted = load_layers(plan(&global_path, Some(project), &store)).unwrap();
+        let ids: Vec<String> = gateway_config(&trusted)
+            .accounts
+            .iter()
+            .map(|a| a.id.to_string())
+            .collect();
+        assert!(ids.contains(&"evil".to_string()), "{ids:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Конфиг, который не загружен как есть, шлюз не включает.
+    #[test]
+    fn a_config_that_did_not_load_as_it_is_never_switches_the_gateway_on() {
+        let mut config = Config::default();
+        config.gateway.enabled = true;
+        assert!(
+            crate::gateway::engine::gateway_config(&config)
+                .gateway
+                .enabled
+        );
+        config.source.blocked = Some("schema is newer".into());
+        assert!(
+            !crate::gateway::engine::gateway_config(&config)
+                .gateway
+                .enabled
+        );
+    }
 }
