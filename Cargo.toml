@@ -62,7 +62,11 @@ textwrap = "0.16"
 unicode-width = "0.2"
 base64 = "0.22"
 regex = "1"
-wasmtime = "27"
+wasmtime = { version = "27", default-features = false, features = [
+    "std",
+    "cranelift",
+    "runtime",
+] }
 
 # MCP OAuth: encrypted token storage, browser launch, PKCE challenge
 keyring = "4.2"
