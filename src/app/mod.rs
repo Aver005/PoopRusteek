@@ -396,6 +396,15 @@ impl App {
         // Bridge ERROR-level logs to the in-UI red marker now that a channel
         // exists (see logging::setup). Idempotent across App re-creation.
         crate::logging::set_error_sink(event_tx.clone());
+        // Сохранение конфига ждёт файловый замок и пишет на диск: оно идёт в фоне, а
+        // ошибка приходит событием. Порядок правок очередь сохраняет.
+        let save_tx = event_tx.clone();
+        crate::config::enable_background_saves(move |message| {
+            let _ = save_tx.send(AppEvent::UpdateStatus {
+                message,
+                notable: true,
+            });
+        });
 
         let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
 
@@ -444,6 +453,11 @@ impl App {
             state.status_message = whitelist_notice
                 .or(instructions_notice)
                 .unwrap_or_else(|| "Ready".to_string());
+        } else if let Some(problem) = config.startup_problem() {
+            // Файл или хранилище не прочитались: это не «первый запуск». Онбординг поверх
+            // заставил бы вводить токен заново и затёр бы то, что лежит на диске.
+            state.status_message = problem.clone();
+            state.push_ui_system(&problem);
         } else {
             state.status_message = "No token configured".to_string();
             state.view = View::Onboarding;
@@ -587,6 +601,11 @@ impl App {
         // saves run on the persist worker now, and quitting right after a
         // turn completes must not lose that turn's save. Bounded like the
         // remote discards above: exiting must not hang on a wedged disk.
+        // Сохранения конфига, поставленные в очередь, тоже должны дойти до диска.
+        let _ = tokio::task::spawn_blocking(|| {
+            crate::config::flush_saves(std::time::Duration::from_secs(5))
+        })
+        .await;
         self.persister
             .flush(std::time::Duration::from_secs(3))
             .await;
@@ -1144,12 +1163,22 @@ impl App {
 
     /// Execute `/wipe`: delete all app-owned data dirs, factory-reset in memory.
     pub(crate) async fn execute_wipe(&mut self) {
+        if let Some(reason) = crate::config::wipe_blocked_reason(crate::config::is_isolated()) {
+            self.state.status_message = reason.to_string();
+            self.state.push_ui_system(reason);
+            return;
+        }
         self.cancel_all_turns().await;
         // Drain queued writes first — a still-in-flight session save could
         // otherwise re-create files inside the directories deleted below.
         self.persister
             .flush(std::time::Duration::from_secs(3))
             .await;
+        // Поставленное в очередь сохранение не должно воскресить файл после удаления.
+        let _ = tokio::task::spawn_blocking(|| {
+            crate::config::flush_saves(std::time::Duration::from_secs(5))
+        })
+        .await;
         let roots = wipe_roots();
         let mut errors: Vec<String> = Vec::new();
         // Ключи в системном хранилище, токены MCP и файлы конфига: папки их не содержат.

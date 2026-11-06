@@ -82,7 +82,7 @@ impl From<WriteError> for MigrateError {
     fn from(error: WriteError) -> Self {
         match error {
             WriteError::Damaged(m) => Self::Damaged(m),
-            WriteError::Io(m) => Self::Io(m),
+            WriteError::Io(m) | WriteError::Refused(m) => Self::Io(m),
         }
     }
 }
@@ -256,45 +256,97 @@ pub fn copy_legacy_config(legacy: &Path, new: &Path) -> LegacyConfig {
     }
 }
 
-/// Старый конфиг с открытыми секретами убираем, когда в новом их уже нет.
-/// Возвращает `true`, если файл удалён.
-pub fn retire_legacy_config(legacy: &Path, new: &Path) -> bool {
+/// Старый конфиг остаётся на месте ради отката: старый бинарь читает именно его. Когда ключи
+/// подтверждённо в хранилище, в нём затираются только значения секретов, настройки целы.
+/// Старый бинарь после отката увидит настройки и попросит токен заново.
+/// Возвращает `true`, если файл переписан. Сомнение в чём-либо — файл не трогается.
+pub fn scrub_legacy_config(legacy: &Path, new: &Path, store: &SecretStore) -> bool {
     let (Ok(old_text), Ok(new_text)) =
         (crate::util::read_text(legacy), crate::util::read_text(new))
     else {
         return false;
     };
-    let had_secrets = {
-        let Ok(mut doc) = old_text.parse::<toml_edit::DocumentMut>() else {
-            return false;
-        };
-        !fields::plaintext_slots(&mut doc).is_empty()
+    let Ok(mut old_doc) = old_text.parse::<toml_edit::DocumentMut>() else {
+        return false;
     };
-    if !had_secrets
-        || fields::contains_inline_secrets(&new_text)
-        || super::parse(&new_text).is_err()
-    {
+    let secrets = fields::plaintext_slots(&mut old_doc);
+    if secrets.is_empty() {
         return false;
     }
-    std::fs::remove_file(legacy).is_ok()
+    let Ok(mut new_doc) = new_text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    if fields::contains_inline_secrets(&new_text) || super::parse(&new_text).is_err() {
+        return false;
+    }
+    // Каждый ключ старого файла: в новом на него есть ссылка, и хранилище отдаёт то же значение.
+    let new_ids: Vec<String> = fields::reference_slots(&mut new_doc)
+        .into_iter()
+        .filter_map(
+            |(_, reference)| match crate::secrets::RefKind::parse(&reference) {
+                Ok(crate::secrets::RefKind::Keyring(id)) => Some(id),
+                _ => None,
+            },
+        )
+        .collect();
+    for (slot, value) in &secrets {
+        let id = slot.secret_id();
+        let confirmed = new_ids.contains(&id)
+            && matches!(store.get(&id), Ok(Some(stored)) if stored.matches(value));
+        if !confirmed {
+            return false;
+        }
+    }
+    for (slot, _) in &secrets {
+        fields::blank(&mut old_doc, slot);
+    }
+    let blanked = old_doc.to_string();
+    if super::parse(&blanked).is_err() {
+        return false;
+    }
+    write::write_file(legacy, &blanked).is_ok()
 }
 
 // ── старая папка данных ─────────────────────────────────────────────────
 
-/// Что можно перекачать само и потому не переносится.
-const REBUILDABLE_TOP_LEVEL: [&str; 2] = ["models", "semantic"];
+/// Явный список переносимого. Всё остальное остаётся в старой папке нетронутым: на Windows и
+/// macOS старый конфиг лежит прямо в папке данных, и «скопировать всё, кроме» унесло бы ключи.
+/// Конфиг и его копии сюда не входят никогда: они едут отдельным шагом через `migrate::run`.
+const MIGRATED_FILES: [&str; 5] = [
+    "history.json",
+    "whitelist.json",
+    "checkpoints.jsonl",
+    "checkpoints-undone.jsonl",
+    // Серверы MCP — данные пользователя; env/headers в нём закрыты от модели (`protect`).
+    "mcp.json",
+];
+const MIGRATED_DIRS: [&str; 5] = [
+    "sessions",
+    "checkpoints",
+    "tool-output",
+    "exports",
+    "skills",
+];
+/// Перекачивается само или это журналы: не переносится и не считается «оставленным».
+const REBUILDABLE: [&str; 3] = ["models", "semantic", "provider_models.json"];
 
 #[derive(Debug, Default)]
 pub struct DataReport {
     pub copied: usize,
     pub already_there: usize,
-    /// Файл есть в обоих местах и различается: старая версия сохранена рядом.
+    /// Файл есть в обоих местах и различается: побеждает более свежий, другой лежит рядом
+    /// как `.legacy`. Здесь только то, что сохранено впервые.
     pub kept_both: Vec<String>,
+    /// Записи старой папки вне списка: остались на месте, не копировались.
+    pub left_behind: Vec<String>,
     pub failed: Vec<String>,
 }
 
 fn skip_name(name: &str) -> bool {
-    name.ends_with(".log") || name.ends_with(".tmp") || name.ends_with(".lock")
+    name.ends_with(".log")
+        || name.ends_with(".tmp")
+        || name.ends_with(".lock")
+        || name.contains(".legacy")
 }
 
 fn digest(bytes: &[u8]) -> Vec<u8> {
@@ -308,29 +360,73 @@ fn walk_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-        let top = relative
-            .components()
-            .next()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if REBUILDABLE_TOP_LEVEL.contains(&top.as_str()) {
-            continue;
-        }
         if path.is_dir() {
             walk_files(root, &path, out);
         } else if !skip_name(&entry.file_name().to_string_lossy()) {
-            out.push(relative);
+            out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
         }
     }
+}
+
+/// Файлы к переносу по списку и названия остальных записей верхнего уровня.
+fn plan_data_files(old: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut left_behind = Vec::new();
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return (files, left_behind);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if path.is_dir() && MIGRATED_DIRS.contains(&name.as_str()) {
+            walk_files(old, &path, &mut files);
+        } else if path.is_file() && MIGRATED_FILES.contains(&name.as_str()) {
+            files.push(PathBuf::from(&name));
+        } else if !REBUILDABLE.contains(&name.as_str()) && !skip_name(&name) {
+            left_behind.push(name);
+        }
+    }
+    left_behind.sort();
+    (files, left_behind)
+}
+
+/// Кладёт проигравшую версию рядом (`имя.legacy`, `имя.legacy.2`, …). Такая же уже лежит —
+/// ничего не добавляет, чтобы повторный запуск не плодил копии. `true` — сохранено впервые.
+fn keep_aside(target: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let base = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for n in 1u32.. {
+        let name = if n == 1 {
+            format!("{base}.legacy")
+        } else {
+            format!("{base}.legacy.{n}")
+        };
+        let side = target.with_file_name(name);
+        match std::fs::read(&side) {
+            Ok(existing) if existing == bytes => return Ok(false),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::util::atomic_write(&side, bytes)?;
+                return Ok(true);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the counter is unbounded")
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// Копирует данные из старой папки в новую. Старая остаётся нетронутой.
 /// Метка в новой папке ставится только после полного успеха: иначе перенос повторится.
 pub fn migrate_data_dir(old: &Path, new: &Path) -> DataReport {
     let mut report = DataReport::default();
-    let mut files = Vec::new();
-    walk_files(old, old, &mut files);
+    let (files, left_behind) = plan_data_files(old);
+    report.left_behind = left_behind;
     for relative in files {
         let source = old.join(&relative);
         let target = new.join(&relative);
@@ -342,29 +438,39 @@ pub fn migrate_data_dir(old: &Path, new: &Path) -> DataReport {
                 continue;
             }
         };
+        let mut existing_newer = false;
         match std::fs::read(&target) {
             Ok(existing) if existing == bytes => {
                 report.already_there += 1;
                 continue;
             }
-            Ok(_) => {
-                // Не затираем ни ту, ни другую версию.
-                let mut name = target
-                    .file_name()
-                    .map(|n| n.to_os_string())
-                    .unwrap_or_default();
-                name.push(".legacy");
-                let side = target.with_file_name(name);
-                if crate::util::atomic_write(&side, &bytes).is_ok() {
-                    report.kept_both.push(shown);
-                } else {
-                    report
-                        .failed
-                        .push(format!("{shown}: cannot keep the old version"));
+            Ok(existing) => {
+                // Две разные версии: свежая по времени изменения остаётся в работе, вторая
+                // сохраняется рядом. Время неизвестно — в работе остаётся то, что уже лежит.
+                let old_is_newer = match (modified(&source), modified(&target)) {
+                    (Some(old_time), Some(new_time)) => old_time > new_time,
+                    _ => false,
+                };
+                let loser = if old_is_newer { &existing } else { &bytes };
+                match keep_aside(&target, loser) {
+                    Ok(true) => report.kept_both.push(shown.clone()),
+                    Ok(false) => {}
+                    Err(e) => {
+                        report.failed.push(format!(
+                            "{shown}: cannot keep the other version ({})",
+                            e.kind()
+                        ));
+                        continue;
+                    }
                 }
-                continue;
+                if !old_is_newer {
+                    existing_newer = true;
+                }
             }
             Err(_) => {}
+        }
+        if existing_newer {
+            continue;
         }
         if let Err(e) = crate::util::atomic_write(&target, &bytes) {
             report.failed.push(format!("{shown}: {}", e.kind()));
@@ -386,6 +492,7 @@ pub fn migrate_data_dir(old: &Path, new: &Path) -> DataReport {
             "copied": report.copied,
             "already_there": report.already_there,
             "kept_both": report.kept_both,
+            "left_behind": report.left_behind,
         });
         let text = serde_json::to_string_pretty(&marker).unwrap_or_default();
         if let Err(e) =
@@ -700,33 +807,64 @@ base_url = "http://localhost:1/v1"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Старый файл не удаляется: откат на прежнюю версию находит настройки и просит токен заново.
     #[test]
-    fn the_old_config_is_retired_only_when_its_secrets_are_safe_elsewhere() {
+    fn the_old_config_keeps_its_settings_and_loses_only_the_keys_once_they_are_safe() {
         let dir = dir("retire");
         let old = dir.join("old.toml");
         let new = dir.join("new.toml");
         std::fs::write(&old, LEGACY).unwrap();
         std::fs::write(&new, LEGACY).unwrap();
+        let (backend, store) = store();
         assert!(
-            !retire_legacy_config(&old, &new),
-            "new still holds plaintext"
+            !scrub_legacy_config(&old, &new, &store),
+            "new still holds plaintext: the old file is untouched"
         );
-        let (_, store) = store();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), LEGACY);
         run(&new, &store).unwrap();
-        assert!(retire_legacy_config(&old, &new));
-        assert!(!old.exists());
+
+        // Хранилище не подтверждает значение — не трогаем.
+        backend.mode(Mode::Differs);
+        let fresh = SecretStore::new(backend.clone());
+        assert!(!scrub_legacy_config(&old, &new, &fresh));
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), LEGACY);
+        backend.mode(Mode::Healthy);
+
+        assert!(scrub_legacy_config(&old, &new, &store));
+        let text = std::fs::read_to_string(&old).unwrap();
+        assert!(no_plaintext(&text), "{text}");
+        assert!(
+            text.contains("# мой конфиг") && text.contains("# DeepSeek"),
+            "{text}"
+        );
+        assert!(
+            text.contains("model = \"qwen\"") && text.contains("[[providers]]"),
+            "{text}"
+        );
+        // Старый бинарь прочтёт файл: токена нет, настройки на месте.
+        let parsed = super::super::parse(&text).unwrap();
+        assert!(parsed.provider.token.is_empty());
+        assert_eq!(parsed.providers.len(), 2);
+        assert_eq!(parsed.providers[0].api_key, None);
+        assert!(!fields::contains_inline_secrets(&text));
+        // Второй раз молчит: нечего затирать.
+        assert!(!scrub_legacy_config(&old, &new, &store));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_secretless_old_config_is_never_deleted() {
+    fn a_secretless_old_config_is_never_rewritten() {
         let dir = dir("keepold");
         let old = dir.join("old.toml");
         let new = dir.join("new.toml");
         std::fs::write(&old, "[ui]\ntheme = \"x\"\n").unwrap();
         std::fs::write(&new, "[ui]\ntheme = \"x\"\n").unwrap();
-        assert!(!retire_legacy_config(&old, &new));
-        assert!(old.exists());
+        let (_, store) = store();
+        assert!(!scrub_legacy_config(&old, &new, &store));
+        assert_eq!(
+            std::fs::read_to_string(&old).unwrap(),
+            "[ui]\ntheme = \"x\"\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -745,6 +883,83 @@ base_url = "http://localhost:1/v1"
         std::fs::write(old.join("debug.log"), "x").unwrap();
     }
 
+    /// На Windows и macOS старый конфиг лежит прямо в папке данных. Он, его копии и всё
+    /// незнакомое остаются в старой папке; в новую не попадает ничего, что может держать ключи.
+    #[test]
+    fn a_config_inside_the_old_data_folder_is_never_copied() {
+        let dir = dir("data-config");
+        let (old, new) = (dir.join("old"), dir.join("new"));
+        populate(&old);
+        std::fs::write(old.join("config.toml"), LEGACY).unwrap();
+        std::fs::write(old.join("config.toml.pre-gateway"), LEGACY).unwrap();
+        std::fs::write(old.join("mcp.json.bak-craws"), "{\"env\":{\"K\":\"v\"}}").unwrap();
+        std::fs::write(old.join("notes.txt"), "token = abc").unwrap();
+        std::fs::create_dir_all(old.join("secrets")).unwrap();
+        std::fs::write(old.join("secrets").join("key.bin"), "k").unwrap();
+        let report = migrate_data_dir(&old, &new);
+        assert!(report.failed.is_empty(), "{report:?}");
+        for left in [
+            "config.toml",
+            "config.toml.pre-gateway",
+            "mcp.json.bak-craws",
+            "notes.txt",
+            "secrets",
+        ] {
+            assert!(!new.join(left).exists(), "{left} must not be copied");
+            assert!(old.join(left).exists(), "{left} stays in the old folder");
+            assert!(report.left_behind.contains(&left.to_string()), "{report:?}");
+        }
+        // Ничто в новой папке не держит ключ.
+        fn any_key(dir: &Path) -> bool {
+            std::fs::read_dir(dir).unwrap().flatten().any(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    any_key(&p)
+                } else {
+                    std::fs::read_to_string(&p).is_ok_and(|t| t.contains("ds-token-1234567890"))
+                }
+            })
+        }
+        assert!(!any_key(&new));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_kind_of_user_data_in_the_list_is_moved() {
+        let dir = dir("data-list");
+        let (old, new) = (dir.join("old"), dir.join("new"));
+        for d in [
+            "sessions",
+            "checkpoints",
+            "tool-output",
+            "exports",
+            "skills",
+        ] {
+            std::fs::create_dir_all(old.join(d).join("nested")).unwrap();
+            std::fs::write(old.join(d).join("nested").join("f.txt"), d).unwrap();
+        }
+        for f in [
+            "history.json",
+            "whitelist.json",
+            "checkpoints.jsonl",
+            "checkpoints-undone.jsonl",
+            "mcp.json",
+        ] {
+            std::fs::write(old.join(f), f).unwrap();
+        }
+        let report = migrate_data_dir(&old, &new);
+        assert!(
+            report.failed.is_empty() && report.left_behind.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(report.copied, 10);
+        assert_eq!(
+            std::fs::read_to_string(new.join("skills/nested/f.txt")).unwrap(),
+            "skills"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn data_moves_without_loss_and_what_can_be_rebuilt_stays_behind() {
         let dir = dir("data");
@@ -759,6 +974,10 @@ base_url = "http://localhost:1/v1"
         );
         assert!(!new.join("models").exists() && !new.join("semantic").exists());
         assert!(!new.join("debug.log").exists());
+        assert!(
+            report.left_behind.is_empty(),
+            "rebuildable data is not 'left behind'"
+        );
         assert!(new.join(super::super::paths::DATA_MARKER).exists());
         assert!(
             old.join("sessions/s1.json").exists(),
@@ -767,13 +986,50 @@ base_url = "http://localhost:1/v1"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn set_age(path: &Path, newer_than: &Path) {
+        let later = std::fs::metadata(newer_than).unwrap().modified().unwrap()
+            + std::time::Duration::from_secs(120);
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(later).unwrap();
+    }
+
+    /// Свежая копия по времени изменения побеждает, другая сохраняется рядом; повтор ничего не плодит.
     #[test]
-    fn a_repeat_run_copies_nothing_new_and_a_differing_file_keeps_both_versions() {
+    fn the_newer_copy_wins_and_the_other_is_kept_aside_once() {
+        let dir = dir("data-newer");
+        let (old, new) = (dir.join("old"), dir.join("new"));
+        populate(&old);
+        migrate_data_dir(&old, &new);
+        // Новая папка получила свою версию позже копии, старая — ещё позже (старый бинарь писал дальше).
+        std::fs::write(new.join("history.json"), "[\"новая\"]").unwrap();
+        std::fs::write(old.join("history.json"), "[\"свежая старая\"]").unwrap();
+        set_age(&old.join("history.json"), &new.join("history.json"));
+        let first = migrate_data_dir(&old, &new);
+        assert_eq!(first.kept_both, ["history.json"]);
+        assert_eq!(
+            std::fs::read_to_string(new.join("history.json")).unwrap(),
+            "[\"свежая старая\"]",
+            "the fresher old file wins"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("history.json.legacy")).unwrap(),
+            "[\"новая\"]",
+            "nothing is lost"
+        );
+        let second = migrate_data_dir(&old, &new);
+        assert!(second.kept_both.is_empty(), "{second:?}");
+        assert!(!new.join("history.json.legacy.2").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_the_new_copy_is_newer_the_old_one_is_kept_aside_and_repeats_add_nothing() {
         let dir = dir("data-repeat");
         let (old, new) = (dir.join("old"), dir.join("new"));
         populate(&old);
         migrate_data_dir(&old, &new);
         std::fs::write(new.join("history.json"), "[\"новая\"]").unwrap();
+        set_age(&new.join("history.json"), &old.join("history.json"));
         let report = migrate_data_dir(&old, &new);
         assert_eq!(report.copied, 0);
         assert_eq!(report.kept_both, ["history.json"]);
@@ -785,6 +1041,23 @@ base_url = "http://localhost:1/v1"
             std::fs::read_to_string(new.join("history.json.legacy")).unwrap(),
             "[\"hi\"]"
         );
+        for _ in 0..3 {
+            assert!(migrate_data_dir(&old, &new).kept_both.is_empty());
+        }
+        assert!(!new.join("history.json.legacy.2").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Два разных проигравших подряд не затирают друг друга.
+    #[test]
+    fn a_second_different_loser_gets_its_own_aside_file() {
+        let dir = dir("data-two-losers");
+        let target = dir.join("x.json");
+        assert!(keep_aside(&target, b"one").unwrap());
+        assert!(keep_aside(&target, b"two").unwrap());
+        assert!(!keep_aside(&target, b"one").unwrap());
+        assert_eq!(std::fs::read(dir.join("x.json.legacy")).unwrap(), b"one");
+        assert_eq!(std::fs::read(dir.join("x.json.legacy.2")).unwrap(), b"two");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

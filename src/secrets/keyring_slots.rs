@@ -52,11 +52,11 @@ fn classify(error: keyring::Error) -> SlotError {
         E::PlatformFailure(platform) => SlotError::Unavailable(format!("failure: {platform}")),
         E::TooLong(_, limit) => SlotError::TooLong(limit as usize),
         E::BadEncoding(_) | E::BadDataFormat(..) => {
-            SlotError::Other("stored data is not valid text".to_string())
+            SlotError::Damaged("stored data is not valid text".to_string())
         }
         E::BadStoreFormat(_) => SlotError::Other("the store is damaged".to_string()),
-        E::Invalid(attribute, _) => SlotError::Other(format!("invalid {attribute}")),
-        E::Ambiguous(_) => SlotError::Other("several entries match".to_string()),
+        E::Invalid(attribute, _) => SlotError::Damaged(format!("invalid {attribute}")),
+        E::Ambiguous(_) => SlotError::Damaged("several entries match".to_string()),
         _ => SlotError::Other("unsupported by this store".to_string()),
     }
 }

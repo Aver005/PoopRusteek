@@ -63,21 +63,11 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Любой `config.toml` и его копия `.pre-gateway`: где бы ни лежали (в том числе забытые копии
+/// старого конфига внутри папки данных). Читать их модели можно, пока в них нет открытых ключей.
 fn is_config_like(path: &Path) -> bool {
     let name = file_name(path);
-    let base = name.strip_suffix(".pre-gateway").unwrap_or(&name);
-    if base != "config.toml" {
-        return false;
-    }
-    let global = paths::global_config_path();
-    let in_known_place = same_path(path, &global)
-        || paths::legacy_config_path().is_some_and(|legacy| same_path(path, &legacy))
-        || paths::explicit_config().is_some_and(|explicit| same_path(path, explicit))
-        || path
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n == ".pooprusteek");
-    in_known_place || name.ends_with(".pre-gateway")
+    name.strip_suffix(".pre-gateway").unwrap_or(&name) == "config.toml"
 }
 
 fn mcp_holds_secrets(text: &str) -> bool {
@@ -170,6 +160,26 @@ mod tests {
         )
         .unwrap();
         assert!(read_refusal(&path).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Забытая копия старого конфига в папке данных (Windows/macOS: конфиг лежал там же).
+    #[test]
+    fn a_forgotten_copy_of_the_old_config_in_any_folder_is_refused() {
+        let root = dir("forgotten");
+        let folder = root.join("pooprusteek");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        std::fs::write(
+            &path,
+            "[[providers]]
+name = \"a\"
+base_url = \"http://x\"
+api_key = \"canary-key-000000\"
+",
+        )
+        .unwrap();
+        assert!(read_refusal(&path).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 

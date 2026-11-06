@@ -330,3 +330,123 @@ async fn a_real_400_stays_a_bad_request_and_usage_is_still_asked_next_time() {
     assert_eq!(bodies.len(), 3);
     assert!(bodies[2].contains("stream_options"));
 }
+
+/// Сервер-приёмник: записывает каждый пришедший запрос целиком (с заголовками).
+async fn recorder() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/stolen", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buffer = vec![0u8; 8192];
+            let n = socket.read(&mut buffer).await.unwrap_or(0);
+            log.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buffer[..n]).to_string());
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (url, seen)
+}
+
+fn entry_with_key(base_url: &str, protocol: crate::config::ProviderProtocol) -> ProviderEntry {
+    ProviderEntry {
+        name: "keyed".to_string(),
+        base_url: base_url.to_string(),
+        api_key: Some("canary-redirect-key-4242".to_string()),
+        model: "m".to_string(),
+        protocol,
+        tools: crate::config::ToolProtocol::default(),
+    }
+}
+
+/// Ключ в заголовке (`Authorization`, `x-api-key`, `x-goog-api-key`) не уходит за редиректом на
+/// другой адрес: клиент получает понятную ошибку, а «чужой» сервер не видит ни одного запроса.
+#[tokio::test]
+async fn a_redirect_to_another_host_never_carries_the_key_for_any_protocol() {
+    use crate::config::ProviderProtocol::{Anthropic, Gemini, Openai};
+    for protocol in [Openai, Anthropic, Gemini] {
+        let (stolen_url, seen) = recorder().await;
+        let location: &'static str = Box::leak(stolen_url.into_boxed_str());
+        let (base, _) = serve(vec![
+            Reply {
+                status: "302 Found",
+                headers: vec![("location", location)],
+                body: String::new(),
+            },
+            // Запасной ответ на случай, если клиент всё же пойдёт дальше сам.
+            Reply::json("200 OK", vec![], "{}"),
+        ])
+        .await;
+        let entry = entry_with_key(&base, protocol);
+        let error = match protocol {
+            Openai => OpenAiCompatProvider::new(&entry)
+                .unwrap()
+                .complete(request())
+                .await
+                .unwrap_err(),
+            Anthropic => super::anthropic_client::AnthropicCompatProvider::new(&entry)
+                .unwrap()
+                .complete(request())
+                .await
+                .unwrap_err(),
+            Gemini => super::gemini_client::GeminiProvider::new(&entry)
+                .unwrap()
+                .complete(request())
+                .await
+                .unwrap_err(),
+        };
+        let failure = failure_of(error);
+        assert!(
+            failure.message.contains("redirect") && failure.message.contains("base_url"),
+            "{protocol:?}: {}",
+            failure.message
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let received = seen.lock().unwrap().clone();
+        assert!(
+            received.is_empty(),
+            "{protocol:?}: the other host received a request: {received:?}"
+        );
+        assert!(!failure.message.contains("canary-redirect-key"));
+    }
+}
+
+/// Сторона «против»: без редиректа тот же клиент по-прежнему работает и ключ уходит заголовком.
+#[tokio::test]
+async fn without_a_redirect_the_key_still_reaches_the_configured_host() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(String::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buffer = vec![0u8; 8192];
+            let n = socket.read(&mut buffer).await.unwrap_or(0);
+            *log.lock().unwrap() = String::from_utf8_lossy(&buffer[..n]).to_string();
+            let body = r#"{"id":"x","object":"chat.completion","created":0,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    let entry = entry_with_key(&base, crate::config::ProviderProtocol::Openai);
+    let response = OpenAiCompatProvider::new(&entry)
+        .unwrap()
+        .complete(request())
+        .await;
+    assert!(response.is_ok(), "{:?}", response.err());
+    assert!(
+        seen.lock()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer canary-redirect-key-4242")
+    );
+}

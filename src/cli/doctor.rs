@@ -88,6 +88,16 @@ fn layer_line(info: &config::LayerInfo) -> String {
     )
 }
 
+/// Частный блок 172.16.0.0/12: второй октет 16–31. Остальные `172.*` — публичные адреса.
+fn is_private_172(host: &str) -> bool {
+    let mut parts = host.split('.');
+    parts.next() == Some("172")
+        && parts
+            .next()
+            .and_then(|octet| octet.parse::<u8>().ok())
+            .is_some_and(|octet| (16..=31).contains(&octet))
+}
+
 fn http_to_public_host(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -102,7 +112,7 @@ fn http_to_public_host(url: &str) -> bool {
         || host.starts_with("10.")
         || host.starts_with("192.168.")
         || host == "[::1]"
-        || host.split('.').next() == Some("172");
+        || is_private_172(&host);
     !private
 }
 
@@ -128,6 +138,24 @@ pub fn build(config: &Config, store: &SecretStore) -> Report {
             Level::Info,
             "isolation",
             "this run uses --config/--data-dir: the system keyring is not touched, and nothing is migrated",
+        );
+    }
+    if let Some(reason) = &config.source.blocked {
+        report.add(
+            Level::Error,
+            "config",
+            format!("the config was not loaded as it is, so nothing is saved: {reason}"),
+        );
+    }
+    if let Some(request) = &config.source.pending_trust {
+        report.add(
+            Level::Warn,
+            "trust",
+            format!(
+                "{} proposes changes to where requests go and is NOT applied; your global settings are in force. Proposed: {}. Review the file, then run `pooprusteek trust`",
+                request.config_path.display(),
+                request.held_back.join("; ")
+            ),
         );
     }
     for layer in &config.source.layers {
@@ -523,6 +551,13 @@ mod tests {
         assert!(http_to_public_host("http://api.example.com/v1"));
         assert!(!http_to_public_host("http://localhost:1234/v1"));
         assert!(!http_to_public_host("http://192.168.1.5:8080"));
+        assert!(!http_to_public_host("http://172.16.0.5/v1"));
+        assert!(!http_to_public_host("http://172.31.255.1/v1"));
+        assert!(
+            http_to_public_host("http://172.217.14.206/v1"),
+            "172.217.x is a public (Google) address"
+        );
+        assert!(http_to_public_host("http://172.32.0.1/v1"));
         assert!(!http_to_public_host("https://api.example.com"));
     }
 

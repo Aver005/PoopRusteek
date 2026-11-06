@@ -89,6 +89,8 @@ enum Command {
     Secrets(cli::secrets::SecretsArgs),
     /// Show where config values and secrets come from and what is wrong.
     Doctor(cli::doctor::DoctorArgs),
+    /// Confirm a project's .pooprusteek config that wants to change where requests go.
+    Trust(cli::trust::TrustArgs),
 }
 
 /// Ошибка аргументов — это `setup_failed` (код 3). Код 2 от clap совпадал с
@@ -151,13 +153,14 @@ fn main() -> Result<()> {
     // `secrets` и `doctor` не требуют рабочего конфига: сломанный файл — как раз их случай.
     if matches!(
         args.command,
-        Some(Command::Secrets(_)) | Some(Command::Doctor(_))
+        Some(Command::Secrets(_)) | Some(Command::Doctor(_)) | Some(Command::Trust(_))
     ) {
         let code = match args.command {
             Some(Command::Secrets(secrets_args)) => cli::secrets::run(secrets_args),
             Some(Command::Doctor(doctor_args)) => {
                 cli::doctor::run(doctor_args, args.config.as_deref())
             }
+            Some(Command::Trust(trust_args)) => cli::trust::run(trust_args, args.config.as_deref()),
             _ => 0,
         };
         std::process::exit(code);
@@ -182,7 +185,11 @@ fn main() -> Result<()> {
         }
         Err(e) => {
             eprintln!("Warning: failed to load config, using defaults: {e}");
-            Config::default()
+            // Не «первый запуск»: файл есть, но не прочитан. Онбординг поверх него не нужен,
+            // а сохранение затёрло бы то, что человек правил руками.
+            let mut fallback = Config::default();
+            fallback.source.blocked = Some(e.to_string());
+            fallback
         }
     };
 

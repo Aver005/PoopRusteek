@@ -9,8 +9,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-const WAIT: Duration = Duration::from_secs(15);
-const STALE: Duration = Duration::from_secs(30);
+/// Ожидание больше срока «брошенного» замка: замок упавшего процесса можно и переждать, и забрать.
+/// Срок щедрый: держатель замка ходит в хранилище (до 10 с на запись) и пишет на медленный диск.
+const STALE: Duration = Duration::from_secs(60);
+const WAIT: Duration = Duration::from_secs(75);
 const POLL: Duration = Duration::from_millis(25);
 
 pub struct FileLock {
@@ -165,5 +167,12 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&target).unwrap().trim(), "12");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Замок, оставленный упавшим процессом секунду назад, переживается: ожидание дольше срока
+    /// «брошенного», иначе его нельзя было бы ни взять, ни переждать.
+    #[test]
+    fn waiting_outlasts_the_time_after_which_a_lock_counts_as_abandoned() {
+        assert!(WAIT > STALE);
     }
 }

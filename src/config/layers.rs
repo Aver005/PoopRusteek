@@ -148,14 +148,100 @@ fn scan_literals(prefix: &str, value: &Value, found: &mut Vec<String>) {
 
 /// Целые секции, которым проект не хозяин: куда уходит код и ключи, что запускается,
 /// кто обновляет бинарь и какие правила едут в промпт.
-const FORBIDDEN_SECTIONS: [&str; 6] = [
+const FORBIDDEN_SECTIONS: [&str; 7] = [
     "server",
     "update",
     "instructions",
     "providers",
     "active_provider",
     "secrets",
+    "trust",
 ];
+
+/// Разделы, меняющие, КУДА уходит запрос: шлюз, аккаунты, маршруты, роли. Проект может их
+/// предложить, но применяются они только после того, как человек подтвердил именно этот файл
+/// (`pooprusteek trust`). Пока не подтверждено, действуют общие значения.
+pub const GATED_SECTIONS: [&str; 4] = ["gateway", "accounts", "routes", "roles"];
+
+/// Делит проектный слой на безопасную часть и часть, ждущую подтверждения.
+pub fn split_gated(table: &Table) -> (Table, Table) {
+    let (mut open, mut gated) = (Table::new(), Table::new());
+    for (key, value) in table {
+        if GATED_SECTIONS.contains(&key.as_str()) {
+            gated.insert(key.clone(), value.clone());
+        } else {
+            open.insert(key.clone(), value.clone());
+        }
+    }
+    (open, gated)
+}
+
+/// Что именно проект хочет изменить, человеческими словами и с адресами. Без значений секретов.
+pub fn describe_gated(gated: &Table) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(gateway) = gated.get("gateway").and_then(Value::as_table) {
+        let enabled = gateway.get("enabled").and_then(Value::as_bool);
+        lines.push(match enabled {
+            Some(true) => "[gateway] enabled = true (turns request routing on)".to_string(),
+            Some(false) => "[gateway] enabled = false".to_string(),
+            None => "[gateway] settings".to_string(),
+        });
+    }
+    let none = Vec::new();
+    for account in gated
+        .get("accounts")
+        .and_then(Value::as_array)
+        .unwrap_or(&none)
+        .iter()
+        .filter_map(Value::as_table)
+    {
+        let id = account.get("id").and_then(Value::as_str).unwrap_or("?");
+        let target = account
+            .get("base_url")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                account
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(|p| format!("provider {p}"))
+            })
+            .unwrap_or_else(|| "?".to_string());
+        let key = account
+            .get("secret")
+            .and_then(Value::as_str)
+            .filter(|s| *s != "none")
+            .map(|s| format!(", key from {s}"))
+            .unwrap_or_default();
+        lines.push(format!("account '{id}' sends requests to {target}{key}"));
+    }
+    for route in gated
+        .get("routes")
+        .and_then(Value::as_array)
+        .unwrap_or(&none)
+        .iter()
+        .filter_map(Value::as_table)
+    {
+        let id = route.get("id").and_then(Value::as_str).unwrap_or("?");
+        let steps: Vec<&str> = route
+            .get("steps")
+            .and_then(Value::as_array)
+            .unwrap_or(&none)
+            .iter()
+            .filter_map(|s| s.get("account").and_then(Value::as_str))
+            .collect();
+        lines.push(format!("route '{id}' goes through: {}", steps.join(" -> ")));
+    }
+    if let Some(roles) = gated.get("roles").and_then(Value::as_table) {
+        for (role, route) in roles {
+            lines.push(format!(
+                "role '{role}' uses route '{}'",
+                route.as_str().unwrap_or("?")
+            ));
+        }
+    }
+    lines
+}
 const FORBIDDEN_PROVIDER_KEYS: [&str; 4] = ["token", "base_url", "kind", "client_version"];
 const FORBIDDEN_ACCOUNT_KEYS: [&str; 4] = ["api_key", "direct_token", "direct_token_ack", "home"];
 

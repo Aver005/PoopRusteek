@@ -18,6 +18,8 @@ pub enum SlotKind {
     AccountKey(String),
     /// Ссылка `secret = "…"` аккаунта.
     AccountSecret(String),
+    /// Ссылка `direct_token = "…"` аккаунта.
+    AccountDirectToken(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,7 @@ impl Slot {
             SlotKind::ProviderKey(name) => format!("providers[{name}].api_key"),
             SlotKind::AccountKey(id) => format!("accounts[{id}].api_key"),
             SlotKind::AccountSecret(id) => format!("accounts[{id}].secret"),
+            SlotKind::AccountDirectToken(id) => format!("accounts[{id}].direct_token"),
         }
     }
 
@@ -44,7 +47,8 @@ impl Slot {
             SlotKind::ServerKey => secrets::SERVER_KEY_ID.to_string(),
             SlotKind::ProviderKey(name)
             | SlotKind::AccountKey(name)
-            | SlotKind::AccountSecret(name) => secrets::account_secret_id(name),
+            | SlotKind::AccountSecret(name)
+            | SlotKind::AccountDirectToken(name) => secrets::account_secret_id(name),
         }
     }
 }
@@ -109,13 +113,37 @@ fn walk(doc: &mut DocumentMut, mut visit: impl FnMut(Slot, &mut dyn TableLike, &
             };
             visit(
                 Slot {
-                    kind: SlotKind::AccountKey(id),
+                    kind: SlotKind::AccountKey(id.clone()),
                 },
                 table,
                 "api_key",
             );
+            // Эти два поля по правилам хранят только ссылку; литерал в них — чужая ошибка,
+            // но это всё равно ключ, и читать такой файл модели нельзя.
+            visit(
+                Slot {
+                    kind: SlotKind::AccountSecret(id.clone()),
+                },
+                table,
+                "secret",
+            );
+            visit(
+                Slot {
+                    kind: SlotKind::AccountDirectToken(id),
+                },
+                table,
+                "direct_token",
+            );
         }
     }
+}
+
+/// Поля аккаунта, где допустима любая известная ссылка, в том числе `none`.
+fn holds_reference_only(kind: &SlotKind) -> bool {
+    matches!(
+        kind,
+        SlotKind::AccountSecret(_) | SlotKind::AccountDirectToken(_)
+    )
 }
 
 /// Открытые секреты в файле: непустые строки, не являющиеся ссылками.
@@ -126,7 +154,11 @@ pub fn plaintext_slots(doc: &mut DocumentMut) -> Vec<(Slot, Secret)> {
         if let Some(value) = text_of(table.get(key))
             && !value.trim().is_empty()
             && value != SCRUBBED
-            && !is_reference(value)
+            && !(if holds_reference_only(&slot.kind) {
+                looks_like_reference(value)
+            } else {
+                is_reference(value)
+            })
         {
             found.push((slot, Secret::new(value)));
         }
@@ -134,7 +166,7 @@ pub fn plaintext_slots(doc: &mut DocumentMut) -> Vec<(Slot, Secret)> {
     found
 }
 
-/// Ссылки, уже стоящие в файле: подпись поля и сама ссылка (не значение).
+/// Ссылки, уже стоящие в файле: подпись поля и сама ссылка (не значение). `none` не в счёт.
 pub fn reference_slots(doc: &mut DocumentMut) -> Vec<(Slot, String)> {
     let mut found = Vec::new();
     walk(doc, |slot, table, key| {
@@ -144,24 +176,6 @@ pub fn reference_slots(doc: &mut DocumentMut) -> Vec<(Slot, String)> {
             found.push((slot, value.trim().to_string()));
         }
     });
-    // Ссылки аккаунтов лежат в `secret`, не в `api_key`.
-    if let Some(item) = doc.get_mut("accounts") {
-        for table in tables_mut(item) {
-            if let (Some(id), Some(secret)) = (
-                text_of(table.get("id")).map(str::to_string),
-                text_of(table.get("secret")).map(str::to_string),
-            ) && is_reference(&secret)
-                && secret.trim() != "none"
-            {
-                found.push((
-                    Slot {
-                        kind: SlotKind::AccountSecret(id),
-                    },
-                    secret.trim().to_string(),
-                ));
-            }
-        }
-    }
     found
 }
 
@@ -182,6 +196,22 @@ pub fn replace_with_reference(doc: &mut DocumentMut, target: &Slot, reference: &
                 table.insert("secret", toml_edit::value(reference));
             }
             _ => set_string(table, key, reference),
+        }
+    });
+}
+
+/// Пустое значение поля секрета для файла, который читает старый бинарь: токены становятся
+/// пустой строкой, ключи записей `api_key` убираются совсем (пустой ключ ушёл бы заголовком).
+pub fn blank(doc: &mut DocumentMut, target: &Slot) {
+    walk(doc, |slot, table, key| {
+        if slot.kind != target.kind {
+            return;
+        }
+        match &slot.kind {
+            SlotKind::DeepseekToken | SlotKind::ServerKey => set_string(table, key, ""),
+            _ => {
+                table.remove(key);
+            }
         }
     });
 }
@@ -284,6 +314,43 @@ base_url = "http://localhost:1/v1"
         let text = doc.to_string();
         assert!(!text.contains("api_key"), "{text}");
         assert!(text.contains("secret = \"keyring:global/a\""), "{text}");
+    }
+
+    /// Литерал в `secret` и `direct_token` аккаунта — тоже ключ: файл читать модели нельзя,
+    /// а копию он должен затирать. `secret = "none"` и ссылки секретом не считаются.
+    #[test]
+    fn a_literal_in_an_accounts_secret_or_direct_token_counts_as_a_key() {
+        let mut doc: DocumentMut = "[[accounts]]
+id = \"a\"
+provider = \"openai\"
+secret = \"sk-literal-abcdef012345\"
+direct_token = \"tok-literal-0123456\"
+"
+        .parse()
+        .unwrap();
+        let labels: Vec<String> = plaintext_slots(&mut doc)
+            .iter()
+            .map(|(s, _)| s.label())
+            .collect();
+        assert_eq!(labels, ["accounts[a].secret", "accounts[a].direct_token"]);
+        assert!(contains_inline_secrets(&doc.to_string()));
+        let scrubbed = scrub_plaintext(&doc.to_string()).unwrap();
+        assert!(!scrubbed.contains("literal"), "{scrubbed}");
+        for fine in [
+            "[[accounts]]
+id = \"a\"
+provider = \"openai\"
+secret = \"none\"
+",
+            "[[accounts]]
+id = \"a\"
+provider = \"openai\"
+secret = \"keyring:global/a\"
+direct_token = \"env:T\"
+",
+        ] {
+            assert!(!contains_inline_secrets(fine), "{fine}");
+        }
     }
 
     #[test]

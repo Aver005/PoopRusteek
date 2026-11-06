@@ -371,9 +371,6 @@ pub struct SaveReport {
     pub wrote: bool,
     /// Правки, которых в этом файле нет по смыслу (значение из проектного слоя).
     pub skipped: Vec<String>,
-    /// Ссылки на секреты, исчезнувшие из файла, и те, что в нём остались.
-    pub removed_refs: Vec<String>,
-    pub kept_refs: Vec<String>,
 }
 
 fn reference_set(doc: &mut DocumentMut) -> Vec<String> {
@@ -387,6 +384,8 @@ fn reference_set(doc: &mut DocumentMut) -> Vec<String> {
 pub enum WriteError {
     /// Файл существует и не читается как TOML или как конфиг: не трогаем.
     Damaged(String),
+    /// Запись убрала бы ссылку на секрет, который не удалось прочитать: не пишем.
+    Refused(String),
     Io(String),
 }
 
@@ -397,7 +396,7 @@ impl std::fmt::Display for WriteError {
                 f,
                 "{message}. The file was left untouched: fix or move it, then try again"
             ),
-            Self::Io(message) => f.write_str(message),
+            Self::Refused(message) | Self::Io(message) => f.write_str(message),
         }
     }
 }
@@ -472,6 +471,7 @@ pub fn save_diff(
     path: &Path,
     baseline: Option<&Table>,
     current: &Table,
+    guard_refs: &[String],
 ) -> Result<SaveReport, WriteError> {
     let _guard =
         FileLock::acquire(path).map_err(|e| WriteError::Io(format!("{}: {e}", path.display())))?;
@@ -501,16 +501,21 @@ pub fn save_diff(
     let refs_before = reference_set(&mut doc);
     let skipped = apply(&mut doc, &ops);
     let kept_refs = reference_set(&mut doc);
-    let removed_refs = refs_before
+    let removed_refs: Vec<String> = refs_before
         .into_iter()
         .filter(|r| !kept_refs.contains(r))
         .collect();
+    // Ссылку, которую не смогли прочитать, не затираем: ключ, возможно, цел, а хранилище лишь
+    // не ответило. Заменить её может только человек, поправив файл или хранилище.
+    if let Some(blocked) = removed_refs.iter().find(|r| guard_refs.contains(r)) {
+        return Err(WriteError::Refused(format!(
+            "this change would drop {blocked}, which could not be read just now; fix the keyring (see `pooprusteek doctor`) and retry. Nothing was written"
+        )));
+    }
     let text = doc.to_string();
     let mut report = SaveReport {
         wrote: false,
         skipped,
-        removed_refs,
-        kept_refs,
     };
     if existing.as_deref() == Some(text.as_str()) || (existing.is_none() && ops.is_empty()) {
         return Ok(report);
@@ -656,7 +661,7 @@ mod tests {
         .unwrap();
         let before = table("[ui]\ntheme = \"nord\"\n");
         let after = table("[ui]\ntheme = \"dark\"\n");
-        let report = save_diff(&path, Some(&before), &after).unwrap();
+        let report = save_diff(&path, Some(&before), &after, &[]).unwrap();
         assert!(report.wrote);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -678,7 +683,7 @@ mod tests {
         let path = dir.join("config.toml");
         let broken = "[ui\ntheme = \"nord\"\ntoken = \"sk-canary-0000\"\n";
         std::fs::write(&path, broken).unwrap();
-        let error = save_diff(&path, None, &table("[ui]\ntheme = \"x\"\n")).unwrap_err();
+        let error = save_diff(&path, None, &table("[ui]\ntheme = \"x\"\n"), &[]).unwrap_err();
         assert!(matches!(error, WriteError::Damaged(_)), "{error}");
         assert!(!error.to_string().contains("canary"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
@@ -691,7 +696,7 @@ mod tests {
         let path = dir.join("config.toml");
         let typo = "[agent]\nmax_retries = \"many\"\n";
         std::fs::write(&path, typo).unwrap();
-        let error = save_diff(&path, None, &table("[ui]\ntheme = \"x\"\n")).unwrap_err();
+        let error = save_diff(&path, None, &table("[ui]\ntheme = \"x\"\n"), &[]).unwrap_err();
         assert!(matches!(error, WriteError::Damaged(_)), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), typo);
         let _ = std::fs::remove_dir_all(&dir);
@@ -705,7 +710,7 @@ mod tests {
         let mut changed = super::super::Config::default();
         changed.ui.theme = "nord".into();
         let current = Table::try_from(&changed).unwrap();
-        let report = save_diff(&path, Some(&defaults), &current).unwrap();
+        let report = save_diff(&path, Some(&defaults), &current, &[]).unwrap();
         assert!(report.wrote);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("theme = \"nord\""), "{text}");
@@ -727,7 +732,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let before = table("");
                     let after = table(&format!("[k{index}]\nv = {index}\n"));
-                    save_diff(&path, Some(&before), &after).unwrap();
+                    save_diff(&path, Some(&before), &after, &[]).unwrap();
                 })
             })
             .collect();

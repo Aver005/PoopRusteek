@@ -313,4 +313,46 @@ mod tests {
         assert!(error.to_string().contains("harness run"));
         assert!(store.set_verified("x", &Secret::new("v")).is_err());
     }
+
+    /// Одна повреждённая запись — это «не прочитали её», а не «хранилище недоступно»: остальные
+    /// секреты читаются, и по ним не запоминается отказ на 30 секунд.
+    #[test]
+    fn one_damaged_entry_does_not_make_the_whole_store_unavailable() {
+        use crate::secrets::chunked::{ChunkedBackend, SlotError, Slots};
+        struct OneBad(std::sync::Mutex<std::collections::HashMap<String, String>>);
+        impl Slots for OneBad {
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+            fn read(&self, slot: &str) -> Result<Option<String>, SlotError> {
+                if slot == "bad" {
+                    return Err(SlotError::Damaged("not valid text".into()));
+                }
+                Ok(self.0.lock().unwrap().get(slot).cloned())
+            }
+            fn write(&self, slot: &str, text: &str) -> Result<(), SlotError> {
+                self.0.lock().unwrap().insert(slot.into(), text.into());
+                Ok(())
+            }
+            fn remove(&self, slot: &str) -> Result<(), SlotError> {
+                self.0.lock().unwrap().remove(slot);
+                Ok(())
+            }
+        }
+        let store = SecretStore::new(Arc::new(ChunkedBackend::new(OneBad(Default::default()))));
+        store
+            .set_verified("good", &Secret::new("fine-value"))
+            .unwrap();
+        let error = store.get("bad").unwrap_err();
+        assert!(matches!(error, SecretError::Corrupt { .. }), "{error}");
+        assert!(!error.is_unavailable());
+        assert!(store.known_down().is_none(), "no 30-second blackout");
+        // Рядом лежащий секрет читается, но кэш уже есть — проверяем и мимо кэша.
+        let fresh = SecretStore::new(Arc::new(ChunkedBackend::new(OneBad(Default::default()))));
+        fresh
+            .set_verified("other", &Secret::new("other-value"))
+            .unwrap();
+        let _ = fresh.get("bad");
+        assert_eq!(fresh.get("other").unwrap().unwrap().expose(), "other-value");
+    }
 }

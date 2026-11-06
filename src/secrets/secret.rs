@@ -48,13 +48,13 @@ impl std::fmt::Debug for Secret {
 }
 
 impl Drop for Secret {
-    /// Затирание по возможности: компилятор не должен выкинуть запись.
+    /// Обнуляет сам буфер значения, а не его замену: `into_bytes` отдаёт ту же память, `fill`
+    /// пишет в неё нули, `black_box` не даёт компилятору выбросить запись. Копии, которые
+    /// ушли в заголовки и сокеты, этим не достать, и стопроцентной гарантии нет.
     fn drop(&mut self) {
-        // SAFETY-free способ: пересобираем буфер нулями через безопасный API.
-        let len = self.0.len();
-        let mut zeros = String::with_capacity(len);
-        zeros.extend(std::iter::repeat_n('\0', len));
-        self.0 = std::hint::black_box(zeros);
+        let mut bytes = std::mem::take(&mut self.0).into_bytes();
+        bytes.fill(0);
+        std::hint::black_box(&bytes);
     }
 }
 

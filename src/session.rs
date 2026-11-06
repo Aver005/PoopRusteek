@@ -333,9 +333,9 @@ pub fn is_sensitive_input(input: &str) -> bool {
     match name {
         "secrets" => true,
         // `/providers add …` и быстрая форма с ключом последним аргументом.
+        // Ключ вписывают только в `/providers add …`; остальные подкоманды историю не пачкают.
         "providers" => {
-            rest.first() == Some(&"add") && rest.len() > 1
-                || rest.len() >= 4
+            rest.first().is_some_and(|word| word.starts_with("add")) && rest.len() > 1
                 || rest.iter().any(|t| crate::config::looks_like_key(t))
         }
         // Одна строка добавления сервера несёт `env` и заголовки с токенами.
@@ -621,7 +621,6 @@ mod history_privacy_tests {
     fn commands_that_carry_a_key_are_sensitive() {
         for input in [
             "/providers add lm http://localhost:1234/v1 qwen sk-secret-key-0000",
-            "/providers lm http://localhost:1234/v1 qwen mykey",
             "/providers add lm http://x/v1",
             "/providers lm openai http://x/v1 m abcdefghijklmnopqrstuvwxyz0123456789ABCD",
             "/secrets set global/x value",
@@ -637,6 +636,8 @@ mod history_privacy_tests {
     fn ordinary_input_is_kept() {
         for input in [
             "/providers",
+            "/providers tools lmstudio native",
+            "/providers lm http://localhost:1234/v1 qwen mykey",
             "/models qwen",
             "/mcp reload",
             "fix the failing test",

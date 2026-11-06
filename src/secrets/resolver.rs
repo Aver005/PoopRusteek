@@ -39,16 +39,41 @@ pub struct TrustContext {
 
 impl TrustContext {
     /// Хост из адреса: нижний регистр, без порта и пути.
+    #[cfg(test)]
     pub fn host_of(base_url: &str) -> Option<String> {
         reqwest::Url::parse(base_url)
             .ok()
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
     }
 
-    fn bound(&self, reference: &str, host: &str) -> bool {
-        self.bindings
-            .get(reference)
-            .is_some_and(|hosts| hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+    /// Происхождение запроса: схема и хост (`https://api.openai.com`), без порта и пути. Привязка
+    /// держится за схему тоже: подтверждённый https не разрешает ключ по открытому http.
+    pub fn origin_of(base_url: &str) -> Option<String> {
+        let url = reqwest::Url::parse(base_url).ok()?;
+        Some(format!(
+            "{}://{}",
+            url.scheme().to_ascii_lowercase(),
+            url.host_str()?.to_ascii_lowercase()
+        ))
+    }
+
+    /// Запись привязки или адрес аккаунта к единому виду: голый `host` значит `https://host`.
+    fn normalize_origin(raw: &str) -> String {
+        let raw = raw.trim().trim_end_matches('/').to_ascii_lowercase();
+        if raw.contains("://") {
+            raw
+        } else {
+            format!("https://{raw}")
+        }
+    }
+
+    fn bound(&self, reference: &str, origin: &str) -> bool {
+        let wanted = Self::normalize_origin(origin);
+        self.bindings.get(reference).is_some_and(|allowed| {
+            allowed
+                .iter()
+                .any(|entry| Self::normalize_origin(entry) == wanted)
+        })
     }
 }
 
@@ -87,9 +112,19 @@ impl StoreResolver {
         if !from_project && !has_bindings {
             return Ok(());
         }
-        // Аккаунт без адреса уходит на фиксированный хост провайдера: утекать некуда.
         let Some(host) = self.trust.hosts.get(account) else {
-            return Ok(());
+            // Аккаунт пользователя без адреса идёт на штатный хост провайдера. Проектный без
+            // адреса подтвердить нечем: чужой репозиторий мог бы жечь квоту, поэтому отказ.
+            return if from_project {
+                Err(SecretError::Refused {
+                    name: reference.to_string(),
+                    reason: format!(
+                        "account '{account}' comes from the project config and has no base_url, so there is no host to confirm"
+                    ),
+                })
+            } else {
+                Ok(())
+            };
         };
         if self.trust.bound(reference, host) {
             Ok(())
@@ -514,5 +549,62 @@ mod tests {
             Some("api.example.com".into())
         );
         assert_eq!(TrustContext::host_of("not a url"), None);
+    }
+
+    /// Проектный аккаунт без адреса подтвердить нечем: ключ ему не выдаётся.
+    #[test]
+    fn a_project_account_without_an_address_gets_no_key() {
+        let mut trust = TrustContext::default();
+        trust.project_accounts.insert(account("proj"));
+        let (backend, resolver) = resolver(trust);
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("global/k".into(), Secret::new("v"));
+        let error = resolver
+            .resolve(&reference("keyring:global/k"), &account("proj"))
+            .unwrap_err();
+        assert!(matches!(error, SecretError::Refused { .. }), "{error}");
+        // Аккаунт пользователя без адреса работает как раньше.
+        assert!(
+            resolver
+                .resolve(&reference("keyring:global/k"), &account("mine"))
+                .is_ok()
+        );
+    }
+
+    /// Подтверждённый https не разрешает тот же хост по открытому http; явный http — разрешает.
+    #[test]
+    fn a_binding_covers_the_scheme_not_just_the_host() {
+        let make = |origin: &str, binding: &str| {
+            let mut trust = TrustContext::default();
+            trust.project_accounts.insert(account("proj"));
+            trust.hosts.insert(account("proj"), origin.to_string());
+            trust
+                .bindings
+                .insert("keyring:global/k".into(), vec![binding.to_string()]);
+            let (backend, resolver) = resolver(trust);
+            backend
+                .data
+                .lock()
+                .unwrap()
+                .insert("global/k".into(), Secret::new("v"));
+            resolver.resolve(&reference("keyring:global/k"), &account("proj"))
+        };
+        assert!(make("https://api.example.com", "api.example.com").is_ok());
+        assert!(make("https://api.example.com", "https://API.example.com/").is_ok());
+        assert!(
+            matches!(
+                make("http://api.example.com", "api.example.com"),
+                Err(SecretError::HostNotTrusted { .. })
+            ),
+            "a bare host means https only"
+        );
+        assert!(make("http://localhost", "http://localhost").is_ok());
+        assert_eq!(
+            TrustContext::origin_of("HTTP://Api.Example.com:8080/v1").as_deref(),
+            Some("http://api.example.com")
+        );
     }
 }

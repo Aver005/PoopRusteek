@@ -93,7 +93,9 @@ pub fn set(store: &SecretStore, name: &str, value: Secret) -> Result<String, Str
     let mut message = format!("Stored {reference} (…{}).", value.fingerprint());
     if !name.contains('/') {
         match config::link_secret_reference(name, &reference) {
-            Ok(Some(label)) => message.push_str(&format!(" Linked to {label}.")),
+            Ok(Some(label)) => message.push_str(&format!(
+                " Written to {label} in the config file; it is picked up on the next start."
+            )),
             Ok(None) => message.push_str(&format!(
                 " Use it in the config as secret = \"{reference}\"."
             )),

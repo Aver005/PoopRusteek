@@ -46,8 +46,15 @@ fn choose_data_dir(old: Option<PathBuf>, new: PathBuf) -> (PathBuf, Vec<String>)
         )];
         if !report.kept_both.is_empty() {
             notices.push(format!(
-                "{} file(s) existed in both places; the old versions are kept as *.legacy",
-                report.kept_both.len()
+                "{} file(s) existed in both places; the fresher one is in use, the other is kept as *.legacy: {}",
+                report.kept_both.len(),
+                report.kept_both.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !report.left_behind.is_empty() {
+            notices.push(format!(
+                "Not copied (left in the old folder, may hold keys): {}",
+                report.left_behind.join(", ")
             ));
         }
         (new, notices)
@@ -97,10 +104,10 @@ fn prepare_config_with(
         Err(error) => notices.push(format!("Secrets were not moved to the keyring: {error}")),
     }
     if let Some(legacy) = &legacy
-        && migrate::retire_legacy_config(legacy, global)
+        && migrate::scrub_legacy_config(legacy, global, store)
     {
         notices.push(format!(
-            "The old config {} held keys in plain text and was removed after they were moved.",
+            "The old config {} was kept for a rollback, with its keys blanked now that they are in the keyring.",
             legacy.display()
         ));
     }
@@ -130,36 +137,6 @@ pub fn kick_background_migration(path: &Path) {
         .spawn(move || {
             if let Err(error) = migrate::run(&path, &store) {
                 tracing::warn!("background secret migration: {error}");
-            }
-        });
-}
-
-/// Записи хранилища, на которые больше никто не ссылается, удаляем: выход из
-/// аккаунта не должен оставлять рабочий ключ в хранилище.
-pub fn delete_orphans(removed_refs: Vec<String>, still_used: Vec<String>) {
-    use crate::secrets::RefKind;
-    if paths::is_isolated() || cfg!(test) || removed_refs.is_empty() {
-        return;
-    }
-    let ids: Vec<String> = removed_refs
-        .iter()
-        .filter(|r| !still_used.contains(r))
-        .filter_map(|r| match RefKind::parse(r) {
-            Ok(RefKind::Keyring(id)) if id.starts_with("global/") => Some(id),
-            _ => None,
-        })
-        .collect();
-    if ids.is_empty() {
-        return;
-    }
-    let store = process_store();
-    let _ = std::thread::Builder::new()
-        .name("secret-gc".to_string())
-        .spawn(move || {
-            for id in ids {
-                if let Err(error) = store.delete(&id) {
-                    tracing::warn!("could not delete an unused secret: {error}");
-                }
             }
         });
 }
@@ -219,8 +196,11 @@ mod tests {
             "ds-token-1234567890"
         );
         assert!(
-            !old.exists(),
-            "the old plain-text copy is removed once the key is safe"
+            old.exists()
+                && !std::fs::read_to_string(&old)
+                    .unwrap()
+                    .contains("ds-token-1234567890"),
+            "the old file stays for a rollback, without the key"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -261,7 +241,12 @@ mod tests {
                 .unwrap()
                 .contains("ds-token-1234567890")
         );
-        assert!(!old.exists());
+        assert!(
+            !std::fs::read_to_string(&old)
+                .unwrap()
+                .contains("ds-token-1234567890"),
+            "the old file is blanked, not deleted"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

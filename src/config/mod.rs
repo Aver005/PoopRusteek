@@ -11,21 +11,32 @@ mod lock;
 mod migrate;
 mod paths;
 pub mod protect;
+mod queue;
 mod startup;
 mod write;
 
 /// Новейшая схема `[gateway]`, которую понимает эта сборка.
 pub const GATEWAY_SCHEMA: u32 = 1;
 
-pub use layers::{LayerInfo, LayerStatus, looks_like_key};
+pub use layers::{Layer, LayerInfo, LayerStatus, looks_like_key};
 pub use load::{
-    ConfigSource, SecretsConfig, bind_secret_host, file_references, inline_secret_labels,
-    link_secret_reference, wipe_secrets_and_files,
+    ConfigSource, SecretsConfig, TrustConfig, bind_secret_host, file_references,
+    inline_secret_labels, link_secret_reference, project_key, trust_project, untrust_project,
+    wipe_secrets_and_files,
 };
 pub use paths::{
     is_isolated, legacy_config_path as legacy_config_file, legacy_data_dir,
     set_explicit_config as mark_explicit_config,
 };
+pub use queue::{enable_background_saves, flush_saves};
+
+/// Почему `/wipe` сейчас нельзя: прогон с `--config`/`--data-dir` не должен трогать настоящие папки,
+/// а `/wipe` сносит и старые места данных.
+pub fn wipe_blocked_reason(isolated: bool) -> Option<&'static str> {
+    isolated.then_some(
+        "/wipe is disabled in runs with --config or --data-dir: it would delete your real data folders",
+    )
+}
 pub use startup::{after_verified_load, prepare_data_dir as choose_data_dir};
 pub use write::restrict_to_owner;
 
@@ -84,6 +95,9 @@ pub struct Config {
     /// `[secrets]` — подтверждённые хосты секретов. Только в общем слое.
     #[serde(default, skip_serializing_if = "SecretsConfig::is_empty")]
     pub secrets: SecretsConfig,
+    /// `[trust.projects]` — проектные конфиги, которые человек подтвердил (путь → хэш содержимого).
+    #[serde(default, skip_serializing_if = "TrustConfig::is_empty")]
+    pub trust: TrustConfig,
     /// Откуда загружен конфиг. Не ключ файла.
     #[serde(skip)]
     pub source: ConfigSource,
@@ -1082,6 +1096,12 @@ mod tests {
         agent.rate_limit_ms = rate_limit_ms;
         agent.rate_limit_per_minute = rate_limit_per_minute;
         agent
+    }
+
+    #[test]
+    fn wipe_is_blocked_in_an_isolated_run_and_allowed_otherwise() {
+        assert!(wipe_blocked_reason(true).is_some_and(|r| r.contains("--config")));
+        assert!(wipe_blocked_reason(false).is_none());
     }
 
     #[test]
