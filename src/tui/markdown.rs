@@ -51,18 +51,101 @@ fn syntect_to_ratatui(style: SynStyle) -> Style {
     Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b))
 }
 
+/// Обрезать до `width` клеток, оставив место под многоточие.
+fn truncate_cells(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Самая широкая колонка таблицы: дальше ячейка обрезается многоточием.
+const TABLE_MAX_CELL_W: usize = 40;
+
+/// Таблица в колонках по ширине содержимого, без заливки. Первая строка — заголовок.
+fn table_lines(rows: &[Vec<String>], theme: &Theme) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return Vec::new();
+    }
+    let mut widths = vec![1usize; columns];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index]
+                .max(UnicodeWidthStr::width(cell.as_str()))
+                .min(TABLE_MAX_CELL_W);
+        }
+    }
+    let pad = |text: &str, width: usize| -> String {
+        let shown = if UnicodeWidthStr::width(text) > width {
+            truncate_cells(text, width)
+        } else {
+            text.to_string()
+        };
+        let fill = width.saturating_sub(UnicodeWidthStr::width(shown.as_str()));
+        format!("{shown}{}", " ".repeat(fill))
+    };
+    let divider = Style::default().fg(theme.text_dim);
+    let mut lines = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut spans = vec![Span::raw("  ")];
+        for (column, width) in widths.iter().enumerate() {
+            let cell = row.get(column).map_or("", String::as_str);
+            let style = if row_index == 0 {
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg)
+            };
+            if column > 0 {
+                spans.push(Span::styled(" \u{2502} ", divider));
+            }
+            spans.push(Span::styled(pad(cell, *width), style));
+        }
+        lines.push(Line::from(spans));
+        if row_index == 0 {
+            let rule: Vec<String> = widths.iter().map(|w| "\u{2500}".repeat(*w)).collect();
+            lines.push(Line::from(Span::styled(
+                format!("  {}", rule.join("\u{2500}\u{253C}\u{2500}")),
+                divider,
+            )));
+        }
+    }
+    lines
+}
+
 pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
 
+    let glyph = crate::tui::glyphs::get();
+    let quote_prefix = Span::styled(
+        format!("  {} ", glyph.quote_bar),
+        Style::default().fg(theme.text_dim),
+    );
     let parser = Parser::new_ext(text, options);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut in_code_block = false;
     let mut code_block_lang = String::new();
     let mut code_buffer: Vec<String> = Vec::new();
+    // Таблица собирается целиком: ширина колонок известна только в конце.
     let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut table_row: Vec<String> = Vec::new();
+    let mut table_cell = String::new();
+    let mut quote_depth = 0usize;
     // Stack of active emphasis/strong/strikethrough modifiers, pushed on
     // `Start` and popped on the matching `End` so nested spans (e.g. bold
     // inside italic) revert to the right accumulated style rather than
@@ -70,12 +153,15 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut style_stack: Vec<Modifier> = Vec::new();
 
     for event in parser {
+        let quote = (quote_depth > 0).then_some(&quote_prefix);
         match event {
             Event::Start(tag) => match tag {
                 Tag::Table(_) => {
                     in_table = true;
-                    flush_line(&mut lines, &mut current_line);
+                    table_rows.clear();
+                    flush_line(&mut lines, &mut current_line, quote);
                 }
+                Tag::TableHead | Tag::TableRow => table_row.clear(),
                 Tag::Heading { level, .. } => {
                     use pulldown_cmark::HeadingLevel;
                     let style = match level {
@@ -104,11 +190,14 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                         pulldown_cmark::CodeBlockKind::Indented => String::new(),
                     };
                     code_buffer.clear();
-                    flush_line(&mut lines, &mut current_line);
+                    flush_line(&mut lines, &mut current_line, quote);
                 }
                 Tag::List(_) => {}
                 Tag::Item => {
-                    current_line.push(Span::styled("  * ", Style::default().fg(theme.accent)));
+                    current_line.push(Span::styled(
+                        "  \u{2022} ",
+                        Style::default().fg(theme.accent),
+                    ));
                 }
                 Tag::Emphasis => {
                     style_stack.push(Modifier::ITALIC);
@@ -120,7 +209,8 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                     style_stack.push(Modifier::CROSSED_OUT);
                 }
                 Tag::BlockQuote(_) => {
-                    current_line.push(Span::styled("  | ", Style::default().fg(theme.text_dim)));
+                    flush_line_if_text(&mut lines, &mut current_line, quote);
+                    quote_depth += 1;
                 }
                 Tag::Link { dest_url, .. } => {
                     current_line.push(Span::styled(
@@ -135,37 +225,42 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
             Event::End(tag) => match tag {
                 TagEnd::Table => {
                     in_table = false;
-                    flush_line(&mut lines, &mut current_line);
+                    lines.extend(table_lines(&table_rows, theme));
+                    table_rows.clear();
+                    flush_line(&mut lines, &mut current_line, quote);
                 }
-                TagEnd::TableRow => {
+                TagEnd::TableHead | TagEnd::TableRow => {
                     if in_table {
-                        flush_line(&mut lines, &mut current_line);
+                        table_rows.push(std::mem::take(&mut table_row));
                     }
                 }
                 TagEnd::TableCell => {
                     if in_table {
-                        current_line.push(Span::styled(" | ", Style::default().fg(theme.text_dim)));
+                        table_row.push(std::mem::take(&mut table_cell));
                     }
                 }
                 TagEnd::Heading(_) => {
-                    flush_line(&mut lines, &mut current_line);
+                    flush_line(&mut lines, &mut current_line, quote);
                 }
                 TagEnd::CodeBlock => {
                     if !code_buffer.is_empty() {
                         let highlighted =
                             highlight_code(&code_buffer.join("\n"), &code_block_lang, theme);
-                        lines.extend(highlighted);
+                        lines.extend(code_block_lines(&code_block_lang, highlighted, theme));
                     }
                     in_code_block = false;
                     code_block_lang.clear();
                     code_buffer.clear();
-                    flush_line(&mut lines, &mut current_line);
+                    flush_line(&mut lines, &mut current_line, quote);
                 }
                 TagEnd::Item => {
-                    flush_line(&mut lines, &mut current_line);
+                    flush_line(&mut lines, &mut current_line, quote);
                 }
                 TagEnd::Paragraph => {
-                    flush_line(&mut lines, &mut current_line);
+                    flush_line(&mut lines, &mut current_line, quote);
+                }
+                TagEnd::BlockQuote(_) => {
+                    quote_depth = quote_depth.saturating_sub(1);
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     style_stack.pop();
@@ -175,6 +270,8 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
             Event::Text(text) => {
                 if in_code_block {
                     code_buffer.push(text.to_string());
+                } else if in_table {
+                    table_cell.push_str(&text);
                 } else {
                     let mut style = Style::default().fg(theme.fg);
                     for modifier in &style_stack {
@@ -184,17 +281,34 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(code) => {
+                if in_table {
+                    table_cell.push_str(&code);
+                } else {
+                    current_line.push(Span::styled(
+                        format!(" {code} "),
+                        Style::default().fg(theme.warning).bg(theme.tool_bg),
+                    ));
+                }
+            }
+            Event::TaskListMarker(checked) => {
+                // Маркер списка заменяется чекбоксом: `[x]` в Unicode — `☑`.
+                current_line.pop();
+                let mark = if checked {
+                    glyph.checked
+                } else {
+                    glyph.unchecked
+                };
                 current_line.push(Span::styled(
-                    format!(" {code} "),
-                    Style::default().fg(theme.warning).bg(theme.tool_bg),
+                    format!("  {mark} "),
+                    Style::default().fg(theme.accent),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
-                flush_line(&mut lines, &mut current_line);
+                flush_line(&mut lines, &mut current_line, quote);
             }
             Event::Rule => {
-                flush_line(&mut lines, &mut current_line);
-                let rule = "─".repeat(40);
+                flush_line(&mut lines, &mut current_line, quote);
+                let rule = "\u{2500}".repeat(40);
                 lines.push(Line::from(vec![Span::styled(
                     rule,
                     Style::default().fg(theme.text_dim),
@@ -211,10 +325,32 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     }
 
     if !current_line.is_empty() {
-        flush_line(&mut lines, &mut current_line);
+        let quote = (quote_depth > 0).then_some(&quote_prefix);
+        flush_line(&mut lines, &mut current_line, quote);
     }
 
     lines
+}
+
+/// Блок кода: подпись языка и заливка цветом панели на всю ширину строки.
+fn code_block_lines(
+    lang: &str,
+    highlighted: Vec<Line<'static>>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let panel = Style::default().bg(theme.panel);
+    let mut out = Vec::with_capacity(highlighted.len() + 1);
+    if !lang.is_empty() {
+        out.push(
+            Line::from(Span::styled(
+                format!("  {lang}"),
+                Style::default().fg(theme.text_dim),
+            ))
+            .style(panel),
+        );
+    }
+    out.extend(highlighted.into_iter().map(|line| line.style(panel)));
+    out
 }
 
 fn plain_code_lines(code: &str, theme: &Theme) -> Vec<Line<'static>> {
@@ -349,12 +485,31 @@ fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-fn flush_line(lines: &mut Vec<Line<'static>>, current_line: &mut Vec<Span<'static>>) {
+/// Закрыть строку. В цитате перед ней ставится полоса.
+fn flush_line(
+    lines: &mut Vec<Line<'static>>,
+    current_line: &mut Vec<Span<'static>>,
+    quote: Option<&Span<'static>>,
+) {
     if current_line.is_empty() {
         lines.push(Line::from(""));
-    } else {
-        let line: Line<'static> = Line::from(std::mem::take(current_line));
-        lines.push(line);
+        return;
+    }
+    let mut spans = std::mem::take(current_line);
+    if let Some(prefix) = quote {
+        spans.insert(0, prefix.clone());
+    }
+    lines.push(Line::from(spans));
+}
+
+/// Закрыть строку только если в ней что-то накоплено (границы блоков).
+fn flush_line_if_text(
+    lines: &mut Vec<Line<'static>>,
+    current_line: &mut Vec<Span<'static>>,
+    quote: Option<&Span<'static>>,
+) {
+    if !current_line.is_empty() {
+        flush_line(lines, current_line, quote);
     }
 }
 
