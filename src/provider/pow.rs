@@ -348,7 +348,7 @@ mod tests {
         assert_eq!(value["target_path"], challenge.target_path);
 
         // Неверный ответ даёт другой payload — сервер его не примет.
-        let mut wrong = PowSolution {
+        let wrong = PowSolution {
             answer: 43,
             ..solution
         };
