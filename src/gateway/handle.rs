@@ -235,6 +235,12 @@ pub enum SkipReason {
     },
     /// Подписка Claude наружу через `/serve` не раздаётся.
     NotForServe,
+    /// Ошибка конфига: аккаунт не используется, пока её не исправят.
+    InvalidConfig {
+        message: String,
+    },
+    /// В ходе есть файл, а аккаунт не умеет его приложить.
+    NoAttachmentSupport,
     /// Уже упал в этом вызове.
     FailedThisCall {
         class: String,
@@ -265,6 +271,8 @@ pub enum Why {
     OnlyCandidate,
     /// Выбирать некого.
     RouteExhausted,
+    /// Маршрут или роль не используются из-за ошибки конфига.
+    ConfigInvalid { message: String },
 }
 
 /// Запрос на выбор.
@@ -321,6 +329,8 @@ impl SkipReason {
                 )
             }
             Self::NotForServe => "not served to outside clients".into(),
+            Self::InvalidConfig { message } => format!("config error: {message}"),
+            Self::NoAttachmentSupport => "cannot take the attached file".into(),
             Self::FailedThisCall { class } => format!("just failed ({class})"),
             Self::PinnedElsewhere => "another account is pinned".into(),
         }
@@ -338,6 +348,7 @@ impl Decision {
                 format!("{} · {}: {from} failed ({class})", t.account, t.model)
             }
             (Some(t), _) => format!("{} · {}: the only candidate left", t.account, t.model),
+            (None, Why::ConfigInvalid { message }) => format!("route is off: {message}"),
             (None, _) => "no account available".to_string(),
         };
         if self.skipped.is_empty() {
@@ -449,6 +460,8 @@ pub struct GatewaySnapshot {
     pub roles: Roles,
     /// Последние решения, новые в конце.
     pub recent: Vec<Decision>,
+    /// Замечания проверки конфига (ошибки и предупреждения); ошибки отключают аккаунт или маршрут.
+    pub problems: Vec<super::types::Problem>,
     pub generated_at: SystemTime,
 }
 
@@ -585,6 +598,7 @@ impl Gateway for DisabledGateway {
             routes: Vec::new(),
             roles: Roles::default(),
             recent: Vec::new(),
+            problems: Vec::new(),
             generated_at: SystemTime::now(),
         }
     }

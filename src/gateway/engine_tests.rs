@@ -4,8 +4,8 @@
 use super::backend::Capabilities;
 use super::clock::{Clock, ManualClock, SystemClock, scratch_dir};
 use super::engine::{
-    Binding, BuiltinFactory, Engine, EngineDeps, EnvOnlyResolver, Secret, SecretError,
-    SecretResolver, build_gateway, gateway_config,
+    BackendFactory, Binding, BuiltinFactory, Engine, EngineDeps, EnvOnlyResolver, Secret,
+    SecretError, SecretResolver, build_gateway, gateway_config,
 };
 use super::handle::{
     AccountStatus, CallSource, ConfigEdit, Decision, DecisionQuery, EditError, Gateway,
@@ -13,7 +13,9 @@ use super::handle::{
     WindowKind, main_provider,
 };
 use super::testkit::{FakeBackend, Rig, TWO_ACCOUNTS, caps, parse, rig, rig_in};
-use super::types::{Account, AccountId, AccountProvider, GatewayConfig, Role, SecretRef, ToolMode};
+use super::types::{
+    Account, AccountId, AccountProvider, GatewayConfig, Role, SecretRef, Severity, ToolMode,
+};
 use crate::config::{Config, ToolProtocol};
 use crate::provider::failure::FailureClass;
 use std::sync::Arc;
@@ -850,4 +852,254 @@ fn a_disabled_gateway_builds_exactly_the_provider_the_old_path_builds() {
 #[test]
 fn the_config_hook_is_disabled_until_secrets_wires_it_in() {
     assert!(!gateway_config(&Config::default()).gateway.enabled);
+}
+
+// ── Проверка конфига при сборке ─────────────────────────────────────────
+
+fn zero_slots_on_a() -> String {
+    TWO_ACCOUNTS.replace(
+        "model = \"model-a\"",
+        "model = \"model-a\"\n[accounts.limits]\nmax_concurrency = 0",
+    )
+}
+
+fn two_fakes() -> Vec<(&'static str, Arc<FakeBackend>)> {
+    vec![
+        ("a", FakeBackend::new(vec![])),
+        ("b", FakeBackend::new(vec![])),
+    ]
+}
+
+/// Ошибка конфига отключает аккаунт, а не весь шлюз; причина видна и в снимке, и в решении.
+#[tokio::test]
+async fn an_account_with_a_config_error_is_off_with_its_reason_and_the_rest_keeps_working() {
+    let rig = rig(&zero_slots_on_a(), two_fakes());
+    let snapshot = rig.engine.snapshot();
+    assert!(
+        snapshot
+            .problems
+            .iter()
+            .any(|p| p.severity == Severity::Error && p.message.contains("max_concurrency")),
+        "{:?}",
+        snapshot.problems
+    );
+    assert!(matches!(
+        &snapshot.accounts[0].status,
+        AccountStatus::Unavailable { reason } if reason.contains("max_concurrency")
+    ));
+    assert_eq!(snapshot.accounts[1].status, AccountStatus::Ready);
+
+    let decision = rig.engine.decide(&query());
+    assert_eq!(target(&decision), Some("b"));
+    assert!(matches!(
+        skip_of(&decision, "a"),
+        Some(SkipReason::InvalidConfig { message }) if message.contains("max_concurrency")
+    ));
+    assert!(decision.explain().contains("a: config error"));
+
+    // Нулевой семафор не вешает вызов: ход спокойно идёт на b.
+    let provider = rig.main();
+    let (result, text) = super::testkit::ask(&provider, "go").await;
+    result.unwrap();
+    assert_eq!(text, "ok");
+    assert_eq!(rig.fakes["a"].call_count(), 0);
+}
+
+#[test]
+fn a_healthy_config_has_no_errors_to_report() {
+    let rig = two();
+    assert!(
+        rig.engine
+            .snapshot()
+            .problems
+            .iter()
+            .all(|p| p.severity != Severity::Error)
+    );
+}
+
+#[test]
+fn a_route_that_mixes_tool_protocols_is_off_not_silently_prompt_mode() {
+    let mixed = r#"
+        [gateway]
+        enabled = true
+        [[accounts]]
+        id = "a"
+        provider = "custom"
+        base_url = "http://a.invalid/v1"
+        secret = "none"
+        tools = "native"
+        model = "m"
+        [[accounts]]
+        id = "b"
+        provider = "custom"
+        base_url = "http://b.invalid/v1"
+        secret = "none"
+        model = "m"
+        [[routes]]
+        id = "main"
+        steps = [{ account = "a" }, { account = "b" }]
+        [roles]
+        main = "main"
+    "#;
+    let rig = rig(mixed, two_fakes());
+    assert!(
+        rig.engine
+            .provider_for_role(Role::Main, CallSource::Chat)
+            .is_none(),
+        "the app stays on its old path and says why"
+    );
+    let decision = rig.engine.decide(&query());
+    assert_eq!(decision.target, None);
+    assert!(
+        matches!(&decision.why, Why::ConfigInvalid { message } if message.contains("allow_mixed_tools"))
+    );
+    assert!(
+        decision.explain().starts_with("route is off:"),
+        "{}",
+        decision.explain()
+    );
+
+    // Обратная сторона: с явным разрешением тот же маршрут работает, в промптовом режиме.
+    let allowed = mixed.replace("id = \"main\"", "id = \"main\"\nallow_mixed_tools = true");
+    let rig = self::rig(&allowed, two_fakes());
+    let provider = rig
+        .engine
+        .provider_for_role(Role::Main, CallSource::Chat)
+        .expect("allowed");
+    assert!(!provider.native_tools());
+}
+
+#[test]
+fn a_route_step_without_a_model_is_off_with_the_reason() {
+    let no_model = TWO_ACCOUNTS.replace("    model = \"model-a\"\n", "");
+    let rig = rig(&no_model, two_fakes());
+    let decision = rig.engine.decide(&query());
+    assert!(
+        matches!(&decision.why, Why::ConfigInvalid { message } if message.contains("has no model"))
+    );
+    assert!(
+        rig.engine
+            .snapshot()
+            .problems
+            .iter()
+            .any(|p| p.message.contains("has no model"))
+    );
+}
+
+fn claude_token(provider: AccountProvider, base_url: Option<&str>, ack: bool) -> Account {
+    let mut account = Account::new(id("t"), provider);
+    account.base_url = base_url.map(str::to_string);
+    account.direct_token = Some(SecretRef::parse("none").unwrap());
+    account.direct_token_ack = ack;
+    account.model = Some("m".into());
+    account
+}
+
+/// `direct_token` на Claude не работает при любых условиях, даже в обход `validate`.
+#[test]
+fn a_direct_token_never_builds_an_adapter_for_claude() {
+    let factory = BuiltinFactory::new(None);
+    let build = |account: &Account| {
+        factory
+            .build(account, &EnvOnlyResolver)
+            .expect("an API account")
+    };
+    for account in [
+        claude_token(AccountProvider::Anthropic, None, true),
+        claude_token(
+            AccountProvider::Custom,
+            Some("https://api.anthropic.com/v1"),
+            true,
+        ),
+        claude_token(AccountProvider::Custom, Some("https://claude.ai/x"), true),
+    ] {
+        let error = build(&account).err().expect("refused");
+        assert!(error.contains("not allowed for Claude"), "{error}");
+    }
+    // Не Claude и с подтверждением — строится; без подтверждения — нет.
+    let fine = claude_token(
+        AccountProvider::Custom,
+        Some("https://api.example.com/v1"),
+        true,
+    );
+    assert!(build(&fine).is_ok());
+    let unacknowledged = claude_token(
+        AccountProvider::Custom,
+        Some("https://api.example.com/v1"),
+        false,
+    );
+    assert!(
+        build(&unacknowledged)
+            .err()
+            .unwrap()
+            .contains("direct_token_ack")
+    );
+}
+
+#[test]
+fn a_direct_token_for_claude_in_a_config_leaves_the_account_off() {
+    let toml = format!(
+        "{}\n[[accounts]]\nid = \"claude\"\nprovider = \"anthropic\"\nmodel = \"m\"\ndirect_token = \"env:SOME_TOKEN\"\ndirect_token_ack = true\n",
+        TWO_ACCOUNTS
+    );
+    let deps = EngineDeps {
+        data_dir: None,
+        clock: Arc::new(SystemClock),
+        resolver: Arc::new(EnvOnlyResolver),
+        factories: vec![Arc::new(BuiltinFactory::new(None))],
+        persist: None,
+    };
+    let engine = Engine::new(parse(&toml), deps);
+    let view = engine
+        .snapshot()
+        .accounts
+        .into_iter()
+        .find(|a| a.id.as_str() == "claude")
+        .unwrap();
+    assert!(matches!(
+        view.status,
+        AccountStatus::Unavailable { reason } if reason.contains("not allowed for Claude")
+    ));
+}
+
+#[test]
+fn old_errors_do_not_block_unrelated_edits_but_new_ones_still_do() {
+    let rig = rig(&zero_slots_on_a(), two_fakes());
+    rig.engine
+        .apply_edit(ConfigEdit::SetLabel {
+            id: id("b"),
+            label: "Spare".into(),
+        })
+        .expect("an unrelated edit goes through while a is broken");
+    // Исправить сломанное тоже можно.
+    let mut repaired = parse(&zero_slots_on_a()).accounts.remove(0);
+    repaired.limits.max_concurrency = Some(2);
+    rig.engine
+        .apply_edit(ConfigEdit::UpsertAccount(Box::new(repaired)))
+        .expect("the fix applies");
+    assert!(
+        rig.engine
+            .snapshot()
+            .problems
+            .iter()
+            .all(|p| p.severity != Severity::Error)
+    );
+    assert_eq!(target(&rig.engine.decide(&query())), Some("a"), "a is back");
+    // Новая ошибка по-прежнему отказывает.
+    let ghost = super::types::Route {
+        id: super::types::RouteId::parse("ghost").unwrap(),
+        strategy: super::types::Strategy::Ordered,
+        steps: vec![super::types::Step {
+            account: id("nobody"),
+            model: None,
+        }],
+        on: Vec::new(),
+        switch_at_pct: None,
+        allow_mixed_tools: false,
+    };
+    assert!(matches!(
+        rig.engine
+            .apply_edit(ConfigEdit::UpsertRoute(Box::new(ghost))),
+        Err(EditError::Invalid(_))
+    ));
 }

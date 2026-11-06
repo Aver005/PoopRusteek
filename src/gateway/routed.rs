@@ -1,14 +1,12 @@
-//! `RoutedProvider`: шлюз за существующим `LLMProvider`.
-//!
-//! Цикл агента, компакция и `/serve` видят обычного провайдера. Внутри на каждый вызов
-//! выбирается цель (`Core::select`), берётся место на аккаунте (семафор) и вызывается
-//! адаптер. Отказ до первого ушедшего текста или вызова переводит на следующий шаг;
-//! после первого чанка ошибка идёт вверх как есть (`EmitTracker`).
+//! `RoutedProvider`: шлюз за обычным `LLMProvider`; на вызов выбирает цель, место и адаптер.
+//! Отказ до первого ушедшего текста или вызова переводит на следующий шаг, после — идёт вверх.
 
 use super::api_backend::estimate_prompt_tokens;
 use super::backend::{Backend, BackendError, CallContext, Capabilities, EmitTracker};
 use super::engine::{Binding, Core, Runtime};
-use super::handle::{CallSource, DecisionQuery, GatewayEvent, Outcome, Target, UsageRecord};
+use super::handle::{
+    CallSource, Decision, DecisionQuery, GatewayEvent, Outcome, SkipReason, Target, UsageRecord,
+};
 use super::history::{carries_foreign_state, flatten_for_switch};
 use super::state::RouteState;
 use super::types::{AccountId, Role, ToolMode};
@@ -20,6 +18,7 @@ use crate::provider::{
     RemoteSessionInfo, SessionLiveness,
 };
 use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -178,38 +177,31 @@ impl RoutedProvider {
     }
 
     /// Сколько начальных сообщений развернуть в текст: всё, если цель сменилась.
-    fn flatten_len(&self, target: &Target, messages: usize) -> usize {
+    /// Без привязки и подсказки откуда история неизвестно, а чужие вызовы в ней разворачиваются.
+    fn flatten_len(&self, target: &Target, messages: &[ChatMessage]) -> usize {
         let aff = self.affinity();
         let switching = match (&aff.bound, &aff.seed) {
             (Some(bound), _) => bound.account != target.account || bound.model != target.model,
             (None, Some(seed)) => seed.account != target.account || seed.model != target.model,
-            (None, None) => false,
+            (None, None) => carries_foreign_state(messages),
         };
         if switching {
-            messages
+            messages.len()
         } else {
-            aff.flatten_prefix.min(messages)
+            aff.flatten_prefix.min(messages.len())
         }
     }
 
+    /// Прежний адаптер просто отпускается: серверную сессию, которую видит пользователь, смена цели не удаляет.
     fn commit(&self, target: &Target, backend: Arc<dyn Backend>, flatten_len: usize) {
-        let previous = {
-            let mut aff = self.affinity();
-            let previous = aff.bound.take();
-            aff.bound = Some(Bound {
-                account: target.account.clone(),
-                model: target.model.clone(),
-                backend,
-            });
-            aff.seed = None;
-            aff.flatten_prefix = flatten_len;
-            previous
-        };
-        if let Some(previous) = previous
-            && previous.account != target.account
-        {
-            discard_in_background(previous.backend);
-        }
+        let mut aff = self.affinity();
+        aff.bound = Some(Bound {
+            account: target.account.clone(),
+            model: target.model.clone(),
+            backend,
+        });
+        aff.seed = None;
+        aff.flatten_prefix = flatten_len;
     }
 
     // ── Вызов ───────────────────────────────────────────────────────────
@@ -271,6 +263,7 @@ impl RoutedProvider {
     ) -> AppResult<()> {
         let request_id = uuid::Uuid::new_v4().simple().to_string();
         let input_tokens = estimate_prompt_tokens(&request);
+        let attachments = attached_paths(&request);
         let mut failed: Vec<(AccountId, String)> = Vec::new();
         let mut last_error: Option<BackendError> = None;
         let mut previous: Option<(AccountId, FailureClass)> = None;
@@ -290,7 +283,9 @@ impl RoutedProvider {
             };
             let route_id = plan.route.as_ref().map(|route| route.id.clone());
             let query = self.query(&self.tool_mode, Some(input_tokens), failed.clone());
-            let selection = self.core.select(&plan, &query, route_id.clone());
+            let selection = self
+                .core
+                .select_with(&plan, &query, route_id.clone(), &attachments);
             self.core.remember_decision(&selection.decision);
             debug_log::log_json(
                 "gateway.decision",
@@ -301,10 +296,21 @@ impl RoutedProvider {
                 }),
             );
             let Some(target) = selection.decision.target.clone() else {
+                if let Some(error) = self.attachment_refusal(&selection.decision, &attachments) {
+                    return Err(error);
+                }
                 return Err(self
                     .core
                     .exhausted_error(&selection.decision, last_error.as_ref()));
             };
+            let Some(runtime) = self.core.runtime(&target.account) else {
+                failed.push((target.account.clone(), "unavailable".to_string()));
+                continue;
+            };
+            let Some(permit) = self.take_place(&runtime, selection.queue).await? else {
+                continue;
+            };
+            // О переходе сообщаем, когда он состоялся, а не когда выбран: гонка за место его не съедает.
             if let Some((from, class)) = previous.take() {
                 debug_log::log_json(
                     "gateway.fallback",
@@ -317,13 +323,6 @@ impl RoutedProvider {
                     source: self.source,
                 });
             }
-            let Some(runtime) = self.core.runtime(&target.account) else {
-                failed.push((target.account.clone(), "unavailable".to_string()));
-                continue;
-            };
-            let Some(permit) = self.take_place(&runtime, selection.queue).await? else {
-                continue;
-            };
 
             let (backend, fresh_fork) = match self.backend_for(&target, &runtime) {
                 Ok(pair) => pair,
@@ -334,7 +333,7 @@ impl RoutedProvider {
                 }
             };
             let mut attempt_request = request.clone();
-            let flatten_len = self.flatten_len(&target, attempt_request.messages.len());
+            let flatten_len = self.flatten_len(&target, &attempt_request.messages);
             if flatten_len > 0 && carries_foreign_state(&attempt_request.messages[..flatten_len]) {
                 let flat = flatten_for_switch(&attempt_request.messages[..flatten_len]);
                 attempt_request.messages.splice(..flatten_len, flat);
@@ -373,7 +372,7 @@ impl RoutedProvider {
                     return Ok(());
                 }
                 Err(error) => {
-                    if fresh_fork {
+                    if fresh_fork && !error.emitted {
                         discard_in_background(backend);
                     }
                     self.core.report_failure(
@@ -406,6 +405,36 @@ impl RoutedProvider {
             format!(
                 "gateway could not settle on an account for '{}'",
                 self.label
+            ),
+        ))
+    }
+
+    /// Файл не должен тихо пропасть: если принять его некому, ход кончается понятной ошибкой.
+    fn attachment_refusal(&self, decision: &Decision, attachments: &[PathBuf]) -> Option<AppError> {
+        let blocked = decision
+            .skipped
+            .iter()
+            .any(|skip| skip.reason == SkipReason::NoAttachmentSupport);
+        if !blocked {
+            return None;
+        }
+        let names: Vec<String> = attachments
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        let class = match decision.retry_at {
+            Some(at) => FailureClass::RateLimit {
+                retry_after: Some(at.duration_since(self.core.now()).unwrap_or_default()),
+            },
+            None => FailureClass::BadRequest,
+        };
+        Some(failure(
+            class,
+            format!(
+                "the attached file ({}) was not sent: only accounts that accept attachments can take this turn and none is available now ({})",
+                names.join(", "),
+                decision.explain()
             ),
         ))
     }
@@ -462,7 +491,18 @@ impl RoutedProvider {
     }
 }
 
-/// Удалить серверную сессию прежнего адаптера, не задерживая вызов.
+/// Файлы хвоста после последнего ответа модели: доставляются сейчас, а не в прошлых ходах.
+fn attached_paths(request: &CompletionRequest) -> Vec<PathBuf> {
+    request
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != crate::provider::Role::Assistant)
+        .flat_map(|message| message.attachments.iter().map(PathBuf::from))
+        .collect()
+}
+
+/// Удалить сессию, которую создала неудачная попытка и которой не видел пользователь.
 fn discard_in_background(backend: Arc<dyn Backend>) {
     if !backend.capabilities().server_side_session {
         return;
@@ -594,9 +634,18 @@ impl LLMProvider for RoutedProvider {
         self.tool_mode == ToolMode::Native
     }
 
-    fn accepts_attachment(&self, path: &std::path::Path) -> bool {
-        self.session_backend()
-            .is_some_and(|backend| backend.accepts_attachment(path))
+    /// Отвечает по цели, куда файл реально уйдёт: выбор ограничен аккаунтами, которые его приложат.
+    fn accepts_attachment(&self, path: &Path) -> bool {
+        let Some(plan) = self.core.plan(&self.binding) else {
+            return false;
+        };
+        let query = self.query(&plan.tool_mode, None, Vec::new());
+        let attachments = [path.to_path_buf()];
+        self.core
+            .select_with(&plan, &query, None, &attachments)
+            .decision
+            .target
+            .is_some()
     }
 
     fn session_tokens(&self) -> Option<u32> {
@@ -608,11 +657,14 @@ impl LLMProvider for RoutedProvider {
     }
 
     fn route_state(&self) -> Option<RouteState> {
-        let (account, model) = self
-            .affinity()
-            .bound
-            .as_ref()
-            .map(|b| (b.account.clone(), b.model.clone()))?;
+        let (account, model) = {
+            let aff = self.affinity();
+            match (&aff.bound, &aff.seed) {
+                (Some(bound), _) => (bound.account.clone(), bound.model.clone()),
+                (None, Some(seed)) => (seed.account.clone(), seed.model.clone()),
+                (None, None) => return None,
+            }
+        };
         let route = match &self.binding {
             Binding::Role(role) => self.core.config().roles.route_for(*role).cloned(),
             Binding::Route(route) => Some(route.clone()),
@@ -643,12 +695,12 @@ impl LLMProvider for RoutedProvider {
         })
     }
 
-    /// Локальный сброс, как у DeepSeek: привязка забыта, следующий вызов берёт свежий форк.
+    /// Сессия сбрасывается, но откуда пришла история, помнится: чужие вызовы в ней всё ещё чужие.
     async fn reset(&self) -> AppResult<()> {
+        let route = self.route_state();
         let mut aff = self.affinity();
         aff.bound = None;
-        aff.seed = None;
-        aff.flatten_prefix = 0;
+        aff.seed = route;
         Ok(())
     }
 

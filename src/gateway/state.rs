@@ -1,14 +1,12 @@
-//! Состояние аккаунта в движке: cooldown, возврат без человека, подсказки после перезапуска.
-//!
-//! Чистая логика без ввода-вывода (кроме `HintStore`) и без `.await`: время приходит
-//! параметром, поэтому всё проверяется на ручных часах. Ничего здесь не блокирует
-//! аккаунт навсегда: каждый запрет либо кончается по часам, либо снимается успехом.
+//! Состояние аккаунта: cooldown, возврат без человека, подсказки после перезапуска (без замков и `.await`).
+//! Время приходит параметром; любой запрет кончается по часам или снимается успехом.
 
-use super::clock::{from_unix, to_unix};
+use super::clock::{checked_from_unix, to_unix};
 use super::handle::{AccountStatus, LimitSnapshot, StateHint};
 use super::types::{AccountId, RouteId};
 use crate::provider::failure::FailureClass;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -135,9 +133,10 @@ impl AccountState {
         let strikes = self.strikes + 1;
         match class {
             FailureClass::RateLimit { retry_after } => {
+                // `Retry-After: 0` ничего не говорит о паузе: считаем его отсутствующим.
                 let wait = match retry_after {
-                    Some(wait) => (*wait).min(RETRY_AFTER_CAP),
-                    None => backoff(strikes, id.as_str()),
+                    Some(wait) if !wait.is_zero() => (*wait).min(RETRY_AFTER_CAP),
+                    _ => backoff(strikes, id.as_str()),
                 };
                 self.cool(strikes, now + wait);
             }
@@ -249,16 +248,51 @@ impl HintStore {
         file.hints
             .into_iter()
             .filter_map(|row| {
+                // Огромное число в файле не должно переполнять время: такая строка пропускается.
                 Some(StateHint {
                     account: AccountId::parse(&row.account).ok()?,
-                    exhausted_until: row.exhausted_until.map(from_unix),
-                    saved_at: from_unix(row.saved_at),
+                    exhausted_until: match row.exhausted_until {
+                        Some(secs) => Some(checked_from_unix(secs)?),
+                        None => None,
+                    },
+                    saved_at: checked_from_unix(row.saved_at)?,
                 })
             })
             .collect()
     }
 
-    pub fn save(&self, hints: &[StateHint]) -> std::io::Result<()> {
+    /// Слить свои подсказки с тем, что записали другие процессы: по аккаунту побеждает более
+    /// поздняя запись, снятые у нас (`cleared`) стираются, только если на диске они не новее.
+    pub fn merge_save(
+        &self,
+        ours: &[StateHint],
+        cleared: &[(AccountId, SystemTime)],
+        now: SystemTime,
+    ) -> std::io::Result<()> {
+        let mut merged: BTreeMap<AccountId, StateHint> = self
+            .load()
+            .into_iter()
+            .filter(|hint| hint.soft_deadline(now).is_some())
+            .map(|hint| (hint.account.clone(), hint))
+            .collect();
+        for (account, at) in cleared {
+            if merged.get(account).is_some_and(|disk| disk.saved_at <= *at) {
+                merged.remove(account);
+            }
+        }
+        for hint in ours {
+            match merged.get(&hint.account) {
+                Some(disk) if disk.saved_at > hint.saved_at => {}
+                _ => {
+                    merged.insert(hint.account.clone(), hint.clone());
+                }
+            }
+        }
+        let list: Vec<StateHint> = merged.into_values().collect();
+        self.save(&list)
+    }
+
+    fn save(&self, hints: &[StateHint]) -> std::io::Result<()> {
         let file = HintFile {
             version: 1,
             hints: hints
@@ -277,7 +311,7 @@ impl HintStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::clock::scratch_dir;
+    use super::super::clock::{from_unix, scratch_dir};
     use super::*;
 
     fn id(raw: &str) -> AccountId {
@@ -471,6 +505,107 @@ mod tests {
         );
         assert_eq!(state.hint_deadline(at(200)), Some(at(500)));
         assert_eq!(state.hint_deadline(at(500)), None, "an old hint is ignored");
+    }
+
+    #[test]
+    fn a_zero_retry_after_is_no_hint_and_backs_off() {
+        let mut state = AccountState::new(true, None);
+        fail(
+            &mut state,
+            FailureClass::RateLimit {
+                retry_after: Some(secs(0)),
+            },
+            100,
+        );
+        let AccountStatus::Cooling { until, .. } = state.effective(at(100)) else {
+            panic!("a zero wait must still cool the account");
+        };
+        assert!(until > at(103), "the backoff applies: {until:?}");
+    }
+
+    /// Файл с числом, которое переполняет время, не роняет запуск: строка пропускается.
+    #[test]
+    fn a_hint_row_with_an_absurd_time_is_skipped_not_fatal() {
+        let dir = scratch_dir("hints-huge");
+        let path = dir.join("state.json");
+        let huge = u64::MAX;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"hints":[
+                    {{"account":"a","exhausted_until":{huge},"saved_at":1}},
+                    {{"account":"b","exhausted_until":null,"saved_at":{huge}}},
+                    {{"account":"c","exhausted_until":500,"saved_at":100}}]}}"#
+            ),
+        )
+        .unwrap();
+        let loaded = HintStore::new(path).load();
+        assert_eq!(loaded.len(), 1, "{loaded:?}");
+        assert_eq!(loaded[0].account.as_str(), "c");
+    }
+
+    fn hint(account: &str, until: u64, saved: u64) -> StateHint {
+        StateHint {
+            account: id(account),
+            exhausted_until: Some(at(until)),
+            saved_at: at(saved),
+        }
+    }
+
+    /// Параллельные процессы не затирают друг друга: чужая подсказка на диске остаётся.
+    #[test]
+    fn saving_hints_keeps_what_another_process_wrote() {
+        let dir = scratch_dir("hints-merge");
+        let store = HintStore::new(dir.join("state.json"));
+        store.save(&[hint("other", 900, 100)]).unwrap();
+        store
+            .merge_save(&[hint("mine", 800, 110)], &[], at(120))
+            .unwrap();
+        let accounts: Vec<String> = store.load().iter().map(|h| h.account.to_string()).collect();
+        assert_eq!(accounts, ["mine", "other"]);
+
+        // По одному аккаунту побеждает более поздняя запись, в обе стороны.
+        store
+            .merge_save(&[hint("other", 700, 90)], &[], at(120))
+            .unwrap();
+        let other = store
+            .load()
+            .into_iter()
+            .find(|h| h.account == id("other"))
+            .unwrap();
+        assert_eq!(other.saved_at, at(100), "the disk copy is newer");
+        store
+            .merge_save(&[hint("other", 950, 130)], &[], at(131))
+            .unwrap();
+        let other = store
+            .load()
+            .into_iter()
+            .find(|h| h.account == id("other"))
+            .unwrap();
+        assert_eq!(other.exhausted_until, Some(at(950)), "ours is newer");
+    }
+
+    #[test]
+    fn a_cleared_hint_goes_away_unless_the_disk_copy_is_newer() {
+        let dir = scratch_dir("hints-clear");
+        let store = HintStore::new(dir.join("state.json"));
+        store
+            .save(&[hint("a", 900, 100), hint("b", 900, 200)])
+            .unwrap();
+        store
+            .merge_save(&[], &[(id("a"), at(150)), (id("b"), at(150))], at(210))
+            .unwrap();
+        let left: Vec<String> = store.load().iter().map(|h| h.account.to_string()).collect();
+        assert_eq!(left, ["b"], "b was written after we cleared ours");
+    }
+
+    #[test]
+    fn expired_hints_do_not_survive_a_merge() {
+        let dir = scratch_dir("hints-expire");
+        let store = HintStore::new(dir.join("state.json"));
+        store.save(&[hint("old", 150, 100)]).unwrap();
+        store.merge_save(&[], &[], at(200)).unwrap();
+        assert!(store.load().is_empty());
     }
 
     #[test]

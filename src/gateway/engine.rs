@@ -1,12 +1,8 @@
-//! Движок маршрутов: аккаунты в работе, выбор цели с причиной, cooldown, правки, события.
-//!
-//! `Engine` реализует фасад `Gateway`. Выбор (`Core::select`) — одна функция над
-//! конфигом, состоянием аккаунтов и часами; `decide()` зовёт её без побочных эффектов,
-//! вызов провайдера (`routed.rs`) — с записью в журнал решений. Замки `std::sync::Mutex`
-//! держатся только на короткие синхронные операции, никогда через `.await`.
+//! Движок маршрутов: аккаунты в работе, выбор цели с причиной, cooldown, правки и события.
+//! Замки `std::sync::Mutex` держатся только на короткие синхронные операции, не через `.await`.
 
 use super::api_backend::ApiBackend;
-use super::backend::{Backend, BackendError, Capabilities};
+use super::backend::{Backend, BackendError, BackendKind, Capabilities};
 use super::clock::{Clock, SystemClock};
 use super::deepseek_backend::DeepseekBackend;
 use super::handle::{
@@ -19,8 +15,8 @@ use super::ledger::EngineLedger;
 use super::routed::{RoutedProvider, failure, upstream_error};
 use super::state::{AccountState, HintStore};
 use super::types::{
-    Account, AccountId, AccountLimits, AccountProvider, Credential, GatewayConfig, Role, Route,
-    RouteId, SecretRef, Severity, Step, ToolMode,
+    Account, AccountId, AccountLimits, AccountProvider, Credential, GatewayConfig, Problem, Role,
+    Route, RouteId, SecretRef, Severity, Step, ToolMode, is_claude_host,
 };
 use crate::config::{Config, ProviderConfig, ToolProtocol};
 use crate::error::AppError;
@@ -174,6 +170,16 @@ fn resolve_api_key(
             .map_err(|error| error.to_string())
     };
     match account.credential()? {
+        // Последняя линия обороны: подписка Claude живёт только в официальном CLI.
+        Credential::DirectToken(_)
+            if account.provider.is_claude_family()
+                || account.base_url.as_deref().is_some_and(is_claude_host) =>
+        {
+            Err("direct tokens are not allowed for Claude: use cli:claude".to_string())
+        }
+        Credential::DirectToken(_) if !account.direct_token_ack => {
+            Err("direct_token needs direct_token_ack = true".to_string())
+        }
         Credential::None => Ok(None),
         Credential::ApiKey(key) => Ok(Some(key).filter(|key| !key.is_empty())),
         Credential::SecretRef(reference) | Credential::DirectToken(reference) => {
@@ -220,6 +226,7 @@ impl BuiltinFactory {
         Ok(Arc::new(DeepseekBackend::new(
             account.id.clone(),
             Arc::new(provider),
+            settings.provider.model.clone(),
         )))
     }
 }
@@ -274,6 +281,8 @@ pub fn build_gateway(gateway: GatewayConfig, deps: EngineDeps) -> GatewayHandle 
 pub(super) struct Runtime {
     /// Только то, что меняет подключение (см. `connection_of`).
     pub connection: Account,
+    /// Ошибка конфига этого аккаунта: он не используется, пока её не исправят.
+    pub invalid: Option<String>,
     pub backend: Result<Arc<dyn Backend>, String>,
     pub caps: Option<Capabilities>,
     pub sem: Arc<Semaphore>,
@@ -308,9 +317,66 @@ struct Candidate {
     age: Option<Duration>,
 }
 
-enum Verdict {
-    Skip(SkipReason),
-    Take(Candidate),
+/// Ошибки конфига, разложенные по тому, что они отключают.
+#[derive(Default)]
+pub(super) struct Issues {
+    accounts: HashMap<AccountId, String>,
+    routes: HashMap<RouteId, String>,
+    roles: HashMap<Role, String>,
+    pub problems: Vec<Problem>,
+}
+
+fn bracketed<'p>(path: &'p str, prefix: &str) -> Option<&'p str> {
+    let rest = path.strip_prefix(prefix)?.strip_prefix('[')?;
+    Some(&rest[..rest.find(']')?])
+}
+
+fn role_named(name: &str) -> Option<Role> {
+    [Role::Main, Role::Title, Role::Summary, Role::Evaluator]
+        .into_iter()
+        .find(|role| format!("{role:?}") == name)
+}
+
+impl Issues {
+    pub fn of(config: &GatewayConfig) -> Self {
+        let mut issues = Self {
+            problems: config.validate(),
+            ..Self::default()
+        };
+        let add = |slot: &mut String, message: &str| {
+            if !slot.is_empty() {
+                slot.push_str("; ");
+            }
+            slot.push_str(message);
+        };
+        for problem in issues
+            .problems
+            .clone()
+            .iter()
+            .filter(|p| p.severity == Severity::Error)
+        {
+            if let Some(id) =
+                bracketed(&problem.path, "accounts").and_then(|id| AccountId::parse(id).ok())
+            {
+                add(issues.accounts.entry(id).or_default(), &problem.message);
+            } else if let Some(id) =
+                bracketed(&problem.path, "routes").and_then(|id| RouteId::parse(id).ok())
+            {
+                add(issues.routes.entry(id).or_default(), &problem.message);
+            } else if let Some(role) = problem.path.strip_prefix("roles.").and_then(role_named) {
+                add(issues.roles.entry(role).or_default(), &problem.message);
+            }
+        }
+        issues
+    }
+
+    pub fn errors(&self) -> Vec<String> {
+        self.problems
+            .iter()
+            .filter(|p| p.severity == Severity::Error)
+            .map(|p| format!("{}: {}", p.path, p.message))
+            .collect()
+    }
 }
 
 pub(super) struct Core {
@@ -326,6 +392,9 @@ pub(super) struct Core {
     windows: Mutex<HashMap<(AccountId, String), u32>>,
     hints: Option<HintStore>,
     saved_hints: Mutex<Vec<StateHint>>,
+    /// Подсказки, снятые успехом или правкой, но ещё не стёртые на диске.
+    cleared_hints: Mutex<Vec<(AccountId, SystemTime)>>,
+    issues: Mutex<Arc<Issues>>,
     limits_ttl: Duration,
 }
 
@@ -382,37 +451,80 @@ impl Core {
         ))
     }
 
-    fn build_runtime(&self, account: &Account, hint: Option<StateHint>) -> Arc<Runtime> {
-        let backend = self.build_backend(account);
+    fn build_runtime(
+        &self,
+        account: &Account,
+        hint: Option<StateHint>,
+        invalid: Option<String>,
+    ) -> Arc<Runtime> {
+        let backend = match &invalid {
+            Some(message) => Err(format!("config error: {message}")),
+            None => self.build_backend(account),
+        };
         if let Err(reason) = &backend {
             tracing::warn!("gateway account '{}' unavailable: {reason}", account.id);
         }
         let caps = backend.as_ref().ok().map(|backend| backend.capabilities());
         Arc::new(Runtime {
             connection: connection_of(account),
+            invalid,
             backend,
             caps,
-            sem: Arc::new(Semaphore::new(account.max_concurrency() as usize)),
+            // Нулевой семафор повесил бы каждый вызов; ноль в конфиге и так ошибка.
+            sem: Arc::new(Semaphore::new(account.max_concurrency().max(1) as usize)),
             state: Mutex::new(AccountState::new(account.enabled, hint)),
         })
     }
 
+    fn issues(&self) -> Arc<Issues> {
+        self.issues
+            .lock()
+            .map(|issues| Arc::clone(&issues))
+            .unwrap_or_default()
+    }
+
+    /// Почему привязка не используется из-за конфига, если это так.
+    pub(super) fn binding_issue(&self, binding: &Binding) -> Option<String> {
+        let issues = self.issues();
+        let config = self.config();
+        match binding {
+            Binding::Role(role) => issues.roles.get(role).cloned().or_else(|| {
+                let route = config.roles.route_for(*role)?;
+                issues.routes.get(route).cloned()
+            }),
+            Binding::Route(route) => issues.routes.get(route).cloned(),
+            Binding::Fixed(target) => issues.accounts.get(&target.account).cloned(),
+        }
+    }
+
+    fn note_cleared(&self, account: &AccountId) {
+        if let Ok(mut cleared) = self.cleared_hints.lock() {
+            cleared.push((account.clone(), self.now()));
+        }
+    }
+
     /// Привести аккаунты в работе к конфигу: неизменившиеся остаются со своим состоянием.
-    fn sync_runtimes(&self, config: &GatewayConfig, hints: &[StateHint]) {
+    fn sync_runtimes(&self, config: &GatewayConfig, hints: &[StateHint], issues: &Issues) {
         let Ok(mut runtimes) = self.runtimes.lock() else {
             return;
         };
         let mut next: HashMap<AccountId, Arc<Runtime>> = HashMap::new();
         for account in &config.accounts {
+            let invalid = issues.accounts.get(&account.id).cloned();
             let kept = runtimes
                 .get(&account.id)
-                .filter(|runtime| runtime.connection == connection_of(account))
+                .filter(|runtime| {
+                    runtime.connection == connection_of(account) && runtime.invalid == invalid
+                })
                 .cloned();
             let runtime = match kept {
                 Some(runtime) => {
                     if let Ok(mut state) = runtime.state.lock() {
                         let off = state.effective(self.now()) == AccountStatus::Disabled;
                         if off == account.enabled {
+                            if state.hint.is_some() {
+                                self.note_cleared(&account.id);
+                            }
                             state.set_enabled(account.enabled);
                         }
                     }
@@ -420,7 +532,7 @@ impl Core {
                 }
                 None => {
                     let hint = hints.iter().find(|h| h.account == account.id).cloned();
-                    self.build_runtime(account, hint)
+                    self.build_runtime(account, hint, invalid)
                 }
             };
             next.insert(account.id.clone(), runtime);
@@ -428,14 +540,18 @@ impl Core {
         *runtimes = next;
     }
 
+    /// План привязки; `None`, если маршрута нет или конфиг к нему не пускает.
     pub(super) fn plan(&self, binding: &Binding) -> Option<Plan> {
+        if self.binding_issue(binding).is_some() {
+            return None;
+        }
         let config = self.config();
         match binding {
             Binding::Role(role) => {
                 let route = config.route(config.roles.route_for(*role)?)?.clone();
-                Some(Self::plan_of_route(&config, route))
+                Self::plan_of_route(&config, route)
             }
-            Binding::Route(id) => Some(Self::plan_of_route(&config, config.route(id)?.clone())),
+            Binding::Route(id) => Self::plan_of_route(&config, config.route(id)?.clone()),
             Binding::Fixed(target) => {
                 let account = config.account(&target.account)?;
                 Some(Plan {
@@ -450,15 +566,14 @@ impl Core {
         }
     }
 
-    fn plan_of_route(config: &GatewayConfig, route: Route) -> Plan {
-        let tool_mode = route
-            .tool_mode(&config.accounts)
-            .unwrap_or(ToolMode::Prompt);
-        Plan {
+    /// Смесь родных и промптовых инструментов без разрешения — ошибка, а не тихая смена режима.
+    fn plan_of_route(config: &GatewayConfig, route: Route) -> Option<Plan> {
+        let tool_mode = route.tool_mode(&config.accounts).ok()?;
+        Some(Plan {
             steps: route.steps.clone(),
             route: Some(route),
             tool_mode,
-        }
+        })
     }
 
     // ── Выбор ───────────────────────────────────────────────────────────
@@ -467,16 +582,18 @@ impl Core {
         &self,
         config: &GatewayConfig,
         step: &Step,
-        pinned: Option<&Target>,
         plan: &Plan,
         query: &DecisionQuery,
+        attachments: &[PathBuf],
         now: SystemTime,
     ) -> (Option<SkipReason>, Option<Candidate>, Option<SystemTime>) {
         let skip = |reason| (Some(reason), None, None);
         let Some(account) = config.account(&step.account) else {
             return skip(SkipReason::Unavailable);
         };
-        let model = pinned
+        let model = query
+            .pinned
+            .as_ref()
             .filter(|pin| pin.account == account.id)
             .map(|pin| pin.model.clone())
             .or_else(|| step.model.clone())
@@ -496,7 +613,12 @@ impl Core {
         let Some(runtime) = self.runtime(&account.id) else {
             return skip(SkipReason::Unavailable);
         };
-        let Some(caps) = runtime.caps.as_ref().filter(|_| runtime.backend.is_ok()) else {
+        if let Some(message) = &runtime.invalid {
+            return skip(SkipReason::InvalidConfig {
+                message: message.clone(),
+            });
+        }
+        let (Some(caps), Ok(backend)) = (runtime.caps.as_ref(), runtime.backend.as_ref()) else {
             return skip(SkipReason::Unavailable);
         };
         let (status, returns_at, hint_deadline, limits) = match runtime.state.lock() {
@@ -522,6 +644,18 @@ impl Core {
         }
         if !caps.pure_model {
             return skip(SkipReason::NotPureModel);
+        }
+        // Адаптеру с HTTP-API нужна модель: пустое поле `model` сервер не примет.
+        if model.is_empty() && matches!(backend.kind(), BackendKind::Api(_)) {
+            return skip(SkipReason::InvalidConfig {
+                message: "no model chosen: set model on the account or on the route step".into(),
+            });
+        }
+        if attachments
+            .iter()
+            .any(|path| !backend.accepts_attachment(path))
+        {
+            return skip(SkipReason::NoAttachmentSupport);
         }
         if !caps.supports_tool_mode(query.tool_mode) {
             return skip(SkipReason::ToolModeMismatch);
@@ -600,12 +734,23 @@ impl Core {
         }
     }
 
-    /// Чистая функция выбора: ничего не меняет, кроме чтения состояния.
     pub fn select(
         &self,
         plan: &Plan,
         query: &DecisionQuery,
         route_id: Option<RouteId>,
+    ) -> Selection {
+        self.select_with(plan, query, route_id, &[])
+    }
+
+    /// Чистая функция выбора: ничего не меняет, кроме чтения состояния. `attachments` —
+    /// файлы хода: брать можно только аккаунт, который их приложит.
+    pub fn select_with(
+        &self,
+        plan: &Plan,
+        query: &DecisionQuery,
+        route_id: Option<RouteId>,
+        attachments: &[PathBuf],
     ) -> Selection {
         let now = self.now();
         let config = self.config();
@@ -632,7 +777,7 @@ impl Core {
                 });
                 continue;
             }
-            let verdict = self.evaluate(&config, step, query.pinned.as_ref(), plan, query, now);
+            let verdict = self.evaluate(&config, step, plan, query, attachments, now);
             match verdict {
                 (Some(reason), _, at) => {
                     returns.extend(at);
@@ -782,9 +927,14 @@ impl Core {
     /// Свежий снимок лимитов от сервера. Событие — только когда он правда новый.
     pub fn note_limits(&self, runtime: &Runtime, account: &AccountId, snapshot: LimitSnapshot) {
         let changed = runtime.state.lock().is_ok_and(|mut state| {
-            let changed = state.limits.as_ref() != Some(&snapshot);
+            // Время наблюдения меняется на каждом ответе: событие только когда изменились сами числа.
+            let same = state.limits.as_ref().is_some_and(|old| {
+                old.windows == snapshot.windows
+                    && old.source == snapshot.source
+                    && old.plan == snapshot.plan
+            });
             state.limits = Some(snapshot);
-            changed
+            !same
         });
         if changed {
             self.emit(GatewayEvent::LimitsUpdated {
@@ -795,10 +945,13 @@ impl Core {
 
     pub fn report_success(&self, runtime: &Runtime, account: &AccountId) {
         let now = self.now();
-        let changed = runtime
-            .state
-            .lock()
-            .is_ok_and(|mut state| state.on_success(now));
+        let (changed, had_hint) = runtime.state.lock().map_or((false, false), |mut state| {
+            let had_hint = state.hint.is_some();
+            (state.on_success(now), had_hint)
+        });
+        if had_hint {
+            self.note_cleared(account);
+        }
         if changed {
             self.emit(GatewayEvent::AccountStatusChanged {
                 account: account.clone(),
@@ -846,24 +999,34 @@ impl Core {
         hints
     }
 
-    /// Сбросить учёт и подсказки на диск; вызывается фоновой задачей и при выходе.
+    /// Сбросить учёт и подсказки на диск, слив их с записанным другими процессами.
     pub fn flush(&self) {
         if let Err(error) = self.ledger.flush() {
             tracing::warn!("gateway usage flush failed: {error}");
         }
         let Some(store) = &self.hints else { return };
         let hints = self.live_hints();
+        let cleared = self
+            .cleared_hints
+            .lock()
+            .map(|mut cleared| std::mem::take(&mut *cleared))
+            .unwrap_or_default();
         let unchanged = self.saved_hints.lock().is_ok_and(|saved| *saved == hints);
-        if unchanged {
+        if unchanged && cleared.is_empty() {
             return;
         }
-        match store.save(&hints) {
+        match store.merge_save(&hints, &cleared, self.now()) {
             Ok(()) => {
                 if let Ok(mut saved) = self.saved_hints.lock() {
                     *saved = hints;
                 }
             }
-            Err(error) => tracing::warn!("gateway state flush failed: {error}"),
+            Err(error) => {
+                tracing::warn!("gateway state flush failed: {error}");
+                if let Ok(mut pending) = self.cleared_hints.lock() {
+                    pending.extend(cleared);
+                }
+            }
         }
     }
 }
@@ -891,6 +1054,10 @@ impl Engine {
             .map(HintStore::load)
             .unwrap_or_default();
         let ledger = EngineLedger::new(deps.data_dir.as_ref().map(|dir| dir.join("usage.json")));
+        let issues = Issues::of(&config);
+        for message in issues.errors() {
+            tracing::warn!("gateway config error: {message}");
+        }
         let core = Arc::new(Core {
             clock: deps.clock,
             resolver: deps.resolver,
@@ -904,9 +1071,14 @@ impl Engine {
             windows: Mutex::new(HashMap::new()),
             hints: hints_store,
             saved_hints: Mutex::new(loaded_hints.clone()),
+            cleared_hints: Mutex::new(Vec::new()),
+            issues: Mutex::new(Arc::new(Issues::default())),
             limits_ttl: LIMITS_TTL,
         });
-        core.sync_runtimes(&config, &loaded_hints);
+        core.sync_runtimes(&config, &loaded_hints, &issues);
+        if let Ok(mut slot) = core.issues.lock() {
+            *slot = Arc::new(issues);
+        }
         Self::spawn_flusher(&core);
         Self { core }
     }
@@ -1074,6 +1246,7 @@ impl Gateway for Engine {
                 .lock()
                 .map(|recent| recent.iter().cloned().collect())
                 .unwrap_or_default(),
+            problems: self.core.issues().problems.clone(),
             generated_at: now,
         }
     }
@@ -1123,7 +1296,10 @@ impl Gateway for Engine {
                 route: None,
                 target: None,
                 tool_mode: query.tool_mode,
-                why: Why::RouteExhausted,
+                why: match self.core.binding_issue(&binding) {
+                    Some(message) => Why::ConfigInvalid { message },
+                    None => Why::RouteExhausted,
+                },
                 skipped: Vec::new(),
                 snapshot_age: None,
                 retry_at: None,
@@ -1135,22 +1311,27 @@ impl Gateway for Engine {
     fn apply_edit(&self, edit: ConfigEdit) -> Result<(), EditError> {
         let mut next = (*self.core.config()).clone();
         apply_to_config(&mut next, edit)?;
-        let blocking: Vec<String> = next
-            .validate()
+        // Мешают только новые ошибки: чинить конфиг по одной правке можно и при старых.
+        let issues = Issues::of(&next);
+        let known = self.core.issues().errors();
+        let introduced: Vec<String> = issues
+            .errors()
             .into_iter()
-            .filter(|p| p.severity == Severity::Error)
-            .map(|p| format!("{}: {}", p.path, p.message))
+            .filter(|error| !known.contains(error))
             .collect();
-        if !blocking.is_empty() {
-            return Err(EditError::Invalid(blocking));
+        if !introduced.is_empty() {
+            return Err(EditError::Invalid(introduced));
         }
         if let Some(persist) = &self.core.persist {
             persist.persist(&next).map_err(EditError::Storage)?;
         }
         let hints = self.core.live_hints();
-        self.core.sync_runtimes(&next, &hints);
+        self.core.sync_runtimes(&next, &hints, &issues);
         if let Ok(mut config) = self.core.config.lock() {
             *config = Arc::new(next);
+        }
+        if let Ok(mut slot) = self.core.issues.lock() {
+            *slot = Arc::new(issues);
         }
         self.core.emit(GatewayEvent::ConfigChanged);
         Ok(())

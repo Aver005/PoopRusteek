@@ -122,6 +122,12 @@ fn switch_provider(
     epoch_cell: &Arc<AtomicU64>,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    // История остаётся, поэтому новый провайдер узнаёт, откуда она: чужие вызовы в ней он развернёт.
+    if let (Some(old), Some(new)) = (&state.focused().provider, &provider)
+        && let Some(origin) = old.route_state()
+    {
+        new.seed_route_state(origin);
+    }
     state.focused_mut().provider = provider;
     state.focused_mut().session_id = crate::session::create_session_id();
     let epoch = invalidate_context_window(state, epoch_cell);
@@ -170,6 +176,27 @@ pub struct App {
     provider_window_epoch: Arc<AtomicU64>,
     /// Шлюз аккаунтов и маршрутов. Выключенный не вмешивается в сборку провайдера.
     gateway: crate::gateway::handle::GatewayHandle,
+}
+
+/// Строка статуса при старте, если конфиг включённого шлюза содержит ошибки.
+fn gateway_startup_note(gateway: &crate::gateway::handle::GatewayHandle) -> Option<String> {
+    use crate::gateway::types::Severity;
+    if !gateway.is_enabled() {
+        return None;
+    }
+    let errors: Vec<_> = gateway
+        .snapshot()
+        .problems
+        .into_iter()
+        .filter(|problem| problem.severity == Severity::Error)
+        .collect();
+    let first = errors.first()?;
+    Some(format!(
+        "Gateway config has {} error(s), the accounts and routes they touch are off. First: {}: {}",
+        errors.len(),
+        first.path,
+        first.message
+    ))
 }
 
 /// Передать события шлюза в цикл приложения. Задача кончается вместе со шлюзом.
@@ -487,6 +514,11 @@ impl App {
         // the chat non-empty and replace the home screen on every launch.
         if !config.migration_notices.is_empty() {
             state.status_message = config.migration_notices.join(" · ");
+        }
+
+        // Ошибки конфига шлюза: приложение запускается, а отключённые аккаунты названы.
+        if let Some(note) = gateway_startup_note(&gateway) {
+            state.status_message = note;
         }
 
         // Semantic matcher: background init (first run downloads the
@@ -1525,5 +1557,90 @@ mod window_tests {
                 .is_err(),
             "the provider we switched away from must not overwrite the new window"
         );
+    }
+
+    fn history_with_calls() -> Vec<ChatMessage> {
+        let mut assistant = ChatMessage::assistant("looking");
+        assistant.tool_calls = vec![crate::provider::ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+            provider_state: Some(serde_json::json!({"thoughtSignature": "sig"})),
+        }];
+        vec![
+            ChatMessage::user("read it"),
+            assistant,
+            ChatMessage::tool("call_1", "contents"),
+            ChatMessage::user("and now?"),
+        ]
+    }
+
+    /// Переключение провайдера оставляет историю, поэтому новый узнаёт, откуда она.
+    #[tokio::test]
+    async fn switching_provider_hands_the_route_origin_to_the_new_one() {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, ask, ask_with, rig};
+        let rig = rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut state = test_state();
+
+        // Беседа шла на a, потом a остыл: новый провайдер уйдёт на b и не должен получить подписи a.
+        let old = rig.main();
+        ask(&old, "hi").await.0.unwrap();
+        state.focused_mut().provider = Some(old);
+        rig.cool("a", 300);
+        let fresh = rig.main();
+        switch_provider(&mut state, Some(Arc::clone(&fresh)), &epoch, &tx);
+        ask_with(&fresh, history_with_calls()).await.0.unwrap();
+        let seen = rig.fakes["b"].last_messages();
+        assert!(seen[1].tool_calls.is_empty(), "b never sees a's ids");
+        assert!(seen[1].content.contains("<tool_use>"));
+
+        // Обратная сторона: цель не сменилась — вызовы остаются как были.
+        let rig = rig_pair();
+        let old = rig.main();
+        ask(&old, "hi").await.0.unwrap();
+        state.focused_mut().provider = Some(old);
+        let same = rig.main();
+        switch_provider(&mut state, Some(Arc::clone(&same)), &epoch, &tx);
+        ask_with(&same, history_with_calls()).await.0.unwrap();
+        assert_eq!(rig.fakes["a"].last_messages()[1].tool_calls.len(), 1);
+    }
+
+    fn rig_pair() -> crate::gateway::testkit::Rig {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, rig};
+        rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_gateway_with_config_errors_is_named_at_startup_and_a_healthy_one_is_silent() {
+        use crate::gateway::handle::GatewayHandle;
+        use crate::gateway::testkit::TWO_ACCOUNTS;
+        let bad = TWO_ACCOUNTS.replace(
+            "model = \"model-a\"",
+            "model = \"model-a\"\n[accounts.limits]\nmax_concurrency = 0",
+        );
+        let broken: GatewayHandle = Arc::new(crate::gateway::testkit::rig(&bad, Vec::new()).engine);
+        let note = gateway_startup_note(&broken).expect("the errors are named");
+        assert!(
+            note.contains("1 error") && note.contains("max_concurrency"),
+            "{note}"
+        );
+        let healthy: GatewayHandle = Arc::new(rig_pair().engine);
+        assert_eq!(gateway_startup_note(&healthy), None);
+        let off: GatewayHandle = Arc::new(crate::gateway::handle::DisabledGateway::new());
+        assert_eq!(gateway_startup_note(&off), None);
     }
 }

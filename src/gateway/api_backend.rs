@@ -1,8 +1,5 @@
-//! Адаптер аккаунта с ключом: оборачивает существующие HTTP-клиенты (OpenAI, Anthropic,
-//! Gemini) и общий разбор потока `drive_provider`, которым пользуется и DeepSeek.
-//!
-//! Модель берётся из `CallContext`, а не из запроса: клиент хранит модель при создании,
-//! поэтому на каждую модель аккаунта заводится свой клиент (кэш в `Shared::clients`).
+//! Адаптер аккаунта с ключом поверх существующих HTTP-клиентов (OpenAI, Anthropic, Gemini).
+//! Здесь же общий разбор потока `drive_provider`; модель берётся из `CallContext`, а не из запроса.
 
 use super::backend::{
     AuthState, Backend, BackendError, BackendKind, CallContext, CallReport, Capabilities,
@@ -44,9 +41,11 @@ pub(super) fn estimate_prompt_tokens(request: &CompletionRequest) -> u32 {
         .sum()
 }
 
-/// Прогнать `complete_stream` провайдера до конца, переслав чанки в `tracker`.
-/// Поток читается целиком, даже если получатель ушёл: чанк расхода OpenAI идёт после
-/// `finish_reason`, и без дочитывания его не увидеть.
+/// Сколько после `finish_reason` ждать чанк расхода, прежде чем считать вызов законченным.
+/// Меньше `AFTER_STOP_GRACE` цикла агента: иначе тот оборвёт нас раньше и учёт пропадёт.
+pub(super) const USAGE_GRACE: Duration = Duration::from_secs(2);
+
+/// Прогнать `complete_stream` до конца, переслав чанки в `tracker`; расход ждём ограниченно.
 #[allow(
     clippy::result_large_err,
     reason = "`BackendError` отдаётся трейтом `Backend` по значению (контракт GW-0)"
@@ -57,37 +56,58 @@ pub(super) async fn drive_provider(
     tracker: &EmitTracker,
     account: &AccountId,
 ) -> Result<Driven, BackendError> {
+    drive_with_grace(provider, request, tracker, account, USAGE_GRACE).await
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "`BackendError` отдаётся трейтом `Backend` по значению (контракт GW-0)"
+)]
+async fn drive_with_grace(
+    provider: &Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    tracker: &EmitTracker,
+    account: &AccountId,
+    grace: Duration,
+) -> Result<Driven, BackendError> {
     let started = Instant::now();
     let prompt_estimate = estimate_prompt_tokens(&request);
     let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel::<CompletionChunk>();
-    let drive = provider.complete_stream(request, inner_tx);
-    let forward = async {
-        let mut usage: Option<Usage> = None;
-        let mut finish_reason: Option<String> = None;
-        let mut ttft: Option<Duration> = None;
-        let mut reply_chars = 0usize;
-        let mut receiver_alive = true;
-        while let Some(chunk) = inner_rx.recv().await {
-            if chunk.usage.is_some() {
-                // Последнее слово сервера: расход приходит один раз, но не суммируется.
-                usage = chunk.usage.clone();
+    let mut drive = Box::pin(provider.complete_stream(request, inner_tx));
+    let mut result: Option<crate::error::AppResult<()>> = None;
+    let mut usage: Option<Usage> = None;
+    let mut finish_reason: Option<String> = None;
+    let mut ttft: Option<Duration> = None;
+    let mut reply_chars = 0usize;
+    let mut receiver_alive = true;
+    let mut give_up_at: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::select! {
+            outcome = &mut drive, if result.is_none() => result = Some(outcome),
+            chunk = inner_rx.recv() => {
+                let Some(chunk) = chunk else { break };
+                if chunk.usage.is_some() {
+                    // Последнее слово сервера: расход приходит один раз и не суммируется.
+                    usage = chunk.usage.clone();
+                }
+                if chunk.finish_reason.is_some() {
+                    finish_reason = chunk.finish_reason.clone();
+                    give_up_at.get_or_insert_with(|| tokio::time::Instant::now() + grace);
+                }
+                if ttft.is_none() && is_meaningful(&chunk) {
+                    ttft = Some(started.elapsed());
+                }
+                reply_chars += chunk.content.chars().count();
+                if receiver_alive {
+                    receiver_alive = tracker.send(chunk);
+                }
             }
-            if chunk.finish_reason.is_some() {
-                finish_reason = chunk.finish_reason.clone();
-            }
-            if ttft.is_none() && is_meaningful(&chunk) {
-                ttft = Some(started.elapsed());
-            }
-            reply_chars += chunk.content.chars().count();
-            if receiver_alive {
-                receiver_alive = tracker.send(chunk);
-            }
+            () = tokio::time::sleep_until(give_up_at.unwrap_or_else(tokio::time::Instant::now)),
+                if give_up_at.is_some() => break,
         }
-        (usage, finish_reason, ttft, reply_chars)
-    };
-    let (result, (usage, finish_reason, ttft, reply_chars)) = tokio::join!(drive, forward);
-
-    if let Err(error) = result {
+    }
+    // Оборванный по сроку хвост (поток не закрылся после конца ответа) — не ошибка вызова.
+    if let Some(Err(error)) = result {
         return Err(BackendError::from_app(account, &error, tracker.emitted()));
     }
     if !tracker.emitted() && finish_reason.is_none() {
@@ -529,6 +549,107 @@ mod tests {
             .expect_err("nothing came");
         assert_eq!(error.class, FailureClass::Server);
         assert!(!error.emitted);
+    }
+
+    /// Провайдер, который отдал конец ответа и не закрыл поток.
+    struct HangsAfterFinish;
+
+    #[async_trait]
+    impl LLMProvider for HangsAfterFinish {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> crate::error::AppResult<crate::provider::CompletionResponse> {
+            unreachable!("streaming only")
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
+        ) -> crate::error::AppResult<()> {
+            let _ = tx.send(CompletionChunk {
+                content: "done".into(),
+                finish_reason: Some("stop".into()),
+                ..CompletionChunk::default()
+            });
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+
+        fn model(&self) -> &str {
+            "hang"
+        }
+
+        fn fork(&self) -> Arc<dyn LLMProvider> {
+            Arc::new(Self)
+        }
+    }
+
+    /// Закрытие потока не ждёт вечно: вызов засчитан, расход — оценка.
+    #[tokio::test]
+    async fn a_stream_left_open_after_the_finish_still_counts_as_a_finished_call() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(HangsAfterFinish);
+        let (tracker, mut rx) = tracker();
+        let driven = drive_with_grace(
+            &provider,
+            request(),
+            &tracker,
+            &AccountId::parse("api").unwrap(),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("the reply was complete");
+        assert_eq!(driven.finish_reason.as_deref(), Some("stop"));
+        assert!(driven.usage_estimated, "no usage chunk came before the cut");
+        assert_eq!(rx.try_recv().unwrap().content, "done");
+        assert!(tracker.emitted());
+    }
+
+    /// Обратная сторона: поток, оборвавшийся без конца, остаётся отказом.
+    #[tokio::test]
+    async fn a_stream_that_hangs_before_any_finish_is_not_cut_short() {
+        struct Silent;
+
+        #[async_trait]
+        impl LLMProvider for Silent {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> crate::error::AppResult<crate::provider::CompletionResponse> {
+                unreachable!("streaming only")
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: CompletionRequest,
+                _tx: tokio::sync::mpsc::UnboundedSender<CompletionChunk>,
+            ) -> crate::error::AppResult<()> {
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+
+            fn model(&self) -> &str {
+                "silent"
+            }
+
+            fn fork(&self) -> Arc<dyn LLMProvider> {
+                Arc::new(Self)
+            }
+        }
+
+        let provider: Arc<dyn LLMProvider> = Arc::new(Silent);
+        let (tracker, _rx) = tracker();
+        let account = AccountId::parse("api").unwrap();
+        let waiting = drive_with_grace(
+            &provider,
+            request(),
+            &tracker,
+            &account,
+            Duration::from_millis(5),
+        );
+        let outcome = tokio::time::timeout(Duration::from_millis(100), waiting).await;
+        assert!(outcome.is_err(), "the grace starts only after a finish");
     }
 
     #[test]

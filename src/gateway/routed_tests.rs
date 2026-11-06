@@ -250,6 +250,8 @@ async fn with_everyone_cooling_a_fresh_call_fails_fast_naming_the_wait() {
 async fn a_switch_turns_foreign_tool_calls_into_text_and_a_stay_leaves_them_alone() {
     let rig = pair(vec![], vec![]);
     let provider = rig.main();
+    // Беседа уже стоит на a: свои вызовы a получает назад как были.
+    ask(&provider, "hello").await.0.unwrap();
     ask_with(&provider, calls_in_history()).await.0.unwrap();
     let kept = rig.fakes["a"].last_messages();
     assert_eq!(kept[1].tool_calls.len(), 1, "same target: untouched");
@@ -269,6 +271,16 @@ async fn a_switch_turns_foreign_tool_calls_into_text_and_a_stay_leaves_them_alon
             .contains("<tool_use><name>read_file</name>")
     );
     assert_eq!(moved[2].content, "contents", "results stay as they were");
+    // DeepSeek печатает у ассистента только текст: вызов и его аргументы обязаны в нём быть.
+    let prompt = crate::provider::prompt::build_prompt(
+        &moved,
+        "SYS",
+        crate::provider::prompt::SystemDelivery::Fresh,
+    );
+    assert!(
+        prompt.contains("read_file") && prompt.contains("a.rs") && prompt.contains("contents"),
+        "the result keeps its call in the rendered prompt: {prompt}"
+    );
 
     // Дальше на b: старая история всё ещё развёрнута, чужие подписи не возвращаются.
     ask_with(&provider, calls_in_history()).await.0.unwrap();
@@ -325,8 +337,9 @@ fn server_session_caps() -> Capabilities {
     }
 }
 
+/// Решение ведущего: смена цели никогда не удаляет серверную сессию, которую видит человек.
 #[tokio::test]
-async fn leaving_a_server_session_discards_it_and_staying_keeps_it() {
+async fn moving_to_another_account_never_deletes_the_session_the_user_sees() {
     let a = FakeBackend::with_caps(server_session_caps(), vec![]);
     let rig = rig(
         TWO_ACCOUNTS,
@@ -336,11 +349,6 @@ async fn leaving_a_server_session_discards_it_and_staying_keeps_it() {
     ask(&provider, "one").await.0.unwrap();
     ask(&provider, "two").await.0.unwrap();
     settle().await;
-    assert_eq!(
-        rig.fakes["a"].discards(),
-        0,
-        "staying on a keeps its session"
-    );
     assert_eq!(rig.fakes["a"].forks(), 1, "one session for the whole chat");
 
     let runtime = rig.engine.core().runtime(&id("a")).unwrap();
@@ -349,12 +357,191 @@ async fn leaving_a_server_session_discards_it_and_staying_keeps_it() {
         .report_failure(&runtime, &id("a"), &rate_limit(300), "x");
     ask(&provider, "three").await.0.unwrap();
     settle().await;
+    assert_eq!(rig.fakes["b"].call_count(), 1, "the chat did move to b");
+    assert_eq!(
+        rig.fakes["a"].discards(),
+        0,
+        "but a's session was left alone"
+    );
+    assert_eq!(rig.fakes["a"].deletes(), 0);
+}
+
+/// То же для сессии, подхваченной `/load`: именно её удаление прежний код делал на fallback.
+#[tokio::test]
+async fn a_session_adopted_by_load_survives_a_fallback_and_a_config_edit() {
+    let a = FakeBackend::with_caps(server_session_caps(), vec![Act::Fail(rate_limit(40))]);
+    let rig = rig(
+        TWO_ACCOUNTS,
+        vec![("a", a), ("b", FakeBackend::new(vec![]))],
+    );
+    let provider = rig.main();
+    provider.adopt_session("remote-1", Some(7)).await.unwrap();
+    assert_eq!(rig.fakes["a"].adopts(), 1, "the saved link was adopted");
+
+    // Fallback: a отвечает 429, ход кончается на b.
+    ask(&provider, "go").await.0.unwrap();
+    settle().await;
+    assert_eq!(rig.fakes["b"].call_count(), 1);
+    assert_eq!(rig.fakes["a"].discards(), 0, "no delete after the fallback");
+    // Ссылка в файле сессии не затирается: «не знаю» — это `Unknown`, а не «ссылки нет».
+    assert_eq!(
+        crate::session::RemoteLink::from_identity(provider.session_identity()),
+        crate::session::RemoteLink::Unknown
+    );
+
+    // Правка конфига тоже не трогает чужую сессию.
+    rig.engine
+        .apply_edit(ConfigEdit::SetEnabled {
+            id: id("a"),
+            enabled: false,
+        })
+        .unwrap();
+    ask(&provider, "again").await.0.unwrap();
+    settle().await;
+    assert_eq!(rig.fakes["a"].discards(), 0);
+    assert_eq!(rig.fakes["a"].deletes(), 0);
+}
+
+/// Пользовательские `discard` и `/delete` работают как раньше.
+#[tokio::test]
+async fn the_users_own_discard_and_delete_still_reach_the_server() {
+    let a = FakeBackend::with_caps(server_session_caps(), vec![]);
+    let rig = rig(
+        TWO_ACCOUNTS,
+        vec![("a", a), ("b", FakeBackend::new(vec![]))],
+    );
+    let provider = rig.main();
+    ask(&provider, "one").await.0.unwrap();
+    provider
+        .delete_remote_session_by_id("remote-9")
+        .await
+        .unwrap();
+    assert_eq!(rig.fakes["a"].deletes(), 1, "/delete reached the account");
+    provider.discard_remote_session().await.unwrap();
+    assert_eq!(rig.fakes["a"].discards(), 1, "discard reached the account");
+}
+
+/// Можно удалять только то, что создала эта же попытка и чего человек не видел.
+#[tokio::test]
+async fn a_failed_attempts_own_session_is_discarded_only_if_nothing_was_shown() {
+    let silent =
+        FakeBackend::with_caps(server_session_caps(), vec![Act::Fail(FailureClass::Server)]);
+    let rig = rig(
+        TWO_ACCOUNTS,
+        vec![("a", silent), ("b", FakeBackend::new(vec![]))],
+    );
+    ask(&rig.main(), "go").await.0.unwrap();
+    settle().await;
     assert_eq!(
         rig.fakes["a"].discards(),
         1,
-        "the old server session is deleted"
+        "nothing reached the user: cleaned up"
     );
-    assert_eq!(rig.fakes["b"].discards(), 0);
+
+    let spoke = FakeBackend::with_caps(
+        server_session_caps(),
+        vec![Act::FailAfterText("par", FailureClass::Server)],
+    );
+    let rig = self::rig(
+        TWO_ACCOUNTS,
+        vec![("a", spoke), ("b", FakeBackend::new(vec![]))],
+    );
+    let (result, text) = ask(&rig.main(), "go").await;
+    settle().await;
+    assert!(result.is_err());
+    assert_eq!(text, "par");
+    assert_eq!(
+        rig.fakes["a"].discards(),
+        0,
+        "the user saw part of it: kept"
+    );
+}
+
+// ── Вложения ────────────────────────────────────────────────────────────
+
+fn with_file(text: &str, file: &str) -> Vec<ChatMessage> {
+    let mut message = ChatMessage::user(text);
+    message.attachments = vec![file.to_string()];
+    vec![message]
+}
+
+fn files_on_a() -> Rig {
+    rig(
+        TWO_ACCOUNTS,
+        vec![
+            ("a", FakeBackend::accepting_files(vec![])),
+            ("b", FakeBackend::new(vec![])),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn a_file_goes_to_the_account_that_can_attach_it_and_the_answer_says_yes() {
+    let rig = files_on_a();
+    let provider = rig.main();
+    assert!(provider.accepts_attachment(std::path::Path::new("report.pdf")));
+    ask_with(&provider, with_file("read it", "report.pdf"))
+        .await
+        .0
+        .unwrap();
+    assert_eq!(rig.fakes["a"].call_count(), 1);
+    assert_eq!(rig.fakes["b"].call_count(), 0);
+    assert_eq!(
+        rig.fakes["a"].last_messages()[0].attachments,
+        ["report.pdf"],
+        "the file went along"
+    );
+}
+
+/// Обратная сторона: некому принять — ход не уходит молча на аккаунт без файлов.
+#[tokio::test]
+async fn when_nobody_can_take_the_file_the_turn_fails_loudly_instead_of_dropping_it() {
+    let rig = files_on_a();
+    let provider = rig.main();
+    let runtime = rig.engine.core().runtime(&id("a")).unwrap();
+    rig.engine
+        .core()
+        .report_failure(&runtime, &id("a"), &rate_limit(300), "x");
+
+    assert!(
+        !provider.accepts_attachment(std::path::Path::new("report.pdf")),
+        "the answer follows the real target: only b is left, and it cannot"
+    );
+    let (result, _) = ask_with(&provider, with_file("read it", "dir/report.pdf")).await;
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("report.pdf") && error.contains("was not sent"),
+        "{error}"
+    );
+    assert_eq!(
+        rig.fakes["b"].call_count(),
+        0,
+        "b never saw a question about a missing file"
+    );
+
+    // Тот же ход без файла спокойно уходит на b.
+    let (fine, _) = ask(&provider, "no file this time").await;
+    fine.unwrap();
+    assert_eq!(rig.fakes["b"].call_count(), 1);
+}
+
+#[tokio::test]
+async fn a_file_from_an_earlier_turn_does_not_pin_the_chat_to_one_account() {
+    let rig = files_on_a();
+    let provider = rig.main();
+    let runtime = rig.engine.core().runtime(&id("a")).unwrap();
+    rig.engine
+        .core()
+        .report_failure(&runtime, &id("a"), &rate_limit(300), "x");
+    let mut history = with_file("earlier", "old.pdf");
+    history.push(ChatMessage::assistant("done"));
+    history.push(ChatMessage::user("and now a plain question"));
+    ask_with(&provider, history).await.0.unwrap();
+    assert_eq!(
+        rig.fakes["b"].call_count(),
+        1,
+        "old files were delivered long ago"
+    );
 }
 
 // ── Форки, места, режим инструментов ────────────────────────────────────

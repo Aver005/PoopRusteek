@@ -1,6 +1,4 @@
-//! Подставные адаптеры и сборка движка для тестов шлюза. Только для `cfg(test)`.
-//!
-//! Время идёт по `ManualClock`, адаптеры отвечают по сценарию: настоящих `sleep` и сети нет.
+//! Подставные адаптеры и сборка движка для тестов шлюза (`cfg(test)`); часы ручные, сети нет.
 
 use super::backend::{
     AuthState, Backend, BackendError, BackendKind, CallContext, CallReport, Capabilities,
@@ -44,6 +42,9 @@ pub struct CallSeen {
 
 pub struct Inner {
     caps: Capabilities,
+    accepts_files: bool,
+    pub deletes: AtomicUsize,
+    pub adopts: AtomicUsize,
     acts: Mutex<VecDeque<Act>>,
     pub calls: Mutex<Vec<CallSeen>>,
     pub forks: AtomicUsize,
@@ -75,10 +76,22 @@ impl FakeBackend {
         Self::with_caps(caps(), acts)
     }
 
+    /// Адаптер, умеющий приложить файл (как DeepSeek).
+    pub fn accepting_files(acts: Vec<Act>) -> Arc<Self> {
+        Self::build(caps(), true, acts)
+    }
+
     pub fn with_caps(caps: Capabilities, acts: Vec<Act>) -> Arc<Self> {
+        Self::build(caps, false, acts)
+    }
+
+    fn build(caps: Capabilities, accepts_files: bool, acts: Vec<Act>) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(Inner {
                 caps,
+                accepts_files,
+                deletes: AtomicUsize::new(0),
+                adopts: AtomicUsize::new(0),
                 acts: Mutex::new(acts.into_iter().collect()),
                 calls: Mutex::new(Vec::new()),
                 forks: AtomicUsize::new(0),
@@ -99,6 +112,14 @@ impl FakeBackend {
 
     pub fn discards(&self) -> usize {
         self.inner.discards.load(Ordering::SeqCst)
+    }
+
+    pub fn deletes(&self) -> usize {
+        self.inner.deletes.load(Ordering::SeqCst)
+    }
+
+    pub fn adopts(&self) -> usize {
+        self.inner.adopts.load(Ordering::SeqCst)
     }
 
     /// Сообщения последнего запроса, как их увидел адаптер.
@@ -251,6 +272,20 @@ impl Backend for FakeBackend {
     async fn discard_session(&self) {
         self.inner.discards.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn accepts_attachment(&self, _path: &std::path::Path) -> bool {
+        self.inner.accepts_files
+    }
+
+    async fn delete_remote_session_by_id(&self, _session_id: &str) -> AppResult<()> {
+        self.inner.deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn adopt_session(&self, _session_id: &str, _parent: Option<i64>) -> AppResult<()> {
+        self.inner.adopts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// Отдаёт заранее заготовленные адаптеры по id аккаунта.
@@ -344,6 +379,18 @@ impl Rig {
         self.engine
             .provider_for_role(Role::Main, CallSource::Chat)
             .expect("main route exists")
+    }
+
+    /// Отложить аккаунт на `secs` секунд, как ответ `429` с `Retry-After`.
+    pub fn cool(&self, account: &str, secs: u64) {
+        let account = super::types::AccountId::parse(account).expect("test account id");
+        let runtime = self.engine.core().runtime(&account).expect("known account");
+        let class = FailureClass::RateLimit {
+            retry_after: Some(Duration::from_secs(secs)),
+        };
+        self.engine
+            .core()
+            .report_failure(&runtime, &account, &class, "scripted");
     }
 
     pub fn advance(&self, secs: u64) {

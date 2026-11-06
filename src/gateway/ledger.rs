@@ -1,8 +1,5 @@
-//! Учёт токенов по аккаунту и модели. Записи копятся в памяти (быстро, без ввода-вывода),
-//! агрегаты по дням уходят на диск через `util::atomic_write` фоновой задачей раз в ~30 с.
-//!
-//! Сырые вызовы на диск не пишутся. Одна и та же запись (`request_id` + `attempt` +
-//! аккаунт) считается один раз: повторная отправка той же записи ничего не добавляет.
+//! Учёт токенов по аккаунту и модели: копится в памяти, раз в ~30 с сливается с файлом через `atomic_write`.
+//! Повтор той же записи (`request_id` + `attempt` + аккаунт) не считается дважды.
 
 use super::clock::to_unix;
 use super::handle::{CallSource, Ledger, LedgerQuery, LedgerRow, Outcome, UsageRecord};
@@ -84,10 +81,50 @@ struct LedgerFile {
     rows: Vec<Row>,
 }
 
+impl Agg {
+    fn add(&mut self, other: &Agg) {
+        self.calls += other.calls;
+        self.failed += other.failed;
+        self.fallbacks += other.fallbacks;
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.estimated |= other.estimated;
+    }
+}
+
+/// Строки файла учёта. Нет файла или он битый — пусто, и это не ошибка.
+fn read_rows(path: &std::path::Path) -> BTreeMap<Key, Agg> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let file: LedgerFile = match serde_json::from_str(&text) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!("gateway usage file ignored: {error}");
+            return BTreeMap::new();
+        }
+    };
+    file.rows
+        .into_iter()
+        .map(|row| {
+            let key = Key {
+                day: row.day,
+                account: row.account,
+                model: row.model,
+                source: row.source,
+            };
+            (key, row.agg)
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct Inner {
+    /// Всё известное: прочитанное с диска плюс то, что набрано с последнего сброса.
     rows: BTreeMap<Key, Agg>,
-    dirty: bool,
+    /// Только набранное с последнего сброса: сливается с диском, а не заменяет его.
+    pending: BTreeMap<Key, Agg>,
     seen: HashSet<(String, u8, String)>,
     order: VecDeque<(String, u8, String)>,
 }
@@ -135,67 +172,66 @@ impl EngineLedger {
     /// Битый файл не мешает работе: учёт начнётся с нуля и перепишет его.
     fn load(&self) {
         let Some(path) = &self.path else { return };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let file: LedgerFile = match serde_json::from_str(&text) {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::warn!("gateway usage file ignored: {error}");
-                return;
-            }
-        };
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
-        for row in file.rows {
-            inner.rows.insert(
-                Key {
-                    day: row.day,
-                    account: row.account,
-                    model: row.model,
-                    source: row.source,
-                },
-                row.agg,
-            );
+        let rows = read_rows(path);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.rows = rows;
         }
     }
 
-    /// Записать на диск, если что-то изменилось. `Ok(false)` — писать было нечего.
+    /// Слить набранное с файлом на диске и записать: чужие процессы свои строки не теряют.
+    /// Между чтением и записью остаётся маленькая гонка, потерять всё накопленное она не может.
     pub fn flush(&self) -> std::io::Result<bool> {
         let Some(path) = &self.path else {
             return Ok(false);
         };
-        let bytes = {
+        let pending = {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| std::io::Error::other("lock"))?;
-            if !inner.dirty {
+            if inner.pending.is_empty() {
                 return Ok(false);
             }
-            inner.dirty = false;
-            let file = LedgerFile {
-                version: 1,
-                rows: inner
-                    .rows
-                    .iter()
-                    .map(|(key, agg)| Row {
-                        day: key.day,
-                        account: key.account.clone(),
-                        model: key.model.clone(),
-                        source: key.source.clone(),
-                        agg: agg.clone(),
-                    })
-                    .collect(),
-            };
-            serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)?
+            std::mem::take(&mut inner.pending)
         };
-        let written = crate::util::atomic_write(path, &bytes);
-        if written.is_err()
-            && let Ok(mut inner) = self.inner.lock()
-        {
-            inner.dirty = true;
+        let mut merged = read_rows(path);
+        for (key, agg) in &pending {
+            merged.entry(key.clone()).or_default().add(agg);
+        }
+        let file = LedgerFile {
+            version: 1,
+            rows: merged
+                .iter()
+                .map(|(key, agg)| Row {
+                    day: key.day,
+                    account: key.account.clone(),
+                    model: key.model.clone(),
+                    source: key.source.clone(),
+                    agg: agg.clone(),
+                })
+                .collect(),
+        };
+        let written = serde_json::to_vec_pretty(&file)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::util::atomic_write(path, &bytes));
+        let Ok(mut inner) = self.inner.lock() else {
+            return written.map(|()| true);
+        };
+        match &written {
+            Ok(()) => {
+                // Вид теперь включает чужое с диска и то, что набралось за время записи.
+                let since = std::mem::take(&mut inner.pending);
+                inner.rows = merged;
+                for (key, agg) in &since {
+                    inner.rows.entry(key.clone()).or_default().add(agg);
+                }
+                inner.pending = since;
+            }
+            Err(_) => {
+                for (key, agg) in pending {
+                    inner.pending.entry(key).or_default().add(&agg);
+                }
+            }
         }
         written.map(|()| true)
     }
@@ -222,21 +258,20 @@ impl Ledger for EngineLedger {
             model: record.model.clone(),
             source: source_key(record.source),
         };
-        let agg = inner.rows.entry(key).or_default();
-        agg.calls += 1;
-        if matches!(record.outcome, Outcome::Failed(_)) {
-            agg.failed += 1;
-        }
-        if record.fallback_from.is_some() {
-            agg.fallbacks += 1;
-        }
+        let mut agg = Agg {
+            calls: 1,
+            failed: u64::from(matches!(record.outcome, Outcome::Failed(_))),
+            fallbacks: u64::from(record.fallback_from.is_some()),
+            ..Agg::default()
+        };
         if let Some(usage) = &record.usage {
-            agg.prompt_tokens += u64::from(usage.prompt_tokens);
-            agg.completion_tokens += u64::from(usage.completion_tokens);
-            agg.cache_read_tokens += u64::from(usage.cache_read_tokens.unwrap_or(0));
-            agg.estimated |= record.estimated;
+            agg.prompt_tokens = u64::from(usage.prompt_tokens);
+            agg.completion_tokens = u64::from(usage.completion_tokens);
+            agg.cache_read_tokens = u64::from(usage.cache_read_tokens.unwrap_or(0));
+            agg.estimated = record.estimated;
         }
-        inner.dirty = true;
+        inner.rows.entry(key.clone()).or_default().add(&agg);
+        inner.pending.entry(key).or_default().add(&agg);
     }
 
     /// Суммы за все дни не раньше дня `since`; день целиком (границу не режем).
@@ -414,6 +449,67 @@ mod tests {
         let rows = reloaded.totals(&LedgerQuery::default());
         assert_eq!((rows[0].calls, rows[0].prompt_tokens), (1, 100));
         assert_eq!(rows[0].source, CallSource::Chat);
+    }
+
+    /// Два процесса с одним `data_dir`: каждый сохраняет свои строки, итог — сумма.
+    #[test]
+    fn two_processes_flushing_the_same_file_add_up_instead_of_overwriting() {
+        let path = scratch_dir("ledger-two").join("usage.json");
+        let first = EngineLedger::new(Some(path.clone()));
+        let second = EngineLedger::new(Some(path.clone()));
+        first.record(record("a", Some("r1"), 1, (100, 10)));
+        second.record(record("a", Some("r2"), 1, (30, 3)));
+        second.record(record("b", Some("r3"), 1, (7, 1)));
+        assert!(first.flush().unwrap());
+        assert!(second.flush().unwrap());
+        let on_disk = EngineLedger::new(Some(path));
+        let rows = on_disk.totals(&LedgerQuery::default());
+        let a = rows.iter().find(|r| r.account.as_str() == "a").unwrap();
+        assert_eq!((a.calls, a.prompt_tokens), (2, 130), "{rows:?}");
+        assert!(rows.iter().any(|r| r.account.as_str() == "b"));
+        let seen_by_second: u64 = second
+            .totals(&LedgerQuery::default())
+            .iter()
+            .map(|r| r.calls)
+            .sum();
+        assert_eq!(
+            seen_by_second, 3,
+            "the second process now sees the first call too"
+        );
+    }
+
+    #[test]
+    fn a_second_flush_adds_only_what_is_new() {
+        let path = scratch_dir("ledger-twice").join("usage.json");
+        let ledger = EngineLedger::new(Some(path.clone()));
+        ledger.record(record("a", Some("r1"), 1, (100, 10)));
+        ledger.flush().unwrap();
+        ledger.record(record("a", Some("r2"), 1, (50, 5)));
+        ledger.flush().unwrap();
+        assert!(!ledger.flush().unwrap(), "nothing new, nothing written");
+        let rows = EngineLedger::new(Some(path)).totals(&LedgerQuery::default());
+        assert_eq!(
+            (rows[0].calls, rows[0].prompt_tokens),
+            (2, 150),
+            "no double counting"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_pending_counts_for_the_next_try() {
+        // Путь под обычным файлом: записать нельзя.
+        let dir = scratch_dir("ledger-bad-path");
+        let blocker = dir.join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let ledger = EngineLedger::new(Some(blocker.join("usage.json")));
+        ledger.record(record("a", Some("r1"), 1, (100, 10)));
+        assert!(ledger.flush().is_err());
+        assert_eq!(ledger.totals(&LedgerQuery::default())[0].calls, 1);
+        std::fs::remove_file(&blocker).unwrap();
+        assert!(
+            ledger.flush().unwrap(),
+            "the counts were kept and now go out"
+        );
     }
 
     #[test]

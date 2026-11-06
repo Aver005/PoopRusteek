@@ -22,8 +22,14 @@ pub fn to_unix(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+/// `None`, если число не помещается во время: такое значение в файле — мусор.
+pub fn checked_from_unix(secs: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs))
+}
+
+#[cfg(test)]
 pub fn from_unix(secs: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(secs)
+    checked_from_unix(secs).expect("a sane test time")
 }
 
 /// Часы, которые идут только по команде теста.
