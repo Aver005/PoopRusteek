@@ -474,6 +474,21 @@ pub fn last_decision(snapshot: &GatewaySnapshot, now: SystemTime) -> Option<Deci
         .map(|d| decision_view(snapshot, d, now))
 }
 
+/// Модель последнего выбора шлюза, а если выборов ещё не было, модель первого шага главного маршрута.
+pub fn last_decision_model(snapshot: &GatewaySnapshot) -> Option<String> {
+    if let Some(target) = snapshot.recent.iter().rev().find_map(|d| d.target.as_ref()) {
+        return Some(target.model.clone());
+    }
+    let step = super::edits::main_route(snapshot)?.steps.first()?;
+    step.model.clone().or_else(|| {
+        snapshot
+            .accounts
+            .iter()
+            .find(|a| a.id == step.account)
+            .and_then(|a| a.default_model.clone())
+    })
+}
+
 /// Короткие фишки для главной и подвала: `● claude-max 52%`.
 pub fn chip_text(row: &AccountRow) -> String {
     match row.limits.first().and_then(|l| l.pct.map(|p| (l, p))) {

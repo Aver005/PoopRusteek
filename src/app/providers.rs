@@ -294,7 +294,15 @@ impl crate::app::App {
     fn switch_account_model(&mut self, model: &str) {
         use crate::gateway::types::AccountProvider;
         let snapshot = self.gateway.snapshot();
-        let current = crate::app::gateway_view::rows::current_account(&snapshot)
+        // Закреплённый чат отвечает своим аккаунтом: модель меняется у него, а не у маршрутного.
+        let pinned = self
+            .state
+            .gateway_view
+            .pins
+            .get(&self.state.conversations.focused_id())
+            .map(|pin| pin.account.to_string());
+        let current = pinned
+            .or_else(|| crate::app::gateway_view::rows::current_account(&snapshot))
             .or_else(|| {
                 crate::app::gateway_view::edits::main_route(&snapshot)
                     .and_then(|r| r.steps.first())
@@ -349,22 +357,36 @@ impl crate::app::App {
             .config
             .active_provider_entry()
             .map(|entry| entry.name.clone());
-        match active_name {
-            Some(name) => {
+        let saved = match &active_name {
+            // Записи `[[providers]]` в сериализацию конфига не входят: модель пишется в файл точечно.
+            Some(name) => crate::config::set_provider_field_at(
+                &self
+                    .config
+                    .source
+                    .write_path
+                    .clone()
+                    .unwrap_or_else(crate::config::Config::path),
+                name,
+                "model",
+                model,
+            )
+            .map(|()| {
                 if let Some(entry) = self
                     .config
                     .providers
                     .iter_mut()
-                    .find(|entry| entry.name == name)
+                    .find(|entry| &entry.name == name)
                 {
                     entry.model = model.to_string();
                 }
-            }
+            })
+            .map_err(|error| format!("Failed to save config: {error}")),
             None => {
                 self.config.provider.model = model.to_string();
+                crate::config::save_or_message(&self.config)
             }
-        }
-        match crate::config::save_or_message(&self.config) {
+        };
+        match saved {
             Ok(()) => {
                 self.rebuild_provider();
                 self.state

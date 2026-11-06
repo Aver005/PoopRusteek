@@ -149,6 +149,34 @@ fn scenes() -> Vec<Scene> {
             first_run: false,
         },
         Scene {
+            name: "accounts-remove",
+            build: |c| with_base(c, accounts::accounts_remove),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "accounts-off-confirm",
+            build: |c| with_base(c, accounts::accounts_off_confirm),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "accounts-starting",
+            build: |c| with_base(c, accounts::accounts_starting),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "trust-long",
+            build: |c| with_base(c, accounts::trust_long),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
             name: "landing-accounts",
             build: |c| with_base(c, accounts::landing_accounts),
             sizes: SIZES_ACCOUNTS,
@@ -319,7 +347,9 @@ fn at(mut message: ChatMessage, time: &str, tokens: u32, model: &str) -> ChatMes
 }
 
 fn tool(name: &str, id: &str, body: &str, time: &str, failed: bool) -> ChatMessage {
-    let mut message = ChatMessage::tool_with_display(id, name, body, body, failed);
+    // Лента собирается тем же путём, что в рабочем коде (`run_tool_calls`).
+    let display = crate::agent::result_display(name, body, false);
+    let mut message = ChatMessage::tool_with_display(id, name, body, &display, failed);
     message.created_at = format!("2026-11-06T{time}+00:00");
     message
 }
@@ -383,7 +413,8 @@ fn chat_messages() -> Vec<ChatMessage> {
             "$ cargo test items::range\nrunning 3 tests\ntest items::range::empty ... FAILED\ntest items::range::single ... ok\ntest items::range::pair ... ok\n\nfailures:\n    items::range::empty\n\ntest result: FAILED. 2 passed; 1 failed
 [exit code 101]",
             "14:02:34",
-            false,
+            // Команда с ненулевым кодом приходит как ошибка инструмента.
+            true,
         ),
         tool(
             "read_file",

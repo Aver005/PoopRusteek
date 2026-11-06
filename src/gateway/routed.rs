@@ -375,6 +375,7 @@ impl RoutedProvider {
                     to: target.account.clone(),
                     class,
                     source: self.source,
+                    conversation: super::handle::current_chat(),
                 });
             }
 

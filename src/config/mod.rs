@@ -11,6 +11,7 @@ mod lock;
 mod migrate;
 mod paths;
 pub mod protect;
+mod providers_file;
 mod queue;
 mod startup;
 mod write;
@@ -28,6 +29,7 @@ pub use paths::{
     is_isolated, legacy_config_path as legacy_config_file, legacy_data_dir,
     set_explicit_config as mark_explicit_config,
 };
+pub use providers_file::{add_provider_at, remove_provider_at, set_provider_field_at};
 pub use queue::{enable_background_saves, flush_saves};
 
 /// Почему `/wipe` сейчас нельзя: прогон с `--config`/`--data-dir` не должен трогать настоящие папки,

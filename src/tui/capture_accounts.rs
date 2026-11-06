@@ -289,10 +289,61 @@ pub(super) fn accounts_routes(base: AppState, config: &mut Config) -> AppState {
     state
 }
 
-pub(super) fn accounts_off(base: AppState, _config: &mut Config) -> AppState {
+pub(super) fn accounts_off(base: AppState, config: &mut Config) -> AppState {
     let mut state = base;
     state.view = View::Accounts;
     state.gateway_view.enabled = false;
+    // Старые записи видны, одна из них активна, выбранная — вторая.
+    for (name, model, url) in [
+        ("ollama", "llama3", "http://localhost:11434/v1"),
+        ("lm-studio", "qwen3-32b", "http://localhost:1234/v1"),
+    ] {
+        config.providers.push(crate::config::ProviderEntry {
+            name: name.into(),
+            base_url: url.into(),
+            api_key: None,
+            model: model.into(),
+            protocol: Default::default(),
+            tools: Default::default(),
+        });
+    }
+    config.active_provider = Some("ollama".into());
+    state.gateway_view.screen.selected = 2;
+    state
+}
+
+/// Вопрос об удалении аккаунта, что стоит шагом маршрута.
+pub(super) fn accounts_remove(base: AppState, config: &mut Config) -> AppState {
+    let mut state = accounts(base, config);
+    state.gateway_view.screen.confirm_remove = Some(crate::app::gateway_view::RemoveConfirm {
+        id: id("claude-max"),
+        text: "Remove claude-max? Its steps in route main (role main) go too. 1 pinned chat(s) go back to the route. The key stays in the keyring; /secrets rm account-claude-max deletes it. y/n"
+            .into(),
+    });
+    state
+}
+
+/// Включение шлюза спрашивает: старые записи станут аккаунтами.
+pub(super) fn accounts_off_confirm(base: AppState, config: &mut Config) -> AppState {
+    let mut state = accounts_off(base, config);
+    state.gateway_view.screen.confirm_enable = true;
+    state
+}
+
+/// Шлюз ещё собирается: список пуст не потому, что аккаунтов нет.
+pub(super) fn accounts_starting(base: AppState, config: &mut Config) -> AppState {
+    let mut state = base;
+    demo_config(config);
+    let mut snapshot = demo_snapshot();
+    snapshot.accounts.clear();
+    snapshot.problems = vec![crate::gateway::types::Problem {
+        severity: crate::gateway::types::Severity::Warning,
+        path: "gateway".into(),
+        message: "the gateway is starting: accounts are being connected".into(),
+    }];
+    state.gateway_view.snapshot = Some(snapshot);
+    state.gateway_view.enabled = true;
+    state.view = View::Accounts;
     state
 }
 
@@ -359,7 +410,7 @@ pub(super) fn secret_prompt(base: AppState, _config: &mut Config) -> AppState {
 
 pub(super) fn trust(base: AppState, _config: &mut Config) -> AppState {
     let mut state = base;
-    state.modal = Some(Modal::Trust(Box::new(TrustDialog::new(TrustRequest {
+    let mut request = TrustRequest {
         config_path: std::path::PathBuf::from(r"D:\Projects\demo-api\.pooprusteek\config.toml"),
         key: "demo".into(),
         hash: "abc".into(),
@@ -368,7 +419,42 @@ pub(super) fn trust(base: AppState, _config: &mut Config) -> AppState {
             "route \"default\" now starts with team-proxy".into(),
             "role main -> default".into(),
         ],
-    }))));
+        summary: Default::default(),
+    };
+    request.summary.hosts = vec!["llm.team.example".into()];
+    request.summary.accounts = 1;
+    request.summary.routes = 1;
+    request.summary.roles = 1;
+    state.modal = Some(Modal::Trust(Box::new(TrustDialog::new(request))));
+    state
+}
+
+/// Длинный список: чужой хост стоит последним, но сводка называет его в первых строках.
+pub(super) fn trust_long(base: AppState, _config: &mut Config) -> AppState {
+    let mut state = base;
+    let mut held_back = Vec::new();
+    let mut hosts = Vec::new();
+    for n in 0..24 {
+        let host = if n == 23 {
+            "attacker.example".to_string()
+        } else {
+            format!("proxy{n}.team.example")
+        };
+        held_back.push(format!(
+            "account \"team-{n}\" sends requests to https://{host}/v1"
+        ));
+        hosts.push(host);
+    }
+    let mut request = TrustRequest {
+        config_path: std::path::PathBuf::from(r"D:\Projects\demo-api\.pooprusteek\config.toml"),
+        key: "demo".into(),
+        hash: "abc".into(),
+        held_back,
+        summary: Default::default(),
+    };
+    request.summary.hosts = hosts;
+    request.summary.accounts = 24;
+    state.modal = Some(Modal::Trust(Box::new(TrustDialog::new(request))));
     state
 }
 

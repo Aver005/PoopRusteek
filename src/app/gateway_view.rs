@@ -1,9 +1,9 @@
 //! Экран аккаунтов и маршрутов: состояние, кэш снимка шлюза и связка с приложением.
-//!
-//! Читаем только `Gateway::snapshot()`, пишем только `Gateway::apply_edit()`; сохранение на
-//! диск идёт через очередь конфига по событию `GatewayPersist`. Рендер состояние не меняет.
+//! Читаем `Gateway::snapshot()`, пишем `Gateway::apply_edit()`; на диск — событием `GatewayPersist`.
 
 pub mod edits;
+#[cfg(test)]
+mod flow_tests;
 pub mod forms;
 pub mod rows;
 pub mod wizard;
@@ -59,7 +59,36 @@ pub struct AccountsScreen {
     pub history: bool,
     pub notice: Option<Notice>,
     /// Ждёт ответа `y/n` на удаление.
-    pub confirm_remove: Option<AccountId>,
+    pub confirm_remove: Option<RemoveConfirm>,
+    /// Экран «шлюз выключен»: ждёт `y/n` на включение.
+    pub confirm_enable: bool,
+}
+
+/// Вопрос об удалении аккаунта: текст называет всё, что заденет удаление.
+#[derive(Debug, Clone)]
+pub struct RemoveConfirm {
+    pub id: AccountId,
+    pub text: String,
+}
+
+/// Закрепление чата за аккаунтом (`/pin`).
+#[derive(Debug, Clone)]
+pub struct Pin {
+    pub account: AccountId,
+    pub model: Option<String>,
+    /// Имя для подвала.
+    pub label: String,
+    /// Шлюз, для которого собран провайдер чата: пересобрали шлюз — пересобираем и пин.
+    gateway: usize,
+}
+
+impl Pin {
+    fn address(&self) -> String {
+        match &self.model {
+            Some(model) => format!("{}/{model}", self.account),
+            None => self.account.to_string(),
+        }
+    }
 }
 
 impl AccountsScreen {
@@ -92,7 +121,9 @@ impl AccountsScreen {
 pub struct ProjectWatch {
     /// Хэш файла, от которого человек уже отказался: пока файл тот же, не спрашиваем снова.
     pub denied: Option<String>,
-    pub known: Option<SystemTime>,
+    /// Последний штамп файла: внешний `None` — ещё не смотрели, внутренний — файла нет.
+    pub known: Option<Option<SystemTime>>,
+    path: Option<std::path::PathBuf>,
     pub checking: bool,
     last_check: Option<Instant>,
 }
@@ -104,8 +135,8 @@ pub struct GatewayView {
     pub snapshot: Option<GatewaySnapshot>,
     refreshed: Option<Instant>,
     pub screen: AccountsScreen,
-    /// Закреплённые чаты: ярлык аккаунта для подвала.
-    pub pins: HashMap<ConversationId, String>,
+    /// Закреплённые чаты.
+    pub pins: HashMap<ConversationId, Pin>,
     pub project: ProjectWatch,
 }
 
@@ -131,6 +162,16 @@ pub struct AccountPlan {
     pub account: Account,
     pub login_command: Option<String>,
     pub warnings: Vec<String>,
+    pub stored: Result<(), String>,
+    /// Запись в хранилище, если секрет клали: на откате она удаляется.
+    pub secret_id: Option<String>,
+}
+
+/// Итог мастера при выключенном шлюзе: запись `[[providers]]` записана (или нет).
+#[derive(Debug, Clone)]
+pub struct LegacyPlan {
+    /// Ключ здесь значением (как после загрузки конфига); в файле только ссылка.
+    pub entry: crate::config::ProviderEntry,
     pub stored: Result<(), String>,
 }
 
@@ -163,6 +204,24 @@ pub fn seam_text(from: &str, to: &str, class_code: &str, back_in: Option<&str>) 
         text.push_str(&format!(", back in {left}"));
     }
     text
+}
+
+/// Токен-ключ быстрой формы `<имя> [openai|anthropic|gemini] <адрес> [модель] [ключ]`: по позиции.
+pub fn quick_key_token(raw: &str) -> Option<&str> {
+    let mut words = raw.split_whitespace().skip(1).peekable();
+    if matches!(words.peek(), Some(&("openai" | "anthropic" | "gemini"))) {
+        words.next();
+    }
+    words.nth(2)
+}
+
+/// Текст ошибки без кусков ввода: названные слова и всё, что похоже на ключ, вычёркиваются.
+pub fn echo_safe(reason: &str, hidden: &[&str]) -> String {
+    let mut out = reason.to_string();
+    for word in hidden.iter().filter(|w| !w.is_empty()) {
+        out = out.replace(word, crate::secrets::redact::MASK);
+    }
+    crate::secrets::redact::redact(&out).into_owned()
 }
 
 /// Найти аккаунт по id или имени (без учёта регистра).
@@ -207,6 +266,8 @@ impl App {
             self.refresh_gateway_view();
         }
         self.watch_project_file();
+        // Диалог мог быть отложен из-за другой модалки: после её закрытия он возвращается.
+        self.open_trust_dialog_if_needed();
     }
 
     fn project_config_path(&self) -> Option<std::path::PathBuf> {
@@ -225,6 +286,11 @@ impl App {
             return;
         };
         let watch = &mut self.state.gateway_view.project;
+        // Другой проект (`/cd`): прежний штамп к нему не относится.
+        if watch.path.as_ref() != Some(&path) {
+            watch.path = Some(path.clone());
+            watch.known = None;
+        }
         if watch.checking
             || watch
                 .last_check
@@ -244,8 +310,9 @@ impl App {
     pub(crate) fn on_project_stamp(&mut self, stamp: Option<SystemTime>) {
         let watch = &mut self.state.gateway_view.project;
         watch.checking = false;
-        let changed = watch.known.is_some() && watch.known != stamp;
-        watch.known = stamp;
+        // Файл появился, пропал или изменился с прошлого взгляда; первый взгляд не в счёт.
+        let changed = watch.known.is_some_and(|previous| previous != stamp);
+        watch.known = Some(stamp);
         if changed {
             self.reload_config_async();
         }
@@ -270,9 +337,6 @@ impl App {
             }
         };
         let gateway_changed = fresh.gateway_config() != self.config.gateway_config();
-        self.state.gateway_view.project.known = self
-            .project_config_path_of(&fresh)
-            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
         self.config = fresh;
         if gateway_changed {
             self.restart_gateway();
@@ -280,16 +344,6 @@ impl App {
         self.rebuild_provider();
         self.refresh_gateway_view();
         self.open_trust_dialog_if_needed();
-    }
-
-    fn project_config_path_of(&self, config: &Config) -> Option<std::path::PathBuf> {
-        use crate::config::Layer;
-        config
-            .source
-            .layers
-            .iter()
-            .find(|l| l.layer == Layer::Project)
-            .map(|l| l.path.clone())
     }
 
     /// Проектный слой ждёт подтверждения — показать диалог (если ничего другого на экране нет).
@@ -355,9 +409,21 @@ impl App {
 
     /// Включить шлюз: старые записи становятся аккаунтами, появляется маршрут `main`.
     pub(crate) fn enable_gateway(&mut self) {
+        self.state.gateway_view.screen.confirm_enable = false;
         let mut next = self.config.gateway_config();
-        if next.accounts.is_empty() {
-            next.accounts = GatewayConfig::from_legacy(&self.config).0.accounts;
+        // Записи `[[providers]]`, которых ещё нет аккаунтами (добавлены при выключенном шлюзе).
+        for mut account in GatewayConfig::from_legacy(&self.config).0.accounts {
+            if next.accounts.iter().any(|a| a.id == account.id) {
+                continue;
+            }
+            if account.api_key.take().is_some() {
+                // Ключ лежит в хранилище под именем записи; значением в аккаунт он не идёт.
+                let entry = crate::secrets::account_secret_id(account.id.as_str());
+                account.secret =
+                    crate::gateway::types::SecretRef::parse(&crate::secrets::keyring_ref(&entry))
+                        .ok();
+            }
+            next.accounts.push(account);
         }
         if next.routes.is_empty()
             && let Some(route) = edits::starter_route(&next.accounts)
@@ -384,6 +450,8 @@ impl App {
         }
         self.restart_gateway();
         self.rebuild_provider();
+        // Экран сразу видит новое состояние (идёт сборка), а не прежний «OFF».
+        self.refresh_gateway_view();
         self.state
             .gateway_view
             .screen
@@ -453,6 +521,7 @@ impl App {
         match event {
             GatewayEvent::ConfigChanged => {
                 self.refresh_gateway_view();
+                self.refresh_pins();
                 self.adopt_provider_after_edit();
             }
             GatewayEvent::FallbackTaken {
@@ -460,13 +529,20 @@ impl App {
                 to,
                 class,
                 source,
+                conversation,
             } => {
                 self.refresh_gateway_view();
-                if matches!(source, CallSource::Chat | CallSource::SubAgent) {
+                // Шов пишется в чат, чей вызов переключился; нет такого чата — не пишем никуда.
+                if matches!(source, CallSource::Chat | CallSource::SubAgent)
+                    && let Some(id) = conversation.map(ConversationId)
+                    && self.state.conversations.contains(id)
+                {
                     let text = self.seam_for(from, to, class.code());
                     let mut seam = crate::provider::ChatMessage::ui_system(&text);
                     seam.status = Some(SEAM_STATUS.to_string());
-                    self.state.focused_mut().messages.push(seam);
+                    if let Some(chat) = self.state.conversations.get_mut(id) {
+                        chat.messages.push(seam);
+                    }
                 }
             }
             _ => {
@@ -490,34 +566,81 @@ impl App {
         seam_text(&label(from), &label(to), code, back.as_deref())
     }
 
-    /// Мастер дошёл до конца: секрет в хранилище (вне цикла событий), затем правка шлюза.
-    pub(crate) fn submit_account_wizard(&mut self, mut wizard: Box<wizard::AccountWizard>) {
-        let snapshot = self.state.gateway_view.snapshot.clone();
-        let ids: Vec<AccountId> = snapshot
+    /// Что мастеру известно о занятых именах; `legacy` — шлюз выключен.
+    pub(crate) fn wizard_context(&self) -> (Vec<AccountId>, Vec<String>, bool) {
+        let enabled = self.gateway.is_enabled();
+        let snapshot = self.state.gateway_view.snapshot.as_ref();
+        let mut ids: Vec<AccountId> = snapshot
             .iter()
             .flat_map(|s| s.accounts.iter().map(|a| a.id.clone()))
             .chain(self.config.accounts.iter().map(|a| a.id.clone()))
             .collect();
-        let labels: Vec<String> = snapshot
+        let mut labels: Vec<String> = snapshot
             .iter()
             .flat_map(|s| s.accounts.iter().map(|a| a.label.clone()))
             .collect();
+        for entry in &self.config.providers {
+            if let Ok(id) = AccountId::parse(&entry.name) {
+                ids.push(id);
+            }
+            labels.push(entry.name.clone());
+        }
+        (ids, labels, !enabled)
+    }
+
+    /// Файл, куда пишет конфиг: проектный слой не трогаем.
+    fn config_target(&self) -> std::path::PathBuf {
+        self.config
+            .source
+            .write_path
+            .clone()
+            .unwrap_or_else(Config::path)
+    }
+
+    fn reopen_wizard(&mut self, mut wizard: Box<wizard::AccountWizard>, error: impl Into<String>) {
+        wizard.error = Some(error.into());
+        self.state.modal = Some(Modal::AccountWizard(wizard));
+    }
+
+    /// Мастер дошёл до конца. Секрет пишется только когда запись точно примут: шлюз готов,
+    /// кандидат прошёл проверку; при отказе после записи секрет убирается.
+    pub(crate) fn submit_account_wizard(&mut self, mut wizard: Box<wizard::AccountWizard>) {
+        use crate::gateway::handle::BuildState;
+        if self.gateway.is_enabled() {
+            match self.gateway.build_state() {
+                BuildState::Ready => {}
+                BuildState::Starting => {
+                    return self.reopen_wizard(
+                        wizard,
+                        "the gateway is still starting: wait a moment and press Enter again",
+                    );
+                }
+                BuildState::Failed(reason) => {
+                    return self
+                        .reopen_wizard(wizard, format!("the gateway failed to start: {reason}"));
+                }
+            }
+        }
+        let (ids, labels, legacy) = self.wizard_context();
         let root = wizard::login_home_root();
         let existing = wizard::Existing {
             ids: &ids,
             labels: &labels,
             home_root: &root,
+            legacy,
         };
+        if legacy {
+            return self.submit_legacy_provider(wizard, &existing);
+        }
         let built = match wizard.build(&existing) {
             Ok(built) => built,
-            Err(error) => {
-                wizard.error = Some(error);
-                self.state.modal = Some(Modal::AccountWizard(wizard));
-                return;
-            }
+            Err(error) => return self.reopen_wizard(wizard, error),
         };
-        let secret = built
-            .secret_id
+        if let Some(error) = self.new_config_errors(&built.account) {
+            return self.reopen_wizard(wizard, error);
+        }
+        let secret_id = built.secret_id.clone();
+        let secret = secret_id
             .clone()
             .map(|id| (id, wizard.secret.take_secret()));
         let tx = self.event_tx.clone();
@@ -526,6 +649,7 @@ impl App {
             login_command: built.login_command,
             warnings: built.warnings,
             stored: Ok(()),
+            secret_id,
         };
         self.state.gateway_view.screen.say("Adding the account…");
         tokio::task::spawn_blocking(move || {
@@ -540,6 +664,70 @@ impl App {
         });
     }
 
+    /// Новая ошибка конфига, которую принесёт аккаунт; проверка до записи секрета.
+    fn new_config_errors(&self, account: &Account) -> Option<String> {
+        let current = self.config.gateway_config();
+        let errors = |config: &GatewayConfig| -> Vec<String> {
+            config
+                .validate()
+                .into_iter()
+                .filter(|p| p.severity == Severity::Error)
+                .map(|p| format!("{}: {}", p.path, p.message))
+                .collect()
+        };
+        let known = errors(&current);
+        let mut candidate = current;
+        match candidate.accounts.iter_mut().find(|a| a.id == account.id) {
+            Some(existing) => *existing = account.clone(),
+            None => candidate.accounts.push(account.clone()),
+        }
+        errors(&candidate)
+            .into_iter()
+            .find(|error| !known.contains(error))
+    }
+
+    /// Шлюз выключен: запись `[[providers]]` в файл ссылкой, затем ключ в хранилище; сбой ключа
+    /// убирает запись.
+    fn submit_legacy_provider(
+        &mut self,
+        mut wizard: Box<wizard::AccountWizard>,
+        existing: &wizard::Existing<'_>,
+    ) {
+        let built = match wizard.build_legacy(existing) {
+            Ok(built) => built,
+            Err(error) => return self.reopen_wizard(wizard, error),
+        };
+        let secret = built
+            .secret_id
+            .clone()
+            .map(|id| (id, wizard.secret.take_secret()));
+        let path = self.config_target();
+        let tx = self.event_tx.clone();
+        let entry = built.entry;
+        self.state.gateway_view.screen.say("Adding the provider…");
+        tokio::task::spawn_blocking(move || {
+            let plan = store_legacy_provider(&path, entry, secret);
+            let _ = tx.send(AppEvent::LegacyProviderStored(Box::new(plan)));
+        });
+    }
+
+    /// Запись `[[providers]]` готова (или нет): в память приложения, с подсказкой, как её включить.
+    pub(crate) fn on_legacy_provider_stored(&mut self, plan: LegacyPlan) {
+        if let Err(error) = &plan.stored {
+            self.state
+                .gateway_view
+                .screen
+                .complain(format!("Not added: {error}"));
+            return;
+        }
+        let name = plan.entry.name.clone();
+        self.config.providers.push(plan.entry);
+        self.state.gateway_view.screen.selected = self.config.providers.len();
+        self.state.gateway_view.screen.say(format!(
+            "Added {name}. Enter on it makes it the active provider; the gateway stays off."
+        ));
+    }
+
     /// Секрет записан (или не нужен): добавить аккаунт и поставить его в конец главного маршрута.
     pub(crate) fn on_account_stored(&mut self, plan: AccountPlan) {
         if let Err(error) = &plan.stored {
@@ -552,6 +740,10 @@ impl App {
         let label = plan.account.display_name().to_string();
         let account_copy = plan.account.clone();
         if !self.gateway_edit(ConfigEdit::UpsertAccount(Box::new(plan.account)), "") {
+            // Аккаунт не принят: записанный ради него секрет сиротой не остаётся.
+            if let Some(secret_id) = plan.secret_id {
+                drop_secret(secret_id);
+            }
             return;
         }
         let route_note = self.append_to_main_route(&account_copy);
@@ -633,74 +825,291 @@ impl App {
         self.config.accounts.iter().find(|a| &a.id == id).cloned()
     }
 
-    /// `/pin <аккаунт[/модель]>` и `/pin off`: чат закреплён, глобальный маршрут не меняется.
+    /// `/pin <аккаунт[/модель]>` и `/pin off`: ответ показывается заметкой в чате.
     pub(crate) fn pin_chat(&mut self, arg: &str) {
+        let text = match self.pin_outcome(arg) {
+            Ok(text) | Err(text) => text,
+        };
+        self.state.push_ui_system(&text);
+    }
+
+    /// Закрепить или открепить фокусный чат. Ответ годится и для чата, и для экрана аккаунтов.
+    pub(crate) fn pin_outcome(&mut self, arg: &str) -> Result<String, String> {
         let arg = arg.trim();
         let conversation = self.state.conversations.focused_id();
         if arg.is_empty() {
-            let text = match self.state.gateway_view.pins.get(&conversation) {
-                Some(label) => format!("This chat is pinned to {label}. /pin off releases it."),
-                None => "Usage: /pin <account>[/model] | /pin off".to_string(),
+            return match self.state.gateway_view.pins.get(&conversation) {
+                Some(pin) => Ok(format!(
+                    "This chat is pinned to {}. /pin off releases it.",
+                    pin.label
+                )),
+                None => Err("Usage: /pin <account>[/model] | /pin off".to_string()),
             };
-            self.state.push_ui_system(&text);
-            return;
         }
         if arg.eq_ignore_ascii_case("off") {
             if self.state.gateway_view.pins.remove(&conversation).is_none() {
-                self.state.push_ui_system("This chat is not pinned.");
-                return;
+                return Err("This chat is not pinned.".to_string());
             }
             self.rebuild_provider();
-            self.state
-                .push_ui_system("Unpinned: the chat follows the route again.");
-            return;
+            return Ok("Unpinned: the chat follows the route again.".to_string());
         }
         if !self.gateway.is_enabled() {
-            self.state
-                .push_ui_system("Turn the gateway on first (/accounts), then pin.");
-            return;
+            return Err("Turn the gateway on first (/accounts), then pin.".to_string());
         }
         let snapshot = self.gateway.snapshot();
         let (name, model) = arg.split_once('/').unwrap_or((arg, ""));
-        let Some(id) = find_account(&snapshot, name).cloned() else {
-            self.state
-                .push_ui_system(&format!("No account named '{name}'. See /accounts."));
-            return;
+        let Some(view) = find_account(&snapshot, name)
+            .and_then(|id| snapshot.accounts.iter().find(|a| &a.id == id))
+        else {
+            return Err(format!("No account named '{name}'. See /accounts."));
         };
-        let address = if model.is_empty() {
-            id.to_string()
-        } else {
-            format!("{id}/{model}")
+        if let Some(why) = unusable_reason(&view.status) {
+            return Err(format!("{} can't take a pinned chat: {why}.", view.label));
+        }
+        let pin = Pin {
+            account: view.id.clone(),
+            model: (!model.is_empty()).then(|| model.to_string()),
+            label: view.label.clone(),
+            gateway: gateway_key(&self.gateway),
         };
-        match self
+        let provider = self
             .gateway
-            .provider_for_model_id(&address, CallSource::Chat)
+            .provider_for_model_id(&pin.address(), CallSource::Chat)
+            .map_err(|error| error.to_string())?;
+        switch_provider(
+            &mut self.state,
+            Some(provider),
+            &self.provider_window_epoch,
+            &self.event_tx,
+        );
+        let label = pin.label.clone();
+        self.state.gateway_view.pins.insert(conversation, pin);
+        Ok(format!(
+            "Pinned this chat to {label} until you quit or /pin off. The route is unchanged."
+        ))
+    }
+
+    /// Закрепления после смены шлюза или конфига: пересобрать провайдера, а если аккаунта нет
+    /// или он выключен, снять закрепление с заметкой в том чате.
+    pub(crate) fn refresh_pins(&mut self) {
+        use crate::gateway::handle::BuildState;
+        if self.state.gateway_view.pins.is_empty()
+            || self.gateway.build_state() != BuildState::Ready
         {
-            Ok(provider) => {
-                let label = snapshot
-                    .accounts
-                    .iter()
-                    .find(|a| a.id == id)
-                    .map_or_else(|| id.to_string(), |a| a.label.clone());
-                switch_provider(
-                    &mut self.state,
-                    Some(provider),
-                    &self.provider_window_epoch,
-                    &self.event_tx,
+            return;
+        }
+        let snapshot = self.gateway.snapshot();
+        let current = gateway_key(&self.gateway);
+        let pinned: Vec<(ConversationId, Pin)> = self
+            .state
+            .gateway_view
+            .pins
+            .iter()
+            .map(|(id, pin)| (*id, pin.clone()))
+            .collect();
+        for (conversation, pin) in pinned {
+            let view = snapshot.accounts.iter().find(|a| a.id == pin.account);
+            let problem = match view {
+                None => Some(format!("{} was removed", pin.label)),
+                Some(view) => unusable_reason(&view.status)
+                    .map(|why| format!("{} can't answer: {why}", pin.label)),
+            };
+            if let Some(problem) = problem {
+                self.state.gateway_view.pins.remove(&conversation);
+                self.use_route_provider(conversation);
+                self.note_in_chat(
+                    conversation,
+                    &format!("Unpinned: {problem}. The chat follows the route again."),
                 );
-                self.state
-                    .gateway_view
-                    .pins
-                    .insert(conversation, label.clone());
-                self.state.push_ui_system(&format!(
-                    "Pinned this chat to {label}. The route is unchanged; /pin off releases it."
-                ));
+                continue;
             }
-            Err(error) => self.state.push_ui_system(&error.to_string()),
+            if pin.gateway == current {
+                continue;
+            }
+            match self
+                .gateway
+                .provider_for_model_id(&pin.address(), CallSource::Chat)
+            {
+                Ok(provider) => {
+                    self.set_chat_provider(conversation, Some(provider));
+                    if let Some(kept) = self.state.gateway_view.pins.get_mut(&conversation) {
+                        kept.gateway = current;
+                    }
+                }
+                Err(error) => {
+                    self.state.gateway_view.pins.remove(&conversation);
+                    self.use_route_provider(conversation);
+                    self.note_in_chat(
+                        conversation,
+                        &format!("Unpinned: {} is not available ({error}).", pin.label),
+                    );
+                }
+            }
         }
     }
 
-    /// `/usage`: расход за сутки по аккаунтам.
+    /// Положить провайдера в чат; у фокусного заодно меняется сессия и окно контекста.
+    fn set_chat_provider(
+        &mut self,
+        conversation: ConversationId,
+        provider: Option<std::sync::Arc<dyn crate::provider::LLMProvider>>,
+    ) {
+        if conversation == self.state.conversations.focused_id() {
+            switch_provider(
+                &mut self.state,
+                provider,
+                &self.provider_window_epoch,
+                &self.event_tx,
+            );
+        } else if let Some(chat) = self.state.conversations.get_mut(conversation) {
+            chat.provider = provider;
+            chat.session_id = crate::session::create_session_id();
+        }
+    }
+
+    /// Чат снова идёт по маршруту (пин снят).
+    fn use_route_provider(&mut self, conversation: ConversationId) {
+        let provider = crate::gateway::handle::main_provider(&self.config, Some(&self.gateway));
+        self.set_chat_provider(conversation, provider);
+    }
+
+    /// Заметка в нужном чате, а не в том, что на экране.
+    fn note_in_chat(&mut self, conversation: ConversationId, text: &str) {
+        if conversation == self.state.conversations.focused_id() {
+            self.state.push_ui_system(text);
+        } else if let Some(chat) = self.state.conversations.get_mut(conversation) {
+            chat.messages
+                .push(crate::provider::ChatMessage::ui_system(text));
+        }
+    }
+
+    /// Снять закрепления за аккаунтом (его удалили) и сказать об этом в каждом чате.
+    pub(crate) fn unpin_account(&mut self, account: &AccountId, label: &str) -> usize {
+        let chats: Vec<ConversationId> = self
+            .state
+            .gateway_view
+            .pins
+            .iter()
+            .filter(|(_, pin)| &pin.account == account)
+            .map(|(id, _)| *id)
+            .collect();
+        for conversation in &chats {
+            self.state.gateway_view.pins.remove(conversation);
+            self.use_route_provider(*conversation);
+            self.note_in_chat(
+                *conversation,
+                &format!("Unpinned: {label} was removed. The chat follows the route again."),
+            );
+        }
+        chats.len()
+    }
+
+    /// Вопрос об удалении аккаунта: называет маршруты, закреплённые чаты и ключ в хранилище.
+    /// Единственный шаг маршрута не снимаем: отказ с объяснением.
+    pub(crate) fn ask_remove_account(&mut self, id: &AccountId) {
+        let Some(snapshot) = self.state.gateway_view.snapshot.clone() else {
+            return;
+        };
+        let label = snapshot
+            .accounts
+            .iter()
+            .find(|a| &a.id == id)
+            .map_or_else(|| id.to_string(), |a| a.label.clone());
+        let route_name = |route: &crate::gateway::types::Route| {
+            let roles: Vec<String> = snapshot
+                .roles
+                .0
+                .iter()
+                .filter(|(_, target)| **target == route.id)
+                .map(|(role, _)| rows::role_name(*role).to_string())
+                .collect();
+            if roles.is_empty() {
+                route.id.to_string()
+            } else {
+                format!("{} (role {})", route.id, roles.join(", "))
+            }
+        };
+        let routes: Vec<&crate::gateway::types::Route> = snapshot
+            .routes
+            .iter()
+            .filter(|r| edits::in_route(r, id))
+            .collect();
+        if let Some(only) = routes
+            .iter()
+            .find(|r| r.steps.iter().all(|s| &s.account == id))
+        {
+            self.state.gateway_view.screen.complain(format!(
+                "Can't remove {label}: it is the only step of route {}. Add another account to that route first.",
+                route_name(only)
+            ));
+            return;
+        }
+        let mut text = format!("Remove {label}?");
+        if !routes.is_empty() {
+            let names: Vec<String> = routes.iter().map(|r| route_name(r)).collect();
+            text.push_str(&format!(" Its steps in route {} go too.", names.join(", ")));
+        }
+        let pinned = self
+            .state
+            .gateway_view
+            .pins
+            .values()
+            .filter(|pin| &pin.account == id)
+            .count();
+        if pinned > 0 {
+            text.push_str(&format!(" {pinned} pinned chat(s) go back to the route."));
+        }
+        if let Some(entry) = self.stored_key_of(id) {
+            text.push_str(&format!(
+                " The key stays in the keyring; /secrets rm {entry} deletes it."
+            ));
+        }
+        text.push_str(" y/n");
+        self.state.gateway_view.screen.confirm_remove = Some(RemoveConfirm {
+            id: id.clone(),
+            text,
+        });
+    }
+
+    /// Имя записи в хранилище, если ключ аккаунта лежит там.
+    fn stored_key_of(&self, id: &AccountId) -> Option<String> {
+        let account = self.account_config(id)?;
+        [&account.secret, &account.direct_token]
+            .into_iter()
+            .flatten()
+            .find_map(|reference| reference.as_str().strip_prefix("keyring:"))
+            .map(str::to_string)
+    }
+
+    /// Подтверждённое удаление: шаги маршрутов уходят той же правкой, закрепления снимаются.
+    pub(crate) fn remove_account(&mut self, id: &AccountId) {
+        let label = self
+            .state
+            .gateway_view
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| &a.id == id))
+            .map_or_else(|| id.to_string(), |a| a.label.clone());
+        let key = self.stored_key_of(id);
+        if !self.gateway_edit(ConfigEdit::RemoveAccount(id.clone()), "") {
+            return;
+        }
+        let unpinned = self.unpin_account(id, &label);
+        let mut text = format!("Removed {label}.");
+        if unpinned > 0 {
+            text.push_str(&format!(
+                " {unpinned} pinned chat(s) follow the route again."
+            ));
+        }
+        if let Some(key) = key {
+            text.push_str(&format!(
+                " Its key stays in the keyring (/secrets rm {key})."
+            ));
+        }
+        self.state.gateway_view.screen.say(text);
+    }
+
+    /// `/usage`: расход за сегодня и вчера (учёт посуточный, по UTC) по аккаунтам.
     pub(crate) fn show_usage(&mut self) {
         if !self.gateway.is_enabled() {
             self.state
@@ -722,6 +1131,44 @@ impl App {
         self.state.push_ui_system(&text);
     }
 
+    /// Шлюз выключен: объявление инструментов записи `[[providers]]` меняется в файле.
+    fn set_legacy_tools(&mut self, name: &str, tools: crate::config::ToolProtocol) {
+        let Some(entry) = self.config.providers.iter().find(|e| e.name == name) else {
+            self.state
+                .push_ui_system(&format!("No provider named '{name}' - see /accounts."));
+            return;
+        };
+        let word = match tools {
+            crate::config::ToolProtocol::Native => "native",
+            crate::config::ToolProtocol::Prompt => "prompt",
+        };
+        let entry_name = entry.name.clone();
+        match crate::config::set_provider_field_at(
+            &self.config_target(),
+            &entry_name,
+            "tools",
+            word,
+        ) {
+            Ok(()) => {
+                if let Some(entry) = self
+                    .config
+                    .providers
+                    .iter_mut()
+                    .find(|e| e.name == entry_name)
+                {
+                    entry.tools = tools;
+                }
+                self.rebuild_provider();
+                self.state.push_ui_system(&format!(
+                    "Provider '{entry_name}' now declares tools: {tools:?}."
+                ));
+            }
+            Err(error) => self
+                .state
+                .push_ui_system(&format!("Failed to save config: {error}")),
+        }
+    }
+
     /// `/providers tools <имя> <native|prompt>` для аккаунта.
     pub(crate) fn set_account_tools(&mut self, name: &str, tools: crate::config::ToolProtocol) {
         let Some(snapshot) = self
@@ -731,8 +1178,7 @@ impl App {
             .clone()
             .or_else(|| self.gateway.is_enabled().then(|| self.gateway.snapshot()))
         else {
-            self.state
-                .push_ui_system("Turn the gateway on first (/accounts).");
+            self.set_legacy_tools(name, tools);
             return;
         };
         let Some(id) = find_account(&snapshot, name).cloned() else {
@@ -758,6 +1204,67 @@ impl App {
             self.state.push_ui_system(&text);
         }
     }
+}
+
+/// Идентичность собранного шлюза: пока она та же, провайдер чата действителен.
+fn gateway_key(gateway: &crate::gateway::handle::GatewayHandle) -> usize {
+    std::sync::Arc::as_ptr(gateway).cast::<()>() as usize
+}
+
+/// Почему аккаунт не может отвечать чату; `None` — может (остывание и лимит проходят).
+fn unusable_reason(status: &crate::gateway::handle::AccountStatus) -> Option<String> {
+    use crate::gateway::handle::AccountStatus;
+    match status {
+        AccountStatus::Disabled => Some("it is switched off (Space turns it on)".to_string()),
+        AccountStatus::Unavailable { reason } | AccountStatus::NeedsAttention { reason } => {
+            Some(reason.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Записать `[[providers]]` ссылкой на ключ, затем сам ключ. Блокирующий; зовётся из `spawn_blocking`.
+fn store_legacy_provider(
+    path: &std::path::Path,
+    mut entry: crate::config::ProviderEntry,
+    secret: Option<(String, crate::secrets::Secret)>,
+) -> LegacyPlan {
+    let reference = secret
+        .as_ref()
+        .map(|(id, _)| crate::secrets::keyring_ref(id));
+    if let Err(error) = crate::config::add_provider_at(path, &entry, reference.as_deref()) {
+        return LegacyPlan {
+            entry,
+            stored: Err(error.to_string()),
+        };
+    }
+    if let Some((id, value)) = secret {
+        crate::secrets::redact::register(&value);
+        if let Err(error) = crate::secrets::process_store().set_verified(&id, &value) {
+            // Ключ не лёг: запись без ключа сиротой не оставляем.
+            let _ = crate::config::remove_provider_at(path, &entry.name);
+            return LegacyPlan {
+                entry,
+                stored: Err(format!(
+                    "the key was not stored, nothing was added: {error}"
+                )),
+            };
+        }
+        entry.api_key = Some(value.expose().to_string());
+    }
+    LegacyPlan {
+        entry,
+        stored: Ok(()),
+    }
+}
+
+/// Убрать запись из хранилища (откат); отказ хранилища не страшен, остаётся строка в журнале.
+fn drop_secret(id: String) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = crate::secrets::process_store().delete(&id) {
+            tracing::warn!("secret {id} was not removed after a refused account: {error}");
+        }
+    });
 }
 
 /// Компактное число токенов: `1.2M`, `96k`.
@@ -807,7 +1314,7 @@ pub fn usage_table(
         sum.estimated |= row.any_estimated;
     }
     if sums.is_empty() {
-        return "Usage, last 24 h: no calls yet.".to_string();
+        return "Usage, today and yesterday (UTC days): no calls yet.".to_string();
     }
     let width = sums
         .iter()
@@ -816,7 +1323,7 @@ pub fn usage_table(
         .unwrap_or(7)
         .max(7);
     let mut out = format!(
-        "Usage, last 24 h\n{:<width$}  {:>6} {:>6} {:>9} {:>8} {:>8} {:>6}",
+        "Usage, today and yesterday (UTC days)\n{:<width$}  {:>6} {:>6} {:>9} {:>8} {:>8} {:>6}",
         "account", "calls", "failed", "fallbacks", "in", "out", "cache"
     );
     for (name, sum) in &sums {
@@ -1123,11 +1630,13 @@ mod tests {
         let mut app = test_app().await;
         app.gateway = Arc::new(rig.engine);
         app.refresh_gateway_view();
+        let chat = Some(app.state.conversations.focused_id().0);
         let event = |source| GatewayEvent::FallbackTaken {
             from: AccountId::parse("a").unwrap(),
             to: AccountId::parse("b").unwrap(),
             class: crate::provider::failure::FailureClass::RateLimit { retry_after: None },
             source,
+            conversation: chat,
         };
         app.on_gateway_event_view(&event(CallSource::Chat));
         let seam = app.state.focused().messages.last().expect("a seam").clone();
@@ -1142,6 +1651,55 @@ mod tests {
         let before = app.state.focused().messages.len();
         app.on_gateway_event_view(&event(CallSource::Serve));
         assert_eq!(app.state.focused().messages.len(), before);
+    }
+
+    fn fallback_in(conversation: Option<u64>) -> GatewayEvent {
+        GatewayEvent::FallbackTaken {
+            from: AccountId::parse("a").unwrap(),
+            to: AccountId::parse("b").unwrap(),
+            class: crate::provider::failure::FailureClass::RateLimit { retry_after: None },
+            source: CallSource::Chat,
+            conversation,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seam_lands_in_the_chat_that_switched_not_in_the_focused_one() {
+        let rig = rig(TWO_ACCOUNTS, Vec::new());
+        let mut app = test_app().await;
+        app.gateway = Arc::new(rig.engine);
+        app.refresh_gateway_view();
+        let background = crate::app::conversation::Conversation::fresh_main(None);
+        let background_id = background.id;
+        app.state.conversations.add_background(background);
+        let focused_before = app.state.focused().messages.len();
+
+        app.on_gateway_event_view(&fallback_in(Some(background_id.0)));
+
+        assert_eq!(
+            app.state.focused().messages.len(),
+            focused_before,
+            "the chat on screen did not switch, so it gets no seam"
+        );
+        let other = app.state.conversations.get(background_id).unwrap();
+        assert!(
+            other
+                .messages
+                .last()
+                .is_some_and(|m| m.content.contains("switched a")),
+            "the chat that switched has the seam"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_with_no_chat_writes_no_seam_anywhere() {
+        let rig = rig(TWO_ACCOUNTS, Vec::new());
+        let mut app = test_app().await;
+        app.gateway = Arc::new(rig.engine);
+        app.refresh_gateway_view();
+        app.on_gateway_event_view(&fallback_in(None));
+        app.on_gateway_event_view(&fallback_in(Some(u64::MAX)));
+        assert!(app.state.focused().messages.is_empty());
     }
 
     #[tokio::test]
@@ -1200,6 +1758,7 @@ mod tests {
             key: "k".into(),
             hash: "h".into(),
             held_back: vec!["account evil (https://evil.test)".into()],
+            summary: Default::default(),
         });
         app.open_trust_dialog_if_needed();
         let Some(Modal::Trust(dialog)) = app.state.modal.take() else {
@@ -1230,6 +1789,7 @@ mod tests {
             key: "k".into(),
             hash: hash.into(),
             held_back: Vec::new(),
+            summary: Default::default(),
         };
         app.config.source.pending_trust = Some(request("one"));
         app.open_trust_dialog_if_needed();
@@ -1254,6 +1814,7 @@ mod tests {
             key: "k".into(),
             hash: "h".into(),
             held_back: Vec::new(),
+            summary: Default::default(),
         };
         let dialog = Box::new(forms::TrustDialog::new(request));
         app.handle_trust_key(press(KeyCode::Char('y')), dialog.clone())

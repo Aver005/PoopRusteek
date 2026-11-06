@@ -70,6 +70,8 @@ pub struct TrustRequest {
     pub hash: String,
     /// Что именно предложено: аккаунты с адресами, маршруты, роли, включение шлюза.
     pub held_back: Vec<String>,
+    /// Сводка по самой таблице: настоящие хосты и число записей.
+    pub summary: layers::GatedSummary,
 }
 
 /// Ссылка на секрет, которую при загрузке не удалось прочитать.
@@ -332,6 +334,7 @@ fn load_project_layer(
         table
     } else {
         let held_back = layers::describe_gated(&gated);
+        let summary = layers::summarize_gated(&gated);
         if !held_back.is_empty() {
             notices.push(format!(
                 "Project config {} proposes changes to where requests go and is held back until you run `pooprusteek trust`: {}",
@@ -343,6 +346,7 @@ fn load_project_layer(
                 key,
                 hash,
                 held_back,
+                summary,
             });
         }
         open

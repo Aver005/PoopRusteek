@@ -634,12 +634,19 @@ fn a_garbage_state_file_cannot_block_anything() {
 fn an_invalid_edit_is_refused_and_changes_nothing() {
     let rig = two();
     let mut rx = rig.engine.subscribe();
-    let result = rig.engine.apply_edit(ConfigEdit::RemoveAccount(id("a")));
+    let mut ghost = rig.engine.snapshot().routes[0].clone();
+    ghost.steps.push(crate::gateway::types::Step {
+        account: id("ghost"),
+        model: None,
+    });
+    let result = rig
+        .engine
+        .apply_edit(ConfigEdit::UpsertRoute(Box::new(ghost)));
     assert!(
-        matches!(&result, Err(EditError::Invalid(items)) if items.iter().any(|i| i.contains("unknown account 'a'"))),
-        "the route still points at a: {result:?}"
+        matches!(&result, Err(EditError::Invalid(items)) if items.iter().any(|i| i.contains("unknown account 'ghost'"))),
+        "the route would point at nobody: {result:?}"
     );
-    assert_eq!(rig.engine.snapshot().accounts.len(), 2);
+    assert_eq!(rig.engine.snapshot().routes[0].steps.len(), 2);
     assert!(rx.try_recv().is_err(), "no event for a refused edit");
     assert_eq!(
         rig.engine
@@ -650,6 +657,62 @@ fn an_invalid_edit_is_refused_and_changes_nothing() {
             .err(),
         Some(EditError::NotFound("ghost".into()))
     );
+}
+
+/// Удаление аккаунта, стоящего шагом маршрута: шаги уходят той же правкой, конфиг остаётся годным.
+#[test]
+fn removing_an_account_takes_its_steps_out_of_every_route_in_one_edit() {
+    let rig = two();
+    let mut rx = rig.engine.subscribe();
+    rig.engine
+        .apply_edit(ConfigEdit::RemoveAccount(id("a")))
+        .expect("a is a step of main, and that is not a reason to refuse");
+    let snapshot = rig.engine.snapshot();
+    let ids: Vec<_> = snapshot.accounts.iter().map(|a| a.id.to_string()).collect();
+    assert_eq!(ids, ["b"]);
+    let steps: Vec<_> = snapshot.routes[0]
+        .steps
+        .iter()
+        .map(|s| s.account.to_string())
+        .collect();
+    assert_eq!(steps, ["b"], "the step of the removed account is gone");
+    assert!(
+        snapshot
+            .problems
+            .iter()
+            .all(|p| p.severity != crate::gateway::types::Severity::Error),
+        "{:?}",
+        snapshot.problems
+    );
+    assert!(
+        matches!(rx.try_recv(), Ok(GatewayEvent::ConfigChanged)),
+        "one edit, one event"
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+/// Обратная сторона: единственный шаг не снимаем молча, ответ называет маршрут и роль.
+#[test]
+fn removing_the_only_step_of_a_route_is_refused_with_the_route_and_the_role() {
+    let rig = two();
+    rig.engine
+        .apply_edit(ConfigEdit::RemoveAccount(id("a")))
+        .unwrap();
+    let mut rx = rig.engine.subscribe();
+    let result = rig.engine.apply_edit(ConfigEdit::RemoveAccount(id("b")));
+    let Err(EditError::Invalid(items)) = &result else {
+        panic!("must be refused: {result:?}");
+    };
+    assert!(
+        items[0].contains("route main")
+            && items[0].contains("role main")
+            && items[0].contains("no steps"),
+        "{items:?}"
+    );
+    let snapshot = rig.engine.snapshot();
+    assert_eq!(snapshot.accounts.len(), 1, "nothing changed");
+    assert_eq!(snapshot.routes[0].steps.len(), 1);
+    assert!(rx.try_recv().is_err(), "no event for a refused edit");
 }
 
 #[test]

@@ -1412,11 +1412,36 @@ fn apply_to_config(config: &mut GatewayConfig, edit: ConfigEdit) -> Result<(), E
             }
         }
         ConfigEdit::RemoveAccount(id) => {
-            let before = config.accounts.len();
-            config.accounts.retain(|a| a.id != id);
-            if config.accounts.len() == before {
+            if !config.accounts.iter().any(|a| a.id == id) {
                 return Err(not_found(&id));
             }
+            // Шаги аккаунта уходят из всех маршрутов той же правкой; пустой маршрут не оставляем.
+            let mut emptied = Vec::new();
+            for route in &mut config.routes {
+                let before = route.steps.len();
+                route.steps.retain(|s| s.account != id);
+                if before > 0 && route.steps.is_empty() {
+                    emptied.push(route.id.clone());
+                }
+            }
+            if let Some(route) = emptied.first() {
+                let roles: Vec<String> = config
+                    .roles
+                    .0
+                    .iter()
+                    .filter(|(_, target)| *target == route)
+                    .map(|(role, _)| format!("{role:?}").to_lowercase())
+                    .collect();
+                let used = if roles.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (role {})", roles.join(", "))
+                };
+                return Err(EditError::Invalid(vec![format!(
+                    "route {route}{used} would have no steps: add another account to it first"
+                )]));
+            }
+            config.accounts.retain(|a| a.id != id);
         }
         ConfigEdit::SetLabel { id, label } => {
             let account = config

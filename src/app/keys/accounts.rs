@@ -34,16 +34,19 @@ fn hidden_key(field: &mut HiddenInput, key: KeyEvent) -> bool {
 
 impl App {
     pub(crate) async fn handle_accounts_key(&mut self, key: KeyEvent) -> AppResult<bool> {
-        if let Some(id) = self.state.gateway_view.screen.confirm_remove.take() {
+        if let Some(confirm) = self.state.gateway_view.screen.confirm_remove.take() {
             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                self.gateway_edit(
-                    crate::gateway::handle::ConfigEdit::RemoveAccount(id.clone()),
-                    &format!(
-                        "Removed {id}. Its stored key, if any, stays in the keyring (/secrets rm)."
-                    ),
-                );
+                self.remove_account(&confirm.id);
             } else {
                 self.state.gateway_view.screen.say("Not removed.");
+            }
+            return Ok(false);
+        }
+        if std::mem::take(&mut self.state.gateway_view.screen.confirm_enable) {
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.enable_gateway();
+            } else {
+                self.state.gateway_view.screen.say("The gateway stays off.");
             }
             return Ok(false);
         }
@@ -78,20 +81,71 @@ impl App {
         Ok(false)
     }
 
-    /// Шлюз выключен: экран только объясняет и предлагает включить.
+    /// Шлюз выключен: старые записи видны, активную можно сменить, добавить новую; включение — с вопросом.
     fn handle_gateway_off_key(&mut self, key: KeyEvent) -> bool {
+        self.state.gateway_view.screen.notice = None;
+        let rows = 1 + self.config.providers.len();
+        if let Some(nav) = ListNav::from_code(key.code) {
+            let page = page_rows(self.state.terminal_rows, list_rows::PROVIDER);
+            let selected = self.state.gateway_view.screen.selected;
+            self.state.gateway_view.screen.selected = nav.move_within(selected, rows, page);
+            return false;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.state.view = View::Chat,
-            KeyCode::Enter | KeyCode::Char('g') => self.enable_gateway(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.activate_legacy_provider(),
             KeyCode::Char('a') => {
-                self.enable_gateway();
-                if self.gateway.is_enabled() {
-                    self.state.modal = Some(Modal::AccountWizard(Box::default()));
-                }
+                self.state.modal = Some(Modal::AccountWizard(Box::default()));
             }
+            KeyCode::Char('g') => self.state.gateway_view.screen.confirm_enable = true,
             _ => {}
         }
         false
+    }
+
+    /// Сделать выбранную запись активной (или встроенный DeepSeek): `active_provider` в файл.
+    fn activate_legacy_provider(&mut self) {
+        let at = self.state.gateway_view.screen.selected;
+        let target = match at {
+            0 => None,
+            n => match self.config.providers.get(n - 1) {
+                Some(entry) => Some(entry.name.clone()),
+                None => return,
+            },
+        };
+        let name = target.clone().unwrap_or_else(|| "DeepSeek".to_string());
+        let current = self
+            .config
+            .active_provider_entry()
+            .map(|entry| entry.name.clone());
+        if current == target {
+            self.state
+                .gateway_view
+                .screen
+                .say(format!("{name} is already active."));
+            return;
+        }
+        let previous = std::mem::replace(&mut self.config.active_provider, target);
+        if let Err(message) = crate::config::save_or_message(&self.config) {
+            self.config.active_provider = previous;
+            self.state.gateway_view.screen.complain(message);
+            return;
+        }
+        self.rebuild_provider();
+        let mut text = format!("{name} is now active.");
+        if self
+            .config
+            .active_provider_entry()
+            .is_some_and(|entry| entry.model.is_empty())
+        {
+            text.push_str(" It has no model yet: pick one with /models.");
+        }
+        if self.state.focused().provider.is_none() {
+            text = format!(
+                "{name} selected, but nothing usable answers (check the token or the address)."
+            );
+        }
+        self.state.gateway_view.screen.say(text);
     }
 
     fn accounts_focus_key(&mut self, key: KeyEvent) {
@@ -127,11 +181,19 @@ impl App {
             }
             KeyCode::Enter => self.open_account_detail(),
             KeyCode::Char('a') => {
-                self.state.modal = Some(Modal::AccountWizard(Box::default()));
+                if self.gateway.build_state() == crate::gateway::handle::BuildState::Starting {
+                    self.state
+                        .gateway_view
+                        .screen
+                        .complain("The gateway is still starting: wait a moment, then press a.");
+                } else {
+                    self.state.modal = Some(Modal::AccountWizard(Box::default()));
+                }
             }
             KeyCode::Char('d') => {
                 if let Some(view) = current {
-                    self.state.gateway_view.screen.confirm_remove = Some(view.id.clone());
+                    let id = view.id.clone();
+                    self.ask_remove_account(&id);
                 }
             }
             KeyCode::Char('e') => {
@@ -166,11 +228,10 @@ impl App {
             KeyCode::Char('p') => {
                 if let Some(view) = current {
                     let id = view.id.to_string();
-                    self.pin_chat(&id);
-                    self.state
-                        .gateway_view
-                        .screen
-                        .say(format!("Pinned this chat to {}.", view.label));
+                    match self.pin_outcome(&id) {
+                        Ok(text) => self.state.gateway_view.screen.say(text),
+                        Err(text) => self.state.gateway_view.screen.complain(text),
+                    }
                 }
             }
             KeyCode::Char('u') => {
@@ -340,12 +401,13 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let (ids, labels) = self.existing_accounts();
+                let (ids, labels, legacy) = self.wizard_context();
                 let root = login_home_root();
                 let existing = Existing {
                     ids: &ids,
                     labels: &labels,
                     home_root: &root,
+                    legacy,
                 };
                 if let Ok(true) = wizard.advance(&existing) {
                     self.submit_account_wizard(wizard);
@@ -356,16 +418,6 @@ impl App {
         }
         self.state.modal = Some(Modal::AccountWizard(wizard));
         Ok(false)
-    }
-
-    fn existing_accounts(&self) -> (Vec<crate::gateway::types::AccountId>, Vec<String>) {
-        match &self.state.gateway_view.snapshot {
-            Some(snapshot) => (
-                snapshot.accounts.iter().map(|a| a.id.clone()).collect(),
-                snapshot.accounts.iter().map(|a| a.label.clone()).collect(),
-            ),
-            None => (Vec::new(), Vec::new()),
-        }
     }
 
     // ── Секрет под маской ───────────────────────────────────────────────
@@ -464,19 +516,38 @@ impl App {
         key: KeyEvent,
         mut dialog: Box<TrustDialog>,
     ) -> AppResult<bool> {
+        use crate::app::gateway_view::forms::{TrustChoice, trust_view};
+        let view = trust_view(self.state.terminal_cols, self.state.terminal_rows);
+        // Окно, что было на экране до этой клавиши, засчитывается прочитанным.
+        dialog.reveal(&view);
+        let page = view.max_room.saturating_sub(1).max(1) as isize;
         match key.code {
+            KeyCode::Up | KeyCode::Char('k') => dialog.scroll(-1, &view),
+            KeyCode::Down | KeyCode::Char('j') => dialog.scroll(1, &view),
+            KeyCode::PageUp => dialog.scroll(-page, &view),
+            KeyCode::PageDown | KeyCode::Char(' ') => dialog.scroll(page, &view),
+            KeyCode::Home => dialog.scroll_to(false, &view),
+            KeyCode::End => dialog.scroll_to(true, &view),
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                dialog.toggle();
-                self.state.modal = Some(Modal::Trust(dialog));
+                dialog.toggle(&view);
             }
-            // Подтвердить можно только выбрав «Trust» и нажав Enter: `y` и случайный Enter не годятся.
-            KeyCode::Enter => self.resolve_trust(*dialog),
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                dialog.choice = crate::app::gateway_view::forms::TrustChoice::Deny;
+            // Доверие — только выбранное «Trust» и Enter, и только когда список прочитан целиком.
+            KeyCode::Enter if dialog.confirmed() && !dialog.fully_read(&view) => {
+                dialog.choice = TrustChoice::Deny;
+                dialog.toggle(&view);
+            }
+            KeyCode::Enter => {
                 self.resolve_trust(*dialog);
+                return Ok(false);
             }
-            _ => self.state.modal = Some(Modal::Trust(dialog)),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                dialog.choice = TrustChoice::Deny;
+                self.resolve_trust(*dialog);
+                return Ok(false);
+            }
+            _ => {}
         }
+        self.state.modal = Some(Modal::Trust(dialog));
         Ok(false)
     }
 }

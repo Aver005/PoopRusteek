@@ -2,7 +2,7 @@
 //! Состояние и сборка `Account` — чистые; хранилище и шлюз трогает вызывающий.
 
 use crate::app::input::InputState;
-use crate::config::Config;
+use crate::config::{Config, ProviderEntry};
 use crate::gateway::types::{
     Account, AccountId, AccountProvider, CliTool, DIRECT_TOKEN_WARNING, SecretRef,
 };
@@ -168,6 +168,8 @@ pub struct Existing<'a> {
     pub labels: &'a [String],
     /// Корень папок входа: `~/.pooprusteek/accounts`.
     pub home_root: &'a Path,
+    /// Шлюз выключен: подписки недоступны, API-аккаунт пишется как запись `[[providers]]`.
+    pub legacy: bool,
 }
 
 /// Готовый к записи результат мастера.
@@ -324,6 +326,10 @@ impl AccountWizard {
                 }
                 Ok(())
             }
+            Step::Kind if existing.legacy && self.kind() != Kind::Api => Err(
+                "subscriptions and tokens need the gateway: turn it on first (g on the accounts screen)"
+                    .into(),
+            ),
             Step::BaseUrl => crate::app::providers::validate_base_url(self.base_url.buffer.trim())
                 .map(|_| ()),
             Step::Consent if self.consent_choice != 1 => Err(
@@ -335,7 +341,8 @@ impl AccountWizard {
     }
 
     /// Стабильный id из имени: `a-z`, цифры, `-`; при совпадении `-2`, `-3`.
-    pub fn make_id(label: &str, taken: &[AccountId], fallback: &str) -> AccountId {
+    /// Не паникует: длинное имя режется по границе символа, суффикс остаётся уникальным.
+    pub fn make_id(label: &str, taken: &[AccountId], fallback: &str) -> Result<AccountId, String> {
         let mut slug = String::new();
         for ch in label.trim().chars() {
             if ch.is_ascii_alphanumeric() {
@@ -344,23 +351,18 @@ impl AccountWizard {
                 slug.push('-');
             }
         }
-        let slug = slug.trim_matches('-').to_string();
+        let slug = slug.trim_matches('-');
         let base = if slug.is_empty() || !slug.starts_with(|c: char| c.is_ascii_lowercase()) {
             format!("{fallback}-{slug}")
-                .trim_end_matches('-')
-                .to_string()
         } else {
-            slug
+            slug.to_string()
         };
-        let free = |candidate: &str| !taken.iter().any(|t| t.as_str() == candidate);
-        if free(&base) {
-            return AccountId::parse(&base).expect("slug is a valid id");
-        }
-        (2..)
-            .map(|n| format!("{base}-{n}"))
-            .find(|c| free(c))
-            .and_then(|c| AccountId::parse(&c).ok())
-            .expect("a free id exists")
+        // Занято конечное число id, поэтому свободный находится за `taken.len() + 2` шагов.
+        std::iter::once(String::new())
+            .chain((2..=taken.len() + 2).map(|n| format!("-{n}")))
+            .map(|suffix| id_with_suffix(&base, &suffix))
+            .find(|candidate| candidate.as_ref().is_ok_and(|id| !taken.contains(id)))
+            .unwrap_or_else(|| Err("could not make an id from this name".to_string()))
     }
 
     /// Собрать аккаунт. Секрет остаётся в мастере: его забирает `take_secret`.
@@ -376,7 +378,7 @@ impl AccountWizard {
             Kind::OpenCode => "opencode",
             Kind::DirectToken => "token",
         };
-        let id = Self::make_id(&label, existing.ids, fallback);
+        let id = Self::make_id(&label, existing.ids, fallback)?;
         let model = self.model.buffer.trim();
         let mut warnings = Vec::new();
         let mut login_command = None;
@@ -435,6 +437,62 @@ impl AccountWizard {
     }
 }
 
+/// Предел длины id (как в `AccountId::parse`): база с суффиксом должна в него влезть.
+const ID_LEN_MAX: usize = 64;
+
+/// База плюс суффикс; база режется по границе символа, чтобы всё влезало в id.
+fn id_with_suffix(base: &str, suffix: &str) -> Result<AccountId, String> {
+    let room = ID_LEN_MAX.saturating_sub(suffix.len());
+    let head = crate::util::truncate_at_char_boundary(base, room).trim_end_matches('-');
+    AccountId::parse(&format!("{head}{suffix}"))
+}
+
+/// Запись `[[providers]]` из мастера при выключенном шлюзе. Секрет остаётся в мастере.
+#[derive(Debug, Clone)]
+pub struct LegacyProvider {
+    pub entry: ProviderEntry,
+    /// Имя записи в хранилище; значение лежит отдельно (`take_secret`).
+    pub secret_id: Option<String>,
+}
+
+impl AccountWizard {
+    /// Собрать запись для выключенного шлюза; имя — тот же slug, что дал бы аккаунту.
+    pub fn build_legacy(&self, existing: &Existing<'_>) -> Result<LegacyProvider, String> {
+        if self.kind() != Kind::Api {
+            return Err("subscriptions need the gateway: turn it on first".into());
+        }
+        let label = self.label.buffer.trim();
+        if label.is_empty() {
+            return Err("the name can't be empty".into());
+        }
+        let builtin = AccountId::parse(crate::config::BUILTIN_PROVIDER_NAME)?;
+        let taken: Vec<AccountId> = existing
+            .ids
+            .iter()
+            .cloned()
+            .chain(std::iter::once(builtin))
+            .collect();
+        let name = Self::make_id(label, &taken, "api")?.to_string();
+        let base_url = crate::app::providers::validate_base_url(self.base_url.buffer.trim())?;
+        let protocol = PROTOCOLS[self.protocol.min(PROTOCOLS.len() - 1)]
+            .0
+            .protocol()
+            .unwrap_or_default();
+        let secret_id = (!self.secret.is_empty()).then(|| crate::secrets::account_secret_id(&name));
+        Ok(LegacyProvider {
+            entry: ProviderEntry {
+                name,
+                base_url,
+                api_key: None,
+                model: self.model.buffer.trim().to_string(),
+                protocol,
+                tools: crate::config::ToolProtocol::default(),
+            },
+            secret_id,
+        })
+    }
+}
+
 /// Команда входа в CLI в своей папке. Показываем её человеку; сами токены не читаем.
 pub fn login_command_for(tool: CliTool, home: &Path) -> String {
     let (var, command) = match tool {
@@ -459,6 +517,7 @@ mod tests {
             ids,
             labels,
             home_root: root,
+            legacy: false,
         }
     }
 
@@ -477,16 +536,69 @@ mod tests {
     #[test]
     fn ids_come_from_the_name_and_stay_unique() {
         let taken = vec![AccountId::parse("claude-max").unwrap()];
+        let id = |label: &str, taken: &[AccountId], fallback: &str| {
+            AccountWizard::make_id(label, taken, fallback).unwrap()
+        };
+        assert_eq!(id("Claude Max", &taken, "claude").as_str(), "claude-max-2");
         assert_eq!(
-            AccountWizard::make_id("Claude Max", &taken, "claude").as_str(),
-            "claude-max-2"
-        );
-        assert_eq!(
-            AccountWizard::make_id("Рабочий", &[], "claude").as_str(),
+            id("Рабочий", &[], "claude").as_str(),
             "claude",
             "a name with no Latin letters falls back to the kind"
         );
-        assert!(AccountWizard::make_id("  !!  ", &[], "api").is_slug());
+        assert!(id("  !!  ", &[], "api").is_slug());
+    }
+
+    /// Ни один ввод не должен ронять мастер, а id всегда проходит `AccountId::parse`.
+    #[test]
+    fn a_long_name_is_cut_with_a_unique_suffix_and_never_panics() {
+        for len in [63, 64, 65, 200, 5_000] {
+            let name = "a".repeat(len);
+            let first = AccountWizard::make_id(&name, &[], "api").unwrap();
+            assert!(first.as_str().len() <= 64, "{len}: {first}");
+            assert!(first.is_slug());
+            let second =
+                AccountWizard::make_id(&name, std::slice::from_ref(&first), "api").unwrap();
+            assert_ne!(first, second, "{len}: the repeat must not collide");
+            assert!(second.as_str().len() <= 64, "{len}: {second}");
+            let third = AccountWizard::make_id(&name, &[first, second.clone()], "api").unwrap();
+            assert_ne!(third, second);
+        }
+    }
+
+    #[test]
+    fn odd_names_still_make_an_id() {
+        let mut taken = Vec::new();
+        for name in [
+            "",
+            "   ",
+            "Рабочий аккаунт",
+            "日本語のアカウント",
+            "😀😀😀",
+            "a/b c\td",
+            "123456",
+            &"9".repeat(300),
+            &"я".repeat(300),
+            &format!("{}é", "a".repeat(63)),
+        ] {
+            let id = AccountWizard::make_id(name, &taken, "token").unwrap();
+            assert!(id.as_str().len() <= 64, "{name}: {id}");
+            assert!(!taken.contains(&id), "{name}: {id} is taken");
+            taken.push(id);
+        }
+    }
+
+    #[test]
+    fn a_wizard_with_a_very_long_name_builds_instead_of_crashing() {
+        let name = "claude-max-work-subscription-primary-account-for-the-platform-team-x";
+        let built = claude(name, 0)
+            .build(&existing(&[], &[], Path::new("/accounts")))
+            .unwrap();
+        assert!(built.account.id.as_str().len() <= 64);
+        assert_eq!(
+            built.account.label.as_deref(),
+            Some(name),
+            "the label stays whole"
+        );
     }
 
     #[test]
@@ -654,6 +766,69 @@ mod tests {
                     && p.message.contains("not allowed for Claude")),
             "a Claude address with a direct token is refused by validate()"
         );
+    }
+
+    fn legacy<'a>(ids: &'a [AccountId], labels: &'a [String], root: &'a Path) -> Existing<'a> {
+        Existing {
+            legacy: true,
+            ..existing(ids, labels, root)
+        }
+    }
+
+    #[test]
+    fn with_the_gateway_off_only_an_api_account_can_be_chosen() {
+        let mut wizard = AccountWizard::new();
+        wizard.step = Step::Kind;
+        wizard.kind = 1;
+        let error = wizard
+            .advance(&legacy(&[], &[], Path::new("/a")))
+            .unwrap_err();
+        assert!(error.contains("need the gateway"), "{error}");
+        assert_eq!(wizard.step, Step::Kind);
+        // Обратная сторона: API-аккаунт проходит, и с включённым шлюзом подписка тоже.
+        wizard.kind = 0;
+        assert_eq!(
+            wizard.advance(&legacy(&[], &[], Path::new("/a"))),
+            Ok(false)
+        );
+        let mut sub = AccountWizard::new();
+        sub.kind = 1;
+        assert_eq!(sub.advance(&existing(&[], &[], Path::new("/a"))), Ok(false));
+    }
+
+    #[test]
+    fn a_legacy_entry_gets_the_slug_of_the_name_and_never_the_builtin_name() {
+        let mut wizard = AccountWizard::new();
+        type_into(&mut wizard.label, "Local LM");
+        type_into(&mut wizard.base_url, "http://localhost:1234/v1/");
+        type_into(&mut wizard.model, "qwen");
+        wizard.secret.push_str("sk-test-key-123456");
+        let built = wizard
+            .build_legacy(&legacy(&[], &[], Path::new("/a")))
+            .unwrap();
+        assert_eq!(built.entry.name, "local-lm");
+        assert_eq!(built.entry.base_url, "http://localhost:1234/v1");
+        assert_eq!(built.entry.api_key, None, "the key stays out of the entry");
+        assert!(built.secret_id.is_some());
+        assert!(!format!("{built:?} {wizard:?}").contains("sk-test-key"));
+
+        let mut taken_wizard = AccountWizard::new();
+        type_into(&mut taken_wizard.label, "deepseek");
+        type_into(&mut taken_wizard.base_url, "http://localhost:1234/v1");
+        let builtin = taken_wizard
+            .build_legacy(&legacy(&[], &[], Path::new("/a")))
+            .unwrap();
+        assert_ne!(
+            builtin.entry.name, "deepseek",
+            "the built-in name is reserved"
+        );
+        // Подписку при выключенном шлюзе собрать нельзя.
+        let mut sub = claude("x", 0);
+        assert!(
+            sub.build_legacy(&legacy(&[], &[], Path::new("/a")))
+                .is_err()
+        );
+        sub.kind = 0;
     }
 
     #[test]

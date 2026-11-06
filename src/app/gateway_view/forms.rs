@@ -34,18 +34,74 @@ impl SecretPrompt {
 
 // ── Подтверждение проектного слоя ───────────────────────────────────────
 
-/// Что выбрано в диалоге. По умолчанию — отказ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustChoice {
-    #[default]
     Deny,
     Trust,
+}
+
+/// Вид строки документа диалога.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustLineKind {
+    /// Сводка: хосты и число записей. Идёт первой и показывается целиком.
+    Summary,
+    Heading,
+    Item,
+    Plain,
+    Blank,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustLine {
+    pub kind: TrustLineKind,
+    pub text: String,
+}
+
+/// Размеры окна диалога: одни и те же для кадра и для клавиш, чтобы «прочитано до конца»
+/// значило то, что человек видел на экране.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustView {
+    pub popup_w: u16,
+    /// Ширина текста внутри окна.
+    pub text_w: usize,
+    /// Сколько строк документа помещается над кнопками.
+    pub max_room: usize,
+}
+
+/// Служебные строки окна: рамка, разделитель, кнопки, подсказка.
+const TRUST_CHROME: usize = 6;
+
+pub fn trust_view(cols: u16, rows: u16) -> TrustView {
+    let (cols, rows) = if cols == 0 || rows == 0 {
+        (80, 24)
+    } else {
+        (cols, rows)
+    };
+    let popup_w = cols.clamp(48, 92);
+    TrustView {
+        popup_w,
+        text_w: usize::from(popup_w).saturating_sub(8).max(20),
+        max_room: usize::from(rows.saturating_sub(2))
+            .saturating_sub(TRUST_CHROME)
+            .max(3),
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct TrustDialog {
     pub request: TrustRequest,
     pub choice: TrustChoice,
+    /// Первая видимая строка документа.
+    pub offset: usize,
+    /// До какой строки документ показан подряд с самого начала. Прыжок мимо непрочитанного
+    /// эту границу не двигает.
+    covered: usize,
+    /// Почему «Trust» ещё недоступен.
+    pub notice: Option<String>,
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 impl TrustDialog {
@@ -53,19 +109,166 @@ impl TrustDialog {
         Self {
             request,
             choice: TrustChoice::Deny,
+            offset: 0,
+            covered: 0,
+            notice: None,
         }
     }
 
-    pub fn toggle(&mut self) {
-        self.choice = match self.choice {
-            TrustChoice::Deny => TrustChoice::Trust,
-            TrustChoice::Trust => TrustChoice::Deny,
+    /// Документ диалога: сводка (хосты и число записей) вперёд, потом полный список.
+    pub fn lines(&self, text_w: usize) -> Vec<TrustLine> {
+        let mut out = Vec::new();
+        let summary = &self.request.summary;
+        let counts = format!(
+            "{}, {}, {}",
+            plural(summary.accounts, "account", "accounts"),
+            plural(summary.routes, "route", "routes"),
+            plural(summary.roles, "role", "roles"),
+        );
+        // Счёт идёт вперёд хостов: длинный список хостов переносится, а число остаётся целым.
+        let head = if summary.hosts.is_empty() {
+            format!("Proposed: {counts}. No new request address.")
+        } else {
+            format!(
+                "Proposed: {counts}. Requests would go to: {}.",
+                summary.hosts.join(", ")
+            )
         };
+        push_wrapped(&mut out, text_w, TrustLineKind::Summary, &head, "  ", "");
+        out.push(blank());
+        push_wrapped(
+            &mut out,
+            text_w,
+            TrustLineKind::Plain,
+            "Nothing is applied until you trust this file. If it changes, you are asked again.",
+            "  ",
+            "",
+        );
+        push_wrapped(
+            &mut out,
+            text_w,
+            TrustLineKind::Plain,
+            &format!("File: {}", self.request.config_path.display()),
+            "  ",
+            "",
+        );
+        out.push(blank());
+        push_wrapped(
+            &mut out,
+            text_w,
+            TrustLineKind::Heading,
+            &format!(
+                "It would add or change ({}):",
+                plural(self.request.held_back.len(), "item", "items")
+            ),
+            "  ",
+            "",
+        );
+        for item in &self.request.held_back {
+            push_wrapped(
+                &mut out,
+                text_w,
+                TrustLineKind::Item,
+                item,
+                "  ",
+                "\u{2022}",
+            );
+        }
+        out
+    }
+
+    /// Строк документа на экране сейчас.
+    fn room(&self, view: &TrustView) -> (usize, usize) {
+        let total = self.lines(view.text_w).len();
+        (total, total.min(view.max_room))
+    }
+
+    /// Учесть показанное окно: вызывается на каждой клавише, до разбора самой клавиши.
+    pub fn reveal(&mut self, view: &TrustView) {
+        let (total, room) = self.room(view);
+        self.offset = self.offset.min(total.saturating_sub(room));
+        if self.offset <= self.covered {
+            self.covered = self.covered.max(self.offset + room);
+        }
+    }
+
+    pub fn scroll(&mut self, delta: isize, view: &TrustView) {
+        let (total, room) = self.room(view);
+        let last = total.saturating_sub(room);
+        self.offset = self.offset.saturating_add_signed(delta).min(last);
+        self.reveal(view);
+    }
+
+    pub fn scroll_to(&mut self, end: bool, view: &TrustView) {
+        let (total, room) = self.room(view);
+        self.offset = if end { total.saturating_sub(room) } else { 0 };
+        self.reveal(view);
+    }
+
+    /// Документ показан подряд от первой строки до последней; окно на экране сейчас в счёт.
+    pub fn fully_read(&self, view: &TrustView) -> bool {
+        let (total, room) = self.room(view);
+        let offset = self.offset.min(total.saturating_sub(room));
+        let shown = if offset <= self.covered {
+            self.covered.max(offset + room)
+        } else {
+            self.covered
+        };
+        shown >= total
+    }
+
+    /// «Trust» выбирается только после того, как весь список был на экране.
+    pub fn toggle(&mut self, view: &TrustView) {
+        match self.choice {
+            TrustChoice::Trust => {
+                self.choice = TrustChoice::Deny;
+                self.notice = None;
+            }
+            TrustChoice::Deny if self.fully_read(view) => {
+                self.choice = TrustChoice::Trust;
+                self.notice = None;
+            }
+            TrustChoice::Deny => {
+                self.notice = Some("Read the whole list first: PageDown / Down to the end.".into());
+            }
+        }
     }
 
     /// Только явный выбор «Trust» подтверждает; Enter на отказе оставляет заблокированным.
     pub fn confirmed(&self) -> bool {
         self.choice == TrustChoice::Trust
+    }
+}
+
+fn push_wrapped(
+    out: &mut Vec<TrustLine>,
+    text_w: usize,
+    kind: TrustLineKind,
+    text: &str,
+    indent: &str,
+    bullet: &str,
+) {
+    for (n, row) in crate::tui::wrap::wrap_words(text, text_w.saturating_sub(4))
+        .into_iter()
+        .enumerate()
+    {
+        let mark = match (bullet.is_empty(), n) {
+            (true, _) => "",
+            (false, 0) => bullet,
+            (false, _) => " ",
+        };
+        let gap = if bullet.is_empty() { "" } else { " " };
+        out.push(TrustLine {
+            kind,
+            text: format!("{indent}{mark}{gap}{row}"),
+        });
+    }
+}
+
+fn blank() -> TrustLine {
+    TrustLine {
+        kind: TrustLineKind::Blank,
+        text: String::new(),
     }
 }
 
@@ -227,22 +430,115 @@ mod tests {
         assert!(error.contains("Requests per minute"), "{error}");
     }
 
-    #[test]
-    fn the_trust_dialog_refuses_by_default() {
-        let request = TrustRequest {
-            config_path: "x".into(),
+    fn trust_request(accounts: &[(&str, &str)]) -> TrustRequest {
+        let held_back: Vec<String> = accounts
+            .iter()
+            .map(|(id, host)| format!("account '{id}' sends requests to https://{host}/v1"))
+            .collect();
+        let mut hosts: Vec<String> = Vec::new();
+        for (_, host) in accounts {
+            if !hosts.iter().any(|h| h == host) {
+                hosts.push((*host).to_string());
+            }
+        }
+        let mut request = TrustRequest {
+            config_path: "x/.pooprusteek/config.toml".into(),
             key: "k".into(),
             hash: "h".into(),
-            held_back: vec!["account evil (https://evil.test)".into()],
+            held_back,
+            summary: Default::default(),
         };
-        let mut dialog = TrustDialog::new(request);
+        request.summary.hosts = hosts;
+        request.summary.accounts = accounts.len();
+        request
+    }
+
+    const SMALL: TrustView = TrustView {
+        popup_w: 80,
+        text_w: 72,
+        max_room: 16,
+    };
+
+    #[test]
+    fn the_trust_dialog_refuses_by_default() {
+        let mut dialog =
+            TrustDialog::new(trust_request(&[("a", "one.example"), ("b", "two.example")]));
         assert!(
             !dialog.confirmed(),
             "Enter on a fresh dialog must not trust"
         );
-        dialog.toggle();
+        // Короткий файл целиком на экране: «Trust» доступен сразу.
+        dialog.reveal(&SMALL);
+        assert!(dialog.fully_read(&SMALL));
+        dialog.toggle(&SMALL);
         assert!(dialog.confirmed());
-        dialog.toggle();
+        dialog.toggle(&SMALL);
+        assert!(!dialog.confirmed());
+    }
+
+    #[test]
+    fn the_summary_comes_first_and_names_every_host_and_the_count() {
+        let mut entries: Vec<(String, String)> = (0..29)
+            .map(|n| (format!("filler-{n}"), format!("host{n}.example")))
+            .collect();
+        entries.push(("evil".into(), "attacker.example".into()));
+        let borrowed: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let dialog = TrustDialog::new(trust_request(&borrowed));
+        let lines = dialog.lines(SMALL.text_w);
+        let head: String = lines
+            .iter()
+            .take_while(|l| l.kind == TrustLineKind::Summary)
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(head.contains("attacker.example"), "{head}");
+        assert!(
+            head.contains("host0.example") && head.contains("host28.example"),
+            "{head}"
+        );
+        assert!(head.contains("30 accounts"), "{head}");
+        assert_eq!(
+            lines[0].kind,
+            TrustLineKind::Summary,
+            "the summary is the first thing"
+        );
+    }
+
+    #[test]
+    fn a_long_list_must_be_read_to_the_end_before_trust_opens() {
+        let entries: Vec<(String, String)> = (0..40)
+            .map(|n| (format!("a{n}"), format!("h{n}.example")))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let mut dialog = TrustDialog::new(trust_request(&borrowed));
+        dialog.reveal(&SMALL);
+        assert!(!dialog.fully_read(&SMALL), "40 items do not fit");
+        dialog.toggle(&SMALL);
+        assert!(!dialog.confirmed(), "refused before the list was read");
+        assert!(dialog.notice.is_some(), "and the reason is said");
+
+        // Прыжок в конец пропускает середину и доверия не открывает.
+        dialog.scroll_to(true, &SMALL);
+        assert!(!dialog.fully_read(&SMALL), "a jump skips the middle");
+        dialog.toggle(&SMALL);
+        assert!(!dialog.confirmed());
+
+        // Постраничное чтение подряд открывает.
+        dialog.scroll_to(false, &SMALL);
+        for _ in 0..10 {
+            dialog.scroll(15, &SMALL);
+        }
+        assert!(dialog.fully_read(&SMALL));
+        dialog.toggle(&SMALL);
+        assert!(dialog.confirmed());
+        // Назад на отказ можно всегда.
+        dialog.toggle(&SMALL);
         assert!(!dialog.confirmed());
     }
 

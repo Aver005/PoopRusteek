@@ -1,6 +1,5 @@
-//! Экран аккаунтов и маршрутов, мастер добавления, скрытый ввод секрета, ограничения и
-//! подтверждение проектного слоя. Рисуется только по готовым строкам из `app::gateway_view`;
-//! состояние тут не меняется.
+//! Экран аккаунтов и маршрутов, мастер, скрытый ввод секрета, ограничения, подтверждение проекта.
+//! Рисуется только по готовым строкам из `app::gateway_view`; состояние тут не меняется.
 
 use super::popup::{
     center_popup, draw_popup, fill_panel_space, modal_block, option_row, push_text_box_lines,
@@ -8,7 +7,7 @@ use super::popup::{
 };
 use super::util::{fit_col, truncate};
 use crate::app::gateway_view::forms::{
-    LIMIT_FIELDS, LimitsForm, SecretPrompt, TrustChoice, TrustDialog,
+    LIMIT_FIELDS, LimitsForm, SecretPrompt, TrustChoice, TrustDialog, TrustLineKind, trust_view,
 };
 use crate::app::gateway_view::rows::{
     AccountRow, DEFAULT_HARD_PCT, DEFAULT_SOFT_PCT, LimitLine, Mark, RouteRow, Tone, chip_text,
@@ -566,23 +565,47 @@ fn decision_block(
 }
 
 fn problem_line(view: &GatewayView, width: usize, theme: &Theme) -> Option<Line<'static>> {
+    use crate::gateway::types::Severity;
     let snapshot = view.snapshot.as_ref()?;
-    let error = snapshot
+    let (problem, color) = match snapshot
         .problems
         .iter()
-        .find(|p| p.severity == crate::gateway::types::Severity::Error)?;
+        .find(|p| p.severity == Severity::Error)
+    {
+        Some(error) => (error, theme.error),
+        // Пока шлюз собирается, это единственное объяснение пустого списка.
+        None => (
+            snapshot
+                .problems
+                .iter()
+                .find(|p| p.path == "gateway" && p.severity == Severity::Warning)?,
+            theme.warning,
+        ),
+    };
     Some(Line::from(Span::styled(
         truncate(
-            &format!(" {} {}: {}", glyphs::get().warn, error.path, error.message),
+            &format!(
+                " {} {}: {}",
+                glyphs::get().warn,
+                problem.path,
+                problem.message
+            ),
             width,
         ),
-        Style::default().fg(theme.error),
+        Style::default().fg(color),
     )))
 }
 
 /// Подсказки клавиш; что не влезло по ширине, отбрасывается с конца.
-fn hint_line(view: &GatewayView, width: usize, theme: &Theme) -> Line<'static> {
+fn hint_line(view: &GatewayView, width: usize, enabled: bool, theme: &Theme) -> Line<'static> {
     let hints: &[&str] = match view.screen.focus {
+        _ if !enabled => &[
+            "\u{2191}\u{2193} select",
+            "Enter make active",
+            "a add",
+            "g turn the gateway on",
+            "Esc back",
+        ],
         Focus::Accounts => &[
             "\u{2191}\u{2193} select",
             "Enter details",
@@ -613,7 +636,9 @@ fn hint_line(view: &GatewayView, width: usize, theme: &Theme) -> Line<'static> {
         ],
     };
     // Esc всегда остаётся в конце: место под него откладывается заранее, лишнее выпадает из середины.
-    let (last, middle) = hints.split_last().expect("hints are never empty");
+    let Some((last, middle)) = hints.split_last() else {
+        return Line::default();
+    };
     let tail = format!(" \u{00B7} {last}");
     let budget = width.saturating_sub(UnicodeWidthStr::width(tail.as_str()) + 1);
     let mut text = String::new();
@@ -644,55 +669,62 @@ fn notice_line(notice: &Notice, width: usize, theme: &Theme) -> Line<'static> {
     ))
 }
 
-fn off_screen(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let lines = vec![
-        Line::from(""),
+fn off_screen(frame: &mut Frame, area: Rect, config: &Config, view: &GatewayView, theme: &Theme) {
+    let dim = Style::default().fg(theme.text_dim);
+    let soft = Style::default().fg(theme.text_soft);
+    let mut lines = vec![
         Line::from(Span::styled(
-            "  The gateway is off: the old single-provider mode is on.",
+            "  The gateway is off: your providers work the old way, one at a time.",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
         Line::from(Span::styled(
-            "  Turning it on makes your current providers accounts and gives them a route.",
-            Style::default().fg(theme.text_soft),
-        )),
-        Line::from(Span::styled(
-            "  Nothing is deleted; the old config keeps working.",
-            Style::default().fg(theme.text_soft),
+            "  Press g to turn it on: they become accounts in one route. Nothing is deleted.",
+            soft,
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Enter ",
-                Style::default()
-                    .fg(theme.success)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "turn the gateway on    ",
-                Style::default().fg(theme.text_dim),
-            ),
-            Span::styled(
-                "a ",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "turn on and add an account    ",
-                Style::default().fg(theme.text_dim),
-            ),
-            Span::styled(
-                "Esc ",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("back", Style::default().fg(theme.text_dim)),
-        ]),
     ];
+    let active = config
+        .active_provider_entry()
+        .map(|entry| entry.name.as_str());
+    let width = usize::from(area.width);
+    let mut rows: Vec<(String, String, bool)> = vec![(
+        "DeepSeek (built-in)".to_string(),
+        config.provider.model.clone(),
+        active.is_none(),
+    )];
+    rows.extend(config.providers.iter().map(|entry| {
+        (
+            entry.name.clone(),
+            format!("{} \u{00B7} {}", entry.model, entry.base_url),
+            active == Some(entry.name.as_str()),
+        )
+    }));
+    for (i, (name, detail, is_active)) in rows.iter().enumerate() {
+        let selected = i == view.screen.selected;
+        let mark = if *is_active {
+            glyphs::get().radio_on
+        } else {
+            glyphs::get().radio_off
+        };
+        let style = if selected {
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+        } else {
+            soft
+        };
+        let text = format!(
+            "  {} {mark} {name}{}  {detail}",
+            if selected { glyphs::get().pointer } else { " " },
+            if *is_active { "  (active)" } else { "" },
+        );
+        lines.push(Line::from(Span::styled(truncate(&text, width), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter makes it active; a adds a provider (API key or local server).",
+        dim,
+    )));
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -707,7 +739,11 @@ pub(super) fn render_accounts_view(
     let width = usize::from(area.width);
     let rows = view.account_rows();
     let summary = if enabled {
-        format!("gateway ON \u{00B7} {}", summary_text(&rows))
+        if rows.is_empty() {
+            "gateway ON".to_string()
+        } else {
+            format!("gateway ON \u{00B7} {}", summary_text(&rows))
+        }
     } else {
         "gateway OFF".to_string()
     };
@@ -734,47 +770,76 @@ pub(super) fn render_accounts_view(
         Paragraph::new(rule(width, "", theme)),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    // Низ: подсказки и черта над ними, заметка над чертой.
-    let notice_rows =
-        u16::from(view.screen.notice.is_some() || view.screen.confirm_remove.is_some());
+    // Низ: подсказки и черта над ними, заметка или вопрос над чертой.
+    let question = if view.screen.confirm_enable && !enabled {
+        Some(
+            "Turn the gateway on? Your providers become accounts in one route; nothing is deleted. y/n"
+                .to_string(),
+        )
+    } else {
+        view.screen.confirm_remove.as_ref().map(|c| c.text.clone())
+    };
+    let note: Vec<Line<'static>> = match (&question, &view.screen.notice) {
+        (Some(text), _) => wrap_words(text, width.saturating_sub(2))
+            .into_iter()
+            .take(3)
+            .map(|row| {
+                Line::from(Span::styled(
+                    format!(" {row}"),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            })
+            .collect(),
+        (None, Some(notice)) => vec![notice_line(notice, width, theme)],
+        (None, None) => Vec::new(),
+    };
+    let notice_rows = note.len() as u16;
     frame.render_widget(
-        Paragraph::new(hint_line(view, width, theme)),
+        Paragraph::new(hint_line(view, width, enabled, theme)),
         Rect::new(area.x, bottom - 1, area.width, 1),
     );
     frame.render_widget(
         Paragraph::new(rule(width, "", theme)),
         Rect::new(area.x, bottom - 2, area.width, 1),
     );
-    if let Some(id) = &view.screen.confirm_remove {
-        let line = Line::from(Span::styled(
-            format!(" Remove {id}? y/n"),
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-        ));
+    if notice_rows > 0 {
         frame.render_widget(
-            Paragraph::new(line),
-            Rect::new(area.x, bottom - 3, area.width, 1),
-        );
-    } else if let Some(notice) = &view.screen.notice {
-        frame.render_widget(
-            Paragraph::new(notice_line(notice, width, theme)),
-            Rect::new(area.x, bottom - 3, area.width, 1),
+            Paragraph::new(note),
+            Rect::new(
+                area.x,
+                bottom.saturating_sub(2 + notice_rows),
+                area.width,
+                notice_rows,
+            ),
         );
     }
     let top = area.y + 2;
     let body_h = bottom.saturating_sub(top + 2 + notice_rows);
     let body = Rect::new(area.x, top, area.width, body_h);
     if !enabled {
-        off_screen(frame, body, theme);
+        off_screen(frame, body, config, view, theme);
         return;
     }
     if rows.is_empty() {
-        let text = Line::from(Span::styled(
-            "  No accounts yet. a add an API key or a subscription (Claude Code, OpenCode).",
-            Style::default().fg(theme.text_dim),
-        ));
-        frame.render_widget(Paragraph::new(text), body);
+        let starting = view.snapshot.as_ref().is_some_and(|s| {
+            s.problems
+                .iter()
+                .any(|p| p.path == "gateway" && p.message.contains("starting"))
+        });
+        let text = if starting {
+            "  The gateway is starting: the accounts are being connected, give it a moment."
+        } else {
+            "  No accounts yet. a add an API key or a subscription (Claude Code, OpenCode)."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default().fg(theme.text_dim),
+            ))),
+            body,
+        );
         return;
     }
 
@@ -1167,49 +1232,48 @@ pub(super) fn render_limits(frame: &mut Frame, area: Rect, form: &LimitsForm, th
 }
 
 pub(super) fn render_trust(frame: &mut Frame, area: Rect, dialog: &TrustDialog, theme: &Theme) {
-    let popup_w = area.width.clamp(48, 92);
-    let width_text = usize::from(popup_w).saturating_sub(8);
-    let mut body: Vec<Line<'static>> = Vec::new();
-    wrapped(
-        &mut body,
-        "This project's config wants to change where your requests and keys can go. Nothing is applied until you trust it.",
-        width_text,
-        Style::default().fg(theme.text_soft),
-    );
-    body.push(Line::from(""));
-    wrapped(
-        &mut body,
-        &format!("File: {}", dialog.request.config_path.display()),
-        width_text,
-        Style::default().fg(theme.text_dim),
-    );
-    body.push(Line::from(""));
-    body.push(Line::from(Span::styled(
-        "  It would add or change:",
-        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-    )));
-    for item in &dialog.request.held_back {
-        for (n, row) in wrap_words(item, width_text.saturating_sub(4))
-            .into_iter()
-            .enumerate()
-        {
-            body.push(Line::from(Span::styled(
-                format!("  {} {row}", if n == 0 { "\u{2022}" } else { " " }),
-                Style::default().fg(theme.warning),
-            )));
-        }
-    }
-    let chrome = 6usize;
-    let popup_h = (body.len() + chrome).min(usize::from(area.height.saturating_sub(2))) as u16;
-    let popup_area = center_popup(area, popup_w, popup_h);
+    let view = trust_view(area.width, area.height);
+    let doc = dialog.lines(view.text_w);
+    let room = doc.len().min(view.max_room);
+    let popup_h = (room + 6).min(usize::from(area.height.saturating_sub(2))) as u16;
+    let popup_area = center_popup(area, view.popup_w, popup_h);
     let block = modal_block(" Trust this project config? ", theme.warning, theme);
     let inner = block.inner(popup_area);
     let inner_w = usize::from(inner.width);
-    let mut lines = body;
-    let room = usize::from(inner.height).saturating_sub(4);
-    lines.truncate(room);
-    fill_panel_space(&mut lines, usize::from(inner.height).saturating_sub(3));
+    let offset = dialog.offset.min(doc.len().saturating_sub(room));
+    let mut lines: Vec<Line<'static>> = doc[offset..offset + room]
+        .iter()
+        .map(|line| {
+            let style = match line.kind {
+                TrustLineKind::Summary => Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+                TrustLineKind::Heading => {
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                }
+                TrustLineKind::Item => Style::default().fg(theme.warning),
+                TrustLineKind::Plain => Style::default().fg(theme.text_soft),
+                TrustLineKind::Blank => Style::default(),
+            };
+            Line::from(Span::styled(line.text.clone(), style))
+        })
+        .collect();
+    // Строка над кнопками: почему «Trust» закрыт или сколько строк ещё не показано.
+    let below = doc.len().saturating_sub(offset + room);
+    let status = match (&dialog.notice, below) {
+        (Some(notice), _) => Some((notice.clone(), theme.error)),
+        (None, 0) => None,
+        (None, n) => Some((format!("\u{2193} {n} more line(s) below"), theme.text_dim)),
+    };
+    lines.push(match status {
+        Some((text, color)) => Line::from(Span::styled(
+            truncate(&format!("  {text}"), inner_w),
+            Style::default().fg(color),
+        )),
+        None => Line::from(""),
+    });
     lines.push(separator_line(inner_w, theme));
+    let readable = dialog.fully_read(&view);
     let button = |label: &str, active: bool, color: Color| {
         let style = if active {
             Style::default()
@@ -1230,13 +1294,20 @@ pub(super) fn render_trust(frame: &mut Frame, area: Rect, dialog: &TrustDialog, 
         ),
         Span::raw("   "),
         button(
-            "Trust this file",
+            if readable {
+                "Trust this file"
+            } else {
+                "Trust this file (read it all first)"
+            },
             dialog.choice == TrustChoice::Trust,
             theme.error,
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        " Left/Right choose    Enter confirm    Esc deny ",
+        truncate(
+            " Up/Down PgUp/PgDn scroll    Tab choose    Enter confirm    Esc deny ",
+            inner_w,
+        ),
         Style::default().fg(theme.text_dim),
     )));
     draw_popup(frame, popup_area, inner, block, lines, theme);
@@ -1312,4 +1383,99 @@ pub(super) fn footer_account(view: &GatewayView) -> Option<(Mark, Tone, String, 
 
 pub(super) fn footer_glyph(mark: Mark) -> &'static str {
     mark_glyph(mark)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TrustRequest;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn frame_text(cols: u16, rows: u16, draw: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal.draw(draw).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn request(accounts: usize, evil_last: bool) -> TrustRequest {
+        let mut held_back = Vec::new();
+        let mut hosts = Vec::new();
+        for n in 0..accounts {
+            let host = if evil_last && n + 1 == accounts {
+                "attacker.example".to_string()
+            } else {
+                format!("fine{n}.example")
+            };
+            held_back.push(format!(
+                "account 'filler-{n}' sends requests to https://{host}/v1"
+            ));
+            hosts.push(host);
+        }
+        let mut request = TrustRequest {
+            config_path: "repo/.pooprusteek/config.toml".into(),
+            key: "k".into(),
+            hash: "h".into(),
+            held_back,
+            summary: Default::default(),
+        };
+        request.summary.hosts = hosts;
+        request.summary.accounts = accounts;
+        request
+    }
+
+    fn show(dialog: &TrustDialog) -> String {
+        frame_text(80, 24, |frame| {
+            let area = frame.area();
+            render_trust(frame, area, dialog, &Theme::default());
+        })
+    }
+
+    /// Опасный хост последним из тридцати виден уже на первом экране 80×24.
+    #[test]
+    fn a_foreign_host_behind_thirty_accounts_is_on_the_first_screen() {
+        let dialog = TrustDialog::new(request(30, true));
+        let text = show(&dialog);
+        assert!(text.contains("attacker.example"), "{text}");
+        assert!(text.contains("30 accounts"), "{text}");
+        assert!(
+            text.contains("more line"),
+            "the hidden tail is announced: {text}"
+        );
+        assert!(text.contains("read it all first"), "{text}");
+    }
+
+    /// Обратная сторона: обычный файл из двух записей читается целиком и доверие открыто.
+    #[test]
+    fn an_ordinary_two_account_file_shows_everything_and_trust_is_open() {
+        let dialog = TrustDialog::new(request(2, false));
+        let text = show(&dialog);
+        assert!(
+            text.contains("fine0.example") && text.contains("fine1.example"),
+            "{text}"
+        );
+        assert!(text.contains("2 accounts"), "{text}");
+        assert!(!text.contains("more line"), "{text}");
+        assert!(text.contains("Trust this file"), "{text}");
+        assert!(!text.contains("read it all first"), "{text}");
+    }
+
+    /// Прокрутка до конца показывает последние записи.
+    #[test]
+    fn scrolling_reveals_the_end_of_the_list() {
+        let mut dialog = TrustDialog::new(request(30, true));
+        let view = crate::app::gateway_view::forms::trust_view(80, 24);
+        dialog.reveal(&view);
+        dialog.scroll_to(true, &view);
+        let text = show(&dialog);
+        assert!(text.contains("filler-29"), "{text}");
+    }
 }

@@ -1,5 +1,4 @@
 //! Блок результата инструмента в переписке: статус по настоящему итогу и хвост вывода.
-//!
 //! Успех команды определяет код выхода, а не то, что инструмент «отработал».
 
 use crate::provider::ChatMessage;
@@ -30,7 +29,7 @@ pub(super) struct Shape<'a> {
 }
 
 fn is_shell(name: &str) -> bool {
-    matches!(name, "bash" | "powershell")
+    crate::agent::is_shell_tool(name)
 }
 
 /// Отделяет подпись `[exit code N]` от вывода, которую ставит оболочка.
@@ -123,9 +122,10 @@ pub(super) fn tool_lines(msg: &ChatMessage, theme: &Theme) -> Vec<Line<'static>>
     }
     let total = body.len();
     let tail = is_shell(name);
-    let shown = match (msg.tool_error, view.failed) {
-        (true, _) => total.min(ERROR_MAX_LINES),
-        (false, true) => total.min(FAILED_TAIL_LINES),
+    // Команда падает с `is_error`, поэтому хвост нужен и ей: итог теста стоит в конце.
+    let shown = match (tail, view.failed) {
+        (true, true) => total.min(FAILED_TAIL_LINES),
+        (false, _) if msg.tool_error => total.min(ERROR_MAX_LINES),
         _ => total.min(PREVIEW_LINES),
     };
     let text_color = if view.failed {
@@ -134,7 +134,7 @@ pub(super) fn tool_lines(msg: &ChatMessage, theme: &Theme) -> Vec<Line<'static>>
         theme.text_soft
     };
     // Команды показывают конец вывода, остальные инструменты — начало.
-    let (skipped_before, window) = if tail && !msg.tool_error {
+    let (skipped_before, window) = if tail {
         (total - shown, &body[total - shown..])
     } else {
         (0, &body[..shown])
@@ -186,6 +186,68 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Сообщение так, как его собирает рабочий код: `is_error` и лента из `result_display`.
+    fn real(name: &str, content: &str, error: bool) -> ChatMessage {
+        let display = crate::agent::result_display(name, content, false);
+        ChatMessage::tool_with_display("id", name, content, &display, error)
+    }
+
+    /// Длинный вывод упавшего теста: итог и код выхода стоят далеко за первыми 200 байтами.
+    fn failing_cargo_output() -> String {
+        let mut out = String::from("running 40 tests\n");
+        for n in 0..40 {
+            out.push_str(&format!("test module::case_{n} ... ok\n"));
+        }
+        out.push_str("test module::broken ... FAILED\n");
+        out.push_str("test result: FAILED. 40 passed; 1 failed\n[exit code 101]");
+        out
+    }
+
+    #[test]
+    fn a_real_failing_command_shows_its_tail_and_exit_code() {
+        let output = failing_cargo_output();
+        assert!(output.len() > 1_000, "the marker is far beyond 200 bytes");
+        let msg = real("bash", &output, true);
+        let view = shape(&msg);
+        assert_eq!(view.exit, Some(Exit::Code(101)));
+        assert!(view.failed);
+        let rendered = text(&tool_lines(&msg, &Theme::default()));
+        assert!(rendered.contains("exit 101"), "{rendered}");
+        assert!(rendered.contains("40 passed; 1 failed"), "{rendered}");
+        assert!(rendered.contains("earlier lines"), "{rendered}");
+        assert!(
+            !rendered.contains("case_0 "),
+            "the head is not shown: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_successful_long_command_counts_lines_of_the_command() {
+        let output = (0..50)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = real("bash", &output, false);
+        let rendered = text(&tool_lines(&msg, &Theme::default()));
+        assert!(rendered.contains("line 49"), "{rendered}");
+        assert!(
+            rendered.contains("47 earlier lines"),
+            "whole output counted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_failed_non_shell_tool_still_shows_the_head() {
+        let output = (0..60)
+            .map(|n| format!("problem {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = ChatMessage::tool_with_display("id", "edit", &output, &output, true);
+        let rendered = text(&tool_lines(&msg, &Theme::default()));
+        assert!(rendered.contains("problem 0"), "{rendered}");
+        assert!(!rendered.contains("problem 59"), "{rendered}");
     }
 
     #[test]
