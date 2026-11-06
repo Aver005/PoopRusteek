@@ -76,7 +76,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 textwrap = "0.16"
 unicode-width = "0.2"
-base64 = "0.23"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 regex = "1"
 wasmtime = { version = "36", default-features = false, features = [
     "std",
