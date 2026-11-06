@@ -463,6 +463,7 @@ async fn pulse(tx: &tokio::sync::mpsc::UnboundedSender<CompletionChunk>, own_wai
             content: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            usage: None,
         };
         if tx.send(beat).is_err() {
             return;
@@ -546,6 +547,7 @@ impl LLMProvider for DeepseekProvider {
                 content: text,
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                usage: None,
             });
         });
         // Пульс бьёт только в наших ожиданиях: тишину в ответе ловит сторож.
@@ -560,6 +562,7 @@ impl LLMProvider for DeepseekProvider {
             content: String::new(),
             tool_calls: Vec::new(),
             finish_reason: Some(ending.finish_reason().to_string()),
+            usage: None,
         });
         Ok(())
     }

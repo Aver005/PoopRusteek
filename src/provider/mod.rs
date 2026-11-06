@@ -1,7 +1,10 @@
 pub mod anthropic_client;
 pub mod anthropic_compat;
 pub(crate) mod compat_client;
+#[cfg(test)]
+mod compat_http_tests;
 pub mod deepseek;
+pub mod failure;
 
 /// Сколько провайдер ждёт следующего байта ответа. Строго короче сторожа
 /// простоя хода (`agent::stream::STREAM_IDLE_TIMEOUT`), чтобы причину назвал он.
@@ -281,13 +284,21 @@ pub struct CompletionRequest {
     pub stream: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionChunk {
     pub content: String,
     /// Вызовы, собранные протоколом из фрагментов стрима. Приходят только
     /// целиком: частичный JSON наверх не поднимается.
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
+    /// Настоящий расход, когда сервер его сообщил. Anthropic и Gemini кладут его
+    /// в терминальный чанк, OpenAI — в отдельный чанк после него: кто читает
+    /// только до `finish_reason`, его не увидит.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "читает шлюз, он ещё не подключён")
+    )]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone)]
@@ -300,11 +311,21 @@ pub struct CompletionResponse {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Расход токенов. `prompt_tokens` — весь вход, включая кэш; разбивка ниже.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Часть входа, прочитанная из кэша.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    /// Часть входа, записанная в кэш.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
+    /// Часть выхода, ушедшая на рассуждения.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// What a liveness check actually established about a server-side session.
@@ -380,6 +401,16 @@ pub trait LLMProvider: Send + Sync {
     /// when it keeps history server-side. `None` means "no idea, count the
     /// local history instead".
     fn session_tokens(&self) -> Option<u32> {
+        None
+    }
+
+    /// Заголовки лимитов последнего ответа аккаунта (общие для всех форков).
+    /// `None`: протокол их не отдаёт или ответа ещё не было.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "читает шлюз, он ещё не подключён")
+    )]
+    fn rate_limits(&self) -> Option<failure::RateLimitHeaders> {
         None
     }
 

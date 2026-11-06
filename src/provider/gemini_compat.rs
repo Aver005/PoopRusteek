@@ -335,6 +335,24 @@ pub struct UsageMetadata {
     pub candidates_token_count: u32,
     #[serde(default)]
     pub total_token_count: u32,
+    #[serde(default)]
+    pub cached_content_token_count: Option<u32>,
+    /// Токены рассуждений: Gemini считает их отдельно от `candidatesTokenCount`.
+    #[serde(default)]
+    pub thoughts_token_count: Option<u32>,
+}
+
+impl UsageMetadata {
+    pub fn to_usage(&self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_token_count,
+            completion_tokens: self.candidates_token_count,
+            total_tokens: self.total_token_count,
+            cache_read_tokens: self.cached_content_token_count,
+            cache_write_tokens: None,
+            reasoning_tokens: self.thoughts_token_count,
+        }
+    }
 }
 
 /// Map Gemini finish reasons onto the OpenAI-style vocabulary the rest of
@@ -408,11 +426,10 @@ pub fn response_from_gemini(response: GenerateContentResponse) -> CompletionResp
     CompletionResponse {
         content,
         finish_reason,
-        usage: response.usage_metadata.map(|usage| Usage {
-            prompt_tokens: usage.prompt_token_count,
-            completion_tokens: usage.candidates_token_count,
-            total_tokens: usage.total_token_count,
-        }),
+        usage: response
+            .usage_metadata
+            .as_ref()
+            .map(UsageMetadata::to_usage),
     }
 }
 

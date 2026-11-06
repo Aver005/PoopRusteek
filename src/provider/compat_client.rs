@@ -15,6 +15,7 @@
 //! and `fork()` is a plain config copy. All session-related `LLMProvider`
 //! methods keep their "unsupported" trait defaults.
 
+use super::failure::{ProviderFailure, RateLimitHeaders};
 use super::sse::{SseLineBuffer, sse_data_payload};
 use super::{CompletionChunk, CompletionRequest, CompletionResponse, LLMProvider, Role};
 use crate::config::ProviderEntry;
@@ -23,7 +24,8 @@ use crate::error::{AppError, AppResult};
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// What [`CompatProtocol::handle_sse_payload`] tells the pump to do after
 /// interpreting one `data:` payload.
@@ -85,6 +87,22 @@ pub(crate) trait CompatProtocol: Send + Sync + 'static {
 
     /// Parse the model-listing response body into model ids.
     fn parse_models(body: &[u8]) -> AppResult<Vec<String>>;
+
+    /// Заголовки лимитов ответа. У протокола без них — `None`.
+    fn parse_limits(
+        _headers: &reqwest::header::HeaderMap,
+        _now: std::time::SystemTime,
+    ) -> Option<RateLimitHeaders> {
+        None
+    }
+
+    /// Попросить сервер прислать расход в потоке (OpenAI: `stream_options`).
+    fn request_stream_usage(_body: &mut serde_json::Value) {}
+
+    /// Отверг ли сервер этот параметр: тогда запрос повторяется без него.
+    fn rejects_stream_usage(_status: u16, _message: &str) -> bool {
+        false
+    }
 }
 
 /// Кусок потока не разобрался: это ошибка в конверте `{"error": …}` — конец
@@ -173,6 +191,10 @@ pub(crate) struct CompatClient<P: CompatProtocol> {
     model: String,
     /// Запись объявляет инструменты родным протоколом (`tools = "native"`).
     native_tools: bool,
+    /// Заголовки лимитов последнего ответа; общие для форков одного аккаунта.
+    limits: Arc<Mutex<Option<RateLimitHeaders>>>,
+    /// Просить ли расход в потоке. Падает в `false`, когда сервер отверг параметр.
+    stream_usage: Arc<AtomicBool>,
     _protocol: PhantomData<P>,
 }
 
@@ -191,8 +213,19 @@ impl<P: CompatProtocol> CompatClient<P> {
             api_key: entry.api_key.clone(),
             model: entry.model.clone(),
             native_tools: entry.tools == crate::config::ToolProtocol::Native,
+            limits: Arc::new(Mutex::new(None)),
+            stream_usage: Arc::new(AtomicBool::new(true)),
             _protocol: PhantomData,
         })
+    }
+
+    /// Запомнить свежие заголовки лимитов (замок держится без `.await`).
+    fn remember_limits(&self, limits: Option<RateLimitHeaders>) {
+        if let Some(limits) = limits
+            && let Ok(mut slot) = self.limits.lock()
+        {
+            *slot = Some(limits);
+        }
     }
 
     async fn send(
@@ -200,20 +233,31 @@ impl<P: CompatProtocol> CompatClient<P> {
         request: &CompletionRequest,
         stream: bool,
     ) -> AppResult<reqwest::Response> {
-        let body = P::request_body(request, &self.model, stream);
         let url = P::completions_url(&self.base_url, &self.model, stream);
-        debug_log::log(
-            &format!("{}.request", P::LOG_TAG),
-            format!("url={url} stream={stream} model={}", self.model),
-        );
-        let response = P::apply_headers(self.client.post(&url), self.api_key.as_deref())
-            .json(&body)
-            .send()
-            .await
-            .map_err(AppError::Http)?;
+        let mut ask_usage = stream && self.stream_usage.load(Ordering::Relaxed);
+        loop {
+            let mut body = P::request_body(request, &self.model, stream);
+            if ask_usage {
+                P::request_stream_usage(&mut body);
+            }
+            debug_log::log(
+                &format!("{}.request", P::LOG_TAG),
+                format!("url={url} stream={stream} model={}", self.model),
+            );
+            let response = P::apply_headers(self.client.post(&url), self.api_key.as_deref())
+                .json(&body)
+                .send()
+                .await
+                .map_err(AppError::Http)?;
 
-        let status = response.status();
-        if !status.is_success() {
+            let status = response.status();
+            let headers = response.headers().clone();
+            let limits = P::parse_limits(&headers, std::time::SystemTime::now())
+                .filter(|limits| !limits.is_empty());
+            self.remember_limits(limits.clone());
+            if status.is_success() {
+                return Ok(response);
+            }
             let text = response.text().await.unwrap_or_default();
             let message = P::error_message(&text)
                 .unwrap_or_else(|| crate::util::truncate_at_char_boundary(&text, 300).to_string());
@@ -221,9 +265,16 @@ impl<P: CompatProtocol> CompatClient<P> {
                 &format!("{}.error", P::LOG_TAG),
                 format!("status={status} message={message}"),
             );
-            return Err(AppError::Provider(format!("{status}: {message}")));
+            // Сервер не знает параметра расхода: повторяем без него и больше не просим.
+            if ask_usage && P::rejects_stream_usage(status.as_u16(), &message) {
+                self.stream_usage.store(false, Ordering::Relaxed);
+                ask_usage = false;
+                continue;
+            }
+            return Err(AppError::Upstream(Box::new(
+                ProviderFailure::from_response(status, &headers, &text, message, limits),
+            )));
         }
-        Ok(response)
     }
 }
 
@@ -258,7 +309,11 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
                 }) {
                     SseFlow::Continue => {}
                     SseFlow::Done => return Ok(()),
-                    SseFlow::Fail(message) => return Err(AppError::Provider(message)),
+                    SseFlow::Fail(message) => {
+                        return Err(AppError::Upstream(Box::new(ProviderFailure::in_stream(
+                            message,
+                        ))));
+                    }
                 }
             }
         }
@@ -277,8 +332,14 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
         .await
         .map_err(AppError::Http)?;
         let status = response.status();
+        let headers = response.headers().clone();
         if !status.is_success() {
-            return Err(AppError::Provider(format!("GET /models failed: {status}")));
+            let text = response.text().await.unwrap_or_default();
+            let message =
+                P::error_message(&text).unwrap_or_else(|| format!("GET /models failed: {status}"));
+            return Err(AppError::Upstream(Box::new(
+                ProviderFailure::from_response(status, &headers, &text, message, None),
+            )));
         }
         let body = response.bytes().await.map_err(AppError::Http)?;
         P::parse_models(&body)
@@ -319,6 +380,10 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
         self.native_tools
     }
 
+    fn rate_limits(&self) -> Option<RateLimitHeaders> {
+        self.limits.lock().ok().and_then(|slot| slot.clone())
+    }
+
     fn fork(&self) -> Arc<dyn LLMProvider> {
         // Stateless: a fork is just another handle onto the same endpoint.
         Arc::new(Self {
@@ -327,6 +392,8 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
             api_key: self.api_key.clone(),
             model: self.model.clone(),
             native_tools: self.native_tools,
+            limits: Arc::clone(&self.limits),
+            stream_usage: Arc::clone(&self.stream_usage),
             _protocol: PhantomData,
         })
     }
