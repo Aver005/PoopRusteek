@@ -7,7 +7,7 @@
 use crate::config::{CustomTheme, UiConfig};
 use ratatui::style::Color;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Theme {
     pub bg: Color,
     pub panel: Color,
@@ -185,6 +185,15 @@ pub const PRESETS: &[ThemePreset] = &[
 ];
 
 impl Theme {
+    /// Отпечаток палитры для кэшей, где лежат готовые цветные строки: другая
+    /// тема — другой отпечаток, и кэш не отдаёт строки старых цветов.
+    pub fn cache_id(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn default_dark() -> Self {
         Self {
             bg: Color::Rgb(11, 14, 25),
@@ -600,5 +609,14 @@ mod tests {
             ]),
         };
         assert_eq!(Theme::from_custom(&custom), Theme::default_dark());
+    }
+
+    #[test]
+    fn the_theme_fingerprint_follows_the_palette() {
+        let dark = Theme::default_dark();
+        let mut changed = dark.clone();
+        changed.set("accent", Color::Rgb(1, 2, 3));
+        assert_eq!(dark.cache_id(), Theme::default_dark().cache_id());
+        assert_ne!(dark.cache_id(), changed.cache_id());
     }
 }

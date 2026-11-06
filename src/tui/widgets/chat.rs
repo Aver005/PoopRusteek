@@ -15,7 +15,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// Above this many entries the per-message cache is dropped wholesale
@@ -83,6 +83,21 @@ thread_local! {
     /// bubble on every frame, which together with viewport culling is what
     /// keeps typing latency flat on long transcripts.
     static ROWS_CACHE: RefCell<HashMap<CacheKey, (u64, usize)>> = RefCell::new(HashMap::new());
+}
+
+thread_local! {
+    /// Отпечаток темы, под которую собран `MSG_CACHE`.
+    static CACHE_THEME: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Сбросить кэш готовых строк, если тема сменилась: в строках вшиты цвета
+/// палитры, и без этого ответы ассистента остались бы в старых цветах.
+/// Числа строк от темы не зависят и сохраняются.
+fn sync_cache_theme(theme: &Theme) {
+    let id = theme.cache_id();
+    if CACHE_THEME.replace(id) != id {
+        MSG_CACHE.with(|cache| cache.borrow_mut().clear());
+    }
 }
 
 /// Resolved token count for message `index` in conversation `conversation_id`,
@@ -459,6 +474,7 @@ fn message_rows(
 }
 
 pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    sync_cache_theme(theme);
     let conversation_id = state.conversations.focused_id().0;
     let wrap_width = area.width;
     let messages = &state.focused().messages;
@@ -729,5 +745,45 @@ mod tests {
 
         assert_ne!(short_tokens, long_tokens);
         assert_eq!(long_tokens, estimate_tokens(&long.content));
+    }
+
+    /// Смена темы перекрашивает ответ ассистента, а не оставляет старые цвета.
+    #[test]
+    fn switching_the_theme_recolors_cached_assistant_messages() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = AppState {
+            terminal_rows: 10,
+            ..AppState::new(crate::app::conversation::Conversation::fresh_main(None))
+        };
+        state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::assistant("plain answer text"));
+        let dark = Theme::default_dark();
+        let light = Theme::resolve(&crate::config::UiConfig {
+            theme: "paper".to_string(),
+            ..Default::default()
+        });
+        assert_ne!(dark.fg, light.fg);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let text_color = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .find(|&(x, y)| {
+                    buffer[(x, y)].symbol() == "p" && buffer[(x + 1, y)].symbol() == "l"
+                })
+                .map(|(x, y)| buffer[(x, y)].fg)
+        };
+        terminal
+            .draw(|f| render_chat(f, f.area(), &state, &dark))
+            .unwrap();
+        assert_eq!(text_color(&terminal), Some(dark.fg));
+        terminal
+            .draw(|f| render_chat(f, f.area(), &state, &light))
+            .unwrap();
+        assert_eq!(text_color(&terminal), Some(light.fg));
     }
 }
