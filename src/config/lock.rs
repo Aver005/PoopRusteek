@@ -68,6 +68,11 @@ impl FileLock {
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
                     ) =>
                 {
+                    // Держатель умер (процесс-то нет): ждать минуту «брошенности» незачем.
+                    if holder_is_dead(&path) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
                     let age = std::fs::metadata(&path)
                         .and_then(|m| m.modified())
                         .ok()
@@ -88,6 +93,48 @@ impl FileLock {
             }
         }
     }
+}
+
+/// Процесс с таким pid точно не существует. Сомнение (нет прав, pid не прочитан) — «жив».
+fn pid_is_dead(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: сигнал 0 ничего не доставляет, только проверяет существование.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: обычные вызовы Win32; хэндл закрывается ниже.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return GetLastError() == ERROR_INVALID_PARAMETER;
+            }
+            let mut code = 0u32;
+            let known = GetExitCodeProcess(handle, &mut code) != 0;
+            CloseHandle(handle);
+            known && code != STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Файл замка называет умерший процесс. Свой pid и пустой файл (ещё не записан) — не мёртвые.
+fn holder_is_dead(lock: &Path) -> bool {
+    std::fs::read_to_string(lock)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .is_some_and(|pid| pid != std::process::id() && pid_is_dead(pid))
 }
 
 impl FileLock {
@@ -141,6 +188,51 @@ mod tests {
         std::fs::write(lock_path(&target), "999999").unwrap();
         let taken = FileLock::acquire_within(&target, Duration::from_secs(2), Duration::ZERO);
         assert!(taken.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pid мёртвого процесса: запускаем короткий и ждём его конца.
+    fn dead_pid() -> u32 {
+        let mut command = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Упавший держатель не заставляет ждать минуту: его pid мёртв, замок забирается сразу.
+    #[test]
+    fn a_lock_of_a_dead_process_is_taken_at_once_and_a_live_one_is_not() {
+        let dir = dir("deadpid");
+        let target = dir.join("config.toml");
+        std::fs::write(lock_path(&target), dead_pid().to_string()).unwrap();
+        let started = Instant::now();
+        // «Брошенным» по возрасту замок не считается (час), ждать разрешено 20 с.
+        let taken =
+            FileLock::acquire_within(&target, Duration::from_secs(20), Duration::from_secs(3600));
+        assert!(taken.is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(taken);
+
+        // Живой держатель (мы сами с другим «потоком»: pid свой) замок не теряет.
+        let first = FileLock::acquire(&target).unwrap();
+        let blocked = FileLock::acquire_within(
+            &target,
+            Duration::from_millis(150),
+            Duration::from_secs(3600),
+        );
+        assert!(blocked.is_err());
+        drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

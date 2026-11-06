@@ -443,13 +443,80 @@ pub fn marker_started(new: &Path) -> Option<std::time::SystemTime> {
     started.or_else(|| modified(&marker))
 }
 
-/// Есть ли в старой папке переносимые файлы, изменённые после начала прошлого переноса:
-/// их писал запущенный старый бинарь, и они не должны пропасть.
-pub fn old_has_news(old: &Path, since: std::time::SystemTime) -> bool {
-    let (files, _) = plan_data_files(old);
-    files
-        .iter()
-        .any(|relative| modified(&old.join(relative)).is_some_and(|time| time > since))
+/// Дешёвая проверка перед дополнением: один `stat` каталога сессий старой папки. Старый бинарь,
+/// заведя сессию, меняет время каталога; пока оно не новее метки, обходить старую папку не нужно.
+pub fn sessions_dir_changed(old: &Path, since: std::time::SystemTime) -> bool {
+    modified(&old.join("sessions")).is_some_and(|time| time > since)
+}
+
+fn marker_json(new: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(new.join(super::paths::DATA_MARKER)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Сессии, которые видел перенос. `None` — метка без списка: дополнять нельзя, не зная, что
+/// человек мог удалить.
+fn marker_sessions(new: &Path) -> Option<std::collections::BTreeSet<String>> {
+    let value = marker_json(new)?;
+    let list = value.get("sessions")?.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+fn relative_name(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+/// Дополнение: сессии, появившиеся в старой папке уже после переноса (их заводит ещё живой старый
+/// бинарь). Копируются только файлы, которых перенос не видел, новее метки и которых нет в новой
+/// папке. Удалённое человеком не возвращается, настройки (`whitelist.json`, `mcp.json`, `skills`…)
+/// не дополняются вовсе. Возвращает число скопированных; метка обновляется только при полном успехе.
+pub fn top_up_sessions(old: &Path, new: &Path, tick: &dyn Fn()) -> Result<usize, String> {
+    let (Some(since), Some(mut seen)) = (marker_started(new), marker_sessions(new)) else {
+        return Ok(0);
+    };
+    let started_ms = now_ms();
+    let mut found = Vec::new();
+    walk_files(old, &old.join("sessions"), &mut found);
+    let mut copied = 0;
+    for relative in found {
+        let name = relative_name(&relative);
+        let source = old.join(&relative);
+        if seen.contains(&name) || !modified(&source).is_some_and(|time| time > since) {
+            continue;
+        }
+        tick();
+        let target = new.join(&relative);
+        if !target.exists() {
+            let bytes = std::fs::read(&source).map_err(|e| format!("{name}: {}", e.kind()))?;
+            crate::util::atomic_write(&target, &bytes)
+                .map_err(|e| format!("{name}: {}", e.kind()))?;
+            match std::fs::read(&target) {
+                Ok(back) if digest(&back) == digest(&bytes) => copied += 1,
+                _ => {
+                    let _ = std::fs::remove_file(&target);
+                    return Err(format!("{name}: copy did not read back identically"));
+                }
+            }
+        }
+        seen.insert(name);
+    }
+    let mut marker = marker_json(new).unwrap_or_default();
+    marker["started_ms"] = serde_json::json!(started_ms);
+    marker["sessions"] = serde_json::json!(seen);
+    let text = serde_json::to_string_pretty(&marker).unwrap_or_default();
+    crate::util::atomic_write(&new.join(super::paths::DATA_MARKER), text.as_bytes())
+        .map_err(|e| format!("marker: {}", e.kind()))?;
+    Ok(copied)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Копирует данные из старой папки в новую. Старая остаётся нетронутой.
@@ -461,12 +528,16 @@ pub fn migrate_data_dir(old: &Path, new: &Path) -> DataReport {
 
 /// То же, с пульсом после каждого файла: держатель замка сообщает, что жив.
 pub fn migrate_data_dir_ticking(old: &Path, new: &Path, tick: &dyn Fn()) -> DataReport {
-    let started_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let started_ms = now_ms();
     let mut report = DataReport::default();
     let (files, left_behind) = plan_data_files(old);
     report.left_behind = left_behind;
+    // Что видел перенос: по этому списку дополнение отличает новое от удалённого человеком.
+    let sessions: Vec<String> = files
+        .iter()
+        .filter(|f| f.starts_with("sessions"))
+        .map(|f| relative_name(f))
+        .collect();
     for relative in files {
         tick();
         let source = old.join(&relative);
@@ -535,6 +606,7 @@ pub fn migrate_data_dir_ticking(old: &Path, new: &Path, tick: &dyn Fn()) -> Data
             "kept_both": report.kept_both,
             "left_behind": report.left_behind,
             "started_ms": started_ms,
+            "sessions": sessions,
         });
         let text = serde_json::to_string_pretty(&marker).unwrap_or_default();
         if let Err(e) =

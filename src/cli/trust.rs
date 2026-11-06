@@ -66,16 +66,7 @@ pub fn run(args: TrustArgs, explicit_config: Option<&std::path::Path>) -> i32 {
             Some(LayerStatus::Rejected(_))
         ));
     }
-    for request in &requests {
-        println!(
-            "{} wants to change where requests go or what runs:",
-            request.config_path.display()
-        );
-        for line in &request.held_back {
-            println!("  - {line}");
-        }
-        println!("  Content hash: {}", &request.hash[..16]);
-    }
+    print!("{}", describe(&requests));
     println!(
         "Until you confirm, your global settings stay in force and project MCP servers do not start. \
          Keys are not released by this: for an account that needs one, run `pooprusteek secrets bind <ref> <host>`."
@@ -95,6 +86,22 @@ pub fn run(args: TrustArgs, explicit_config: Option<&std::path::Path>) -> i32 {
             1
         }
     }
+}
+
+/// Все ожидающие файлы подряд: отказ или правка одного не прячет остальные.
+fn describe(requests: &[config::TrustRequest]) -> String {
+    let mut text = String::new();
+    for request in requests {
+        text.push_str(&format!(
+            "{} wants to change where requests go or what runs:\n",
+            request.config_path.display()
+        ));
+        for line in &request.held_back {
+            text.push_str(&format!("  - {line}\n"));
+        }
+        text.push_str(&format!("  Content hash: {}\n", &request.hash[..16]));
+    }
+    text
 }
 
 /// Снять подтверждение со всего проекта: конфиг и каждый файл MCP.
@@ -161,6 +168,16 @@ mod tests {
     fn written(tag: &str) -> bool {
         std::fs::read_to_string(config::Config::path())
             .is_ok_and(|text| text.contains(&format!("m2-{tag}")))
+    }
+
+    #[test]
+    fn every_pending_file_is_listed_not_only_the_first() {
+        let requests = [request("a"), request("b"), request("c")];
+        let shown = describe(&requests);
+        for tag in ["m2-a", "m2-b", "m2-c"] {
+            assert!(shown.contains(tag), "{tag} is missing: {shown}");
+        }
+        assert_eq!(shown.matches("Content hash").count(), 3);
     }
 
     #[test]

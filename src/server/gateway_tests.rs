@@ -618,18 +618,16 @@ async fn cors_never_exposes_the_routing_headers_to_a_foreign_site() {
         .unwrap();
     assert!(header(&response, "x-pooprusteek-account").is_some());
     assert_eq!(header(&response, "access-control-expose-headers"), None);
-    // Чужая страница отклоняется целиком, даже с верным ключом: ни запроса, ни заголовков маршрута.
+    // С ключом чужой `Origin` не мешает (чужая страница ключа не знает): расширения работают как раньше.
     let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", keyed.base))
         .bearer_auth("server-key")
-        .header("origin", "https://evil.example")
+        .header("origin", "vscode-webview://abc")
         .json(&serde_json::json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]}))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 403);
-    assert_eq!(header(&response, "x-pooprusteek-account"), None);
-    assert_eq!(header(&response, "access-control-allow-origin"), None);
+    assert!(header(&response, "x-pooprusteek-account").is_some());
     assert_eq!(header(&response, "access-control-expose-headers"), None);
 
     let open = start(gateway, None).await;

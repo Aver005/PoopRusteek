@@ -39,13 +39,33 @@ fn choose_data_dir(old: Option<PathBuf>, new: PathBuf) -> (PathBuf, Vec<String>)
 const MIGRATION_STALE: std::time::Duration = std::time::Duration::from_secs(60);
 const MIGRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(75);
 
-/// Нужен ли перенос: метки нет вовсе, либо есть, но старый бинарь дописывал файлы после неё.
-fn needs_move(old: &Path, new: &Path) -> bool {
-    match migrate::marker_started(new) {
-        None => true,
-        Some(since) => migrate::old_has_news(old, since),
+/// Дополнение (метка уже есть): дешёвая проверка времени каталога `sessions` старой папки на
+/// главном потоке, сам обход — в фоне. Папка данных от этого не зависит, поэтому ничего не ждём.
+fn top_up_in_background(old: &Path, new: &Path, since: std::time::SystemTime) {
+    if !migrate::sessions_dir_changed(old, since) {
+        return;
+    }
+    let (old, new) = (old.to_path_buf(), new.to_path_buf());
+    let _ = std::thread::Builder::new()
+        .name("data-top-up".to_string())
+        .spawn(move || top_up(&old, &new));
+}
+
+/// Дополнение под тем же замком, что и перенос. Занят замок — пропускаем, подберёт следующий запуск.
+fn top_up(old: &Path, new: &Path) {
+    let Ok(guard) = FileLock::acquire_within(
+        &new.join(".migrate"),
+        MIGRATION_TOP_UP_WAIT,
+        MIGRATION_STALE,
+    ) else {
+        return;
+    };
+    if let Err(error) = migrate::top_up_sessions(old, new, &|| guard.touch()) {
+        tracing::warn!("sessions of the old folder were not merged: {error}");
     }
 }
+
+const MIGRATION_TOP_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn choose_data_dir_within(
     old: Option<PathBuf>,
@@ -56,7 +76,11 @@ fn choose_data_dir_within(
     let Some(old) = old else {
         return (new, Vec::new());
     };
-    if old == new || !old.is_dir() || !needs_move(&old, &new) {
+    if old == new || !old.is_dir() {
+        return (new, Vec::new());
+    }
+    if let Some(since) = migrate::marker_started(&new) {
+        top_up_in_background(&old, &new, since);
         return (new, Vec::new());
     }
     // Перенос идёт под замком: второй запуск ждёт, потом видит метку первого и берёт ту же папку.
@@ -77,31 +101,11 @@ fn choose_data_dir_within(
         }
     };
     // Пока ждали, другой запуск мог закончить.
-    if !needs_move(&old, &new) {
+    if migrate::marker_started(&new).is_some() {
         return (new, Vec::new());
     }
-    let already_moved_once = migrate::marker_started(&new).is_some();
     let report = migrate::migrate_data_dir_ticking(&old, &new, &|| guard.touch());
     drop(guard);
-    if already_moved_once && !report.failed.is_empty() {
-        // Дополнение не удалось, но новая папка уже дом: остаёмся в ней, метка прежняя —
-        // следующий запуск повторит.
-        let notice = format!(
-            "Some files from the old folder {} could not be merged into {} ({}); they will be tried again at the next start.",
-            old.display(),
-            new.display(),
-            report.failed.join("; ")
-        );
-        return (new, vec![notice]);
-    }
-    if already_moved_once
-        && report.failed.is_empty()
-        && report.copied == 0
-        && report.kept_both.is_empty()
-    {
-        // Подобрать было нечего (файлы только тронуты): не шумим при каждом запуске.
-        return (new, Vec::new());
-    }
     if report.failed.is_empty() {
         let mut notices = vec![format!(
             "Data moved to {} ({} file(s) copied). The old folder {} was left in place; delete it when you are sure.",
@@ -476,73 +480,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Старый бинарь дописал сессию и поправил файл после переноса: следующий запуск ничего не теряет.
+    /// Ждём, пока фоновое дополнение запишет в метку нужную сессию.
+    fn wait_for_session_in_marker(new: &Path, name: &str) {
+        for _ in 0..200 {
+            let text = std::fs::read_to_string(new.join(paths::DATA_MARKER)).unwrap_or_default();
+            if text.contains(name) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the top-up never recorded {name}");
+    }
+
+    /// Старый бинарь завёл сессию после переноса — она приходит; удалённая человеком не возвращается,
+    /// настройки старой папки не дополняются, существующее в новой папке не затирается.
     #[test]
-    fn what_a_still_running_old_binary_wrote_is_merged_at_the_next_start() {
+    fn a_new_session_of_the_old_binary_comes_but_a_deleted_one_never_returns() {
         let root = dir("oldbin");
         let (old, new) = (root.join("old"), root.join("new"));
         put(&old.join("sessions/s1.json"), "first");
+        put(&old.join("sessions/s2.json"), "second");
         put(&old.join("whitelist.json"), "[\"before\"]");
+        put(&old.join("mcp.json"), "{\"mcpServers\":{}}");
         let (chosen, _) = choose_data_dir(Some(old.clone()), new.clone());
         assert_eq!(chosen, new);
+        std::fs::write(
+            new.join("sessions/s2.json"),
+            "second, continued in the new app",
+        )
+        .unwrap();
 
-        // Старый бинарь живёт и пишет в свою папку.
+        // Человек удалил s1 в новой папке; живой старый бинарь пишет дальше.
+        std::fs::remove_file(new.join("sessions/s1.json")).unwrap();
         std::thread::sleep(Duration::from_millis(80));
-        put(&old.join("sessions/s2.json"), "from the old binary");
+        put(&old.join("sessions/s3.json"), "from the old binary");
+        put(
+            &old.join("sessions/s2.json"),
+            "second, touched by the old binary",
+        );
+        put(
+            &old.join("sessions/s1.json"),
+            "first, touched by the old binary",
+        );
         put(&old.join("whitelist.json"), "[\"after\"]");
+        put(&old.join("mcp.json"), "{\"mcpServers\":{\"x\":{}}}");
+        put(&old.join("skills/new/SKILL.md"), "skill");
 
         let (chosen, notices) = choose_data_dir(Some(old.clone()), new.clone());
         assert_eq!(chosen, new);
-        assert!(notices[0].contains("moved"), "{notices:?}");
+        assert!(
+            notices.is_empty(),
+            "no scary note for a top-up: {notices:?}"
+        );
+        wait_for_session_in_marker(&new, "sessions/s3.json");
+
+        assert_eq!(
+            std::fs::read_to_string(new.join("sessions/s3.json")).unwrap(),
+            "from the old binary",
+            "the new session arrived"
+        );
+        assert!(
+            !new.join("sessions/s1.json").exists(),
+            "a deleted session stays deleted"
+        );
         assert_eq!(
             std::fs::read_to_string(new.join("sessions/s2.json")).unwrap(),
-            "from the old binary",
-            "the new session is not lost"
+            "second, continued in the new app",
+            "what exists in the new folder is not overwritten"
         );
+        assert!(!new.join("sessions/s2.json.legacy").exists());
         assert_eq!(
             std::fs::read_to_string(new.join("whitelist.json")).unwrap(),
-            "[\"after\"]",
-            "the freshest wins"
+            "[\"before\"]",
+            "settings are not topped up"
         );
         assert_eq!(
-            std::fs::read_to_string(new.join("whitelist.json.legacy")).unwrap(),
-            "[\"before\"]",
-            "the other one lies beside it"
+            std::fs::read_to_string(new.join("mcp.json")).unwrap(),
+            "{\"mcpServers\":{}}"
         );
-        // Дальше тихо: метка обновлена, повтор ничего не делает.
-        let (_, notices) = choose_data_dir(Some(old), new);
-        assert!(notices.is_empty(), "{notices:?}");
+        assert!(!new.join("skills/new").exists());
+
+        // Дальше тихо: метка знает s3, повторный запуск ничего не меняет.
+        let before = std::fs::read_to_string(new.join(paths::DATA_MARKER)).unwrap();
+        let (_, notices) = choose_data_dir(Some(old), new.clone());
+        assert!(notices.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(new.join(paths::DATA_MARKER)).unwrap(),
+            before,
+            "nothing to look at: the sessions folder did not change"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Дополнение не удалось: новая папка остаётся домом, метка прежняя — повторим в следующий раз.
+    /// Сначала дешёвая проверка: обход старой папки идёт, только если каталог сессий изменился после метки.
     #[test]
-    fn a_failed_top_up_stays_on_the_new_folder_and_is_tried_again() {
-        let root = dir("topup");
+    fn the_old_folder_is_walked_only_when_its_sessions_directory_changed() {
+        let root = dir("cheap");
         let (old, new) = (root.join("old"), root.join("new"));
         put(&old.join("sessions/s1.json"), "first");
         choose_data_dir(Some(old.clone()), new.clone());
-        let before = migrate::marker_started(&new);
-
+        let since = migrate::marker_started(&new).unwrap();
+        assert!(!migrate::sessions_dir_changed(&old, since));
         std::thread::sleep(Duration::from_millis(80));
-        put(&old.join("sessions/s2.json"), "later");
-        std::fs::create_dir_all(new.join("sessions/s2.json")).unwrap(); // записи мешает папка
-        let (chosen, notices) = choose_data_dir(Some(old.clone()), new.clone());
-        assert_eq!(chosen, new, "never back to the old folder");
-        assert!(notices[0].contains("tried again"), "{notices:?}");
-        assert_eq!(
-            migrate::marker_started(&new),
-            before,
-            "the marker is not refreshed"
-        );
+        put(&old.join("sessions/s2.json"), "second");
+        assert!(migrate::sessions_dir_changed(&old, since));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-        std::fs::remove_dir_all(new.join("sessions/s2.json")).unwrap();
-        let (_, notices) = choose_data_dir(Some(old), new.clone());
-        assert!(notices[0].contains("moved"), "{notices:?}");
-        assert_eq!(
-            std::fs::read_to_string(new.join("sessions/s2.json")).unwrap(),
-            "later"
-        );
+    /// Метка без списка сессий (не знаем, что человек удалил): дополнять нельзя.
+    #[test]
+    fn a_marker_without_the_session_list_tops_up_nothing() {
+        let root = dir("nolist");
+        let (old, new) = (root.join("old"), root.join("new"));
+        put(&old.join("sessions/s1.json"), "first");
+        choose_data_dir(Some(old.clone()), new.clone());
+        let marker = new.join(paths::DATA_MARKER);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("sessions");
+        std::fs::write(&marker, value.to_string()).unwrap();
+        std::fs::remove_file(new.join("sessions/s1.json")).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        put(&old.join("sessions/s2.json"), "second");
+        assert_eq!(migrate::top_up_sessions(&old, &new, &|| {}), Ok(0));
+        assert!(!new.join("sessions/s2.json").exists());
+        assert!(!new.join("sessions/s1.json").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
