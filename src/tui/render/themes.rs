@@ -7,6 +7,7 @@
 
 use super::chrome::{panel_footer, panel_frame};
 use super::popup::{option_row, push_text_box_lines};
+use super::util::{fit_col, truncate};
 use crate::app::list::{ListWindow, NAV_HINT, rows as list_rows};
 use crate::app::themes::{
     ThemeRowKind, ThemeWizardState, ThemeWizardStep, ThemesViewState, theme_rows,
@@ -84,7 +85,11 @@ fn render_theme_list(
         let row = &rows[i];
         let selected = i == view.selected;
         let bg = if selected { theme.selection } else { theme.bg };
-        let marker = if row.active { " ● " } else { "   " };
+        let glyph = crate::tui::glyphs::get();
+        let marker = format!(
+            " {} ",
+            fit_col(if row.active { glyph.radio_on } else { "" }, 3)
+        );
         let label_style = match row.kind {
             _ if selected => Style::default()
                 .fg(theme.accent)
@@ -93,16 +98,17 @@ fn render_theme_list(
             ThemeRowKind::Create => Style::default().fg(theme.accent_soft),
             _ => Style::default().fg(theme.fg),
         };
+        let detail_room = (inner.width as usize).saturating_sub(7);
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(theme.success).bg(bg)),
             Span::styled(
-                if selected { "▶ " } else { "  " },
+                if selected { glyph.pointer } else { " " },
                 Style::default().fg(theme.accent).bg(bg),
             ),
             Span::styled(row.label.clone(), label_style),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("      {}", row.detail),
+            format!("      {}", truncate(&row.detail, detail_room)),
             Style::default().fg(theme.text_dim),
         )));
     }
