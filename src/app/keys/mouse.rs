@@ -27,21 +27,28 @@ impl App {
 
         // A modal owns the screen when present — scroll it, not the chat behind.
         if let Some(Modal::ToolApproval {
+            tool_name,
             arguments,
+            origin,
+            scope,
             scroll_offset,
             ..
-        }) = self.state.modal.as_mut()
+        }) = self.state.modal.as_ref()
         {
-            if up {
-                *scroll_offset = scroll_offset.saturating_sub(WHEEL_STEP);
+            let max_scroll = super::modal::approval_max_scroll(
+                &self.state,
+                tool_name,
+                arguments,
+                origin.as_deref(),
+                scope.as_ref(),
+            );
+            let next = if up {
+                scroll_offset.saturating_sub(WHEEL_STEP)
             } else {
-                // Mirror the key handler's clamp so the wheel can't scroll past
-                // the end of the argument block.
-                let max_scroll = arguments
-                    .lines()
-                    .count()
-                    .saturating_sub(super::modal::TOOL_APPROVAL_VISIBLE_LINES);
-                *scroll_offset = (*scroll_offset + WHEEL_STEP).min(max_scroll);
+                (*scroll_offset + WHEEL_STEP).min(max_scroll)
+            };
+            if let Some(Modal::ToolApproval { scroll_offset, .. }) = self.state.modal.as_mut() {
+                *scroll_offset = next;
             }
             return;
         }

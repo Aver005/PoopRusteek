@@ -6,6 +6,7 @@ pub mod theme;
 pub mod view_model;
 pub mod widgets;
 
+pub mod wrap;
 use color_eyre::Result;
 use crossterm::{
     cursor::{DisableBlinking, EnableBlinking, Show},

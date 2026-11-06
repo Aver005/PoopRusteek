@@ -234,6 +234,9 @@ pub struct AppState {
     /// отрисовки, а шаг `PageUp`/`PageDown` должен совпадать с экраном.
     pub terminal_rows: u16,
     pub modal: Option<Modal>,
+    /// Ширина терминала, обновляется на `Resize`: окно подтверждения по ней
+    /// считает перенос строк, а клавиши прокрутки обязаны считать так же.
+    pub terminal_cols: u16,
     /// Правила авто-одобрения. С областью, а не только с именем
     /// инструмента: см. `crate::whitelist`.
     pub approved_tools: crate::whitelist::Whitelist,
@@ -327,6 +330,7 @@ impl AppState {
             mcp_status: mcp_status::McpStatus::default(),
             providers_view: providers::ProvidersViewState::default(),
             search: search::SearchViewState::default(),
+            terminal_cols: 0,
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
             instructions_section: String::new(),
@@ -548,7 +552,7 @@ impl App {
     pub async fn run(&mut self) -> AppResult<()> {
         let mut terminal = crate::tui::init()?;
         // До первого Resize размер знает только терминал.
-        if let Ok((_, rows)) = crossterm::terminal::size() {
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
             self.state.terminal_rows = rows;
         }
         let result = self.run_loop(&mut terminal).await;
@@ -569,6 +573,7 @@ impl App {
         let discards: Vec<_> = self
             .state
             .conversations
+            self.state.terminal_cols = cols;
             .iter()
             .filter(|c| c.is_background_kind())
             .filter_map(|c| c.provider.clone())
@@ -744,7 +749,10 @@ impl App {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
-            AppEvent::Resize { rows } => self.state.terminal_rows = rows,
+            AppEvent::Resize { cols, rows } => {
+                self.state.terminal_rows = rows;
+                self.state.terminal_cols = cols;
+            }
             AppEvent::Paste(text) => self.handle_paste(text),
             AppEvent::OnboardingActionDone { action, ok } => {
                 self.state.onboarding.report(action, ok);
@@ -1267,7 +1275,7 @@ impl App {
             }
             Event::Mouse(mouse) => AppEvent::Mouse(mouse),
             Event::Paste(text) => AppEvent::Paste(text),
-            Event::Resize(_, rows) => AppEvent::Resize { rows },
+            Event::Resize(cols, rows) => AppEvent::Resize { cols, rows },
             _ => return Ok((false, false)),
         };
         let quit = self.handle_event(app_event).await?;

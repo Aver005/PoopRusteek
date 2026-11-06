@@ -18,6 +18,36 @@ pub(super) fn center_popup(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+/// Доля цвета фона, которая подмешивается к уже нарисованному (в процентах).
+const BACKDROP_DIM_PERCENT: u16 = 60;
+
+/// Смешать цвет текста с фоном: чужие цвета (не RGB) остаются как есть.
+fn dim_color(color: Color, toward: Color) -> Color {
+    match (color, toward) {
+        (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) => {
+            let mix = |from: u8, to: u8| {
+                ((from as u16 * (100 - BACKDROP_DIM_PERCENT) + to as u16 * BACKDROP_DIM_PERCENT)
+                    / 100) as u8
+            };
+            Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb))
+        }
+        _ => color,
+    }
+}
+
+/// Приглушить всё, что уже нарисовано под окном: модалка не спорит за
+/// внимание с панелью и текстом чата. Зовут до отрисовки самой модалки.
+pub(super) fn dim_backdrop(frame: &mut ratatui::Frame, area: Rect, theme: &Theme) {
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.fg = dim_color(cell.fg, theme.bg);
+            }
+        }
+    }
+}
+
 /// The standard modal frame: all borders, `accent`-colored border and bold
 /// title, panel background.
 pub(super) fn modal_block(
@@ -190,6 +220,22 @@ pub(super) fn push_text_box_lines(
                     Style::default().fg(theme.fg).bg(theme.input_bg),
                 ),
             ]));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dimming_moves_a_color_toward_the_background() {
+        let dimmed = dim_color(Color::Rgb(200, 200, 200), Color::Rgb(0, 0, 0));
+        assert_eq!(dimmed, Color::Rgb(80, 80, 80));
+    }
+
+    #[test]
+    fn dimming_leaves_terminal_default_colors_alone() {
+        assert_eq!(dim_color(Color::Reset, Color::Rgb(0, 0, 0)), Color::Reset);
+    }
+}
         }
     }
 }

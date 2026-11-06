@@ -7,7 +7,7 @@ use super::popup::{
     center_popup, draw_popup, fill_panel_space, modal_block, overflow_line, push_text_box_lines,
     separator_line,
 };
-use super::util::{highlight_json, truncate};
+use super::util::truncate;
 use crate::app::AppState;
 use crate::app::events::{ConfirmState, Modal, PickerMode, PickerState, QuestionState};
 use crate::app::list::{NAV_HINT, NAV_HINT_ARROWS};
@@ -27,10 +27,10 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
             scroll_offset,
             grant,
             scope,
-        } => render_tool_approval(
+        } => super::approval::render_tool_approval(
             frame,
             area,
-            ToolApprovalView {
+            super::approval::ToolApprovalView {
                 tool_name,
                 arguments,
                 origin: origin.as_deref(),
@@ -49,167 +49,6 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
             super::providers::render_provider_add(frame, area, state, theme)
         }
     }
-}
-
-/// Состояние модалки одним аргументом: восемь позиционных упирались в
-/// блокирующий гейт clippy, а список только рос.
-struct ToolApprovalView<'a> {
-    tool_name: &'a str,
-    arguments: &'a str,
-    origin: Option<&'a str>,
-    scroll_offset: usize,
-    grant: crate::app::view_state::Grant,
-    scope: Option<&'a crate::whitelist::Scope>,
-}
-
-fn render_tool_approval(frame: &mut Frame, area: Rect, view: ToolApprovalView<'_>, theme: &Theme) {
-    let ToolApprovalView {
-        tool_name,
-        arguments,
-        origin,
-        scroll_offset,
-        grant,
-        scope,
-    } = view;
-    let popup_width = area.width.clamp(50, 72);
-    let max_height = area.height.saturating_sub(4);
-    let content_height = arguments
-        .lines()
-        .count()
-        .max(4)
-        .min(max_height.saturating_sub(6) as usize);
-    // Плюс строка на каждый вариант разрешения — их два или три, и обрезать
-    // их снизу нельзя: именно там человек видит, что именно он разрешает.
-    let grants = crate::app::view_state::Grant::all(scope.is_some()).len();
-    let popup_height = (content_height + 7 + grants + usize::from(origin.is_some()))
-        .min(max_height as usize) as u16;
-    let popup_area = center_popup(area, popup_width, popup_height);
-
-    let block = modal_block(" \u{26A0} Tool Call ", theme.warning, theme);
-    let inner = block.inner(popup_area);
-    let inner_w = inner.width as usize;
-    let inner_h = inner.height as usize;
-
-    let mut all_lines: Vec<Line> = Vec::new();
-
-    // Tool name line
-    all_lines.push(Line::from(vec![
-        Span::styled("  \u{2692} ", Style::default().fg(theme.warning)),
-        Span::styled("Tool:", Style::default().fg(theme.text_dim)),
-        Span::styled(" ", Style::default().fg(theme.fg)),
-        Span::styled(
-            tool_name.to_string(),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    // Кто спрашивает — своей строкой, вне аргументов: подпись из текста модели
-    // не должна рисовать в модалке поддельные аргументы.
-    if let Some(origin) = origin {
-        all_lines.push(Line::from(vec![
-            Span::styled("    From: ", Style::default().fg(theme.text_dim)),
-            Span::styled(origin.to_string(), Style::default().fg(theme.warning)),
-        ]));
-    }
-    all_lines.push(Line::from(""));
-
-    // Arguments header
-    all_lines.push(Line::from(vec![Span::styled(
-        "  \u{1F4CB} Arguments:",
-        Style::default().fg(theme.text_dim),
-    )]));
-
-    // Parse and format arguments with JSON highlighting
-    let arg_lines = highlight_json(arguments, theme);
-    let max_visible = inner_h.saturating_sub(6);
-    let total_args = arg_lines.len();
-    let scroll = scroll_offset;
-    let display_lines: Vec<&Line> = if total_args > max_visible {
-        let end = (scroll + max_visible).min(total_args);
-        arg_lines[scroll..end].iter().collect()
-    } else {
-        arg_lines.iter().collect()
-    };
-
-    for line in &display_lines {
-        let mut line_spans = vec![Span::styled("  ", Style::default().fg(theme.fg))];
-        for span in &line.spans {
-            line_spans.push(Span::styled(span.content.clone(), span.style));
-        }
-        all_lines.push(Line::from(line_spans));
-    }
-
-    // Scroll indicator
-    if total_args > max_visible {
-        let pct = if total_args > 0 {
-            (scroll as f64 / (total_args.saturating_sub(max_visible)) as f64 * 100.0) as u16
-        } else {
-            0
-        };
-        let indicator = format!("\u{2191}\u{2193} {:.0}%", pct.min(100));
-        all_lines.push(Line::from(vec![Span::styled(
-            format!("  {}", indicator),
-            Style::default().fg(theme.text_dim),
-        )]));
-    }
-
-    fill_panel_space(&mut all_lines, inner_h.saturating_sub(3));
-    all_lines.push(separator_line(inner_w, theme));
-
-    // Все варианты списком, а не только текущий: человек, видящий одну
-    // строку «just this once», не знает, что там есть что-то ещё.
-    use crate::app::view_state::Grant;
-    for option in Grant::all(scope.is_some()) {
-        let current = option == grant;
-        let style = match (current, option) {
-            (false, _) => Style::default().fg(theme.text_dim),
-            (true, Grant::Tool) => Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-            (true, _) => Style::default()
-                .fg(theme.success)
-                .add_modifier(Modifier::BOLD),
-        };
-        all_lines.push(Line::from(vec![Span::styled(
-            format!(
-                "  {} {}",
-                if current { "\u{25CF}" } else { "\u{25CB}" },
-                option.label(tool_name, scope)
-            ),
-            style,
-        )]));
-    }
-
-    // Key bindings
-    all_lines.push(Line::from(vec![
-        Span::styled("  ", Style::default().fg(theme.fg)),
-        Span::styled(
-            "Y",
-            Style::default()
-                .fg(theme.success)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" allow  ", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            "N",
-            Style::default()
-                .fg(theme.error)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" deny  ", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            "A",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" change  ", Style::default().fg(theme.text_dim)),
-        Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
-        Span::styled(" scroll", Style::default().fg(theme.text_dim)),
-    ]));
-
-    draw_popup(frame, popup_area, inner, block, all_lines, theme);
 }
 
 fn render_delete_sessions(
@@ -590,13 +429,13 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
     let mut lines: Vec<Line> = Vec::new();
 
     // Question text
-    let wrapped = textwrap::wrap(&qs.question, inner_w.saturating_sub(4));
+    let wrapped = crate::tui::wrap::wrap_words(&qs.question, inner_w.saturating_sub(4));
     for (i, wline) in wrapped.iter().enumerate() {
         let prefix = if i == 0 { "  " } else { "    " };
         lines.push(Line::from(vec![
             Span::styled(prefix, Style::default().fg(theme.fg)),
             Span::styled(
-                wline.to_string(),
+                wline.clone(),
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
             ),
         ]));

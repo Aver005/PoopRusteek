@@ -388,8 +388,15 @@ fn approval(config: &mut Config) -> AppState {
     state.status_message = "Approve tool bash?".to_string();
     state.modal = Some(Modal::ToolApproval {
         tool_name: "bash".to_string(),
-        arguments: r#"{"command":"cargo test --bin pooprusteek items::range -- --nocapture && git diff --stat","timeout":120}"#
-            .to_string(),
+        arguments: concat!(
+            "{\n",
+            "  \"command\": \"cargo test --bin pooprusteek items::range -- --nocapture",
+            " && git diff --stat && cargo clippy --bin pooprusteek -- -D warnings",
+            " && echo the-whole-command-is-visible\",\n",
+            "  \"timeout\": 120\n",
+            "}"
+        )
+        .to_string(),
         origin: Some("sub-agent: refactor tests".to_string()),
         scroll_offset: 0,
         grant: Grant::Once,
