@@ -64,7 +64,14 @@ pub fn match_sample(table: &[Sample], text: &str) -> Option<Rule> {
 pub const MESSAGE_CAP: usize = 2000;
 
 pub fn cap_message(text: &str) -> String {
-    crate::util::truncate_at_char_boundary(text.trim(), MESSAGE_CAP).to_string()
+    safe_text(text, MESSAGE_CAP)
+}
+
+/// Сырой вывод CLI для сообщения или журнала: сначала вычёркиваем секреты, потом режем по
+/// границе символа (секрет, разрезанный раньше, не распознался бы).
+pub fn safe_text(text: &str, cap: usize) -> String {
+    let clean = crate::secrets::redact::redact(text.trim());
+    crate::util::truncate_at_char_boundary(&clean, cap).to_string()
 }
 
 /// Класс отказа Claude по тексту `result`, `api_error_status` и отказу в `rate_limit_event`.
@@ -152,6 +159,29 @@ mod tests {
             Some(Rule::Quota)
         );
         assert_eq!(match_sample(TABLE, "fine"), None);
+    }
+
+    const LEAKY: &str =
+        "boom sk-0123456789abcdef0123456789 and Bearer abcdefghijklmnopqrstuvwx1234 done";
+
+    #[test]
+    fn raw_cli_output_loses_secrets_before_it_reaches_a_message_or_the_log() {
+        for shown in [cap_message(LEAKY), safe_text(LEAKY, 8000)] {
+            assert!(shown.contains("boom") && shown.contains("done"), "{shown}");
+            assert!(!shown.contains("0123456789abcdef"), "{shown}");
+            assert!(!shown.contains("abcdefghijklmnopqrstuvwx"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_secret_that_straddles_the_cut_is_redacted_first_and_ordinary_text_is_untouched() {
+        // Ключ начинается до границы и кончился бы после неё: режем уже вычищенный текст.
+        let text = format!("{} sk-0123456789abcdef0123456789", "a".repeat(30));
+        let cut = safe_text(&text, 40);
+        assert!(!cut.contains("sk-0123"), "{cut}");
+        assert_eq!(safe_text("  plain text  ", 100), "plain text");
+        let wide = safe_text(&"я".repeat(50), 11);
+        assert!(wide.chars().all(|c| c == 'я') && wide.len() <= 11);
     }
 
     #[test]

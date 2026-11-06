@@ -21,7 +21,7 @@ pub struct MockCliArgs {
     #[arg(long, default_value = "claude")]
     pub flavor: String,
 
-    /// success | rate-limit | throttled | not-logged-in | cut-off | cut-off-silent | silence | grandchild |
+    /// success | rate-limit | throttled | not-logged-in | cut-off | cut-off-silent | cut-off-secret | silence | grandchild |
     /// grandchild-fail | unknown-error | garbage | slow-exit | tool-step | old-version | slow-version (the version check takes 1.5 s).
     #[arg(long, default_value = "success")]
     pub scenario: String,
@@ -179,6 +179,10 @@ fn claude_script(scenario: &str) -> Option<Script> {
         )
         .with_stderr("mock: connection reset"),
         "cut-off-silent" => Script::new(vec![claude_init()], Tail::Exit(1)),
+        // Обрыв со строкой, похожей на ключ, в stderr: сообщение и журнал должны её вычеркнуть.
+        "cut-off-secret" => Script::new(vec![claude_init()], Tail::Exit(1)).with_stderr(
+            "mock: boom sk-0123456789abcdef0123456789 Bearer abcdefghijklmnopqrstuvwx1234",
+        ),
         "silence" => Script::new(vec![claude_init()], Tail::Hang),
         "slow-exit" => Script::new(claude_success(), Tail::Hang),
         "grandchild" => Script::new(claude_success(), Tail::Exit(0)).with_grandchild(),

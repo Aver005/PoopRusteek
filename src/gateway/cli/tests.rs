@@ -819,6 +819,25 @@ async fn a_cut_off_stream_is_a_network_failure_and_remembers_whether_text_was_sh
 }
 
 #[tokio::test]
+async fn a_key_like_string_in_stderr_never_reaches_the_error_message() {
+    let rig = Rig::new("secret-stderr");
+    let answer = ask(&claude("cut-off-secret", &rig), "haiku").await;
+    let error = answer.error();
+    assert_eq!(error.class, FailureClass::Network);
+    assert!(error.message.contains("boom"), "{}", error.message);
+    assert!(
+        !error.message.contains("0123456789abcdef"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("abcdefghijklmnopqrstuvwx"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
 async fn silence_longer_than_the_watchdog_is_a_timeout_and_the_process_is_killed() {
     let rig = Rig::new("silence");
     let backend = backend(

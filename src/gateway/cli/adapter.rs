@@ -1,7 +1,7 @@
 //! `Backend` над процессом CLI: один вызов — один процесс в пустой папке, дерево гасится всегда.
 //! Отмена хода (уроненный вызов) убивает дерево сразу и не считается отказом аккаунта.
 
-use super::classify::cap_message;
+use super::classify::{cap_message, safe_text};
 use super::dialect::{Dialect, ModelSource, Plan, check_model};
 use super::discover::{Program, Version};
 use super::launch::Scratch;
@@ -153,10 +153,9 @@ fn estimate(chars: usize) -> u32 {
 /// Отказ по концу процесса без терминального события.
 fn end_failure(end: &End, stderr: &str, emitted: bool) -> (FailureClass, String) {
     let tail = {
-        let trimmed = stderr.trim();
-        let start = trimmed.len().saturating_sub(STDERR_IN_MESSAGE);
-        let start = trimmed.ceil_char_boundary(start);
-        trimmed[start..].trim().to_string()
+        let clean = crate::secrets::redact::redact(stderr.trim());
+        let start = clean.ceil_char_boundary(clean.len().saturating_sub(STDERR_IN_MESSAGE));
+        clean[start..].trim().to_string()
     };
     let with_tail = |text: String| {
         if tail.is_empty() {
@@ -229,7 +228,7 @@ impl Backend for CliBackend {
         let setup = self.setup();
         let model = self.model_for(context);
         if let Err(reason) = check_model(&model) {
-            crate::debug_log::log("gateway.cli.refused", &reason);
+            crate::debug_log::log("gateway.cli.refused", safe_text(&reason, LOG_TEXT_CAP));
             return Err(self.error(FailureClass::BadRequest, reason, false));
         }
         let (system, rest) = split_system_prompt(&request.messages);
@@ -264,7 +263,7 @@ impl Backend for CliBackend {
         let launch = setup.dialect.launch(&plan);
         // Потерянный флаг изоляции не должен пройти молча: лучше отказ, чем агент с инструментами.
         if let Err(reason) = setup.dialect.verify(&launch) {
-            crate::debug_log::log("gateway.cli.refused", &reason);
+            crate::debug_log::log("gateway.cli.refused", safe_text(&reason, LOG_TEXT_CAP));
             return Err(self.error(FailureClass::Server, reason, false));
         }
 
@@ -306,7 +305,7 @@ impl Backend for CliBackend {
                         &serde_json::json!({
                             "account": setup.account.as_str(),
                             "status": failure.status,
-                            "text": crate::util::truncate_at_char_boundary(&failure.message, LOG_TEXT_CAP),
+                            "text": safe_text(&failure.message, LOG_TEXT_CAP),
                         }),
                     );
                 }
@@ -339,7 +338,7 @@ impl Backend for CliBackend {
                 "ms": elapsed.as_millis() as u64,
                 "ok": outcome.is_ok(),
                 "class": outcome.as_ref().err().map(|e| e.class.code()),
-                "stderr": crate::util::truncate_at_char_boundary(ran.stderr.trim(), 1000),
+                "stderr": safe_text(&ran.stderr, 1000),
             }),
         );
 
