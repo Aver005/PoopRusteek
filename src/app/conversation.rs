@@ -56,6 +56,9 @@ pub struct Conversation {
     /// notify / deliver the result). `None` for top-level chats.
     pub parent: Option<ConversationId>,
     pub title: String,
+    /// Заголовок уже просили у служебной модели. Один запрос на чат: отказ,
+    /// пустой ответ и таймаут второго не будет — остаётся `derive_title`.
+    pub title_requested: bool,
     pub session_id: String,
     pub session_started_at: String,
     pub messages: Vec<ChatMessage>,
@@ -98,6 +101,7 @@ impl Conversation {
             kind: ConversationKind::Main,
             parent: None,
             title: String::new(),
+            title_requested: false,
             session_id: crate::session::create_session_id(),
             session_started_at: chrono::Utc::now().to_rfc3339(),
             messages: Vec::new(),

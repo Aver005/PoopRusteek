@@ -508,7 +508,9 @@ fn finish_or_retry(
 
 /// How full the window is, from the one source that knows. A provider holding
 /// the history itself counts what it was actually sent since its session
-/// began; everyone else is measured by the local history we re-send each step.
+/// began — its `usage` tally is the real number; everyone else is measured by
+/// the local history we re-send each step, which is what really goes on the
+/// wire. `session_tokens` of a provider that keeps no session is not that size.
 ///
 /// The single caller feeds all three consumers — `AgentEvent::ContextUsage`,
 /// rung 1 and rung 2 — from the same value, so the status bar can never
@@ -518,9 +520,12 @@ fn context_used(
     system_prompt: &str,
     messages: &[ChatMessage],
 ) -> u32 {
-    provider
-        .session_tokens()
-        .unwrap_or_else(|| crate::context::conversation_tokens(system_prompt, messages))
+    if provider.keeps_server_side_history()
+        && let Some(reported) = provider.session_tokens()
+    {
+        return reported;
+    }
+    crate::context::conversation_tokens(system_prompt, messages)
 }
 
 /// What the ladder already did this turn. Each skip is logged once per turn,
@@ -2764,6 +2769,22 @@ mod tests {
             reset_event,
             Some(11_500),
             "what was reset is what the provider reported holding"
+        );
+    }
+
+    /// Табло без серверной истории — не размер того, что уходит на провод:
+    /// такой провайдер меряется по локальной истории, как раньше.
+    #[tokio::test]
+    async fn a_tally_counts_only_for_a_provider_that_keeps_the_history() {
+        let fake = Arc::new(FakeProvider::with_response("Done.").with_session_tokens(1_000));
+
+        let (_, mut event_rx) =
+            turn_with_session_tokens(&fake, vec![ChatMessage::user("go")]).await;
+
+        let used = reported_usage(&mut event_rx).expect("usage is reported");
+        assert!(
+            used < 1_000,
+            "the wire size is the local history, not a tally of no session: {used}"
         );
     }
 

@@ -22,6 +22,10 @@ impl App {
                 self.state.focused_mut().session_id = s.id.clone();
                 self.state.focused_mut().tag = s.tag.clone();
                 self.state.focused_mut().broken = s.broken;
+                // Загруженный чат уже назван: второй раз модель его не называет.
+                self.state.focused_mut().title = s.title.clone().unwrap_or_default();
+                self.state.focused_mut().title_requested =
+                    !s.title.as_deref().unwrap_or("").trim().is_empty();
                 self.state.scroll_offset = 0;
                 self.state.input.buffer.clear();
                 self.state.input.cursor = 0;
@@ -286,6 +290,7 @@ impl App {
                 model_type: self.config.provider.model.clone(),
                 messages: snapshot,
                 tag: None,
+                title: None,
                 // Not wired to resume yet: `fetch_remote_history` (the only
                 // existing endpoint for this path) doesn't parse a message id
                 // out of `chat/history`'s items, so there's no reliable
@@ -479,6 +484,8 @@ impl App {
             broken,
             remote,
             route: conv.provider.as_ref().and_then(|p| p.route_state()),
+            // Заголовок модели переживает сохранение, которое о нём не знает.
+            title: (!conv.title.trim().is_empty()).then(|| conv.title.clone()),
         };
 
         // Snapshot everything now and hand the write (plus the follow-up

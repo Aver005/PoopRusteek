@@ -24,6 +24,7 @@ mod sessions;
 pub mod system_prompt;
 pub mod themes;
 mod timers;
+pub mod titles;
 pub mod view_state;
 
 use crate::commands::CommandRegistry;
@@ -1005,6 +1006,10 @@ impl App {
             }
             AppEvent::Gateway(event) => self.on_gateway_event(event),
             AppEvent::GatewayBuilt(built) => self.on_gateway_built(built),
+            AppEvent::ChatTitle {
+                conversation,
+                title,
+            } => self.on_chat_title(conversation, title),
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
@@ -1076,6 +1081,7 @@ impl App {
         let goal_end = end
             .clone()
             .filter(|_| self.state.goal.conversation == Some(target));
+        let finished = matches!(end, Some(reduce::TurnEnd::Done));
         match reduce::turn_tail(end, reduce::TurnOwner::classify(focused, background)) {
             reduce::TurnTail::None => {}
             reduce::TurnTail::Background(error) => self.finish_background(target, error),
@@ -1083,6 +1089,10 @@ impl App {
                 self.record_gen_stats();
                 self.auto_save_session();
             }
+        }
+        // Ответ пришёл: заголовок просит служебная модель, в фоне и один раз на чат.
+        if finished {
+            self.maybe_request_chat_title(target);
         }
         // GOAL идёт по своему чату, а не по фокусу: смена чата его не клинит.
         match goal_end {

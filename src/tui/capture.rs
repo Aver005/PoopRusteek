@@ -533,6 +533,7 @@ fn plant_sessions(config: &Config) {
             model_type: model.to_string(),
             messages: vec![ChatMessage::assistant("Готово."), ChatMessage::user(title)],
             tag: None,
+            title: None,
             provider_session_id: None,
             provider_parent_message_id: None,
             broken: false,

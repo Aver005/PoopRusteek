@@ -917,6 +917,32 @@ impl GatewayConfig {
                 );
             }
         }
+
+        // Служебную модель зовут на мелочь: холодный старт CLI (3–4 с) тут дороже
+        // самого ответа. Наследование от `main` — не повод ругаться, там CLI законен.
+        for role in [Role::Title, Role::Summary] {
+            if !self.roles.0.contains_key(&role) {
+                continue;
+            }
+            let Some(route) = self.roles.route_for(role).and_then(|id| self.route(id)) else {
+                continue;
+            };
+            for step in &route.steps {
+                let Some(account) = self.account(&step.account) else {
+                    continue;
+                };
+                if account.provider.cli_tool().is_some() {
+                    add(
+                        Severity::Error,
+                        format!("roles.{role:?}"),
+                        format!(
+                            "route '{}' uses account '{}' ({:?}), whose CLI starts cold (3-4 s): choose an API account for the {role:?} role",
+                            route.id, account.id, account.provider
+                        ),
+                    );
+                }
+            }
+        }
         problems
     }
 
@@ -1054,9 +1080,14 @@ mod tests {
           { account = "lmstudio" },
         ]
 
+        [[routes]]
+        id = "cheap"
+        steps = [{ account = "opencode-work" }]
+
         [roles]
         main = "coding"
-        title = "coding"
+        title = "cheap"
+        summary = "cheap"
     "#;
 
     #[test]
@@ -1597,5 +1628,53 @@ provider = \"cli:claude\"
         assert_eq!(CliTool::Opencode.home_env_var(), "XDG_DATA_HOME");
         assert!(CliTool::Claude.pure_model_verified() && CliTool::Opencode.pure_model_verified());
         assert!(!CliTool::Codex.pure_model_verified());
+    }
+
+    /// Служебные роли не ставятся на CLI: холодный старт дороже самого ответа.
+    #[test]
+    fn title_and_summary_refuse_cli_accounts_while_main_may_use_them() {
+        let base = r#"
+            [[accounts]]
+            id = "cli"
+            provider = "cli:claude"
+            home = "/h"
+            [[accounts]]
+            id = "api"
+            provider = "openai"
+            model = "m"
+            [[routes]]
+            id = "coding"
+            steps = [{ account = "cli" }]
+            [[routes]]
+            id = "cheap"
+            steps = [{ account = "api" }]
+        "#;
+        // Основной чат на CLI — обычное дело.
+        assert!(errors(&parse(base)).is_empty());
+        // Наследование от `main` тоже не наказывается.
+        assert!(
+            errors(&parse(&format!("{base}\n[roles]\nmain = \"coding\"\n"))).is_empty(),
+            "a role that inherits main is not a service role of its own"
+        );
+        // Явная роль на CLI — понятная ошибка.
+        for role in ["title", "summary"] {
+            let config = parse(&format!(
+                "{base}\n[roles]\nmain = \"coding\"\n{role} = \"coding\"\n"
+            ));
+            let found = errors(&config).join("\n");
+            let path = if role == "title" {
+                "roles.Title"
+            } else {
+                "roles.Summary"
+            };
+            assert!(found.contains(path), "{role}: {found}");
+            assert!(found.contains("starts cold"), "{role}: {found}");
+            assert!(found.contains("account 'cli'"), "{role}: {found}");
+        }
+        // Дешёвый API-маршрут проходит.
+        let cheap = parse(&format!(
+            "{base}\n[roles]\nmain = \"coding\"\ntitle = \"cheap\"\nsummary = \"cheap\"\n"
+        ));
+        assert!(errors(&cheap).is_empty());
     }
 }

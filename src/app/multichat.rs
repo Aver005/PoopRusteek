@@ -6,8 +6,21 @@
 use super::{App, conversation, generation};
 use crate::app::events::AppEvent;
 use crate::error::AppResult;
+use crate::gateway::handle::CallSource;
+use crate::gateway::types::Role as ServiceRole;
 use crate::provider::{ChatMessage, Role};
 use std::sync::Arc;
+
+/// Сводку делает служебная модель, если роль настроена; иначе прежний провайдер
+/// чата. Форк одноразовый в любом случае: серверная сессия беседы не пачкается.
+fn summariser_for(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    chat: &Arc<dyn crate::provider::LLMProvider>,
+) -> Arc<dyn crate::provider::LLMProvider> {
+    gateway
+        .provider_for_role(ServiceRole::Summary, CallSource::Role(ServiceRole::Summary))
+        .map_or_else(|| chat.fork(), |provider| provider.fork())
+}
 
 /// Fire-and-forget deletion of an ephemeral conversation's server-side
 /// session — one-shot sidechat/sub-agent runs must not pile up junk chats on
@@ -23,9 +36,14 @@ fn discard_remote_session_of(conv: &conversation::Conversation) {
     }
 }
 
-/// A short display title for a conversation, from its first user message.
-fn conversation_title(messages: &[ChatMessage]) -> String {
-    messages
+/// A short display title for a conversation: the service title when one arrived,
+/// otherwise the opening of the first user message.
+pub(crate) fn conversation_title(conv: &conversation::Conversation) -> String {
+    let service = conv.title.trim();
+    if !service.is_empty() {
+        return service.to_string();
+    }
+    conv.messages
         .iter()
         .find(|m| m.role == Role::User)
         .map(|m| {
@@ -96,6 +114,7 @@ impl App {
                 kind,
                 parent: Some(parent),
                 title,
+                title_requested: true,
                 session_id,
                 session_started_at: chrono::Utc::now().to_rfc3339(),
                 messages,
@@ -268,6 +287,7 @@ impl App {
             kind: conversation::ConversationKind::Session,
             parent: None,
             title: String::new(),
+            title_requested: false,
             session_id: crate::session::create_session_id(),
             session_started_at: chrono::Utc::now().to_rfc3339(),
             messages: Vec::new(),
@@ -341,7 +361,7 @@ impl App {
             let marker = if conv.id == focused { "● " } else { "  " };
             let label = format!(
                 "{marker}{}{}",
-                conversation_title(&conv.messages),
+                conversation_title(conv),
                 if conv.is_streaming() {
                     "  [streaming]"
                 } else {
@@ -454,13 +474,14 @@ impl App {
         let model = self.config.active_model().to_string();
         let event_tx = self.event_tx.clone();
         let snapshot_len = messages.len();
+        // Служебная роль выбирается на цикле событий, зовёт модель — уже в фоне.
+        let summariser = summariser_for(&self.gateway, &provider);
         self.state.status_message = format!("Compacting with mode {}…", mode.number());
         let handle = tokio::spawn(async move {
             // Summarise on a throwaway fork, never on the chat's own handle: a
             // DeepSeek provider would otherwise write the summariser prompt and
             // its reply into the live server branch the user can open in the
             // web UI.
-            let summariser = provider.fork();
             let outcome =
                 crate::context::compact::compact(&summariser, &messages, mode, usable, &model)
                     .await;
@@ -538,5 +559,58 @@ impl App {
         if conversation == self.state.conversations.focused_id() {
             self.state.status_message = status;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::handle::{DisabledGateway, GatewayHandle};
+    use crate::gateway::testkit::{FakeBackend, rig};
+    use crate::provider::fake::FakeProvider;
+
+    const SUMMARY_RIG: &str = r#"
+        [gateway]
+        enabled = true
+
+        [[accounts]]
+        id = "cheap"
+        provider = "custom"
+        base_url = "http://cheap.invalid/v1"
+        secret = "none"
+        model = "cheap-model"
+
+        [[routes]]
+        id = "main"
+        steps = [{ account = "cheap" }]
+
+        [[routes]]
+        id = "cheap"
+        steps = [{ account = "cheap" }]
+
+        [roles]
+        main = "main"
+        summary = "cheap"
+    "#;
+
+    /// Обе стороны: без роли сводку делает провайдер чата, с ролью — служебный.
+    #[test]
+    fn the_summary_role_takes_the_compaction_call_only_when_it_is_set() {
+        let chat: Arc<dyn crate::provider::LLMProvider> =
+            Arc::new(FakeProvider::with_response("сводка"));
+        let off: GatewayHandle = Arc::new(DisabledGateway::new());
+        assert_eq!(
+            summariser_for(&off, &chat).model(),
+            "fake",
+            "a disabled gateway keeps the chat's own provider"
+        );
+
+        let rig = rig(SUMMARY_RIG, vec![("cheap", FakeBackend::new(vec![]))]);
+        let on: GatewayHandle = Arc::new(rig.engine);
+        assert_eq!(
+            summariser_for(&on, &chat).model(),
+            "auto/cheap",
+            "the configured role serves the summary"
+        );
     }
 }
