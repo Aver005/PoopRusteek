@@ -156,8 +156,14 @@ async fn collect(
     let stream_provider = Arc::clone(provider);
     // Гард, а не голый хэндл: отменённый ход роняет этот future, и задача
     // стрима умирает с ним, а не дочитывает ответ сиротой. Ранние `return` тоже.
+    // Отдельная задача теряет чат хода; шлюзу он нужен, чтобы положить шов в свой чат.
+    let chat = crate::gateway::handle::current_chat();
     let mut stream_task = crate::util::AbortOnDrop::spawn(async move {
-        stream_provider.complete_stream(request, tx).await
+        let call = stream_provider.complete_stream(request, tx);
+        match chat {
+            Some(chat) => crate::gateway::handle::with_chat(chat, call).await,
+            None => call.await,
+        }
     });
 
     let mut text = String::new();
@@ -355,6 +361,53 @@ mod tests {
         .expect("collect_stream must not wait forever after a stop chunk");
         assert_eq!(outcome.text, "done");
         assert_eq!(outcome.verdict(), StreamVerdict::Ok);
+    }
+
+    /// Говорит, какой чат видит задача стрима.
+    struct ReportsItsChat;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for ReportsItsChat {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> crate::error::AppResult<crate::provider::CompletionResponse> {
+            unreachable!("collect_stream streams")
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+            tx: mpsc::UnboundedSender<crate::provider::CompletionChunk>,
+        ) -> crate::error::AppResult<()> {
+            let seen = crate::gateway::handle::current_chat();
+            let _ = tx.send(crate::provider::CompletionChunk {
+                content: format!("{seen:?}"),
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+            });
+            Ok(())
+        }
+
+        fn model(&self) -> &str {
+            "reports"
+        }
+
+        fn fork(&self) -> Arc<dyn LLMProvider> {
+            Arc::new(ReportsItsChat)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stream_task_keeps_the_chat_of_its_turn() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(ReportsItsChat);
+        let inside =
+            crate::gateway::handle::with_chat(7, collect_stream(&provider, request(), |_| {}))
+                .await;
+        assert_eq!(inside.text, "Some(7)", "the chat id crosses the spawn");
+        let outside = collect_stream(&provider, request(), |_| {}).await;
+        assert_eq!(outside.text, "None", "no turn, no chat");
     }
 
     #[tokio::test]

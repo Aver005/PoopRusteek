@@ -105,6 +105,38 @@ async fn a_rate_limited_first_account_falls_back_before_anything_is_shown() {
     assert_eq!(rig.fakes["b"].call_count(), 2);
 }
 
+/// Событие переключения несёт чат хода: по нему шов ложится в свой чат, а не в фокусный.
+#[tokio::test]
+async fn the_fallback_event_names_the_chat_of_the_turn() {
+    let chat_of = |events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>| {
+        let mut found = None;
+        while let Ok(event) = events.try_recv() {
+            if let GatewayEvent::FallbackTaken { conversation, .. } = event {
+                found = Some(conversation);
+            }
+        }
+        found.expect("the fallback was announced")
+    };
+
+    let rig = pair(vec![Act::Fail(rate_limit(40))], vec![Act::Reply("from b")]);
+    let mut events = rig.engine.subscribe();
+    let provider = rig.main();
+    let (result, _) = super::handle::with_chat(42, ask(&provider, "hello")).await;
+    result.unwrap();
+    assert_eq!(chat_of(&mut events), Some(42));
+
+    let rig = pair(vec![Act::Fail(rate_limit(40))], vec![Act::Reply("from b")]);
+    let mut events = rig.engine.subscribe();
+    let provider = rig.main();
+    let (result, _) = ask(&provider, "hello").await;
+    result.unwrap();
+    assert_eq!(
+        chat_of(&mut events),
+        None,
+        "a call outside a chat has no chat"
+    );
+}
+
 /// Положительный случай для чистой беседы: после срока новый разговор снова идёт на a.
 #[tokio::test]
 async fn the_first_account_is_used_again_by_a_new_chat_once_its_wait_is_over() {

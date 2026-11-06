@@ -550,8 +550,28 @@ pub enum GatewayEvent {
         to: AccountId,
         class: FailureClass,
         source: CallSource,
+        /// Чат, чей вызов переключился (`ConversationId.0`); `None` — вызов вне чата.
+        conversation: Option<u64>,
     },
     ConfigChanged,
+}
+
+tokio::task_local! {
+    /// Чат текущего хода: так шов в истории попадает в тот чат, что переключился.
+    static CHAT: u64;
+}
+
+/// Выполнить ход от имени чата. Вложенный вызов (суб-агент) остаётся в чате родителя.
+pub async fn with_chat<F: std::future::Future>(chat: u64, future: F) -> F::Output {
+    match current_chat() {
+        Some(_) => future.await,
+        None => CHAT.scope(chat, future).await,
+    }
+}
+
+/// Чат, от имени которого идёт вызов; `None` — вызов не из хода чата.
+pub fn current_chat() -> Option<u64> {
+    CHAT.try_with(|chat| *chat).ok()
 }
 
 /// Готов ли шлюз: сборка идёт на `spawn_blocking`, пока она идёт или упала, снимок пуст.

@@ -346,6 +346,8 @@ pub enum AppEvent {
     GatewayPersist(Box<crate::gateway::types::GatewayConfig>),
     /// Мастер аккаунта: секрет записан в хранилище вне цикла событий, можно править шлюз.
     AccountStored(Box<crate::app::gateway_view::AccountPlan>),
+    /// То же при выключенном шлюзе: запись `[[providers]]` записана, ключ — в хранилище.
+    LegacyProviderStored(Box<crate::app::gateway_view::LegacyPlan>),
     /// Конфиг перечитан вне цикла событий (после команды, `/cd`, подтверждения проекта).
     ConfigReloaded(Box<Result<crate::config::Config, String>>),
     /// Время изменения файла проектного слоя (`None` — файла нет).

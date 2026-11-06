@@ -509,17 +509,20 @@ impl AppState {
 
     /// Append a system message to the focused conversation.
     pub fn push_system(&mut self, content: &str) {
+        // Заметка уходит в сессию и модели: ключ, попавший в текст, вычёркивается здесь.
+        let content = crate::secrets::redact::redact(content);
         self.focused_mut()
             .messages
-            .push(ChatMessage::system(content));
+            .push(ChatMessage::system(&content));
     }
 
     /// Сообщение только для человека. Не путать с `push_system`: тот уезжает
     /// модели в каждом последующем запросе, а такие заметки ей не нужны.
     pub fn push_ui_system(&mut self, content: &str) {
+        let content = crate::secrets::redact::redact(content);
         self.focused_mut()
             .messages
-            .push(ChatMessage::ui_system(content));
+            .push(ChatMessage::ui_system(&content));
     }
 
     /// Reset the focused conversation's chat view: wipe its messages and
@@ -1120,6 +1123,7 @@ impl App {
             } => self.on_chat_title(conversation, title),
             AppEvent::GatewayPersist(next) => self.on_gateway_persist(*next),
             AppEvent::AccountStored(plan) => self.on_account_stored(*plan),
+            AppEvent::LegacyProviderStored(plan) => self.on_legacy_provider_stored(*plan),
             AppEvent::ConfigReloaded(loaded) => self.on_config_reloaded(*loaded),
             AppEvent::ProjectConfigStamp(stamp) => self.on_project_stamp(stamp),
             AppEvent::HistorySearchDone { query, matches } => {
@@ -1156,6 +1160,7 @@ impl App {
                 self.state.status_message =
                     gateway_startup_note(&self.gateway).unwrap_or_else(|| "Gateway ready".into());
                 self.refresh_gateway_view();
+                self.refresh_pins();
                 self.adopt_provider_after_edit();
             }
             Err(reason) => {
@@ -1558,6 +1563,16 @@ impl App {
 
     pub(crate) fn rebuild_provider(&mut self) {
         self.rebuild_gateway_if_stale();
+        // Закреплённый чат остаётся на своём аккаунте: пин пересобирается, а не сбрасывается.
+        self.refresh_pins();
+        if self
+            .state
+            .gateway_view
+            .pins
+            .contains_key(&self.state.conversations.focused_id())
+        {
+            return;
+        }
         switch_provider(
             &mut self.state,
             crate::gateway::handle::main_provider(&self.config, Some(&self.gateway)),

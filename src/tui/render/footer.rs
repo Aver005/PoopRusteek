@@ -56,8 +56,8 @@ fn status_worth_showing(state: &AppState) -> bool {
 /// Одного аккаунта и выключенного шлюза нет в подвале вовсе.
 fn account_indicator(state: &AppState) -> Option<String> {
     let focused = state.conversations.focused_id();
-    if let Some(label) = state.gateway_view.pins.get(&focused) {
-        return Some(format!("pinned {label}"));
+    if let Some(pin) = state.gateway_view.pins.get(&focused) {
+        return Some(format!("pinned {}", pin.label));
     }
     let (mark, _, label, others) = super::accounts::footer_account(&state.gateway_view)?;
     let glyph = super::accounts::footer_glyph(mark);
@@ -68,16 +68,41 @@ fn account_indicator(state: &AppState) -> Option<String> {
     })
 }
 
+/// Модель, что отвечает при включённом шлюзе: у закреплённого чата своя, иначе по последнему выбору.
+fn gateway_model(state: &AppState) -> Option<String> {
+    use crate::app::gateway_view::rows::last_decision_model;
+    let view = &state.gateway_view;
+    let snapshot = view.snapshot.as_ref()?;
+    if let Some(pin) = view.pins.get(&state.conversations.focused_id()) {
+        return pin.model.clone().or_else(|| {
+            snapshot
+                .accounts
+                .iter()
+                .find(|a| a.id == pin.account)
+                .and_then(|a| a.default_model.clone())
+        });
+    }
+    last_decision_model(snapshot)
+}
+
 fn left_segments(state: &AppState, config: &Config, dock_visible: bool) -> Vec<Segment> {
-    let model = config.active_model();
-    let mut left = vec![
-        Segment::new(
-            1,
-            Tone::Plain,
-            format!(" {} \u{00B7} {model}", provider_label(config)),
-        )
-        .or_short(format!(" {model}")),
-    ];
+    let mut left = Vec::new();
+    if state.gateway_view.enabled {
+        // Со шлюзом `[provider]` и `active_provider` ничего не значат: называем то, что отвечает.
+        if let Some(model) = gateway_model(state) {
+            left.push(Segment::new(1, Tone::Plain, format!(" {model}")));
+        }
+    } else {
+        let model = config.active_model();
+        left.push(
+            Segment::new(
+                1,
+                Tone::Plain,
+                format!(" {} \u{00B7} {model}", provider_label(config)),
+            )
+            .or_short(format!(" {model}")),
+        );
+    }
     if let Some(account) = account_indicator(state) {
         left.push(Segment::new(2, Tone::Plain, format!(" \u{00B7} {account}")));
     }

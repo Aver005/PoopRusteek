@@ -108,8 +108,10 @@ pub(super) async fn run_tool_calls(
             chars_sent: for_model.chars().count(),
         });
 
+        // В ленту идёт не 200 байт: у команды важен хвост с итогом и кодом выхода.
+        let display = result_display(&name, &text, whole);
         let message =
-            ChatMessage::tool_with_display(&tool_id, &name, &for_model, &preview, is_error);
+            ChatMessage::tool_with_display(&tool_id, &name, &for_model, &display, is_error);
         messages.push(message.clone());
         collected.push(ToolCallInfo {
             name,
@@ -499,6 +501,34 @@ fn refuse_non_object(name: &str, arguments: &serde_json::Value) -> Option<ToolOu
     )))
 }
 
+/// Сколько байт вывода команды хранится в ленте: хвост, а не начало.
+const SHELL_DISPLAY_BYTES: usize = 6_000;
+
+/// Оболочки: их вывод показывается с конца, и там же подпись `[exit code N]`.
+pub(crate) fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "powershell")
+}
+
+/// Текст результата для ленты и сохранённой истории (модель получает другой).
+/// Команды держат хвост вместе с кодом выхода, остальные инструменты — короткую выжимку.
+pub(crate) fn result_display(name: &str, text: &str, whole: bool) -> String {
+    if whole {
+        return text.to_string();
+    }
+    if !is_shell_tool(name) {
+        return summarize_tool_result(text);
+    }
+    let trimmed = text.trim();
+    if trimmed.len() <= SHELL_DISPLAY_BYTES {
+        return trimmed.to_string();
+    }
+    let from = trimmed.ceil_char_boundary(trimmed.len() - SHELL_DISPLAY_BYTES);
+    let tail = &trimmed[from..];
+    // Обрезанную посередине строку отбрасываем целиком.
+    let tail = tail.split_once('\n').map_or(tail, |(_, rest)| rest);
+    format!("\u{2026}\n{tail}")
+}
+
 /// Короткая выжимка для строки состояния и для трассы. Режет по границе
 /// символа через общий помощник (инвариант 4), а не своей копией.
 fn summarize_tool_result(result: &str) -> String {
@@ -567,6 +597,25 @@ mod tests {
         let result = summarize_tool_result(&"😀".repeat(60));
         assert!(result.len() <= 203);
         assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn a_command_keeps_its_tail_and_exit_code_in_the_feed() {
+        let body = (0..2_000)
+            .map(|n| format!("line {n} ü"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = format!("{body}\ntest result: FAILED. 1 failed\n[exit code 101]");
+        let shown = result_display("bash", &result, false);
+        assert!(shown.ends_with("[exit code 101]"), "{shown}");
+        assert!(shown.contains("1 failed"));
+        assert!(shown.len() <= SHELL_DISPLAY_BYTES + 8, "{}", shown.len());
+        assert!(shown.starts_with('\u{2026}'), "the cut is marked");
+        // Начало и не-команды остаются короткой выжимкой.
+        assert!(!shown.contains("line 0 "));
+        assert!(result_display("read_file", &result, false).len() <= 203);
+        assert_eq!(result_display("read_file", &result, true), result);
+        assert_eq!(result_display("bash", " ok \n", false), "ok");
     }
 
     #[test]

@@ -98,9 +98,15 @@ impl App {
                         self.spawn_mcp_add(entries);
                     }
                     Err(reason) => {
-                        self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                                    &format!("Couldn't parse \"/mcp add {raw}\" as a quick config ({reason}) \u{2014} pick a method:"),
-                                ));
+                        // Строку не повторяем: в ней env и заголовки с токенами.
+                        let hidden: Vec<&str> = raw
+                            .split(|c: char| c.is_whitespace() || "\"'{}[],:=".contains(c))
+                            .filter(|word| word.chars().count() >= 6)
+                            .collect();
+                        let reason = crate::app::gateway_view::echo_safe(&reason, &hidden);
+                        self.state.push_ui_system(&format!(
+                            "Couldn't read the quick config ({reason}) \u{2014} pick a method:"
+                        ));
                         self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
                     }
                 },
@@ -190,8 +196,13 @@ impl App {
                             crate::app::gateway_view::wizard::AccountWizard::from_quick(&entry)
                         }
                         Err(reason) => {
+                            // Строку не повторяем: в ней может быть ключ.
+                            let key: Vec<&str> = crate::app::gateway_view::quick_key_token(raw)
+                                .into_iter()
+                                .collect();
+                            let reason = crate::app::gateway_view::echo_safe(&reason, &key);
                             self.state.push_ui_system(&format!(
-                                "Couldn't parse \"{raw}\" ({reason}) - opening the wizard:"
+                                "Couldn't read the quick form ({reason}) - opening the wizard:"
                             ));
                             crate::app::gateway_view::wizard::AccountWizard::new()
                         }
@@ -537,5 +548,91 @@ impl App {
             self.config.semantic.min_dense_score,
             self.config.semantic.mcp_schemas,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::CommandResult;
+
+    const CANARY: &str = "sk-test-canary-0123456789abcdef";
+
+    async fn app() -> App {
+        let mut config = crate::config::Config::default();
+        config.semantic.enabled = false;
+        config.update.auto = false;
+        App::new(config).await.expect("the app starts")
+    }
+
+    fn everything_said(app: &App) -> String {
+        app.state
+            .focused()
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Ошибка разбора быстрой формы с ключом: ни строка, ни ключ не попадают в чат и сессию.
+    #[tokio::test]
+    async fn a_failed_quick_add_never_echoes_the_line_or_the_key() {
+        let mut app = app().await;
+        let raw = format!("lm http://localhost:1234/v1 model {CANARY} extra");
+        app.apply_command_result(CommandResult::OpenAccountAdd(Some(raw)))
+            .await
+            .unwrap();
+        let said = everything_said(&app);
+        assert!(said.contains("Couldn't read the quick form"), "{said}");
+        assert!(
+            !said.contains("canary") && !said.contains("localhost:1234"),
+            "{said}"
+        );
+        let session = serde_json::to_string(&app.state.focused().messages).unwrap();
+        assert!(
+            !session.contains("canary"),
+            "not in the saved session either"
+        );
+    }
+
+    /// Ключ на месте имени: сообщение «имя занято/неверно» тоже ключа не показывает.
+    #[tokio::test]
+    async fn a_key_pasted_where_the_name_goes_is_masked_in_the_reason() {
+        let mut app = app().await;
+        let raw = format!("{CANARY} not-a-url");
+        app.apply_command_result(CommandResult::OpenAccountAdd(Some(raw)))
+            .await
+            .unwrap();
+        assert!(!everything_said(&app).contains("canary"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_mcp_quick_add_does_not_echo_env_or_tokens() {
+        let mut app = app().await;
+        let raw = format!(r#"{{"servers": {{"x": {{"env": {{"TOKEN": "{CANARY}"}}, }}}}"#);
+        app.apply_command_result(CommandResult::OpenMcpAdd(Some(raw)))
+            .await
+            .unwrap();
+        let said = everything_said(&app);
+        assert!(said.contains("Couldn't read the quick config"), "{said}");
+        assert!(
+            !said.contains("canary") && !said.contains("TOKEN"),
+            "{said}"
+        );
+    }
+
+    /// Любая заметка, что уходит в чат и модели, вычёркивает ключи: и точные, и по виду.
+    #[tokio::test]
+    async fn system_notes_redact_key_shapes_before_they_reach_history() {
+        let mut app = app().await;
+        app.state
+            .push_system(&format!("Unknown tool protocol '{CANARY}'"));
+        app.state
+            .push_ui_system(&format!("No account named '{CANARY}'"));
+        assert!(!everything_said(&app).contains("canary"));
+        // Обратная сторона: обычный текст не страдает.
+        app.state.push_ui_system("Pinned this chat to claude-max.");
+        assert!(everything_said(&app).contains("claude-max"));
     }
 }

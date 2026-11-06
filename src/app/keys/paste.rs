@@ -28,6 +28,15 @@ fn sanitize(text: &str, allow_newline: bool) -> String {
         .collect()
 }
 
+/// Секрет в скрытое поле идёт одной строкой: перевод строки в середине молча склеил бы другое значение.
+fn single_line_secret(text: &str) -> Result<&str, &'static str> {
+    let value = text.trim_end_matches(['\n', '\r']);
+    if value.contains(['\n', '\r']) {
+        return Err("the value has line breaks; paste a single-line token");
+    }
+    Ok(value)
+}
+
 impl App {
     /// Брошенные файлы — чипами в поле ввода у курсора.
     fn attach_dropped(&mut self, paths: &[std::path::PathBuf]) {
@@ -94,12 +103,18 @@ impl App {
                         Step::Label => wiz.label.insert_str(&clean),
                         Step::BaseUrl => wiz.base_url.insert_str(&clean),
                         Step::Model => wiz.model.insert_str(&clean),
-                        Step::Secret => wiz.secret.push_str(&clean),
+                        Step::Secret => match single_line_secret(&text) {
+                            Ok(value) => wiz.secret.push_str(value),
+                            Err(error) => wiz.error = Some(error.to_string()),
+                        },
                         _ => {}
                     }
                 }
                 // Вставка секрета идёт мимо поля ввода и истории: только в скрытое поле.
-                Modal::SecretPrompt(prompt) => prompt.value.push_str(&sanitize(&text, false)),
+                Modal::SecretPrompt(prompt) => match single_line_secret(&text) {
+                    Ok(value) => prompt.value.push_str(value),
+                    Err(error) => prompt.error = Some(error.to_string()),
+                },
                 Modal::AccountLimits(form) => form.current().insert_str(&sanitize(&text, false)),
                 // No text field: tool-approval, delete-sessions, confirm, and a
                 // non-custom (option-list) question.

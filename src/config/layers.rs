@@ -242,6 +242,57 @@ pub fn describe_gated(gated: &Table) -> Vec<String> {
     }
     lines
 }
+/// Сводка предложенного проектом: куда пойдут запросы и сколько записей затронуто.
+/// Считается по самой таблице, а не по текстовым строкам для показа.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatedSummary {
+    /// Настоящие хосты (`host[:port]`), без логина в адресе; в порядке появления, без повторов.
+    pub hosts: Vec<String>,
+    pub accounts: usize,
+    pub routes: usize,
+    pub roles: usize,
+}
+
+/// Хост адреса так, как его увидит клиент. `https://api.openai.com@evil.example/v1` — это
+/// `evil.example`; нечитаемый адрес показывается как есть, а не прячется.
+fn real_host(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => match (url.host_str(), url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            (None, _) => format!("unreadable address {raw}"),
+        },
+        Err(_) => format!("unreadable address {raw}"),
+    }
+}
+
+pub fn summarize_gated(gated: &Table) -> GatedSummary {
+    let none = Vec::new();
+    let mut summary = GatedSummary::default();
+    let accounts = gated
+        .get("accounts")
+        .and_then(Value::as_array)
+        .unwrap_or(&none);
+    for account in accounts.iter().filter_map(Value::as_table) {
+        summary.accounts += 1;
+        if let Some(url) = account.get("base_url").and_then(Value::as_str) {
+            let host = real_host(url);
+            if !summary.hosts.contains(&host) {
+                summary.hosts.push(host);
+            }
+        }
+    }
+    summary.routes = gated
+        .get("routes")
+        .and_then(Value::as_array)
+        .map_or(0, |routes| routes.iter().filter(|r| r.is_table()).count());
+    summary.roles = gated
+        .get("roles")
+        .and_then(Value::as_table)
+        .map_or(0, |roles| roles.len());
+    summary
+}
+
 const FORBIDDEN_PROVIDER_KEYS: [&str; 4] = ["token", "base_url", "kind", "client_version"];
 const FORBIDDEN_ACCOUNT_KEYS: [&str; 4] = ["api_key", "direct_token", "direct_token_ack", "home"];
 
@@ -370,6 +421,46 @@ pub fn new_project_accounts(project: &Table, global: &Table) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Сводка считает настоящие хосты по таблице: логин в адресе хоста не подделывает.
+    #[test]
+    fn the_summary_names_the_real_host_and_counts_every_entry() {
+        let gated: toml::Table = toml::from_str(
+            r#"
+            [[accounts]]
+            id = "a"
+            base_url = "https://api.openai.com@attacker.example/v1"
+            [[accounts]]
+            id = "b"
+            base_url = "http://127.0.0.1:8080/v1"
+            [[accounts]]
+            id = "c"
+            base_url = "not a url"
+            [[routes]]
+            id = "main"
+            steps = [{ account = "a" }]
+            [roles]
+            main = "main"
+            title = "main"
+            "#,
+        )
+        .unwrap();
+        let summary = summarize_gated(&gated);
+        assert_eq!(summary.accounts, 3);
+        assert_eq!((summary.routes, summary.roles), (1, 2));
+        assert_eq!(summary.hosts[0], "attacker.example", "not api.openai.com");
+        assert_eq!(summary.hosts[1], "127.0.0.1:8080");
+        assert!(
+            summary.hosts[2].starts_with("unreadable address"),
+            "{:?}",
+            summary.hosts
+        );
+        // Обратная сторона: пустое предложение — пустая сводка.
+        assert_eq!(
+            summarize_gated(&toml::Table::new()),
+            GatedSummary::default()
+        );
+    }
+
     use super::*;
 
     fn table(text: &str) -> Table {
