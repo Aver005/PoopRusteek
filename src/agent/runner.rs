@@ -1335,6 +1335,7 @@ mod tests {
             tool_calls: Vec::new(),
             stop_reason: None,
             end: crate::agent::stream::StreamEnd::IdleTimeout,
+            failure: None,
         };
         let trace = StepTrace::new(ConversationId::next(), 1, 1);
         let notes = classify_stream(&outcome, &trace);

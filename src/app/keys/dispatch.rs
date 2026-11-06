@@ -18,6 +18,22 @@ impl App {
     pub(super) async fn apply_command_result(&mut self, result: CommandResult) -> AppResult<bool> {
         match result {
             CommandResult::Handled => {}
+            CommandResult::Detached(job) => {
+                let tx = self.event_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let message = job();
+                    let first = message.lines().next().unwrap_or("").to_string();
+                    let _ = tx.send(events::AppEvent::UpdateStatus {
+                        message,
+                        notable: true,
+                    });
+                    // Строка состояния — одна строка: полный текст уже в чате.
+                    let _ = tx.send(events::AppEvent::UpdateStatus {
+                        message: first,
+                        notable: false,
+                    });
+                });
+            }
             CommandResult::LoadSession(id) => {
                 self.handle_load_session(&id).await?;
             }

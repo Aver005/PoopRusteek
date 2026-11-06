@@ -226,12 +226,73 @@ pub struct ContentBlock {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AnthropicUsage {
     #[serde(default)]
-    pub input_tokens: u32,
+    pub input_tokens: Option<u32>,
     #[serde(default)]
-    pub output_tokens: u32,
+    pub output_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OutputTokensDetails {
+    #[serde(default)]
+    pub thinking_tokens: Option<u32>,
+}
+
+impl AnthropicUsage {
+    /// Поля, которых в новом событии нет, остаются прежними: `message_start`
+    /// несёт вход, `message_delta` — итог выхода.
+    pub fn merge(&mut self, newer: AnthropicUsage) {
+        self.input_tokens = newer.input_tokens.or(self.input_tokens);
+        self.output_tokens = newer.output_tokens.or(self.output_tokens);
+        self.cache_read_input_tokens = newer
+            .cache_read_input_tokens
+            .or(self.cache_read_input_tokens);
+        self.cache_creation_input_tokens = newer
+            .cache_creation_input_tokens
+            .or(self.cache_creation_input_tokens);
+        self.output_tokens_details = newer
+            .output_tokens_details
+            .or(self.output_tokens_details.take());
+    }
+
+    /// Вход у Anthropic не включает кэш — в `Usage` он складывается целиком.
+    pub fn to_usage(&self) -> Usage {
+        let read = self.cache_read_input_tokens.unwrap_or(0);
+        let write = self.cache_creation_input_tokens.unwrap_or(0);
+        let prompt = self.input_tokens.unwrap_or(0) + read + write;
+        let completion = self.output_tokens.unwrap_or(0);
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cache_read_tokens: self.cache_read_input_tokens,
+            cache_write_tokens: self.cache_creation_input_tokens,
+            reasoning_tokens: self
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.thinking_tokens),
+        }
+    }
+}
+
+/// Расход из события потока: `message_start` (`message.usage`) или
+/// `message_delta` (`usage`). Остальные события расхода не несут.
+pub fn stream_usage(payload: &str) -> Option<AnthropicUsage> {
+    let event: Value = serde_json::from_str(payload).ok()?;
+    let usage = match event.get("type").and_then(Value::as_str)? {
+        "message_start" => event.get("message")?.get("usage")?,
+        "message_delta" => event.get("usage")?,
+        _ => return None,
+    };
+    serde_json::from_value(usage.clone()).ok()
 }
 
 /// Model families that reject sampling parameters (`temperature`/`top_p`/
@@ -272,11 +333,7 @@ pub fn response_from_anthropic(response: MessagesResponse) -> CompletionResponse
     CompletionResponse {
         content,
         finish_reason: response.stop_reason.map(map_stop_reason),
-        usage: response.usage.map(|usage| Usage {
-            prompt_tokens: usage.input_tokens,
-            completion_tokens: usage.output_tokens,
-            total_tokens: usage.input_tokens + usage.output_tokens,
-        }),
+        usage: response.usage.map(|usage| usage.to_usage()),
     }
 }
 
@@ -404,9 +461,23 @@ pub struct AnthropicStreamState {
     pending: BTreeMap<u64, PendingToolCall>,
     completed: Vec<ToolCall>,
     finish_reason: Option<String>,
+    usage: Option<AnthropicUsage>,
 }
 
 impl AnthropicStreamState {
+    /// Влить расход очередного события.
+    pub fn merge_usage(&mut self, newer: AnthropicUsage) {
+        match &mut self.usage {
+            Some(known) => known.merge(newer),
+            None => self.usage = Some(newer),
+        }
+    }
+
+    /// Накопленный расход, если сервер его присылал.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage.as_ref().map(AnthropicUsage::to_usage)
+    }
+
     pub fn start_tool(&mut self, index: u64, id: String, name: String) {
         self.pending.insert(
             index,

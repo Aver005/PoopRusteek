@@ -18,6 +18,7 @@ use crate::agent::stream::{
 };
 use crate::config::ProviderProtocol;
 use crate::error::AppError;
+use crate::provider::failure::FailureClass;
 use crate::provider::openai_compat::{
     self, ChatCompletionRequest, ChatCompletionResponse, Choice, CompletionMeta, ErrorResponse,
     MessageContent, ReasoningStreamSplitter, WireToolCall,
@@ -236,14 +237,33 @@ const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 
 /// Ошибка апстрима и её HTTP-код: клиент должен отличать «подожди» (429),
 /// «не дождались» (504) и «апстрим сломан» (502) — всё было 500.
+const UPSTREAM_AUTH_MESSAGE: &str =
+    "the upstream provider rejected this server's credentials; see the server log";
+
 struct UpstreamError {
     status: StatusCode,
     message: String,
+    /// Сколько апстрим просил подождать: уходит клиенту заголовком `Retry-After`.
+    retry_after: Option<std::time::Duration>,
+    /// Тег ошибки в теле: по нему клиенты OpenAI решают, повторять ли.
+    kind: &'static str,
+    code: Option<&'static str>,
 }
 
 impl UpstreamError {
     fn new(status: StatusCode, message: String) -> Self {
-        Self { status, message }
+        let (kind, code) = if status == StatusCode::TOO_MANY_REQUESTS {
+            ("rate_limit_error", Some("rate_limit_exceeded"))
+        } else {
+            ("server_error", None)
+        };
+        Self {
+            status,
+            message,
+            retry_after: None,
+            kind,
+            code,
+        }
     }
 
     fn from_app(error: &AppError) -> Self {
@@ -254,12 +274,72 @@ impl UpstreamError {
         {
             message = message.replace(url.as_str(), "<upstream>");
         }
-        let status = match error {
-            AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
-            AppError::Http(http) if http.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
-            _ => StatusCode::BAD_GATEWAY,
+        Self::from_class(message, error.failure_class(), error.retry_after())
+    }
+
+    /// Код и тег по классу отказа; без класса — 502.
+    fn from_class(
+        message: String,
+        class: Option<FailureClass>,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        let mut mapped = Self::new(StatusCode::BAD_GATEWAY, message);
+        mapped.retry_after = retry_after;
+        let Some(class) = class else {
+            return mapped;
         };
-        Self::new(status, message)
+        let (status, kind, code) = match class {
+            FailureClass::RateLimit { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                Some("rate_limit_exceeded"),
+            ),
+            // Квота кончилась: ждать секунды бесполезно, `Retry-After` не шлём.
+            FailureClass::QuotaExhausted { .. } | FailureClass::SpendCap => {
+                mapped.retry_after = None;
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "insufficient_quota",
+                    Some("insufficient_quota"),
+                )
+            }
+            FailureClass::Overloaded => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                Some("overloaded"),
+            ),
+            FailureClass::Timeout => (StatusCode::GATEWAY_TIMEOUT, "server_error", None),
+            // Ключ апстрима — забота сервера. Текст отказа может раскрыть ключ или аккаунт.
+            FailureClass::Auth | FailureClass::AccountBlocked => {
+                mapped.message = UPSTREAM_AUTH_MESSAGE.to_string();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    Some("upstream_auth"),
+                )
+            }
+            FailureClass::ContextTooLong => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("context_length_exceeded"),
+            ),
+            FailureClass::ModelNotFound => (
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                Some("model_not_found"),
+            ),
+            FailureClass::ContentFilter | FailureClass::BadRequest => {
+                (StatusCode::BAD_REQUEST, "invalid_request_error", None)
+            }
+            FailureClass::Server
+            | FailureClass::Network
+            | FailureClass::Protocol
+            | FailureClass::Cancelled => return mapped,
+        };
+        mapped.status = status;
+        mapped.kind = kind;
+        mapped.code = code;
+        mapped
     }
 
     fn idle() -> Self {
@@ -281,10 +361,17 @@ impl UpstreamError {
         )
     }
 
-    fn from_verdict(verdict: StreamVerdict) -> Option<Self> {
+    fn from_verdict(
+        verdict: StreamVerdict,
+        failure: Option<&crate::agent::stream::StreamFailure>,
+    ) -> Option<Self> {
         match verdict {
             StreamVerdict::IdleTimeout => Some(Self::idle()),
-            StreamVerdict::Failed(error) => Some(Self::new(StatusCode::BAD_GATEWAY, error)),
+            StreamVerdict::Failed(error) => Some(Self::from_class(
+                error,
+                failure.map(|f| f.class.clone()),
+                failure.and_then(|f| f.retry_after),
+            )),
             StreamVerdict::ClosedWithoutStop => Some(Self::closed_early()),
             StreamVerdict::Ok | StreamVerdict::Finished(_) => None,
         }
@@ -292,20 +379,23 @@ impl UpstreamError {
 
     /// Тело в духе OpenAI: по `rate_limit_error` клиенты решают, повторять ли.
     fn body(&self) -> ErrorResponse {
-        if self.status != StatusCode::TOO_MANY_REQUESTS {
-            return ErrorResponse::server_error(self.message.clone());
-        }
         ErrorResponse {
             error: openai_compat::ErrorBody {
                 message: self.message.clone(),
-                kind: "rate_limit_error".to_string(),
-                code: Some("rate_limit_exceeded".to_string()),
+                kind: self.kind.to_string(),
+                code: self.code.map(str::to_string),
             },
         }
     }
 
     fn response(&self) -> Response<ApiBody> {
-        json_response(self.status, &self.body())
+        let mut response = json_response(self.status, &self.body());
+        if let Some(wait) = self.retry_after
+            && let Ok(value) = header::HeaderValue::from_str(&wait.as_secs().max(1).to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 
     /// Та же ошибка кадром SSE: статус 200 уже ушёл клиенту.
@@ -351,7 +441,7 @@ async fn tool_attempt(
     bridge: &ToolBridge,
 ) -> Result<(BridgedReply, String, String), UpstreamError> {
     let outcome = collect_stream(provider, request.clone(), |_| {}).await;
-    if let Some(error) = UpstreamError::from_verdict(outcome.verdict()) {
+    if let Some(error) = UpstreamError::from_verdict(outcome.verdict(), outcome.failure.as_ref()) {
         return Err(error);
     }
     if !request.tools.is_empty() {
@@ -435,7 +525,7 @@ fn tool_response(
             },
             finish_reason: Some(finish),
         }],
-        usage,
+        usage: Some(usage.into()),
     }
 }
 
@@ -1438,7 +1528,7 @@ mod tests {
     use crate::provider::{
         ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, LLMProvider,
     };
-    use hyper::StatusCode;
+    use hyper::{StatusCode, header};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1456,6 +1546,117 @@ mod tests {
         let error = UpstreamError::from_app(&AppError::Provider("boom".to_string()));
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.body().error.kind, "server_error");
+    }
+
+    fn typed(class: crate::provider::failure::FailureClass) -> AppError {
+        AppError::Upstream(Box::new(crate::provider::failure::ProviderFailure {
+            class,
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            message: "upstream said no".to_string(),
+            limits: None,
+        }))
+    }
+
+    /// 429 апстрима с `Retry-After` — 429 клиенту с тем же заголовком, а не 502.
+    #[test]
+    fn an_upstream_429_stays_429_and_passes_retry_after_on() {
+        use crate::provider::failure::FailureClass;
+        let wait = Duration::from_secs(42);
+        let error = UpstreamError::from_app(&typed(FailureClass::RateLimit {
+            retry_after: Some(wait),
+        }));
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.body().error.kind, "rate_limit_error");
+        let response = error.response();
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "42");
+    }
+
+    #[test]
+    fn an_upstream_429_without_a_delay_has_no_retry_after_header() {
+        use crate::provider::failure::FailureClass;
+        let error = UpstreamError::from_app(&typed(FailureClass::RateLimit { retry_after: None }));
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            error
+                .response()
+                .headers()
+                .get(header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    /// Квота кончилась: 429, но без `Retry-After` — ждать секунды бесполезно.
+    #[test]
+    fn an_exhausted_quota_is_429_insufficient_quota_without_a_delay() {
+        use crate::provider::failure::FailureClass;
+        let error = UpstreamError::from_app(&typed(FailureClass::SpendCap));
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error.body().error.code.as_deref(),
+            Some("insufficient_quota")
+        );
+        assert!(
+            error
+                .response()
+                .headers()
+                .get(header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    /// Чужой ключ клиенту не виден: отказ авторизации апстрима — 502, не 401.
+    #[test]
+    fn upstream_auth_and_context_failures_map_to_honest_statuses() {
+        use crate::provider::failure::FailureClass;
+        let auth = UpstreamError::from_app(&typed(FailureClass::Auth));
+        assert_eq!(auth.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(auth.body().error.code.as_deref(), Some("upstream_auth"));
+        assert_eq!(auth.body().error.message, super::UPSTREAM_AUTH_MESSAGE);
+        let blocked = UpstreamError::from_app(&typed(FailureClass::AccountBlocked));
+        assert_eq!(blocked.body().error.message, super::UPSTREAM_AUTH_MESSAGE);
+        let context = UpstreamError::from_app(&typed(FailureClass::ContextTooLong));
+        assert_eq!(context.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            context.body().error.code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        let overloaded = UpstreamError::from_app(&typed(FailureClass::Overloaded));
+        assert_eq!(overloaded.status, StatusCode::SERVICE_UNAVAILABLE);
+        let server = UpstreamError::from_app(&typed(FailureClass::Server));
+        assert_eq!(server.status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// Путь с инструментами идёт через `collect_stream`: тип отказа не должен
+    /// теряться по дороге (раньше он превращался в строку и в 502).
+    #[tokio::test]
+    async fn a_typed_failure_survives_the_tool_path() {
+        use crate::provider::failure::FailureClass;
+        let provider: Arc<dyn LLMProvider> = Arc::new(Scripted {
+            chunks: Vec::new(),
+            end: ScriptEnd::Fail(|| {
+                AppError::Upstream(Box::new(crate::provider::failure::ProviderFailure {
+                    class: FailureClass::RateLimit {
+                        retry_after: Some(Duration::from_secs(9)),
+                    },
+                    status: Some(StatusCode::TOO_MANY_REQUESTS),
+                    message: "slow".to_string(),
+                    limits: None,
+                }))
+            }),
+        });
+        let request = CompletionRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 8,
+            stream: true,
+        };
+        let outcome = crate::agent::stream::collect_stream(&provider, request, |_| {}).await;
+        let error = UpstreamError::from_verdict(outcome.verdict(), outcome.failure.as_ref())
+            .expect("a failed stream is an error");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.retry_after, Some(Duration::from_secs(9)));
     }
 
     /// Таймаут — 504, а URL апстрима (с ключом в запросе) клиенту не уходит.
@@ -1509,6 +1710,7 @@ mod tests {
                     content: content.to_string(),
                     tool_calls: Vec::new(),
                     finish_reason: finish.map(str::to_string),
+                    usage: None,
                 });
             }
             match &self.end {

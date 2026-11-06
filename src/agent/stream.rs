@@ -11,6 +11,7 @@
 //! stopless stream as a provider error (with a tool-call salvage path),
 //! while a sub-agent deliberately does not.
 
+use crate::provider::failure::FailureClass;
 use crate::provider::{CompletionRequest, LLMProvider, ToolCall};
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +75,24 @@ pub struct StreamOutcome {
     /// сам, без неё.
     pub stop_reason: Option<String>,
     pub end: StreamEnd,
+    /// Тип отказа провайдера, если `end` — `ProviderError` и тип известен.
+    pub failure: Option<StreamFailure>,
+}
+
+/// Класс отказа и просьба подождать: то, что теряет `ProviderError(String)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamFailure {
+    pub class: FailureClass,
+    pub retry_after: Option<Duration>,
+}
+
+impl StreamFailure {
+    fn of(error: &crate::error::AppError) -> Option<Self> {
+        Some(Self {
+            class: error.failure_class()?,
+            retry_after: error.retry_after(),
+        })
+    }
 }
 
 /// Как понимать конец стрима. Что с этим делать — дело цикла: главный считает
@@ -157,6 +176,7 @@ async fn collect(
                     tool_calls,
                     stop_reason,
                     end: StreamEnd::IdleTimeout,
+                    failure: None,
                 };
             }
             Ok(None) => break,
@@ -170,6 +190,7 @@ async fn collect(
                             tool_calls,
                             stop_reason,
                             end: StreamEnd::ProviderError(oversized_stream_message()),
+                            failure: None,
                         };
                     }
                     on_progress(&text);
@@ -194,6 +215,7 @@ async fn collect(
                                 "tool-call arguments exceeded {} MiB — aborted",
                                 MAX_STREAM_BYTES / (1024 * 1024)
                             )),
+                            failure: None,
                         };
                     }
                 }
@@ -219,6 +241,10 @@ async fn collect(
     } else {
         Some((&mut stream_task).await)
     };
+    let failure = match &joined {
+        Some(Ok(Err(error))) => StreamFailure::of(error),
+        _ => None,
+    };
     let end = match joined {
         None | Some(Ok(Ok(()))) => StreamEnd::Completed,
         Some(Ok(Err(error))) => StreamEnd::ProviderError(error.to_string()),
@@ -233,6 +259,7 @@ async fn collect(
         tool_calls,
         stop_reason,
         end,
+        failure,
     }
 }
 
@@ -301,6 +328,7 @@ mod tests {
                 content: "done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".to_string()),
+                usage: None,
             });
             std::future::pending().await
         }

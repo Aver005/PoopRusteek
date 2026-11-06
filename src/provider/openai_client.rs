@@ -150,6 +150,7 @@ impl CompatProtocol for OpenAiProtocol {
                     content: String::new(),
                     tool_calls: state.assembled(),
                     finish_reason: Some("tool_calls".to_string()),
+                    usage: None,
                 });
             }
             return SseFlow::Done;
@@ -164,7 +165,19 @@ impl CompatProtocol for OpenAiProtocol {
                 );
             }
         };
+        // Нули вместо расхода (часть серверов шлёт их в каждом чанке) не считаются.
+        let usage = chunk
+            .usage
+            .map(crate::provider::Usage::from)
+            .filter(|usage| usage.total_tokens > 0);
         let Some(choice) = chunk.choices.into_iter().next() else {
+            // Чанк расхода: `choices` пуст, приходит после `finish_reason`.
+            if usage.is_some() {
+                emit(CompletionChunk {
+                    usage,
+                    ..CompletionChunk::default()
+                });
+            }
             return SseFlow::Continue;
         };
         for fragment in choice.delta.tool_calls.iter().flatten() {
@@ -177,6 +190,7 @@ impl CompatProtocol for OpenAiProtocol {
                     content: choice.delta.content.unwrap_or_default(),
                     tool_calls: state.assembled(),
                     finish_reason: Some(finish_reason),
+                    usage,
                 });
             }
             None => {
@@ -186,6 +200,7 @@ impl CompatProtocol for OpenAiProtocol {
                     content: choice.delta.content.unwrap_or_default(),
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    usage,
                 });
             }
         }
@@ -195,6 +210,22 @@ impl CompatProtocol for OpenAiProtocol {
     fn parse_models(body: &[u8]) -> AppResult<Vec<String>> {
         let list: openai_compat::ModelList = serde_json::from_slice(body)?;
         Ok(list.data.into_iter().map(|model| model.id).collect())
+    }
+
+    fn parse_limits(
+        headers: &reqwest::header::HeaderMap,
+        now: std::time::SystemTime,
+    ) -> Option<crate::provider::failure::RateLimitHeaders> {
+        Some(crate::provider::failure::parse_openai_limits(headers, now))
+    }
+
+    fn request_stream_usage(body: &mut serde_json::Value) {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
+
+    /// Совместимые серверы отвергают `stream_options` по-разному, иногда с пустым телом.
+    fn may_reject_stream_usage(class: &crate::provider::failure::FailureClass) -> bool {
+        matches!(class, crate::provider::failure::FailureClass::BadRequest)
     }
 }
 

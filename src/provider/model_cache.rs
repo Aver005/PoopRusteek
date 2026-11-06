@@ -43,6 +43,8 @@ struct CacheFile {
 pub struct ProviderModelCache {
     path: PathBuf,
     inner: Mutex<HashMap<String, CachedModels>>,
+    /// Включённый шлюз: списки берутся через живые адаптеры, без нового клиента на запрос.
+    gateway: Mutex<Option<crate::gateway::handle::GatewayHandle>>,
 }
 
 /// One refresh round's outcome, for status lines and the proxy log.
@@ -106,7 +108,24 @@ impl ProviderModelCache {
         Arc::new(Self {
             path,
             inner: Mutex::new(providers),
+            gateway: Mutex::new(None),
         })
+    }
+
+    /// Подключить шлюз: записи, чьё имя совпадает с id аккаунта, обновляются его адаптером.
+    pub fn set_gateway(&self, gateway: crate::gateway::handle::GatewayHandle) {
+        if let Ok(mut slot) = self.gateway.lock() {
+            *slot = Some(gateway);
+        }
+    }
+
+    /// Живой адаптер аккаунта с таким именем, если шлюз включён.
+    fn live_backend(&self, name: &str) -> Option<Arc<dyn crate::gateway::backend::Backend>> {
+        let gateway = self.gateway.lock().ok()?.clone()?;
+        if !gateway.is_enabled() {
+            return None;
+        }
+        gateway.backend_for(&crate::gateway::types::AccountId::parse(name).ok()?)
     }
 
     #[cfg(test)]
@@ -116,6 +135,7 @@ impl ProviderModelCache {
             // and tests point it into a scratch dir.
             path: std::env::temp_dir().join("pooprusteek_test_provider_models.json"),
             inner: Mutex::new(HashMap::new()),
+            gateway: Mutex::new(None),
         })
     }
 
@@ -199,16 +219,29 @@ impl ProviderModelCache {
                 continue;
             }
             let entry = entry.clone();
+            let live = self.live_backend(&entry.name);
             jobs.push(async move {
-                let result = match crate::provider::build_entry_provider(&entry) {
-                    Ok(provider) => {
-                        match tokio::time::timeout(FETCH_TIMEOUT, provider.list_models()).await {
-                            Ok(Ok(models)) => Ok(models),
+                let result = match live {
+                    Some(backend) => {
+                        match tokio::time::timeout(FETCH_TIMEOUT, backend.list_models()).await {
+                            Ok(Ok(models)) => Ok(models.into_iter().map(|m| m.id).collect()),
                             Ok(Err(error)) => Err(error.to_string()),
                             Err(_) => Err(format!("timed out after {}s", FETCH_TIMEOUT.as_secs())),
                         }
                     }
-                    Err(error) => Err(error.to_string()),
+                    None => match crate::provider::build_entry_provider(&entry) {
+                        Ok(provider) => {
+                            match tokio::time::timeout(FETCH_TIMEOUT, provider.list_models()).await
+                            {
+                                Ok(Ok(models)) => Ok(models),
+                                Ok(Err(error)) => Err(error.to_string()),
+                                Err(_) => {
+                                    Err(format!("timed out after {}s", FETCH_TIMEOUT.as_secs()))
+                                }
+                            }
+                        }
+                        Err(error) => Err(error.to_string()),
+                    },
                 };
                 (entry.name, result)
             });
@@ -290,6 +323,43 @@ mod tests {
         // Rows for providers deleted from the config are pruned.
         cache.refresh(&[entry("dead")], 60_000, false).await;
         assert!(cache.snapshot().get("cached").is_none());
+    }
+
+    /// С включённым шлюзом список берётся через живой адаптер аккаунта, а не новым клиентом.
+    #[tokio::test]
+    async fn refresh_prefers_the_gateways_live_backend_for_a_matching_account() {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, rig};
+        let gateway = rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        );
+        let cache = ProviderModelCache::empty_for_tests();
+        cache.set_gateway(Arc::new(gateway.engine));
+        // "a" — аккаунт шлюза (адрес мёртвый, но адаптер подставной и отвечает);
+        // "dead" — обычная запись: идёт старым путём и падает.
+        let outcome = cache
+            .refresh(&[entry("a"), entry("dead")], 60_000, true)
+            .await;
+        assert_eq!(cache.snapshot().get("a"), Some(&vec!["listed".to_string()]));
+        assert_eq!(outcome.fetched.len(), 1);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, "dead");
+    }
+
+    /// Выключенный шлюз ничего не меняет: запись обновляется как раньше.
+    #[tokio::test]
+    async fn a_disabled_gateway_leaves_the_old_fetch_path_alone() {
+        let cache = ProviderModelCache::empty_for_tests();
+        cache.set_gateway(Arc::new(crate::gateway::handle::DisabledGateway::new()));
+        let outcome = cache.refresh(&[entry("a")], 60_000, true).await;
+        assert_eq!(
+            outcome.failed.len(),
+            1,
+            "the dead port is reached the old way"
+        );
     }
 
     #[test]
