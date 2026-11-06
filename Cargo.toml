@@ -78,7 +78,7 @@ textwrap = "0.16"
 unicode-width = "0.2"
 base64 = "0.23"
 regex = "1"
-wasmtime = { version = "27", default-features = false, features = [
+wasmtime = { version = "36", default-features = false, features = [
     "std",
     "cranelift",
     "runtime",
