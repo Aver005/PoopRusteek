@@ -12,7 +12,18 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "net",
+    "process",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+    "io-std",
+] }
 # TUI
 # `unstable-rendered-line-info` exposes Paragraph::line_count — the real
 # WordWrapper row count used for scroll math (estimates diverge on CJK/wrap).
