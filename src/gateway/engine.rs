@@ -253,9 +253,10 @@ impl EngineDeps {
             data_dir: Some(Config::data_dir().join("gateway")),
             clock: Arc::new(SystemClock),
             resolver: Arc::new(EnvOnlyResolver),
-            factories: vec![Arc::new(BuiltinFactory::new(
-                DeepseekSettings::from_config(config),
-            ))],
+            factories: vec![
+                Arc::new(BuiltinFactory::new(DeepseekSettings::from_config(config))),
+                Arc::new(super::cli::CliFactory::new()),
+            ],
             persist: None,
         }
     }

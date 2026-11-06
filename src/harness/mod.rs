@@ -23,6 +23,7 @@ pub mod driver;
 pub mod metrics;
 pub mod mine;
 pub mod mock;
+pub mod mock_cli;
 pub mod report;
 pub mod scenario;
 pub mod trace;
@@ -82,6 +83,8 @@ pub enum Command {
     Mine(MineArgs),
     /// Serve a scripted OpenAI-compatible endpoint for deterministic runs.
     MockProvider(MockArgs),
+    /// Stand in for the `claude`/`opencode` CLI so gateway adapters run without them.
+    MockCli(mock_cli::MockCliArgs),
 }
 
 #[derive(Args)]
@@ -272,6 +275,7 @@ pub async fn run(command: Command, config: Config, globals: GlobalFlags) -> AppR
         Command::Suite(args) => scenario::run_suite(args, &config, globals).await,
         Command::Mine(args) => mine::run(args),
         Command::MockProvider(args) => mock::run(args).await,
+        Command::MockCli(args) => mock_cli::run(args),
     }
 }
 

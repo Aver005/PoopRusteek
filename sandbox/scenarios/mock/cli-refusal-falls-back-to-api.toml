@@ -1,0 +1,24 @@
+# Needs `sandbox mock cli-fallback` running, POOPRUSTEEK_GATEWAY_TOML=sandbox/gateway/cli-then-api.toml
+# and POOPRUSTEEK_CLI_CLAUDE=mock:throttled (the "CLI" is `pooprusteek mock-cli`, it answers a 429; a quota refusal would leave an
+# "exhausted" hint in the data dir and the next repeat would start on the API account).
+name = "cli-refusal-falls-back-to-api"
+description = "The CLI account refuses with a limit, the turn completes on the API account and the trace says why"
+prompt = "What is two plus two?"
+timeout = 60
+max_steps = 3
+
+[expect]
+status = "completed"
+final_matches = ['Four']
+min_pass_rate = 1.0
+
+# Two decisions: the CLI account, then the API one after the refusal.
+[[expect.trace]]
+action = "gateway.decision"
+min_count = 2
+
+# Exactly one hand-over, and it happened before anything was shown.
+[[expect.trace]]
+action = "gateway.fallback"
+min_count = 1
+max_count = 1

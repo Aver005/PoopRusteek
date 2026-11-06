@@ -1,0 +1,24 @@
+# Gateway settings for the CLI → API fallback scenario (read from POOPRUSTEEK_GATEWAY_TOML).
+# The CLI account runs `mock-cli` (POOPRUSTEEK_CLI_CLAUDE=mock:throttled); host `mock` is the compose
+# service, for a local mock use 127.0.0.1.
+[gateway]
+enabled = true
+
+[[accounts]]
+id = "cli"
+provider = "cli:claude"
+model = "haiku"
+
+[[accounts]]
+id = "api"
+provider = "custom"
+base_url = "http://mock:811/api/v1"
+secret = "none"
+model = "mock"
+
+[[routes]]
+id = "main"
+steps = [{ account = "cli" }, { account = "api" }]
+
+[roles]
+main = "main"
