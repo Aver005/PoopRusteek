@@ -380,7 +380,8 @@ fn chat_messages() -> Vec<ChatMessage> {
         tool(
             "bash",
             "c1",
-            "$ cargo test items::range\nrunning 3 tests\ntest items::range::empty ... FAILED\ntest items::range::single ... ok\ntest items::range::pair ... ok\n\nfailures:\n    items::range::empty\n\ntest result: FAILED. 2 passed; 1 failed",
+            "$ cargo test items::range\nrunning 3 tests\ntest items::range::empty ... FAILED\ntest items::range::single ... ok\ntest items::range::pair ... ok\n\nfailures:\n    items::range::empty\n\ntest result: FAILED. 2 passed; 1 failed
+[exit code 101]",
             "14:02:34",
             false,
         ),
