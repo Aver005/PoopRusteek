@@ -211,7 +211,7 @@ impl Theme {
             warning: Color::Rgb(249, 226, 175),
             user_bg: Color::Rgb(28, 39, 64),
             tool_bg: Color::Rgb(38, 32, 58),
-            input_bg: Color::Rgb(15, 21, 36),
+            input_bg: Color::Rgb(28, 34, 48),
             selection: Color::Rgb(34, 45, 72),
         }
     }
@@ -226,14 +226,14 @@ impl Theme {
             accent_soft: rgb(0xb4befe),
             border: rgb(0x313244),
             border_focus: rgb(0xcba6f7),
-            text_dim: rgb(0x6c7086),
+            text_dim: rgb(0x9096af),
             text_soft: rgb(0xa6adc8),
             error: rgb(0xf38ba8),
             success: rgb(0xa6e3a1),
             warning: rgb(0xf9e2af),
             user_bg: rgb(0x313244),
             tool_bg: rgb(0x2a2438),
-            input_bg: rgb(0x181825),
+            input_bg: rgb(0x2a2b3a),
             selection: rgb(0x45475a),
         }
     }
@@ -248,14 +248,14 @@ impl Theme {
             accent_soft: rgb(0xff79c6),
             border: rgb(0x44475a),
             border_focus: rgb(0xbd93f9),
-            text_dim: rgb(0x6272a4),
+            text_dim: rgb(0x8a96b9),
             text_soft: rgb(0x9ea8c7),
             error: rgb(0xff5555),
             success: rgb(0x50fa7b),
             warning: rgb(0xf1fa8c),
             user_bg: rgb(0x3a3d4d),
             tool_bg: rgb(0x35304a),
-            input_bg: rgb(0x21222c),
+            input_bg: rgb(0x363740),
             selection: rgb(0x44475a),
         }
     }
@@ -270,14 +270,14 @@ impl Theme {
             accent_soft: rgb(0xfabd2f),
             border: rgb(0x3c3836),
             border_focus: rgb(0xfe8019),
-            text_dim: rgb(0x7c6f64),
-            text_soft: rgb(0xa89984),
+            text_dim: rgb(0xa69882),
+            text_soft: rgb(0xb5a68d),
             error: rgb(0xfb4934),
             success: rgb(0xb8bb26),
             warning: rgb(0xfabd2f),
             user_bg: rgb(0x3c3836),
             tool_bg: rgb(0x32302f),
-            input_bg: rgb(0x1d2021),
+            input_bg: rgb(0x323330),
             selection: rgb(0x504945),
         }
     }
@@ -292,14 +292,14 @@ impl Theme {
             accent_soft: rgb(0x8fbcbb),
             border: rgb(0x3b4252),
             border_focus: rgb(0x88c0d0),
-            text_dim: rgb(0x616e88),
+            text_dim: rgb(0x949eb0),
             text_soft: rgb(0xd8dee9),
             error: rgb(0xbf616a),
             success: rgb(0xa3be8c),
             warning: rgb(0xebcb8b),
             user_bg: rgb(0x3b4252),
             tool_bg: rgb(0x434c5e),
-            input_bg: rgb(0x292e39),
+            input_bg: rgb(0x393d48),
             selection: rgb(0x434c5e),
         }
     }
@@ -314,14 +314,14 @@ impl Theme {
             accent_soft: rgb(0x7dcfff),
             border: rgb(0x292e42),
             border_focus: rgb(0x7aa2f7),
-            text_dim: rgb(0x565f89),
+            text_dim: rgb(0x8c96c0),
             text_soft: rgb(0x9aa5ce),
             error: rgb(0xf7768e),
             success: rgb(0x9ece6a),
             warning: rgb(0xe0af68),
             user_bg: rgb(0x283457),
             tool_bg: rgb(0x2d2545),
-            input_bg: rgb(0x16161e),
+            input_bg: rgb(0x272834),
             selection: rgb(0x33467c),
         }
     }
@@ -336,14 +336,14 @@ impl Theme {
             accent_soft: rgb(0xebbcba),
             border: rgb(0x26233a),
             border_focus: rgb(0xc4a7e7),
-            text_dim: rgb(0x6e6a86),
-            text_soft: rgb(0x908caa),
+            text_dim: rgb(0x8d89a4),
+            text_soft: rgb(0x9a96b3),
             error: rgb(0xeb6f92),
             success: rgb(0x9ccfd8),
             warning: rgb(0xf6c177),
             user_bg: rgb(0x2a273f),
             tool_bg: rgb(0x26233a),
-            input_bg: rgb(0x1f1d2e),
+            input_bg: rgb(0x272536),
             selection: rgb(0x403d52),
         }
     }
@@ -358,14 +358,14 @@ impl Theme {
             accent_soft: rgb(0x36f9f6),
             border: rgb(0x463465),
             border_focus: rgb(0xff7edb),
-            text_dim: rgb(0x7a6f9b),
+            text_dim: rgb(0x9188ad),
             text_soft: rgb(0xa99bc9),
             error: rgb(0xfe4450),
             success: rgb(0x72f1b8),
             warning: rgb(0xfede5d),
             user_bg: rgb(0x34294f),
             tool_bg: rgb(0x3b2b52),
-            input_bg: rgb(0x241b2f),
+            input_bg: rgb(0x352c3f),
             selection: rgb(0x463465),
         }
     }
@@ -380,14 +380,14 @@ impl Theme {
             accent_soft: rgb(0x80ffaa),
             border: rgb(0x143c14),
             border_focus: rgb(0x00ff41),
-            text_dim: rgb(0x3c823c),
+            text_dim: rgb(0x4b924b),
             text_soft: rgb(0x64b464),
             error: rgb(0xff5050),
             success: rgb(0x00ff41),
             warning: rgb(0xc8ff64),
             user_bg: rgb(0x0a280f),
             tool_bg: rgb(0x082014),
-            input_bg: rgb(0x050f08),
+            input_bg: rgb(0x0f1d12),
             selection: rgb(0x10401c),
         }
     }
@@ -402,14 +402,14 @@ impl Theme {
             accent_soft: rgb(0x4f46e5),
             border: rgb(0xd6d3c8),
             border_focus: rgb(0x6366f1),
-            text_dim: rgb(0x928e82),
-            text_soft: rgb(0x6e6b61),
+            text_dim: rgb(0x757167),
+            text_soft: rgb(0x68655b),
             error: rgb(0xdc2626),
             success: rgb(0x16a34a),
             warning: rgb(0xca8a04),
             user_bg: rgb(0xe8e9f5),
             tool_bg: rgb(0xeee8f5),
-            input_bg: rgb(0xf3f2ec),
+            input_bg: rgb(0xe7e6e0),
             selection: rgb(0xdbdef3),
         }
     }
@@ -609,6 +609,92 @@ mod tests {
             ]),
         };
         assert_eq!(Theme::from_custom(&custom), Theme::default_dark());
+    }
+
+    /// Яркость по WCAG 2.x.
+    fn luminance(color: Color) -> f64 {
+        let Color::Rgb(r, g, b) = color else {
+            return 0.0;
+        };
+        let linear = |channel: u8| {
+            let value = f64::from(channel) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    }
+
+    /// Контраст двух цветов по WCAG: от 1 (одинаковые) до 21.
+    fn contrast(a: Color, b: Color) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (light, dark) = if la > lb { (la, lb) } else { (lb, la) };
+        (light + 0.05) / (dark + 0.05)
+    }
+
+    /// Поверхности, на которых рисуется текст.
+    fn surfaces(theme: &Theme) -> [(&'static str, Color); 6] {
+        [
+            ("bg", theme.bg),
+            ("user_bg", theme.user_bg),
+            ("tool_bg", theme.tool_bg),
+            ("panel", theme.panel),
+            ("input_bg", theme.input_bg),
+            ("selection", theme.selection),
+        ]
+    }
+
+    #[test]
+    fn dim_text_stays_readable_in_every_preset() {
+        for preset in PRESETS {
+            let theme = (preset.build)();
+            let on_bg = contrast(theme.text_dim, theme.bg);
+            assert!(
+                on_bg >= 4.5,
+                "{}: text_dim on bg is {on_bg:.2}",
+                preset.name
+            );
+            for (name, surface) in surfaces(&theme) {
+                let ratio = contrast(theme.text_dim, surface);
+                assert!(
+                    ratio >= 3.0,
+                    "{}: text_dim on {name} is {ratio:.2}",
+                    preset.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_text_is_readable_on_every_surface() {
+        for preset in PRESETS {
+            let theme = (preset.build)();
+            for (name, surface) in surfaces(&theme) {
+                let fg = contrast(theme.fg, surface);
+                assert!(fg >= 4.5, "{}: fg on {name} is {fg:.2}", preset.name);
+                let soft = contrast(theme.text_soft, surface);
+                assert!(
+                    soft >= 3.5,
+                    "{}: text_soft on {name} is {soft:.2}",
+                    preset.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_input_box_is_visibly_different_from_the_background() {
+        for preset in PRESETS {
+            let theme = (preset.build)();
+            let ratio = contrast(theme.input_bg, theme.bg);
+            assert!(
+                ratio >= 1.149,
+                "{}: input_bg vs bg is {ratio:.3}",
+                preset.name
+            );
+        }
     }
 
     #[test]
