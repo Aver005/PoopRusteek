@@ -94,7 +94,10 @@ thread_local! {
 /// палитры, и без этого ответы ассистента остались бы в старых цветах.
 /// Числа строк от темы не зависят и сохраняются.
 fn sync_cache_theme(theme: &Theme) {
-    let id = theme.cache_id();
+    // Набор знаков тоже вшит в готовые строки (чекбоксы, полосы цитат).
+    let id = theme
+        .cache_id()
+        .wrapping_add(u64::from(crate::tui::glyphs::get().ascii));
     if CACHE_THEME.replace(id) != id {
         MSG_CACHE.with(|cache| cache.borrow_mut().clear());
     }
@@ -296,10 +299,12 @@ fn build_segment_lines(
         Role::Assistant => {
             // Only the empty-content placeholder goes through here; the
             // markdown path is `with_assistant_cached`.
-            lines.push(Line::from(vec![
-                assistant_header(msg, theme),
-                Span::styled(" Thinking...", Style::default().fg(theme.text_dim)),
-            ]));
+            let mut head = assistant_header(msg, theme);
+            head.push(Span::styled(
+                " Thinking\u{2026}",
+                Style::default().fg(theme.text_dim),
+            ));
+            lines.push(Line::from(head));
         }
         Role::System => {
             let body = msg.visible_content();
@@ -311,12 +316,16 @@ fn build_segment_lines(
             // + usage) actually render as separate lines.
             if body_lines.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
-                    " \u{2139} ",
+                    format!(" {} ", crate::tui::glyphs::get().info),
                     Style::default().fg(theme.warning).bg(theme.bg),
                 )]));
             } else {
                 for (i, line_text) in body_lines.iter().enumerate() {
-                    let prefix = if i == 0 { " \u{2139} " } else { "   " };
+                    let prefix = if i == 0 {
+                        format!(" {} ", crate::tui::glyphs::get().info)
+                    } else {
+                        "   ".to_string()
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(prefix, Style::default().fg(theme.warning).bg(theme.bg)),
                         Span::styled(
@@ -327,95 +336,119 @@ fn build_segment_lines(
                 }
             }
         }
-        Role::Tool => {
-            let tool_name = msg.name.as_deref().unwrap_or("unknown");
-            let icon = if msg.tool_error {
-                "\u{2717}"
-            } else {
-                "\u{2713}"
-            };
-            let status_color = if msg.tool_error {
-                theme.error
-            } else {
-                theme.success
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {icon} "),
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(status_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" {tool_name} "),
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(if msg.tool_error {
-                            theme.error
-                        } else {
-                            theme.accent
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    if msg.tool_error { " failed " } else { " done " },
-                    Style::default().fg(theme.text_dim).bg(theme.tool_bg),
-                ),
-            ]));
-
-            let body = msg.visible_content();
-            let body_lines: Vec<&str> = body.lines().collect();
-            if body_lines.iter().all(|l| l.trim().is_empty()) {
-                lines.push(Line::from(vec![Span::styled(
-                    "  (no output)",
-                    Style::default().fg(theme.text_dim).bg(theme.tool_bg),
-                )]));
-            } else {
-                for line_text in &body_lines {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            " \u{2502} ",
-                            Style::default().fg(theme.accent_soft).bg(theme.tool_bg),
-                        ),
-                        Span::styled(
-                            (*line_text).to_string(),
-                            Style::default()
-                                .fg(if msg.tool_error {
-                                    theme.error
-                                } else {
-                                    theme.text_soft
-                                })
-                                .bg(theme.tool_bg),
-                        ),
-                    ]));
-                }
-            }
-        }
+        Role::Tool => lines.extend(tool_lines(msg, theme)),
     }
     lines
 }
 
-/// The colored ` pooprusteek (model) ` header span of an assistant bubble.
-fn assistant_header(msg: &ChatMessage, theme: &Theme) -> Span<'static> {
-    let header_color = match msg.status.as_deref() {
+/// Заголовок ответа ассистента: тонкая полоса цвета состояния и имя модели.
+/// Возвращает несколько кусков одной строки.
+fn assistant_header(msg: &ChatMessage, theme: &Theme) -> Vec<Span<'static>> {
+    let bar_color = match msg.status.as_deref() {
         Some("ABORTED") => theme.error,
         Some("WIP") => theme.warning,
         _ => theme.success,
     };
     let model_tag = if !msg.model.is_empty() {
-        format!(" ({})", msg.model)
+        format!(" \u{00B7} {}", msg.model)
     } else {
         String::new()
     };
-    Span::styled(
-        format!(" pooprusteek{} ", model_tag),
-        Style::default()
-            .fg(theme.bg)
-            .bg(header_color)
-            .add_modifier(Modifier::BOLD),
-    )
+    vec![
+        Span::styled(
+            format!(" {} ", crate::tui::glyphs::get().bar),
+            Style::default().fg(bar_color).bg(theme.bg),
+        ),
+        Span::styled(
+            format!("pooprusteek{model_tag}"),
+            Style::default()
+                .fg(theme.text_dim)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
+/// Сколько строк тела результата инструмента видно, пока он не ошибся.
+const TOOL_BODY_PREVIEW_LINES: usize = 3;
+/// Потолок строк ошибки: ошибка раскрыта, но не бесконечна.
+const TOOL_ERROR_MAX_LINES: usize = 40;
+
+/// Результат инструмента: заголовок `✓ имя` и тело, свёрнутое до трёх строк.
+/// Ошибка раскрыта целиком (до потолка). Заливки нет — меньше шума.
+fn tool_lines(msg: &ChatMessage, theme: &Theme) -> Vec<Line<'static>> {
+    let glyph = crate::tui::glyphs::get();
+    let tool_name = msg.name.as_deref().unwrap_or("unknown");
+    let status_color = if msg.tool_error {
+        theme.error
+    } else {
+        theme.success
+    };
+    let body = msg.visible_content();
+    let body_lines: Vec<&str> = body.lines().collect();
+    let empty = body_lines.iter().all(|l| l.trim().is_empty());
+    let total = body_lines.len();
+
+    let mut head = vec![
+        Span::styled(
+            format!(" {} ", glyph.outcome(msg.tool_error)),
+            Style::default()
+                .fg(status_color)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            tool_name.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if msg.tool_error {
+        head.push(Span::styled(
+            " failed",
+            Style::default().fg(theme.error).bg(theme.bg),
+        ));
+    }
+    let mut lines = vec![Line::from(head)];
+
+    if empty {
+        lines.push(Line::from(Span::styled(
+            "   (no output)",
+            Style::default().fg(theme.text_dim).bg(theme.bg),
+        )));
+        return lines;
+    }
+    let shown = if msg.tool_error {
+        total.min(TOOL_ERROR_MAX_LINES)
+    } else {
+        total.min(TOOL_BODY_PREVIEW_LINES)
+    };
+    let text_color = if msg.tool_error {
+        theme.error
+    } else {
+        theme.text_soft
+    };
+    for line_text in &body_lines[..shown] {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "   \u{2502} ",
+                Style::default().fg(theme.text_dim).bg(theme.bg),
+            ),
+            Span::styled(
+                (*line_text).to_string(),
+                Style::default().fg(text_color).bg(theme.bg),
+            ),
+        ]));
+    }
+    if total > shown {
+        lines.push(Line::from(Span::styled(
+            format!("   \u{2026} {} more lines", total - shown),
+            Style::default().fg(theme.text_dim).bg(theme.bg),
+        )));
+    }
+    lines
 }
 
 /// Whether `msg` renders through the cached-markdown assistant path (true)
@@ -527,7 +560,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 theme,
                 |cached, tokens| (cached.lines.clone(), tokens),
             );
-            lines.push(Line::from(vec![assistant_header(msg, theme)]));
+            lines.push(Line::from(assistant_header(msg, theme)));
             lines.extend(md_lines);
             lines.push(meta_line(msg, tokens, theme));
         } else {

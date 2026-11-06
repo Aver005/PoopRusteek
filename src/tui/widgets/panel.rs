@@ -21,9 +21,6 @@ pub fn render_stats_panel(
     config: &Config,
     theme: &Theme,
 ) {
-    if !state.show_stats_panel {
-        return;
-    }
     let panel_w = PANEL_W.min(area.width as usize);
     if panel_w < 20 {
         return;
@@ -119,7 +116,9 @@ pub fn render_stats_panel(
     let speed = if tps > 0.0 {
         format!("{:.1} t/s", tps)
     } else if state.focused().generation.active {
-        spinner(state.focused().generation.animation_tick)
+        crate::tui::glyphs::get()
+            .spin(state.focused().generation.animation_tick)
+            .to_string()
     } else {
         "\u{2014}".to_string()
     };
@@ -178,7 +177,7 @@ pub fn render_stats_panel(
         .filter(|s| s.enabled)
         .collect();
     if enabled_servers.is_empty() {
-        data_row(&mut lines, "\u{2713}", "none", theme);
+        data_row(&mut lines, crate::tui::glyphs::get().check, "none", theme);
     } else {
         for server in &enabled_servers {
             let ok = server.status == "connected";
@@ -199,7 +198,11 @@ pub fn render_stats_panel(
         blank(&mut lines);
         section_header(&mut lines, "Errors", panel_w, theme);
         lines.push(Line::from(Span::styled(
-            format!("  \u{26A0} {} logged", state.error_count),
+            format!(
+                "  {} {} logged",
+                crate::tui::glyphs::get().warn,
+                state.error_count
+            ),
             Style::default()
                 .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
@@ -241,7 +244,11 @@ fn mcp_row_layout(
     let right = format!(
         " {} {}",
         tool_count,
-        if ok { "\u{2713}" } else { "\u{26A0}" }
+        if ok {
+            crate::tui::glyphs::get().check
+        } else {
+            crate::tui::glyphs::get().warn
+        }
     );
     let right_len = right.chars().count();
     let left_budget = panel_w.saturating_sub(right_len + 4);
@@ -258,11 +265,12 @@ fn mcp_row_layout(
 }
 
 fn section_header(lines: &mut Vec<Line<'static>>, title: &str, width: usize, theme: &Theme) {
-    let prefix = " \u{2501}\u{2501} ".to_string();
-    let suffix_len = width.saturating_sub(prefix.len() + title.len() + 1);
-    let suffix = "\u{2501}".repeat(suffix_len);
+    let rule = crate::tui::glyphs::get().heavy_rule;
+    let lead = format!(" {rule}{rule} {title} ");
+    let used = UnicodeWidthStr::width(lead.as_str());
+    let fill = rule.repeat(width.saturating_sub(used + 1));
     lines.push(Line::from(vec![Span::styled(
-        format!("{}{} {}", prefix, title, suffix),
+        format!("{lead}{fill}"),
         Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
@@ -322,15 +330,6 @@ fn format_num(n: u64) -> String {
         format!("{}.{}k", n / 1000, (n % 1000) / 100)
     } else {
         n.to_string()
-    }
-}
-
-fn spinner(tick: u64) -> String {
-    match tick % 4 {
-        0 => "\u{25D0}".to_string(),
-        1 => "\u{25D1}".to_string(),
-        2 => "\u{25D1}".to_string(),
-        _ => "\u{25D0}".to_string(),
     }
 }
 

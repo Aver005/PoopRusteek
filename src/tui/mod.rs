@@ -6,8 +6,8 @@ pub mod render;
 pub mod theme;
 pub mod view_model;
 pub mod widgets;
-
 pub mod wrap;
+
 use color_eyre::Result;
 use crossterm::{
     cursor::{DisableBlinking, EnableBlinking, Show},
@@ -16,12 +16,11 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-
 use std::sync::{Once, OnceLock};
 use std::thread::ThreadId;
+
 pub type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
 
-pub fn init() -> Result<TuiTerminal> {
 /// Поток, в котором крутится интерфейс. Паника в нём фатальна для экрана,
 /// а паника хода агента на рабочем потоке перехватывается — терминал ей трогать нельзя.
 static UI_THREAD: OnceLock<ThreadId> = OnceLock::new();
@@ -59,9 +58,10 @@ fn install_panic_hook() {
     });
 }
 
-    enable_raw_mode()?;
+pub fn init() -> Result<TuiTerminal> {
     let _ = UI_THREAD.set(std::thread::current().id());
     install_panic_hook();
+    enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     // EnableMouseCapture routes wheel/click events to the app so the wheel can
     // scroll the message window. Trade-off: the terminal's own text selection

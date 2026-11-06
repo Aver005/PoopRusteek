@@ -155,9 +155,9 @@ pub enum AppEvent {
     /// Отрисовка сама спрашивает размер у терминала; размер нужен клавишам —
     /// они приходят раньше кадра, а шаг страницы и перенос строк обязаны совпасть с экраном.
     Resize {
+        cols: u16,
         rows: u16,
     },
-        cols: u16,
     Tick,
     /// Фоновая помощь онбординга (браузер, буфер обмена) закончилась.
     OnboardingActionDone {
@@ -276,8 +276,6 @@ pub enum AppEvent {
         matches: Vec<crate::semantic::history::HistoryMatch>,
     },
 
-    // API server lifecycle (`/serve`, `--serve`). Each event carries the
-    // launch generation so a replaced server's late events can't clobber
     /// Фоновое чтение списка сессий для главного экрана закончилось.
     LandingSessionsLoaded(Vec<crate::session::SessionSummary>),
 
@@ -288,6 +286,8 @@ pub enum AppEvent {
         items: Vec<crate::commands::CommandSuggestion>,
     },
 
+    // API server lifecycle (`/serve`, `--serve`). Each event carries the
+    // launch generation so a replaced server's late events can't clobber
     // the handle of its successor.
     /// The server task bound its listener and is accepting requests.
     ServerStarted {

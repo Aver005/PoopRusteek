@@ -1,24 +1,36 @@
-//! Top-level frame assembly: routes to the chat view, the landing screen,
-//! the onboarding screen, or the MCP management view, plus modals and the
-//! status bar.
+//! Top-level frame assembly: routes to the chat view (one skeleton for the
+//! welcome screen and the transcript), the onboarding screen, or the
+//! management views, plus modals.
 //!
 //! Layout of this module tree, bottom layer first:
-//! - [`util`] — pure text/format/layout helpers (no `AppState`, no drawing)
+//! - [`util`], [`segments`], [`layout`] — pure text/format/layout helpers
+//!   (no drawing); `layout::Regions` is the only place heights are computed
 //! - [`popup`] — the shared popup/modal skeleton every modal builds on
-//! - [`status`], [`landing`], [`onboarding`], [`mcp`], [`modals`] — the
-//!   actual views; [`render`] below only dispatches between them.
+//! - [`dock`], [`composer`], [`footer`], [`welcome`], [`onboarding`], [`mcp`],
+//!   [`modals`] — the actual views; [`draw_frame`] below only dispatches.
 
+mod approval;
+mod attach;
 mod chrome;
-mod landing;
+mod composer;
+mod dock;
+mod footer;
+mod layout;
 mod mcp;
 mod modals;
 mod onboarding;
 mod popup;
 mod providers;
 mod search;
-mod status;
+mod segments;
 mod themes;
 mod util;
+mod welcome;
+
+pub(crate) use approval::{ApprovalShape, viewport as approval_viewport};
+pub(crate) use layout::{MAX_INPUT_ROWS, SIDEBAR_AUTO_COLS, SIDEBAR_WIDTH};
+#[cfg(test)]
+pub(crate) use util::fix_clock;
 
 use crate::app::AppState;
 use crate::app::events::View;
@@ -26,12 +38,22 @@ use crate::config::Config;
 use crate::tui::TuiTerminal;
 use crate::tui::theme::Theme;
 use crate::tui::widgets;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use layout::{Needs, Regions};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::Paragraph;
-use std::cell::{Cell, RefCell};
+use ratatui::widgets::Block;
+use std::cell::RefCell;
 
 const BRAND_TITLE: &str = "PoopRusteek \u{1F9FB}";
+
+/// Меньше этого интерфейс не рисуется: рамки и ввод разъезжаются.
+const MIN_COLS: u16 = 40;
+const MIN_ROWS: u16 = 10;
+
+/// Левое поле переписки и самая широкая строка текста: длиннее читать трудно.
+const TRANSCRIPT_LEFT_MARGIN: u16 = 1;
+const TRANSCRIPT_RIGHT_MARGIN: u16 = 1;
+const TRANSCRIPT_MAX_WIDTH: u16 = 110;
 
 thread_local! {
     /// Last title written to the terminal — OSC title changes are emitted
@@ -101,6 +123,87 @@ fn frame_theme(state: &AppState, config: &Config) -> Theme {
     }
 }
 
+/// Главный экран без сообщений: на месте переписки рисуется приветствие.
+fn is_welcome(state: &AppState) -> bool {
+    state.focused().messages.is_empty() && !state.focused().generation.active
+}
+
+/// Чего экран хочет от раскладки.
+fn needs_for(state: &AppState, area: Rect) -> Needs {
+    Needs {
+        dock_rows: dock::height(state),
+        input_rows: widgets::input::visible_rows(&state.input.buffer, area.width),
+        attachments: !state.attached_files.is_empty(),
+        sidebar: !is_welcome(state) && state.stats_panel_visible(area.width),
+    }
+}
+
+/// Раскладка экрана чата. Одна и та же для приветствия и переписки.
+fn chat_regions(state: &AppState, area: Rect) -> Regions {
+    Regions::compute(area, &needs_for(state, area))
+}
+
+/// Область текста внутри переписки: слева поле, ширина ограничена.
+fn transcript_text_area(transcript: Rect) -> Rect {
+    let x = transcript.x + TRANSCRIPT_LEFT_MARGIN.min(transcript.width);
+    let room = transcript
+        .width
+        .saturating_sub(TRANSCRIPT_LEFT_MARGIN + TRANSCRIPT_RIGHT_MARGIN);
+    Rect::new(
+        x,
+        transcript.y,
+        room.min(TRANSCRIPT_MAX_WIDTH),
+        transcript.height,
+    )
+}
+
+/// Экран чата: приветствие или переписка сверху, снизу всегда одно и то же.
+fn draw_chat_screen(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &AppState,
+    config: &Config,
+    theme: &Theme,
+) -> Option<(u16, u16)> {
+    let regions = chat_regions(state, area);
+    if is_welcome(state) {
+        welcome::render_welcome(frame, regions.transcript, state, config, theme);
+    } else {
+        widgets::chat::render_chat(
+            frame,
+            transcript_text_area(regions.transcript),
+            state,
+            theme,
+        );
+        if let Some(sidebar) = regions.sidebar {
+            // Панель сама рисуется у правого края области, зазор слева — её разделитель.
+            let strip = Rect::new(
+                regions.transcript.x,
+                sidebar.y,
+                sidebar.right() - regions.transcript.x,
+                sidebar.height,
+            );
+            widgets::panel::render_stats_panel(frame, strip, state, config, theme);
+        }
+    }
+    attach::render_attach_bar(frame, regions.attach, state, theme);
+    dock::render_dock(frame, regions.dock, state, theme);
+    composer::render_rule(frame, regions.rule, state, theme);
+    let cursor = widgets::input::render_input(frame, regions.input, state, theme);
+    footer::render_footer(
+        frame,
+        regions.footer,
+        state,
+        config,
+        theme,
+        regions.dock.height > 0,
+    );
+    if state.autocomplete.visible {
+        modals::render_autocomplete(frame, regions.rule, state, theme);
+    }
+    cursor
+}
+
 /// Один кадр целиком; вернёт, куда поставить курсор. Отдельно от [`render`],
 /// чтобы тот же код рисовал в `TestBackend` (`tui::capture`).
 pub(crate) fn draw_frame(
@@ -108,27 +211,28 @@ pub(crate) fn draw_frame(
     state: &AppState,
     config: &Config,
 ) -> Option<(u16, u16)> {
+    crate::tui::glyphs::select(config.ui.glyphs);
     let theme = frame_theme(state, config);
-    let cursor_cell = Cell::new(None);
     let area = frame.area();
-    frame.render_widget(
-        Paragraph::new(String::new()).style(Style::default().bg(theme.bg)),
-        area,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
+    if area.width < MIN_COLS || area.height < MIN_ROWS {
+        render_too_small(frame, area, &theme);
+        return None;
+    }
 
+    let mut cursor = None;
     if state.view == View::Onboarding {
-        onboarding::render_onboarding(
+        cursor = onboarding::render_onboarding(
             frame,
             area,
             &state.onboarding,
             state.focused().generation.animation_tick,
             &theme,
-            &cursor_cell,
         );
         // Bottom status line — /logout and /wipe land here with their result.
         if area.height > 1 {
             let status_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-            status::render_mini_status(frame, status_area, state, config, &theme, false);
+            footer::render_status_line(frame, status_area, state, &theme);
         }
     } else if state.view == View::Mcp {
         mcp::render_mcp_view(frame, area, &state.mcp_status.view, &theme);
@@ -138,84 +242,42 @@ pub(crate) fn draw_frame(
         search::render_search_view(frame, area, &state.search, &theme);
     } else if state.view == View::Themes {
         themes::render_themes_view(frame, area, &state.themes, config, &theme);
-    } else if state.focused().messages.is_empty() && !state.focused().generation.active {
-        landing::render_landing(frame, area, state, config, &theme, &cursor_cell);
     } else {
-        let has_attachments = !state.attached_files.is_empty();
-        let mut constraints = vec![Constraint::Min(1), Constraint::Length(1)];
-        if has_attachments {
-            constraints.push(Constraint::Length(1));
-        }
-        constraints.push(Constraint::Length(4));
-        constraints.push(Constraint::Length(1));
-        constraints.push(Constraint::Length(1));
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
-
-        status::render_separator(frame, chunks[1], &theme);
-
-        // Split main content into chat + stats panel. The reserved panel
-        // width MUST equal what the panel actually draws (`panel_width`),
-        // otherwise the chat area overlaps it and chat text bleeds onto
-        // the panel — the panel only recolors backgrounds, it doesn't
-        // clear glyphs. A 1-column gap holds the panel's own separator.
-        let pad_w = 2u16;
-        let panel_w = if state.show_stats_panel {
-            widgets::panel::panel_width(chunks[0].width)
-        } else {
-            0
-        };
-        // Keep the panel only while it still leaves the chat a usable
-        // width; on very narrow terminals it collapses to the plain layout.
-        let show_panel = panel_w > 0 && chunks[0].width >= pad_w + 1 + panel_w + 24;
-        if show_panel {
-            let content_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(pad_w),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                    Constraint::Length(panel_w),
-                ])
-                .split(chunks[0]);
-            widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
-            widgets::panel::render_stats_panel(frame, chunks[0], state, config, &theme);
-        } else {
-            let content_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(pad_w),
-                    Constraint::Min(1),
-                    Constraint::Length(pad_w),
-                ])
-                .split(chunks[0]);
-            widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
-        }
-
-        let attach_idx = 2usize;
-        let input_idx = if has_attachments { 3usize } else { 2usize };
-        let border_idx = if has_attachments { 4usize } else { 3usize };
-        let status_idx = if has_attachments { 5usize } else { 4usize };
-
-        if has_attachments {
-            status::render_attach_bar(frame, chunks[attach_idx], state, &theme);
-        }
-        widgets::input::render_input(frame, chunks[input_idx], state, &theme, false, &cursor_cell);
-        status::render_input_border(frame, chunks[border_idx], &theme);
-        status::render_mini_status(frame, chunks[status_idx], state, config, &theme, show_panel);
-
-        if state.autocomplete.visible {
-            modals::render_autocomplete(frame, chunks[2], state, &theme);
-        }
+        cursor = draw_chat_screen(frame, area, state, config, &theme);
     }
 
     if let Some(modal) = &state.modal {
+        popup::dim_backdrop(frame, area, &theme);
         modals::render_modal(frame, area, modal, &theme);
+        cursor = None;
     }
-    cursor_cell.get()
+    // Единственное место, где ставится курсор: ratatui сам показывает его
+    // после кадра и прячет, если позиции нет.
+    if let Some(position) = cursor {
+        frame.set_cursor_position(position);
+    }
+    cursor
+}
+
+/// Окно слишком мало для интерфейса: вместо развалившейся картинки — подсказка.
+fn render_too_small(frame: &mut ratatui::Frame, area: Rect, theme: &Theme) {
+    let text = format!(
+        "Window too small: {}x{}. Need at least {MIN_COLS}x{MIN_ROWS}.",
+        area.width, area.height
+    );
+    let top = area.y + area.height.saturating_sub(1) / 2;
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(text)
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .style(Style::default().fg(theme.warning).bg(theme.bg)),
+        Rect::new(
+            area.x,
+            top,
+            area.width,
+            area.height.saturating_sub(top - area.y).min(3),
+        ),
+    );
 }
 
 pub fn render(
@@ -224,27 +286,157 @@ pub fn render(
     config: &Config,
 ) -> crate::error::AppResult<()> {
     sync_window_title(terminal, state);
-    let mut cursor = None;
-    terminal.draw(|frame| cursor = draw_frame(frame, state, config))?;
-    // Re-set cursor position after frame flush to prevent flicker onto (0,0)
-    if let Some((cx, cy)) = cursor {
-        use crossterm::cursor::MoveTo;
-        crossterm::execute!(terminal.backend_mut(), MoveTo(cx, cy))?;
-    }
-    if state.modal.is_some()
-        || state.focused().generation.active
-        || state.view == View::Mcp
-        || state.view == View::Providers
-        // Search draws its own block cursor in the query line.
-        || state.view == View::Search
-        // The themes wizard draws its own block cursor in its text boxes.
-        || state.view == View::Themes
-    {
-        terminal.hide_cursor()?;
-    } else {
-        // For the onboarding view the cursor is positioned by render_onboarding
-        // into cursor_cell — show_cursor makes it visible; hide is handled above.
-        terminal.show_cursor()?;
-    }
+    terminal.draw(|frame| {
+        draw_frame(frame, state, config);
+    })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::conversation::Conversation;
+    use crate::provider::ChatMessage;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const SIZES: [(u16, u16); 9] = [
+        (60, 20),
+        (60, 40),
+        (80, 24),
+        (100, 30),
+        (120, 40),
+        (140, 40),
+        (160, 50),
+        (200, 60),
+        (200, 30),
+    ];
+
+    fn state_for(welcome: bool, cols: u16, rows: u16) -> AppState {
+        let mut state = AppState::new(Conversation::fresh_main(None));
+        state.terminal_rows = rows;
+        state.terminal_cols = cols;
+        if !welcome {
+            let messages = &mut state.focused_mut().messages;
+            messages.push(ChatMessage::user("hello"));
+            messages.push(ChatMessage::assistant("hi there"));
+        }
+        state
+    }
+
+    fn row_text(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Номер строки, где нарисован знак приглашения ввода.
+    fn prompt_row(terminal: &Terminal<TestBackend>) -> Option<u16> {
+        let prompt = crate::tui::glyphs::get().prompt;
+        (0..terminal.backend().buffer().area.height)
+            .rev()
+            .find(|y| row_text(terminal, *y).starts_with(&format!(" {prompt} ")))
+    }
+
+    fn config_with_unicode() -> Config {
+        let mut config = Config::default();
+        config.ui.glyphs = crate::config::GlyphMode::Unicode;
+        config
+    }
+
+    /// Поле ввода стоит на одной и той же строке от низа на обоих экранах и
+    /// на любом размере окна: вторая снизу, над подвалом.
+    #[test]
+    fn the_input_sits_on_the_same_row_from_the_bottom_on_every_screen_and_size() {
+        let config = config_with_unicode();
+        for (cols, rows) in SIZES {
+            for welcome in [true, false] {
+                let state = state_for(welcome, cols, rows);
+                let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        draw_frame(frame, &state, &config);
+                    })
+                    .unwrap();
+                assert_eq!(
+                    prompt_row(&terminal),
+                    Some(rows - 2),
+                    "{cols}x{rows} welcome={welcome}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_regions_agree_with_the_drawn_input_row() {
+        for (cols, rows) in SIZES {
+            for welcome in [true, false] {
+                let state = state_for(welcome, cols, rows);
+                let regions = chat_regions(&state, Rect::new(0, 0, cols, rows));
+                assert_eq!(regions.input.y, rows - 2, "{cols}x{rows}");
+                assert_eq!(regions.footer.y, rows - 1, "{cols}x{rows}");
+                assert_eq!(regions.input.bottom() + regions.footer.height, rows);
+            }
+        }
+    }
+
+    #[test]
+    fn a_running_turn_opens_the_dock_without_moving_the_input() {
+        let config = config_with_unicode();
+        let (cols, rows) = (100, 30);
+        let mut state = state_for(false, cols, rows);
+        state.focused_mut().generation.active = true;
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_frame(frame, &state, &config);
+            })
+            .unwrap();
+        assert_eq!(prompt_row(&terminal), Some(rows - 2));
+        let regions = chat_regions(&state, Rect::new(0, 0, cols, rows));
+        assert_eq!(regions.dock.height, 1);
+    }
+
+    #[test]
+    fn a_window_below_the_minimum_gets_a_hint_not_a_broken_layout() {
+        let config = config_with_unicode();
+        let state = state_for(true, 30, 8);
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                assert_eq!(draw_frame(frame, &state, &config), None);
+            })
+            .unwrap();
+        let all: String = (0..8).map(|y| row_text(&terminal, y)).collect();
+        assert!(all.contains("too small"), "{all}");
+    }
+
+    #[test]
+    fn the_stats_panel_is_hidden_by_default_below_the_auto_width() {
+        let mut state = state_for(false, 120, 40);
+        assert!(
+            chat_regions(&state, Rect::new(0, 0, 120, 40))
+                .sidebar
+                .is_none()
+        );
+        assert!(
+            chat_regions(&state, Rect::new(0, 0, 160, 40))
+                .sidebar
+                .is_some()
+        );
+        // Явное решение человека важнее ширины.
+        state.show_stats_panel = Some(false);
+        assert!(
+            chat_regions(&state, Rect::new(0, 0, 160, 40))
+                .sidebar
+                .is_none()
+        );
+        state.show_stats_panel = Some(true);
+        assert!(
+            chat_regions(&state, Rect::new(0, 0, 120, 40))
+                .sidebar
+                .is_some()
+        );
+    }
 }

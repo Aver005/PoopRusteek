@@ -234,10 +234,10 @@ pub struct AppState {
     /// Высота терминала, обновляется на `Resize`. Клавиши приходят раньше
     /// отрисовки, а шаг `PageUp`/`PageDown` должен совпадать с экраном.
     pub terminal_rows: u16,
-    pub modal: Option<Modal>,
     /// Ширина терминала, обновляется на `Resize`: окно подтверждения по ней
     /// считает перенос строк, а клавиши прокрутки обязаны считать так же.
     pub terminal_cols: u16,
+    pub modal: Option<Modal>,
     /// Правила авто-одобрения. С областью, а не только с именем
     /// инструмента: см. `crate::whitelist`.
     pub approved_tools: crate::whitelist::Whitelist,
@@ -260,7 +260,9 @@ pub struct AppState {
     /// правил. Кэш: собирается при старте, на `/cwd` и по `/instructions
     /// reload`, а не на каждый ход (инвариант 1).
     pub instructions_section: String,
-    pub show_stats_panel: bool,
+    /// Боковая панель: `None` — по ширине окна (с `SIDEBAR_AUTO_COLS` колонок
+    /// включена), `Some` — решение человека (`Ctrl+P`).
+    pub show_stats_panel: Option<bool>,
     pub attached_files: Vec<crate::provider::AttachedFile>,
 
     // Goal mode state
@@ -306,6 +308,12 @@ pub fn reload_instructions(state: &mut AppState, config: &Config) -> Option<Stri
 }
 
 impl AppState {
+    /// Показывается ли боковая панель в окне шириной `cols`.
+    pub fn stats_panel_visible(&self, cols: u16) -> bool {
+        self.show_stats_panel
+            .unwrap_or(cols >= crate::tui::render::SIDEBAR_AUTO_COLS)
+    }
+
     /// Рабочая папка путём: от неё считаются `@file`, `/attach` и автодополнение.
     pub fn workspace(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.workspace_path)
@@ -322,23 +330,23 @@ impl AppState {
             last_error: None,
             scroll_offset: 0,
             terminal_rows: 0,
+            terminal_cols: 0,
             modal: None,
             approved_tools: crate::whitelist::Whitelist::default(),
             pending_tool_approval: None,
             pending_question: None,
             pending_interactions: std::collections::VecDeque::new(),
             autocomplete: AutocompleteState::default(),
+            landing: landing::LandingSessions::default(),
             view: View::Chat,
             onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
             providers_view: providers::ProvidersViewState::default(),
             search: search::SearchViewState::default(),
-            terminal_cols: 0,
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
             instructions_section: String::new(),
-            landing: landing::LandingSessions::default(),
-            show_stats_panel: true,
+            show_stats_panel: None,
             attached_files: Vec::new(),
             goal: goal::GoalState::default(),
             timers_pending: 0,
@@ -394,6 +402,13 @@ pub struct AutocompleteState {
     pub items: Vec<CommandSuggestion>,
     pub cursor: list::ListCursor,
     pub file_mode: bool,
+    /// Номер скана папки, чей ответ ждём (0 — никакой). Ответ с другим
+    /// номером устарел; см. `AppEvent::AutocompleteReady`.
+    pub wanted: u64,
+    /// Скан папки идёт: новые нажатия лишь помечают `rescan`, а не плодят задачи.
+    pub scanning: bool,
+    /// Пока шёл скан, ввод изменился.
+    pub rescan: bool,
 }
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;
@@ -406,13 +421,6 @@ impl App {
         crate::logging::set_error_sink(event_tx.clone());
 
         let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
-    /// Номер скана папки, чей ответ ждём (0 — никакой). Ответ с другим
-    /// номером устарел; см. `AppEvent::AutocompleteReady`.
-    pub wanted: u64,
-    /// Скан папки идёт: новые нажатия лишь помечают `rescan`, а не плодят задачи.
-    pub scanning: bool,
-    /// Пока шёл скан, ввод изменился.
-    pub rescan: bool,
 
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let tools = Arc::new(ToolRegistry::new());
@@ -565,6 +573,7 @@ impl App {
         // До первого Resize размер знает только терминал.
         if let Ok((cols, rows)) = crossterm::terminal::size() {
             self.state.terminal_rows = rows;
+            self.state.terminal_cols = cols;
         }
         let result = self.run_loop(&mut terminal).await;
         crate::tui::restore(&mut terminal)?;
@@ -584,7 +593,6 @@ impl App {
         let discards: Vec<_> = self
             .state
             .conversations
-            self.state.terminal_cols = cols;
             .iter()
             .filter(|c| c.is_background_kind())
             .filter_map(|c| c.provider.clone())
@@ -906,6 +914,10 @@ impl App {
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
+            AppEvent::LandingSessionsLoaded(sessions) => self.state.landing.apply(sessions),
+            AppEvent::AutocompleteReady { generation, items } => {
+                self.on_autocomplete_ready(generation, items);
+            }
         }
         Ok(false)
     }
@@ -914,21 +926,17 @@ impl App {
     fn on_tick(&mut self) {
         if self.tick_is_visual() {
             let generation = &mut self.state.focused_mut().generation;
-            AppEvent::LandingSessionsLoaded(sessions) => self.state.landing.apply(sessions),
-            AppEvent::AutocompleteReady { generation, items } => {
-                self.on_autocomplete_ready(generation, items);
-            }
             generation.animation_tick = generation.animation_tick.wrapping_add(1);
         }
         self.maybe_refetch_provider_models();
-    }
-
-    /// Единственный вход агентских событий: историю меняет `reduce`, здесь
-    /// остаётся хвост — фон и фокус расходятся ровно в нём.
         // Главный экран показывает сессии: держим список свежим, не трогая диск в кадре.
         if self.state.view == View::Chat && self.state.focused().messages.is_empty() {
             self.state.landing.refresh_if_stale(&self.event_tx);
         }
+    }
+
+    /// Единственный вход агентских событий: историю меняет `reduce`, здесь
+    /// остаётся хвост — фон и фокус расходятся ровно в нём.
     async fn on_agent_event(&mut self, target: conversation::ConversationId, event: AgentEvent) {
         let focused = self.state.conversations.focused_id() == target;
         let Some(conversation) = self.state.conversations.get_mut(target) else {
@@ -945,6 +953,7 @@ impl App {
             self.state.status_message = message;
         }
 
+        let turn_ended = end.is_some();
         let goal_end = end
             .clone()
             .filter(|_| self.state.goal.conversation == Some(target));
@@ -953,7 +962,6 @@ impl App {
             reduce::TurnTail::Background(error) => self.finish_background(target, error),
             reduce::TurnTail::Focused(_) => {
                 self.record_gen_stats();
-        let turn_ended = end.is_some();
                 self.auto_save_session();
             }
         }
@@ -969,6 +977,10 @@ impl App {
             }
             _ => {}
         }
+        // Ход кончился, а человек успел набрать следующее — отправляем его.
+        if turn_ended {
+            self.send_next_queued(target).await;
+        }
     }
 
     /// Оборвать задачу хода чата и выставить забор: события, что она успела
@@ -977,10 +989,6 @@ impl App {
         let Some(conv) = self.state.conversations.get_mut(conversation) else {
             return;
         };
-        // Ход кончился, а человек успел набрать следующее — отправляем его.
-        if turn_ended {
-            self.send_next_queued(target).await;
-        }
         let Some(handle) = conv.agent_task.take() else {
             return;
         };
@@ -1013,6 +1021,9 @@ impl App {
         // чаты Esc больше не гасит.
         let killed = self.state.background.cleanup_turn_of(conversation).await;
         self.state.focused_mut().generation.active = false;
+        self.state.focused_mut().current_tool = None;
+        let queued = self.state.focused().queued.len();
+        self.restore_queued_to_input();
         // The aborted task may have been a `/compact`: drop its claim here, or
         // the command stays refused for this chat forever.
         self.state.focused_mut().compacting = None;
@@ -1024,9 +1035,6 @@ impl App {
                 "Cancelled; killed {k} background process(es), {n} queued message(s) returned to the input"
             ),
         };
-        self.state.focused_mut().current_tool = None;
-        let queued = self.state.focused().queued.len();
-        self.restore_queued_to_input();
         self.state.needs_terminal_restore = true;
         {
             let focused = self.state.focused_mut();

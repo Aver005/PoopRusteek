@@ -16,7 +16,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     match modal {
@@ -65,7 +66,7 @@ fn render_delete_sessions(
         let popup_h = 8u16.min(area.height.saturating_sub(2));
         let popup_area = center_popup(area, popup_width, popup_h);
 
-        let block = modal_block(" \u{1F5D1} Confirm deletion ", theme.error, theme);
+        let block = modal_block(" Confirm deletion ", theme.error, theme);
         let inner = block.inner(popup_area);
 
         let n = st.confirm_ids.len();
@@ -109,7 +110,7 @@ fn render_delete_sessions(
     let popup_h = ((rows + 7) as u16).min(area.height.saturating_sub(2));
     let popup_area = center_popup(area, popup_width, popup_h);
 
-    let block = modal_block(" \u{1F5D1} Delete sessions ", theme.warning, theme);
+    let block = modal_block(" Delete sessions ", theme.warning, theme);
     let inner = block.inner(popup_area);
     let inner_w = inner.width as usize;
 
@@ -171,7 +172,12 @@ fn render_delete_sessions(
             theme.panel
         };
 
-        let checkbox = if is_checked { "\u{2611} " } else { "\u{2610} " };
+        let glyph = crate::tui::glyphs::get();
+        let checkbox = if is_checked {
+            format!("{} ", glyph.checked)
+        } else {
+            format!("{} ", glyph.unchecked)
+        };
         let badge = match (entry.local, entry.remote) {
             (true, true) => "[L+G]",
             (true, false) => "[L]  ",
@@ -274,6 +280,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, cs: &ConfirmState, theme: &Them
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Theme) {
+    let glyph = crate::tui::glyphs::get();
     let popup_width = area.width.clamp(48, 80);
     let visible = picker.items.len().clamp(3, 12);
     let popup_h = (visible + 8) as u16;
@@ -301,10 +308,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         picker.search.clone()
     };
     lines.push(Line::from(vec![
-        Span::styled(
-            " \u{1F50D} ",
-            Style::default().fg(theme.text_dim).bg(theme.panel),
-        ),
+        Span::styled(" ? ", Style::default().fg(theme.text_dim).bg(theme.panel)),
         Span::styled(
             search_display,
             Style::default()
@@ -332,9 +336,13 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         let is_checked = picker.checked.contains(&i);
 
         let indicator = if is_multi {
-            if is_checked { "\u{2611} " } else { "\u{2610} " }
+            if is_checked {
+                glyph.checked
+            } else {
+                glyph.unchecked
+            }
         } else {
-            if is_cursor { "\u{25B6} " } else { "  " }
+            if is_cursor { glyph.pointer } else { " " }
         };
 
         let item = &picker.items[i];
@@ -407,6 +415,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
 }
 
 fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Theme) {
+    let glyph = crate::tui::glyphs::get();
     let popup_width = area.width.clamp(48, 72);
     let is_custom_mode = qs.is_custom_mode;
     let is_yes_no = qs.options.is_empty();
@@ -513,7 +522,7 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
             };
             let fg = if is_cursor { theme.fg } else { theme.text_soft };
 
-            let indicator = if is_cursor { "\u{25B6} " } else { "  " };
+            let indicator = if is_cursor { glyph.pointer } else { " " };
             let label = if is_custom_entry {
                 "Custom...".to_string()
             } else {
@@ -577,9 +586,11 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;
 
+/// Подсказки команд и файлов над правилом поля ввода. `anchor` — строка
+/// правила: окно встаёт прямо над ней и ничего из ввода не перекрывает.
 pub(super) fn render_autocomplete(
     frame: &mut Frame,
-    input_area: Rect,
+    anchor: Rect,
     state: &AppState,
     theme: &Theme,
 ) {
@@ -588,102 +599,79 @@ pub(super) fn render_autocomplete(
         return;
     }
     let total = items.len();
-
     let window = state
         .autocomplete
         .cursor
         .window(total, AUTOCOMPLETE_VISIBLE);
     let scroll_off = window.start;
     let vis_items = &items[window.range()];
+    let is_file = state.autocomplete.file_mode;
+    let prefix = if is_file { "@" } else { "/" };
 
     let max_name_width = items
         .iter()
-        .map(|s| s.name.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.name.as_str()) + 1)
         .max()
         .unwrap_or(0)
-        .max(6) as u16;
+        .max(6);
     let popup_h = (vis_items.len() + 2) as u16;
-    let popup_w = input_area
+    let popup_w = anchor
         .width
-        .min(64)
-        .max(max_name_width + 28)
-        .min(input_area.width);
+        .min(72)
+        .max((max_name_width + 28) as u16)
+        .min(anchor.width);
+    let popup_h = popup_h.min(anchor.y.saturating_sub(1).max(3));
+    let popup_area = Rect::new(anchor.x, anchor.y.saturating_sub(popup_h), popup_w, popup_h);
 
-    let max_y_above = input_area.y.saturating_sub(1);
-    let popup_h = popup_h.min(max_y_above.max(2));
-    let popup_y = input_area.y.saturating_sub(popup_h);
-    let popup_area = Rect::new(input_area.x, popup_y, popup_w, popup_h);
-
-    frame.render_widget(Clear, popup_area);
-
-    let is_file = state.autocomplete.file_mode;
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border_focus))
-        .title(if is_file { " Files " } else { " Commands " })
-        .title_style(
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(theme.panel));
+    let title = if is_file { " Files " } else { " Commands " };
+    let block = modal_block(title, theme.border_focus, theme);
     let inner = block.inner(popup_area);
+    frame.render_widget(Clear, popup_area);
     frame.render_widget(block, popup_area);
 
-    let sel_style = Style::default()
-        .fg(theme.bg)
-        .bg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let name_style = Style::default().fg(theme.accent_soft).bg(theme.panel);
-    let desc_style = Style::default().fg(theme.text_soft).bg(theme.panel);
-    let usage_style = Style::default().fg(theme.text_dim).bg(theme.panel);
-    let muted = Style::default().fg(theme.text_dim).bg(theme.panel);
-
-    let max_name_w = max_name_width as usize;
-
+    let pointer = crate::tui::glyphs::get().pointer;
     let lines: Vec<Line> = vis_items
         .iter()
         .enumerate()
         .map(|(rel, item)| {
-            let is_sel = (scroll_off + rel) == state.autocomplete.cursor.selected;
-            let indicator = if is_sel { "▸ " } else { "  " };
-            let prefix = if is_file { "@" } else { "/" };
-            let name_full = format!("{prefix}{}", item.name);
-            let padding = max_name_w.saturating_sub(item.name.chars().count()).max(1);
-            let pad_str = " ".repeat(padding);
-
-            let mut spans: Vec<Span> = Vec::new();
-            if is_sel {
-                spans.push(Span::styled(indicator, sel_style));
-                spans.push(Span::styled(name_full, sel_style));
-                spans.push(Span::styled(pad_str, sel_style));
-                let desc_text = if item.description.is_empty() {
-                    String::new()
-                } else {
-                    item.description.clone()
-                };
-                spans.push(Span::styled(desc_text, sel_style));
-                if !item.usage.is_empty() {
-                    spans.push(Span::styled("  ", sel_style));
-                    spans.push(Span::styled(item.usage.clone(), sel_style));
-                }
+            let selected = (scroll_off + rel) == state.autocomplete.cursor.selected;
+            let bg = if selected {
+                theme.selection
             } else {
-                spans.push(Span::styled(indicator, muted));
-                spans.push(Span::styled(name_full, name_style));
-                spans.push(Span::styled(pad_str, muted));
-                spans.push(Span::styled("  ", muted));
-                spans.push(Span::styled(item.description.clone(), desc_style));
-                if !item.usage.is_empty() {
-                    spans.push(Span::styled("  ", muted));
-                    spans.push(Span::styled(item.usage.clone(), usage_style));
-                }
+                theme.panel
+            };
+            let name = format!("{prefix}{}", item.name);
+            let pad = max_name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+            let mark = if selected { pointer } else { " " };
+            let name_style = Style::default().fg(theme.accent_soft).bg(bg);
+            let mut spans = vec![
+                Span::styled(format!("{mark} "), Style::default().fg(theme.accent).bg(bg)),
+                Span::styled(
+                    name,
+                    if selected {
+                        name_style.add_modifier(Modifier::BOLD)
+                    } else {
+                        name_style
+                    },
+                ),
+                Span::styled(" ".repeat(pad + 2), Style::default().bg(bg)),
+                Span::styled(
+                    item.description.clone(),
+                    Style::default()
+                        .fg(if selected { theme.fg } else { theme.text_soft })
+                        .bg(bg),
+                ),
+            ];
+            // Usage повторяет имя команды — показываем, только если добавляет сведений.
+            if !is_file && !item.usage.is_empty() && item.usage != format!("/{}", item.name) {
+                spans.push(Span::styled(
+                    format!("  {}", item.usage),
+                    Style::default().fg(theme.text_dim).bg(bg),
+                ));
             }
             Line::from(spans)
         })
         .collect();
-
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.panel)),
         inner,

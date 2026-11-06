@@ -85,21 +85,18 @@ pub(super) fn overflow_line(up: bool, theme: &Theme) -> Line<'static> {
     ))
 }
 
-/// Маркер курсора в списках вариантов. Один на все мастера: знак был записан
-/// тремя способами, а в автодополнении оказался вообще другим (U+25B8).
-pub(super) const CURSOR_MARK: &str = "\u{25B6} ";
-
-/// Строка варианта в мастере: маркер курсора плюс подпись, без фона.
+/// Строка варианта в мастере: маркер курсора (из набора глифов) плюс подпись, без фона.
 /// Четыре мастера рисовали её порознь и уже разошлись в стиле отбивки.
 pub(super) fn option_row(
     label: impl Into<String>,
     is_cursor: bool,
     theme: &Theme,
 ) -> Line<'static> {
+    let pointer = format!("{} ", crate::tui::glyphs::get().pointer);
     Line::from(vec![
         Span::styled("  ", Style::default().fg(theme.fg)),
         Span::styled(
-            if is_cursor { CURSOR_MARK } else { "  " },
+            if is_cursor { pointer } else { "  ".to_string() },
             Style::default().fg(if is_cursor {
                 theme.accent
             } else {
@@ -220,6 +217,9 @@ pub(super) fn push_text_box_lines(
                     Style::default().fg(theme.fg).bg(theme.input_bg),
                 ),
             ]));
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -234,8 +234,5 @@ mod tests {
     #[test]
     fn dimming_leaves_terminal_default_colors_alone() {
         assert_eq!(dim_color(Color::Reset, Color::Rgb(0, 0, 0)), Color::Reset);
-    }
-}
-        }
     }
 }

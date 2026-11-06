@@ -59,7 +59,8 @@ impl App {
                 self.cycle_focus(-1);
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.show_stats_panel = !self.state.show_stats_panel;
+                let visible = self.state.stats_panel_visible(self.state.terminal_cols);
+                self.state.show_stats_panel = Some(!visible);
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Не стирает историю: перерисовка и прыжок вниз. Стирает `/clear`.

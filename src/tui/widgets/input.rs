@@ -1,20 +1,20 @@
 use crate::app::AppState;
+use crate::tui::render::MAX_INPUT_ROWS;
 use crate::tui::theme::Theme;
 use crate::util::char_to_byte_pos;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
 };
-use std::cell::Cell;
 use unicode_width::UnicodeWidthStr;
 
-/// Display width of the input's left gutter: the `" >  "` prompt on the first
+/// Display width of the input's left gutter: the `" ❯ "` prompt on the first
 /// visual line, matched by a blank indent on wrapped and continuation lines so
 /// every line's text starts in the same column.
-const GUTTER: usize = 4;
+const GUTTER: usize = 3;
 /// Columns kept clear at the right edge so wrapped text never touches — and
 /// the cursor never lands one past — the input box's last column.
 const RIGHT_MARGIN: usize = 1;
@@ -108,202 +108,175 @@ fn scroll_top_row(
     }
 }
 
+/// Сколько строк нужно полю ввода при ширине `width`: от одной до предела.
+pub fn visible_rows(buffer: &str, width: u16) -> u16 {
+    let rows = build_visual_lines(buffer, width).len() as u16;
+    rows.clamp(1, MAX_INPUT_ROWS)
+}
+
+/// Подсказка в пустом поле: зависит от того, что сейчас происходит.
+pub fn placeholder(state: &AppState) -> &'static str {
+    let focused = state.focused();
+    if focused.generation.active {
+        if focused.queued.is_empty() {
+            "Type a follow-up \u{2014} Enter queues it until the turn ends\u{2026}"
+        } else {
+            "Add another message to the queue\u{2026}"
+        }
+    } else if focused.messages.is_empty() {
+        "Ask anything \u{2014} describe a task, debug an issue, or ask a question\u{2026}"
+    } else {
+        "Type a message or / for commands\u{2026}"
+    }
+}
+
+/// Раскладка текста по строкам, посчитанная один раз за кадр.
+struct InputLayout<'a> {
+    logical: Vec<&'a str>,
+    line_starts: Vec<usize>,
+    visual: Vec<VisualLine>,
+}
+
+impl<'a> InputLayout<'a> {
+    fn new(input: &'a str, width: u16) -> Self {
+        let logical: Vec<&str> = input.split('\n').collect();
+        let line_starts = line_starts_from_logical(&logical);
+        let visual = build_visual_lines(input, width);
+        Self {
+            logical,
+            line_starts,
+            visual,
+        }
+    }
+
+    /// Номер визуальной строки, в которой стоит курсор.
+    fn cursor_row(&self, cursor: usize) -> usize {
+        self.visual
+            .iter()
+            .rposition(|v| {
+                let log_start = self.line_starts.get(v.logical_idx).copied().unwrap_or(0);
+                let start = log_start + v.char_start;
+                let end = log_start + v.char_end;
+                cursor >= start && cursor <= end
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// Нарисовать поле ввода в `area` (одна или несколько строк на всю ширину) и
+/// вернуть, где стоит курсор. Курсор ставит вызывающий.
 pub fn render_input(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
     theme: &Theme,
-    is_landing: bool,
-    cursor_out: &Cell<Option<(u16, u16)>>,
-) {
+) -> Option<(u16, u16)> {
     let input = &state.input.buffer;
     let cursor = state.input.cursor.min(input.chars().count());
-    let top_pad = 1;
-
-    let sep_style = Style::default().fg(theme.accent).bg(theme.input_bg);
-    let empty_style = Style::default().bg(theme.input_bg);
-
-    let sel: Option<(usize, usize)> = state.input.selection_anchor.map(|anchor| {
-        let (start, end) = if anchor <= cursor {
-            (anchor, cursor)
-        } else {
-            (cursor, anchor)
-        };
-        (char_to_byte_pos(input, start), char_to_byte_pos(input, end))
-    });
-
-    let logical: Vec<&str> = input.split('\n').collect();
-    let line_starts = line_starts_from_logical(&logical);
-    let visual = build_visual_lines(input, area.width);
-
-    let cursor_visual = visual
-        .iter()
-        .rposition(|v| {
-            let log_start = line_starts[v.logical_idx];
-            let abs_end = log_start + (v.char_end - v.char_start);
-            cursor >= log_start + v.char_start && cursor <= abs_end
-        })
-        .unwrap_or(0);
-
+    let layout = InputLayout::new(input, area.width);
     let visible_rows = area.height as usize;
-    let total_rows = visual.len();
-    let top_row = scroll_top_row(cursor_visual, total_rows, visible_rows, top_pad);
+    let cursor_row = layout.cursor_row(cursor);
+    let top_row = scroll_top_row(cursor_row, layout.visual.len(), visible_rows, 0);
+    let glyph = crate::tui::glyphs::get();
 
-    let mut rendering_lines: Vec<Line> = Vec::with_capacity(visible_rows);
-    let indent_width = GUTTER;
-    let blank = " ".repeat(area.width.saturating_sub(indent_width as u16) as usize);
+    let base = Style::default().fg(theme.fg).bg(theme.input_bg);
+    let blank = Style::default().bg(theme.input_bg);
+    let prompt = Span::styled(
+        format!(" {} ", glyph.prompt),
+        Style::default().fg(theme.accent).bg(theme.input_bg),
+    );
+    let indent = Span::styled(" ".repeat(GUTTER), blank);
 
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
     if input.is_empty() {
-        for i in 0..visible_rows {
-            if i == top_pad {
-                let text = if is_landing {
-                    "Ask anything \u{2014} describe a task, debug an issue, or ask a question..."
-                } else {
-                    "Type a message or / to see commands..."
-                };
-                rendering_lines.push(Line::from(vec![
-                    Span::styled(" >  ", sep_style),
-                    Span::styled(text, Style::default().fg(theme.text_dim).bg(theme.input_bg)),
-                ]));
-            } else {
-                rendering_lines.push(Line::from(vec![Span::styled(&blank, empty_style)]));
-            }
-        }
+        lines.push(Line::from(vec![
+            prompt,
+            Span::styled(
+                placeholder(state),
+                Style::default().fg(theme.text_dim).bg(theme.input_bg),
+            ),
+        ]));
     } else {
-        for _ri in 0..top_pad.min(visible_rows) {
-            rendering_lines.push(Line::from(vec![Span::styled(&blank, empty_style)]));
-        }
-        // Render the scroll window [top_row, top_row + max_content): the visual
-        // lines that fit in the content rows below the top pad. The previous
-        // filter folded `top_pad` into the lower-bound test, so it failed to
-        // drop the scrolled-off lines and `.take()` then clipped the cursor's
-        // own line off the bottom — typing past the last visible row moved the
-        // caret but rendered no text.
-        let max_content = visible_rows.saturating_sub(top_pad);
-        for vi in (top_row..visual.len()).take(max_content) {
-            let vline = &visual[vi];
-            let seg = logical[vline.logical_idx];
-
-            let fg = Style::default().fg(theme.fg).bg(theme.input_bg);
-            let sel_style = Style::default()
-                .fg(theme.fg)
-                .bg(theme.selection)
-                .add_modifier(Modifier::REVERSED);
-
+        let sel: Option<(usize, usize)> = state.input.selection_anchor.map(|anchor| {
+            let (start, end) = if anchor <= cursor {
+                (anchor, cursor)
+            } else {
+                (cursor, anchor)
+            };
+            (char_to_byte_pos(input, start), char_to_byte_pos(input, end))
+        });
+        let sel_style = Style::default().fg(theme.fg).bg(theme.selection);
+        for vi in (top_row..layout.visual.len()).take(visible_rows) {
+            let vline = &layout.visual[vi];
+            let seg = layout.logical[vline.logical_idx];
             let mut spans: Vec<Span> = Vec::new();
-            if vline.logical_idx == 0 && vline.char_start == 0 {
-                spans.push(Span::styled(
-                    " >  ",
-                    Style::default().fg(theme.accent).bg(theme.input_bg),
-                ));
+            let first_line = vline.logical_idx == 0 && vline.char_start == 0;
+            spans.push(if first_line {
+                prompt.clone()
             } else {
-                // GUTTER (4) blank cells, matching the `" >  "` prompt width so
-                // wrapped and continuation lines align under the first line.
-                spans.push(Span::styled("    ", empty_style));
-            }
+                indent.clone()
+            });
 
-            let seg_byte_start = char_to_byte_pos(input, line_starts[vline.logical_idx]);
-            let byte_chunk_start = char_to_byte_pos(seg, vline.char_start);
-            let byte_chunk_end = char_to_byte_pos(seg, vline.char_end);
-            let mut idx = byte_chunk_start;
-            while idx < byte_chunk_end.min(seg.len()) {
-                let Some(ch) = seg[idx..].chars().next() else {
-                    break;
-                };
-                let ch_len = ch.len_utf8();
-                let abs_byte = seg_byte_start + idx;
-                let in_sel = match sel {
-                    Some((s, e)) => abs_byte >= s && abs_byte < e,
-                    None => false,
-                };
-                let mut j = idx + ch_len;
-                while j < byte_chunk_end.min(seg.len()) {
-                    let next_byte = seg_byte_start + j;
-                    let next_in = match sel {
-                        Some((s, e)) => next_byte >= s && next_byte < e,
-                        None => false,
-                    };
-                    if next_in != in_sel {
-                        break;
-                    }
-                    let Some(nch) = seg[j..].chars().next() else {
+            let seg_byte_start = char_to_byte_pos(input, layout.line_starts[vline.logical_idx]);
+            let chunk_start = char_to_byte_pos(seg, vline.char_start);
+            let chunk_end = char_to_byte_pos(seg, vline.char_end).min(seg.len());
+            let in_selection = |byte: usize| sel.is_some_and(|(s, e)| byte >= s && byte < e);
+            let mut idx = chunk_start;
+            while idx < chunk_end {
+                let selected = in_selection(seg_byte_start + idx);
+                let mut next = idx;
+                while next < chunk_end && in_selection(seg_byte_start + next) == selected {
+                    let Some(ch) = seg[next..].chars().next() else {
                         break;
                     };
-                    j += nch.len_utf8();
+                    next += ch.len_utf8();
                 }
-                let byte_end = j;
-                let text = &seg[idx..byte_end];
-                spans.push(Span::styled(text, if in_sel { sel_style } else { fg }));
-                idx = j;
+                if next == idx {
+                    break;
+                }
+                spans.push(Span::styled(
+                    &seg[idx..next],
+                    if selected { sel_style } else { base },
+                ));
+                idx = next;
             }
-            if idx == char_to_byte_pos(seg, vline.char_start) {
-                spans.push(Span::styled("", fg));
+            if idx == chunk_start {
+                spans.push(Span::styled("", base));
             }
-            rendering_lines.push(Line::from(spans));
-        }
-        while rendering_lines.len() < visible_rows {
-            rendering_lines.push(Line::from(vec![Span::styled(&blank, empty_style)]));
+            lines.push(Line::from(spans));
         }
     }
 
-    let paragraph = Paragraph::new(rendering_lines).style(Style::default().bg(theme.input_bg));
-    frame.render_widget(paragraph, area);
-
-    let pos = cursor_pos_inner(input, cursor, area, state);
-    if let Some((x, y)) = pos {
-        frame.set_cursor_position((x, y));
-        cursor_out.set(Some((x, y)));
-    } else {
-        cursor_out.set(None);
-    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.input_bg)),
+        area,
+    );
+    cursor_position(&layout, cursor, cursor_row, top_row, area)
 }
 
-fn cursor_pos_inner(
-    input: &str,
+/// Клетка курсора: после последнего знака перед ним в его строке.
+fn cursor_position(
+    layout: &InputLayout<'_>,
     cursor: usize,
+    cursor_row: usize,
+    top_row: usize,
     area: Rect,
-    state: &AppState,
 ) -> Option<(u16, u16)> {
-    if state.focused().generation.active || state.modal.is_some() {
-        return None;
-    }
-    let top_pad = 1;
-    let logical: Vec<&str> = input.split('\n').collect();
-    let line_starts = line_starts_from_logical(&logical);
-    let visual = build_visual_lines(input, area.width);
-
-    let cursor_visual = visual
-        .iter()
-        .rposition(|v| {
-            let log_start = line_starts.get(v.logical_idx).copied().unwrap_or(0);
-            let abs_end = log_start + (v.char_end - v.char_start);
-            let abs_start = log_start + v.char_start;
-            cursor >= abs_start && cursor <= abs_end
-        })
-        .unwrap_or(0);
-    let cursor_logical = visual[cursor_visual].logical_idx;
-    let cursor_col_in_logical = cursor - line_starts[cursor_logical];
-
-    let visible_rows = area.height as usize;
-    let total_rows = visual.len();
-    let top_row = scroll_top_row(cursor_visual, total_rows, visible_rows, top_pad);
-    let screen_row = top_pad + cursor_visual.saturating_sub(top_row);
-    let indent = GUTTER;
-
-    let seg = logical[cursor_logical];
-    let vchar_start = visual[cursor_visual].char_start;
-    let before_cursor_chars: String = seg
+    let vline = layout.visual.get(cursor_row)?;
+    let line_start = layout.line_starts[vline.logical_idx];
+    let seg = layout.logical[vline.logical_idx];
+    let before: String = seg
         .chars()
-        .skip(vchar_start)
-        .take(cursor_col_in_logical - vchar_start)
+        .skip(vline.char_start)
+        .take((cursor - line_start).saturating_sub(vline.char_start))
         .collect();
-    let h_offset = u16::try_from(UnicodeWidthStr::width(before_cursor_chars.as_str()))
+    let h_offset = u16::try_from(UnicodeWidthStr::width(before.as_str()))
         .unwrap_or(u16::MAX)
         .min(area.width.saturating_sub((GUTTER + RIGHT_MARGIN) as u16));
-    let x = area.x + indent as u16 + h_offset;
-    let cursor_y = area.y.saturating_add(screen_row as u16);
-    let cursor_y = cursor_y.clamp(area.y, area.bottom().saturating_sub(1));
-    Some((x, cursor_y))
+    let x = area.x + GUTTER as u16 + h_offset;
+    let row = cursor_row.saturating_sub(top_row) as u16;
+    let y = (area.y + row).clamp(area.y, area.bottom().saturating_sub(1));
+    Some((x, y))
 }
 
 #[cfg(test)]
@@ -366,5 +339,28 @@ mod tests {
         assert_eq!(scroll_top_row(2, 3, 4, 1), 0);
         assert_eq!(scroll_top_row(3, 4, 4, 1), 1);
         assert_eq!(scroll_top_row(9, 10, 4, 1), 7); // last line → last window
+    }
+
+    #[test]
+    fn the_input_is_one_row_when_empty_and_grows_to_the_limit() {
+        assert_eq!(visible_rows("", 80), 1);
+        assert_eq!(visible_rows("one line", 80), 1);
+        assert_eq!(visible_rows("a\nb\nc", 80), 3);
+        assert_eq!(visible_rows(&"x\n".repeat(50), 80), MAX_INPUT_ROWS);
+    }
+
+    #[test]
+    fn the_placeholder_follows_what_is_going_on() {
+        let mut state = AppState::new(crate::app::conversation::Conversation::fresh_main(None));
+        let landing = placeholder(&state);
+        state
+            .focused_mut()
+            .messages
+            .push(crate::provider::ChatMessage::user("hi"));
+        let chat = placeholder(&state);
+        state.focused_mut().generation.active = true;
+        let running = placeholder(&state);
+        assert!(landing != chat && chat != running && landing != running);
+        assert!(running.contains("queue"));
     }
 }
