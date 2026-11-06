@@ -19,7 +19,7 @@ mod write;
 /// Новейшая схема `[gateway]`, которую понимает эта сборка.
 pub const GATEWAY_SCHEMA: u32 = 1;
 
-pub use layers::{Layer, LayerInfo, LayerStatus, looks_like_key};
+pub use layers::{GatedSummary, Layer, LayerInfo, LayerStatus, looks_like_key, real_host};
 pub use load::{
     ConfigSource, SecretsConfig, TrustConfig, TrustRequest, bind_secret_host, file_references,
     inline_secret_labels, link_secret_reference, project_key, sha256_hex, trust_project,

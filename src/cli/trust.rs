@@ -154,6 +154,7 @@ mod tests {
             key: format!("/m2-{tag}/.pooprusteek/config.toml"),
             hash: "0".repeat(64),
             held_back: Vec::new(),
+            summary: config::GatedSummary::default(),
         }
     }
 

@@ -255,7 +255,7 @@ pub struct GatedSummary {
 
 /// Хост адреса так, как его увидит клиент. `https://api.openai.com@evil.example/v1` — это
 /// `evil.example`; нечитаемый адрес показывается как есть, а не прячется.
-fn real_host(raw: &str) -> String {
+pub fn real_host(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(url) => match (url.host_str(), url.port()) {
             (Some(host), Some(port)) => format!("{host}:{port}"),
