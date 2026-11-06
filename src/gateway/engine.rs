@@ -634,7 +634,7 @@ impl Core {
                 class: class.clone(),
             });
         }
-        if query.source == CallSource::Serve && account.provider == AccountProvider::CliClaude {
+        if query.source == CallSource::Serve && account.provider.cli_tool().is_some() {
             return skip(SkipReason::NotForServe);
         }
         let Some(runtime) = self.runtime(&account.id) else {
@@ -1307,14 +1307,14 @@ impl Gateway for Engine {
         }
         let unknown = || ResolveError::Unknown(id.to_string());
         let binding = self.resolve(id).ok_or_else(unknown)?;
-        // Подписка Claude наружу не раздаётся: такой адрес для `/serve` не существует.
+        // Подписки CLI наружу не раздаются: такой адрес для `/serve` не существует.
         if source == CallSource::Serve
             && let Binding::Fixed(target) = &binding
             && self
                 .core
                 .config()
                 .account(&target.account)
-                .is_some_and(|a| a.provider == AccountProvider::CliClaude)
+                .is_some_and(|a| a.provider.cli_tool().is_some())
         {
             return Err(unknown());
         }

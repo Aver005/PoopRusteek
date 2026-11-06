@@ -16,7 +16,7 @@ use crate::provider::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -158,6 +158,8 @@ pub fn is_meaningful(chunk: &CompletionChunk) -> bool {
 pub struct EmitTracker {
     tx: UnboundedSender<CompletionChunk>,
     emitted: Arc<AtomicBool>,
+    /// Сколько символов текста ушло: оценка расхода оборванного вызова.
+    chars: Arc<AtomicUsize>,
 }
 
 impl EmitTracker {
@@ -165,21 +167,30 @@ impl EmitTracker {
         Self {
             tx,
             emitted: Arc::new(AtomicBool::new(false)),
+            chars: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Отправить чанк. `false` — получатель ушёл, вызов можно прекращать.
     pub fn send(&self, chunk: CompletionChunk) -> bool {
         let meaningful = is_meaningful(&chunk);
+        let length = chunk.content.chars().count();
         let delivered = self.tx.send(chunk).is_ok();
-        if delivered && meaningful {
-            self.emitted.store(true, Ordering::Relaxed);
+        if delivered {
+            self.chars.fetch_add(length, Ordering::Relaxed);
+            if meaningful {
+                self.emitted.store(true, Ordering::Relaxed);
+            }
         }
         delivered
     }
 
     pub fn emitted(&self) -> bool {
         self.emitted.load(Ordering::Relaxed)
+    }
+
+    pub fn emitted_chars(&self) -> usize {
+        self.chars.load(Ordering::Relaxed)
     }
 }
 

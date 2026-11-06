@@ -35,7 +35,6 @@ mod whitelist;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use config::Config;
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "pooprusteek", version)]
@@ -276,18 +275,25 @@ async fn run_async(args: Args, config: Config) -> Result<Option<i32>> {
 }
 
 fn run_acp_server(config: &Config) -> Result<()> {
-    if config.provider.token.is_empty() {
+    // Как в приложении: шлюз собирается вне цикла, запрос в это время ждёт готовности.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (gateway, mut pending) = app::start_gateway(config, &event_tx);
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            if let (app::events::AppEvent::GatewayBuilt(built), Some(waiting)) =
+                (event, pending.take())
+            {
+                match built.0 {
+                    Ok(ready) => waiting.fulfil(ready),
+                    Err(reason) => waiting.fail(reason),
+                }
+            }
+        }
+    });
+    let Some(provider) = gateway::handle::main_provider(config, Some(&gateway)) else {
         eprintln!("Error: No token configured. Run without --acp to set up.");
         std::process::exit(1);
-    }
-
-    let provider = crate::provider::deepseek::DeepseekProvider::new(
-        &config.provider,
-        config.agent.rate_limit_ms,
-        config.agent.rate_limit_per_minute,
-        config.agent.max_retries,
-    )?;
-    let provider = Arc::new(provider);
+    };
     let mut server = acp::server::AcpServer::new(provider);
     server.run()?;
     Ok(())

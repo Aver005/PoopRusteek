@@ -233,7 +233,7 @@ pub enum SkipReason {
         used_pct: f32,
         age: Duration,
     },
-    /// Подписка Claude наружу через `/serve` не раздаётся.
+    /// Подписки CLI наружу через `/serve` не раздаются.
     NotForServe,
     /// Ошибка конфига: аккаунт не используется, пока её не исправят.
     InvalidConfig {
@@ -253,6 +253,15 @@ pub enum SkipReason {
 pub struct Skipped {
     pub account: AccountId,
     pub reason: SkipReason,
+}
+
+/// Кто отвечает на вызов сейчас: для заголовков `/serve`. Ни секретов, ни адресов.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServedBy {
+    pub target: Target,
+    pub route: Option<RouteId>,
+    /// Аккаунты, отказавшие раньше в этом вызове, и код класса отказа.
+    pub failed_before: Vec<(AccountId, String)>,
 }
 
 /// Причина выбора.

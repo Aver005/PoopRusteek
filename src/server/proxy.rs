@@ -8,10 +8,12 @@
 //! loop (the TUI drives refetch off its Tick; here a plain interval does
 //! it). First Ctrl+C shuts down gracefully, second one hard-exits.
 
-use super::{ServerSettings, spawn};
+use super::{GatewayCell, ServerSettings, spawn};
 use crate::app::events::AppEvent;
 use crate::config::Config;
 use crate::error::AppResult;
+use crate::gateway::handle::{GatewayEvent, GatewayHandle};
+use crate::gateway::pending::PendingGateway;
 use crate::provider::model_cache::ProviderModelCache;
 use std::sync::Arc;
 
@@ -21,8 +23,14 @@ fn log_line(text: &str) {
 
 pub async fn run(config: Config) -> AppResult<()> {
     let models = ProviderModelCache::load();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Шлюз собирается так же, как в приложении: вне цикла событий, запросы ждут готовности.
+    let (gateway, mut pending) = crate::app::start_gateway(&config, &event_tx);
+    models.set_gateway(gateway.clone());
+    let gateway_on = gateway.is_enabled();
     let mut settings = ServerSettings::from_config(&config);
     settings.request_log = true;
+    settings.gateway = GatewayCell::new(gateway);
 
     log_line(&format!(
         "pooprusteek proxy — {} dialect on {}:{}, auth {}",
@@ -35,11 +43,14 @@ pub async fn run(config: Config) -> AppResult<()> {
             "off"
         },
     ));
-    if settings.deepseek.is_none() && settings.entries.is_empty() {
+    // Заметки загрузки конфига, в том числе «проектный конфиг ждёт `pooprusteek trust`».
+    for notice in &config.migration_notices {
+        log_line(notice);
+    }
+    if !gateway_on && settings.deepseek.is_none() && settings.entries.is_empty() {
         log_line("warning: no providers configured — the API will expose no models");
     }
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = spawn(settings, Arc::clone(&models), 1, event_tx.clone());
 
     // Startup fetch (respects the persisted cache) + periodic refetch.
@@ -102,6 +113,9 @@ pub async fn run(config: Config) -> AppResult<()> {
                     break;
                 }
                 Some(AppEvent::ServerRequestLog { line }) => log_line(&line),
+                Some(AppEvent::GatewayBuilt(built)) => {
+                    on_gateway_built(built.0, pending.take(), &models, &handle, &event_tx);
+                }
                 Some(AppEvent::ProviderModelsRefreshed { summary, .. }) => log_line(&summary),
                 // Nothing else runs in this process, but the enum is shared
                 // with the TUI — ignore the rest.
@@ -110,4 +124,104 @@ pub async fn run(config: Config) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+/// Движок собран: ждущие запросы продолжаются, сервер и кэш моделей переходят на него.
+fn on_gateway_built(
+    built: Result<GatewayHandle, String>,
+    pending: Option<Arc<PendingGateway>>,
+    models: &Arc<ProviderModelCache>,
+    handle: &super::ServerHandle,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(pending) = pending else { return };
+    match built {
+        Ok(gateway) => {
+            pending.fulfil(Arc::clone(&gateway));
+            models.set_gateway(Arc::clone(&gateway));
+            handle.gateway.set(Arc::clone(&gateway));
+            log_line("gateway ready");
+            forward_fallbacks(&gateway, event_tx.clone());
+        }
+        Err(reason) => {
+            pending.fail(reason.clone());
+            log_line(&format!("the gateway failed to start: {reason}"));
+        }
+    }
+}
+
+/// Переходы на запасной аккаунт попадают в журнал запросов.
+fn forward_fallbacks(
+    gateway: &GatewayHandle,
+    event_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
+) {
+    if !gateway.is_enabled() {
+        return;
+    }
+    let mut events = gateway.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(GatewayEvent::FallbackTaken {
+                    from, to, class, ..
+                }) => {
+                    let line = format!("fallback {from} → {to} ({})", class.code());
+                    let _ = event_tx.send(AppEvent::ServerRequestLog { line });
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::testkit::{Script, engine, start, upstream};
+
+    /// Прокси собирает шлюз так же, как приложение: пока он строится, запрос получает 503, потом сервер переходит на готовый.
+    #[tokio::test]
+    async fn the_proxy_moves_the_server_onto_the_gateway_once_it_is_built() {
+        unsafe { std::env::set_var("POOPRUSTEEK_PROXY_TEST_KEY", "proxy-test-key-0000") };
+        let up = upstream(vec![(
+            "/a/",
+            vec![Script::Stream {
+                chunks: vec!["hello"],
+                usage: None,
+                headers: Vec::new(),
+            }],
+        )])
+        .await;
+        let text = format!(
+            "[gateway]\nschema = 1\nenabled = true\n\n[[accounts]]\nid = \"a\"\nprovider = \"openai\"\nbase_url = \"http://127.0.0.1:{}/a/v1\"\nsecret = \"env:POOPRUSTEEK_PROXY_TEST_KEY\"\nmodel = \"m\"\n",
+            up.port
+        );
+        let parsed = crate::config::parse(&text).unwrap();
+        let pending = PendingGateway::new(crate::gateway::engine::gateway_config(&parsed));
+        let building: GatewayHandle =
+            Arc::new(crate::gateway::pending::PendingHandle(Arc::clone(&pending)));
+        let stand = start(building, None).await;
+        let ask = || async {
+            reqwest::Client::new()
+                .post(format!("{}/v1/chat/completions", stand.base))
+                .json(&serde_json::json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(ask().await, 503);
+
+        let models = ProviderModelCache::empty_for_tests();
+        let (event_tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        on_gateway_built(
+            Ok(engine(&text, Vec::new())),
+            Some(pending),
+            &models,
+            &stand.handle,
+            &event_tx,
+        );
+        assert_eq!(ask().await, 200);
+    }
 }

@@ -204,7 +204,7 @@ fn gateway_startup_note(gateway: &crate::gateway::handle::GatewayHandle) -> Opti
 /// Шлюз для запуска. Выключенный готов сразу и ничего не читает; включённый собирается
 /// на `spawn_blocking` (секреты: хранилище, `cmd:`, файлы), результат приходит `GatewayBuilt`.
 /// Пока он не готов, ввод и панели живы, а запрос ждёт готовности.
-fn start_gateway(
+pub(crate) fn start_gateway(
     config: &Config,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> (
@@ -1023,6 +1023,7 @@ impl App {
                 pending.fulfil(Arc::clone(&gateway));
                 self.gateway = gateway;
                 self.provider_models.set_gateway(self.gateway.clone());
+                self.sync_server_gateway();
                 self.state.status_message =
                     gateway_startup_note(&self.gateway).unwrap_or_else(|| "Gateway ready".into());
             }
@@ -1342,6 +1343,7 @@ impl App {
         // Сборка, которая шла в этот момент, больше не нужна: конфиг стёрт.
         self.pending_gateway = None;
         self.provider_models.set_gateway(self.gateway.clone());
+        self.sync_server_gateway();
         self.state.approved_tools = crate::whitelist::Whitelist::default();
         self.state.input.history.clear();
         if errors.is_empty() {

@@ -10,6 +10,7 @@
 
 use super::catalog::{self, ResolvedModel};
 use super::http::{ApiBody, LogDetail, ServerContext, full_body, json_response};
+use super::routing;
 use super::tools::{BridgedReply, ToolBridge, flatten_history};
 use crate::agent::continuation::continue_cut_off;
 use crate::agent::stream::{
@@ -23,20 +24,30 @@ use crate::provider::openai_compat::{
     self, ChatCompletionRequest, ChatCompletionResponse, Choice, CompletionMeta, ErrorResponse,
     MessageContent, ReasoningStreamSplitter, WireToolCall,
 };
-use crate::provider::{ChatMessage, CompletionRequest, CompletionResponse, LLMProvider};
+use crate::provider::{
+    ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, LLMProvider, Usage,
+};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Requests are buffered before parsing; cap them so a misbehaving client
 /// can't balloon memory. 16 MiB fits any realistic chat history.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Выбранный бэкенд: провайдер, модель для журнала и признак «идёт через шлюз».
+struct Chosen {
+    provider: Arc<dyn LLMProvider>,
+    model: String,
+    routed: bool,
+}
+
 /// A resolved backend, or a ready-to-return error response (boxed — see
 /// [`resolve_backend`]).
-type BackendResult = Result<(ResolvedModel, Arc<dyn LLMProvider>), Box<Response<ApiBody>>>;
+type BackendResult = Result<Chosen, Box<Response<ApiBody>>>;
 
 /// Dispatch one request. `None` = not a route of this dialect (the caller
 /// answers 404).
@@ -96,6 +107,10 @@ fn model_not_found(message: String) -> Response<ApiBody> {
 /// ready-to-return error response (boxed — a `Response` dwarfs the Ok
 /// tuple, and clippy rightly flags a fat `Err`). Shared by chat + legacy.
 fn resolve_backend(model_id: &str, context: &ServerContext) -> BackendResult {
+    let gateway = context.gateway.get();
+    if gateway.is_enabled() {
+        return resolve_routed(&gateway, model_id, context);
+    }
     let resolved = catalog::resolve_model(
         model_id,
         context.deepseek.is_some(),
@@ -130,15 +145,75 @@ fn resolve_backend(model_id: &str, context: &ServerContext) -> BackendResult {
             })?
         }
     };
-    Ok((resolved, provider))
+    Ok(Chosen {
+        provider,
+        model: resolved.internal_model().to_string(),
+        routed: false,
+    })
+}
+
+/// Адрес через шлюз: каталог проверяет `account/model` и `auto/<route>`, шлюз выбирает аккаунт.
+/// Адрес, базовый URL и заголовки аккаунта клиент задать не может.
+fn resolve_routed(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    model_id: &str,
+    context: &ServerContext,
+) -> BackendResult {
+    use crate::gateway::handle::{CallSource, ResolveError};
+    let snapshot = gateway.snapshot();
+    if snapshot.accounts.is_empty() && routing::is_starting(gateway) {
+        return Err(Box::new(starting_response()));
+    }
+    let address = routing::check_address(&snapshot, &context.models.snapshot(), model_id)
+        .map_err(|message| Box::new(model_not_found(message)))?;
+    match gateway.provider_for_model_id(&address, CallSource::Serve) {
+        Ok(provider) => Ok(Chosen {
+            provider,
+            model: address,
+            routed: true,
+        }),
+        Err(ResolveError::Starting) => Err(Box::new(starting_response())),
+        Err(ResolveError::Unknown(_)) => Err(Box::new(model_not_found(format!(
+            "model '{}' not found — see GET /v1/models for what this server exposes",
+            model_id.trim()
+        )))),
+        Err(error @ ResolveError::Disabled) => Err(Box::new(
+            UpstreamError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()).response(),
+        )),
+    }
+}
+
+/// Шлюз собирается: клиент должен повторить, а не получить «модели нет».
+fn starting_response() -> Response<ApiBody> {
+    let mut error = UpstreamError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the gateway is still starting, retry in a moment".to_string(),
+    );
+    error.code = Some("gateway_starting");
+    error.retry_after = Some(std::time::Duration::from_secs(2));
+    error.response()
+}
+
+/// Заголовки `x-pooprusteek-*` по тому, куда ушёл вызов. Без шлюза ничего не добавляется.
+fn add_route_headers(response: &mut Response<ApiBody>, provider: &Arc<dyn LLMProvider>) {
+    if let Some(served) = provider.served_by() {
+        for (name, value) in routing::route_headers(&served) {
+            response.headers_mut().insert(name, value);
+        }
+    }
 }
 
 fn models_response(context: &ServerContext) -> Response<ApiBody> {
-    let ids = catalog::list_model_ids(
-        context.deepseek.is_some(),
-        &context.entries,
-        &context.models.snapshot(),
-    );
+    let gateway = context.gateway.get();
+    let ids = if gateway.is_enabled() {
+        routing::model_ids(&gateway.snapshot(), &context.models.snapshot())
+    } else {
+        catalog::list_model_ids(
+            context.deepseek.is_some(),
+            &context.entries,
+            &context.models.snapshot(),
+        )
+    };
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
     let created = chrono::Utc::now().timestamp().max(0) as u64;
     json_response(
@@ -176,10 +251,15 @@ async fn chat_completions(
         }
     };
 
-    let (resolved, provider) = match resolve_backend(&wire.model, context) {
-        Ok(pair) => pair,
+    let Chosen {
+        provider,
+        model: chosen_model,
+        routed,
+    } = match resolve_backend(&wire.model, context) {
+        Ok(chosen) => chosen,
         Err(response) => return *response,
     };
+    let include_usage = wants_usage(&body);
 
     // The response echoes the id the caller asked for, per OpenAI protocol.
     let public_model = wire.model.clone();
@@ -192,7 +272,7 @@ async fn chat_completions(
             );
         }
     };
-    internal.model = resolved.internal_model().to_string();
+    internal.model = chosen_model.clone();
     // Родной протокол знает вызовы в истории; остальным они нужны текстом.
     let native = provider.native_tools();
     if !native {
@@ -209,20 +289,42 @@ async fn chat_completions(
     let meta = CompletionMeta::generate(&public_model);
     let streaming = internal.stream;
     let with_tools = bridge.is_some();
-    let mut response = match (bridge, streaming) {
-        (Some(bridge), true) => tool_stream(provider, internal, bridge, meta),
-        (Some(bridge), false) => tool_blocking(provider, internal, bridge, meta).await,
-        (None, true) => stream_completion(provider, internal, meta),
-        (None, false) => blocking_completion(provider, internal, meta).await,
+    let observer = Arc::clone(&provider);
+    let mut response = match (bridge, streaming, routed) {
+        (Some(bridge), true, false) => tool_stream(provider, internal, bridge, meta),
+        (Some(bridge), true, true) => tool_stream_held(provider, internal, bridge, meta).await,
+        (Some(bridge), false, _) => tool_blocking(provider, internal, bridge, meta).await,
+        (None, true, false) => stream_completion(provider, internal, meta, include_usage),
+        (None, true, true) => held_stream_completion(provider, internal, meta, include_usage).await,
+        (None, false, _) => blocking_completion(provider, internal, meta).await,
     };
+    if routed {
+        add_route_headers(&mut response, &observer);
+    }
     // Enriches the proxy access log; free otherwise.
     response.extensions_mut().insert(LogDetail(format!(
-        "model={public_model} → {}{}{}",
-        resolved.internal_model(),
+        "model={public_model} → {chosen_model}{}{}",
         if streaming { " (stream)" } else { "" },
         if with_tools { " (tools)" } else { "" }
     )));
     response
+}
+
+/// Клиент просил расход в потоке: `stream_options.include_usage`.
+fn wants_usage(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Probe {
+        stream_options: Option<StreamOptions>,
+    }
+    #[derive(Deserialize)]
+    struct StreamOptions {
+        include_usage: Option<bool>,
+    }
+    serde_json::from_slice::<Probe>(body)
+        .ok()
+        .and_then(|probe| probe.stream_options)
+        .and_then(|options| options.include_usage)
+        .unwrap_or(false)
 }
 
 /// Как часто пустой SSE-комментарий держит соединение, пока ответ с
@@ -635,9 +737,146 @@ fn stream_completion(
     provider: Arc<dyn LLMProvider>,
     request: CompletionRequest,
     meta: CompletionMeta,
+    include_usage: bool,
 ) -> Response<ApiBody> {
-    sse_stream_response(move |body_tx| bridge_stream(provider, request, meta, body_tx))
+    sse_stream_response(move |body_tx| async move {
+        let pump = Pump::new(VecDeque::new(), include_usage, &meta);
+        chat_bridge(Upstream::start(provider, request), pump, meta, body_tx).await;
+    })
 }
+
+/// Поток через шлюз: ответа нет, пока апстрим не дал первый чанк; отказ до него — честный HTTP-код.
+/// Заголовки `x-pooprusteek-*` называют аккаунт, который действительно отвечает.
+async fn held_stream_completion(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    meta: CompletionMeta,
+    include_usage: bool,
+) -> Response<ApiBody> {
+    let mut upstream = Upstream::start(provider, request);
+    let backlog = match await_first(&mut upstream).await {
+        Ok(backlog) => backlog,
+        Err(error) => return error.response(),
+    };
+    let pump = Pump::new(backlog, include_usage, &meta);
+    sse_stream_response(move |body_tx| chat_bridge(upstream, pump, meta, body_tx))
+}
+
+/// Ответ с инструментами через шлюз: копится целиком и уходит одним ответом, поэтому отказ
+/// остаётся честным кодом, а переход на запасной аккаунт виден в заголовках.
+async fn tool_stream_held(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    bridge: ToolBridge,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    match run_tool_completion(&provider, &request, &bridge).await {
+        Ok((reply, finish)) => {
+            let mut body = Vec::new();
+            for frame in tool_frames(reply, &finish, &meta) {
+                body.extend_from_slice(&frame);
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(full_body(body))
+                .expect("static response parts are valid")
+        }
+        Err(error) => error.response(),
+    }
+}
+
+/// Задача апстрима, её канал чанков и уборка за ней.
+struct Upstream {
+    task: crate::util::AbortOnDrop<crate::error::AppResult<()>>,
+    chunks: tokio::sync::mpsc::UnboundedReceiver<CompletionChunk>,
+    discard: crate::provider::SessionDiscard,
+}
+
+impl Upstream {
+    fn start(provider: Arc<dyn LLMProvider>, request: CompletionRequest) -> Self {
+        let discard = crate::provider::SessionDiscard::new(Arc::clone(&provider));
+        let (chunk_tx, chunks) = tokio::sync::mpsc::unbounded_channel();
+        // Гард: ушедший клиент гасит и задачу апстрима, а не оставляет её сиротой.
+        let task = crate::util::AbortOnDrop::spawn(async move {
+            provider.complete_stream(request, chunk_tx).await
+        });
+        Self {
+            task,
+            chunks,
+            discard,
+        }
+    }
+}
+
+/// Первый чанк, по которому можно отвечать: текст, вызов или конец. Чанки только с расходом
+/// ждут вместе с ним. Ошибка до него — ответ-ошибка, а не 200 с обрывом.
+async fn await_first(upstream: &mut Upstream) -> Result<VecDeque<CompletionChunk>, UpstreamError> {
+    let mut seen = VecDeque::new();
+    loop {
+        match tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream.chunks.recv()).await {
+            Err(_elapsed) => return Err(UpstreamError::idle()),
+            Ok(Some(chunk)) => {
+                let decisive = !chunk.content.is_empty()
+                    || !chunk.tool_calls.is_empty()
+                    || chunk.finish_reason.is_some();
+                seen.push_back(chunk);
+                if decisive {
+                    return Ok(seen);
+                }
+            }
+            Ok(None) => {
+                return match (&mut upstream.task).await {
+                    Ok(Ok(())) if !seen.is_empty() => Ok(seen),
+                    Ok(Ok(())) => Err(UpstreamError::closed_early()),
+                    Ok(Err(error)) => Err(UpstreamError::from_app(&error)),
+                    Err(join_error) => Err(UpstreamError::task_failed(
+                        "the upstream stream",
+                        &join_error,
+                    )),
+                };
+            }
+        }
+    }
+}
+
+/// Кадр расхода для клиента, который его просил.
+type UsageFrame = Box<dyn FnOnce(&Usage) -> Bytes + Send>;
+
+/// Что насосу известно сверх канала: снятые при удержании чанки и кадр расхода.
+struct Pump {
+    backlog: VecDeque<CompletionChunk>,
+    usage_frame: Option<UsageFrame>,
+}
+
+impl Pump {
+    fn new(backlog: VecDeque<CompletionChunk>, include_usage: bool, meta: &CompletionMeta) -> Self {
+        let meta = meta.clone();
+        Self {
+            backlog,
+            usage_frame: include_usage.then(|| {
+                Box::new(move |usage: &Usage| {
+                    // Как у OpenAI: последний чанк с пустым `choices` и полем `usage`.
+                    let mut chunk = openai_compat::final_chunk("stop", &meta);
+                    chunk.choices.clear();
+                    chunk.usage = Some(usage.clone().into());
+                    sse_data(&chunk)
+                }) as UsageFrame
+            }),
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            backlog: VecDeque::new(),
+            usage_frame: None,
+        }
+    }
+}
+
+/// Сколько после `finish_reason` ждать чанк расхода, если клиент его просил.
+const USAGE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Respond immediately with an SSE body fed by a detached bridge task —
 /// the channel/poll_fn/header scaffolding both dialects used to duplicate.
@@ -665,15 +904,15 @@ where
 /// reasoning into `reasoning_content` deltas live, so a reasoning model's
 /// chain-of-thought reaches clients in the right field instead of
 /// polluting the answer (see openai_compat::split_reasoning).
-async fn bridge_stream(
-    provider: Arc<dyn LLMProvider>,
-    request: CompletionRequest,
+async fn chat_bridge(
+    upstream: Upstream,
+    pump: Pump,
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) {
     drive_sse_bridge(
-        provider,
-        request,
+        upstream,
+        pump,
         body_tx,
         |reasoning, content, is_first| {
             if reasoning.is_empty() && content.is_empty() {
@@ -698,41 +937,62 @@ async fn bridge_stream(
 }
 
 /// Общий насос обоих SSE-мостов; диалекты дают только кадры: дельту (`None` —
-/// пока нечего слать), удержанный хвост и финальный кадр.
+/// пока нечего слать), удержанный хвост и финальный кадр. Клиент ушёл — апстрим гасится сразу.
 async fn drive_sse_bridge(
-    provider: Arc<dyn LLMProvider>,
-    request: CompletionRequest,
+    upstream: Upstream,
+    mut pump: Pump,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     mut delta_frame: impl FnMut(&str, &str, bool) -> Option<Bytes> + Send,
     tail_frame: impl FnOnce(&str, &str, bool) -> Option<Bytes> + Send,
     final_frame: impl FnOnce(&str, &str) -> Bytes + Send,
 ) {
-    let discard = crate::provider::SessionDiscard::new(Arc::clone(&provider));
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Гард: ушедший клиент гасит и задачу апстрима, а не оставляет её сиротой.
-    let mut upstream = {
-        let provider = Arc::clone(&provider);
-        crate::util::AbortOnDrop::spawn(
-            async move { provider.complete_stream(request, chunk_tx).await },
-        )
-    };
+    let Upstream {
+        mut task,
+        mut chunks,
+        discard,
+    } = upstream;
 
     let mut splitter = ReasoningStreamSplitter::new();
     let mut finish_reason: Option<String> = None;
+    let mut usage: Option<Usage> = None;
+    let mut finish_seen: Option<tokio::time::Instant> = None;
     let mut sent_any = false;
     let mut aborted = false;
     let mut received = 0usize;
     let mut last_sent = tokio::time::Instant::now();
+    let wants_usage = pump.usage_frame.is_some();
     loop {
-        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, chunk_rx.recv()).await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break, // апстрим закрыл канал — разбор ниже
-            Err(_elapsed) => {
-                let _ = body_tx.send(UpstreamError::idle().frame());
-                aborted = true;
-                break;
+        let chunk = match pump.backlog.pop_front() {
+            Some(chunk) => chunk,
+            None => {
+                let wait = match finish_seen {
+                    Some(seen) => USAGE_WAIT.saturating_sub(seen.elapsed()),
+                    None => STREAM_IDLE_TIMEOUT,
+                };
+                tokio::select! {
+                    biased;
+                    // Клиент закрыл соединение: дальше платить за токены некому.
+                    () = body_tx.closed() => {
+                        aborted = true;
+                        break;
+                    }
+                    next = tokio::time::timeout(wait, chunks.recv()) => match next {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break, // апстрим закрыл канал — разбор ниже
+                        Err(_elapsed) if finish_seen.is_some() => break,
+                        Err(_elapsed) => {
+                            let _ = body_tx.send(UpstreamError::idle().frame());
+                            aborted = true;
+                            break;
+                        }
+                    },
+                }
             }
         };
+        if chunk.usage.is_some() {
+            // Последнее слово сервера: расход приходит один раз и не суммируется.
+            usage = chunk.usage.clone();
+        }
         if chunk.finish_reason.is_some() {
             finish_reason = chunk.finish_reason.clone();
         }
@@ -772,7 +1032,11 @@ async fn drive_sse_bridge(
             None => {}
         }
         if finish_reason.is_some() {
-            break;
+            // Расход OpenAI идёт отдельным чанком после конца: ждём его, только если просили.
+            if !wants_usage || usage.is_some() {
+                break;
+            }
+            finish_seen.get_or_insert_with(tokio::time::Instant::now);
         }
     }
 
@@ -783,10 +1047,10 @@ async fn drive_sse_bridge(
         }
         // После финиша ответ уже весь: шлюз, держащий соединение, не держит нас.
         let joined = match &finish_reason {
-            Some(_) => tokio::time::timeout(AFTER_STOP_GRACE, &mut upstream)
+            Some(_) => tokio::time::timeout(AFTER_STOP_GRACE, &mut task)
                 .await
                 .unwrap_or(Ok(Ok(()))),
-            None => (&mut upstream).await,
+            None => (&mut task).await,
         };
         let failure = upstream_failure(joined);
         match finish_reason.as_deref() {
@@ -799,6 +1063,9 @@ async fn drive_sse_bridge(
                     );
                 }
                 let _ = body_tx.send(final_frame(&content, reason));
+                if let (Some(make), Some(usage)) = (pump.usage_frame.take(), usage.as_ref()) {
+                    let _ = body_tx.send(make(usage));
+                }
                 let _ = body_tx.send(Bytes::from_static(DONE_FRAME));
             }
             None => {
@@ -809,7 +1076,7 @@ async fn drive_sse_bridge(
     }
 
     // Сначала гасим апстрим: иначе он жжёт токены, пока сессию удаляют.
-    drop(upstream);
+    drop(task);
     discard.now().await;
 }
 
@@ -888,8 +1155,12 @@ async fn legacy_completions(
         }
     };
 
-    let (resolved, provider) = match resolve_backend(&wire.model, context) {
-        Ok(pair) => pair,
+    let Chosen {
+        provider,
+        model: chosen_model,
+        routed,
+    } = match resolve_backend(&wire.model, context) {
+        Ok(chosen) => chosen,
         Err(response) => return *response,
     };
 
@@ -897,7 +1168,7 @@ async fn legacy_completions(
     let internal = CompletionRequest {
         messages: vec![ChatMessage::user(&prompt)],
         tools: Vec::new(),
-        model: resolved.internal_model().to_string(),
+        model: chosen_model.clone(),
         temperature: wire.temperature.unwrap_or(context.defaults.temperature),
         max_tokens: wire.max_tokens.unwrap_or(context.defaults.max_tokens),
         stream: wire.stream.unwrap_or(false),
@@ -906,14 +1177,17 @@ async fn legacy_completions(
     let meta = CompletionMeta::generate(&public_model);
     let streaming = internal.stream;
 
+    let observer = Arc::clone(&provider);
     let mut response = if streaming {
         legacy_stream(provider, internal, meta)
     } else {
         legacy_blocking(provider, &prompt, internal, meta).await
     };
+    if routed {
+        add_route_headers(&mut response, &observer);
+    }
     response.extensions_mut().insert(LogDetail(format!(
-        "legacy model={public_model} → {}{}",
-        resolved.internal_model(),
+        "legacy model={public_model} → {chosen_model}{}",
         if streaming { " (stream)" } else { "" }
     )));
     response
@@ -985,8 +1259,8 @@ async fn bridge_legacy_stream(
         }))
     };
     drive_sse_bridge(
-        provider,
-        request,
+        Upstream::start(provider, request),
+        Pump::none(),
         body_tx,
         |_reasoning, content, _is_first| {
             if content.is_empty() {
@@ -1013,6 +1287,15 @@ async fn passthrough(
     context: &Arc<ServerContext>,
     path_suffix: &str,
 ) -> Response<ApiBody> {
+    // Эти пути ходят мимо шлюза с ключами старых записей: за шлюзом они закрыты, а не обходят выбор.
+    if context.gateway.get().is_enabled() {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            &ErrorResponse::server_error(format!(
+                "{path_suffix} is not routed through the gateway yet"
+            )),
+        );
+    }
     let body = match read_body(request).await {
         Ok(body) => body,
         Err(response) => return *response,
@@ -1246,6 +1529,7 @@ mod tests {
                 tools: Default::default(),
             }],
             request_log: false,
+            gateway: Default::default(),
         }
     }
 
@@ -1744,9 +2028,9 @@ mod tests {
             stream: true,
         };
         let meta = crate::provider::openai_compat::CompletionMeta::generate("m");
-        tokio::spawn(super::bridge_stream(
-            Arc::new(provider),
-            request,
+        tokio::spawn(super::chat_bridge(
+            super::Upstream::start(Arc::new(provider), request),
+            super::Pump::none(),
             meta,
             body_tx,
         ));
