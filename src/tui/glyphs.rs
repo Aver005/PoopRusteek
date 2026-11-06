@@ -151,6 +151,36 @@ pub fn get() -> &'static Glyphs {
     ACTIVE.with(Cell::get)
 }
 
+/// Служебный текст с готовыми значками: в ASCII-режиме значки заменяются, иначе квадраты.
+pub fn console_text(text: &str) -> std::borrow::Cow<'_, str> {
+    const SIGNS: [(char, &str); 9] = [
+        ('\u{26A0}', "!"),
+        ('\u{2713}', "+"),
+        ('\u{2717}', "x"),
+        ('\u{2139}', "i"),
+        ('\u{23F0}', "~"),
+        ('\u{1F4CE}', "&"),
+        ('\u{2692}', "*"),
+        ('\u{1F512}', "#"),
+        ('\u{1F4CB}', "*"),
+    ];
+    if !get().ascii
+        || !text
+            .chars()
+            .any(|c| SIGNS.iter().any(|(sign, _)| *sign == c))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match SIGNS.iter().find(|(sign, _)| *sign == c) {
+            Some((_, plain)) => out.push_str(plain),
+            None => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Маска скрытого ввода: точки по числу знаков, но не длиннее поля.
 pub fn mask_text(len: usize) -> String {
     let dot = if get().ascii { "*" } else { "\u{2022}" };
@@ -166,6 +196,23 @@ impl Glyphs {
     /// Знак «успех» или «ошибка» для результата инструмента.
     pub fn outcome(&self, failed: bool) -> &'static str {
         if failed { self.cross } else { self.check }
+    }
+}
+
+#[cfg(test)]
+mod console_text_tests {
+    use super::*;
+
+    #[test]
+    fn signs_in_a_note_are_replaced_only_in_ascii_mode() {
+        select(GlyphMode::Ascii);
+        assert_eq!(console_text("\u{26A0} models failed"), "! models failed");
+        assert_eq!(console_text("Привет, мир"), "Привет, мир");
+        select(GlyphMode::Unicode);
+        assert_eq!(
+            console_text("\u{26A0} models failed"),
+            "\u{26A0} models failed"
+        );
     }
 }
 

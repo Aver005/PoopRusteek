@@ -325,7 +325,7 @@ fn build_segment_lines(
             ]));
         }
         Role::System => {
-            let body = msg.visible_content();
+            let body = crate::tui::glyphs::console_text(msg.visible_content());
             let body_lines: Vec<&str> = body.lines().collect();
             // A `Span`'s text is one terminal row — embedded `\n`s inside
             // it don't create new rows, they just get glued onto the same

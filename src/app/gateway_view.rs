@@ -1088,6 +1088,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_model_refresh_keeps_the_welcome_screen_but_warns_in_a_chat() {
+        let mut app = test_app().await;
+        app.on_provider_models_refreshed("provider models: mock failed".to_string(), 1);
+        assert!(app.state.focused().messages.is_empty());
+        assert_eq!(app.state.status_message, "provider models: mock failed");
+
+        app.state.push_ui_system("earlier note");
+        app.on_provider_models_refreshed("provider models: mock failed".to_string(), 1);
+        assert_eq!(app.state.focused().messages.len(), 2);
+    }
+
+    #[tokio::test]
     async fn pinning_an_unknown_account_says_so() {
         let rig = rig(TWO_ACCOUNTS, Vec::new());
         let mut app = test_app().await;

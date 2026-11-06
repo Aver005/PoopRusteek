@@ -457,7 +457,8 @@ impl crate::app::App {
     /// работа; отказ показываем строкой, иначе мёртвый эндпоинт молчит.
     pub(crate) fn on_provider_models_refreshed(&mut self, summary: String, failed: usize) {
         self.state.status_message = summary.clone();
-        if failed > 0 {
+        // На пустом чате заметка убрала бы главную: хватит строки статуса.
+        if failed > 0 && !self.state.focused().messages.is_empty() {
             self.state
                 .focused_mut()
                 .messages
