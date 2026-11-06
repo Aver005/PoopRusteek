@@ -654,6 +654,54 @@ fn tool_response(
     }
 }
 
+/// Задача ответа с инструментами; гард гасит её, когда клиент ушёл.
+type ToolWork = crate::util::AbortOnDrop<Result<(BridgedReply, String), UpstreamError>>;
+
+fn spawn_tool_work(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    bridge: ToolBridge,
+) -> ToolWork {
+    crate::util::AbortOnDrop::spawn(async move {
+        run_tool_completion(&provider, &request, &bridge).await
+    })
+}
+
+/// Кадры по итогу задачи: ответ, ошибка кадром или сбой самой задачи.
+fn tool_outcome_frames(
+    joined: Result<Result<(BridgedReply, String), UpstreamError>, tokio::task::JoinError>,
+    meta: &CompletionMeta,
+) -> Vec<Bytes> {
+    match joined {
+        Ok(Ok((reply, finish))) => tool_frames(reply, &finish, meta),
+        Ok(Err(error)) => vec![error.frame()],
+        Err(join_error) => {
+            vec![UpstreamError::task_failed("the completion task", &join_error).frame()]
+        }
+    }
+}
+
+/// Пока ответ копится — keep-alive, затем готовые кадры.
+async fn finish_tool_stream(
+    mut work: ToolWork,
+    meta: CompletionMeta,
+    body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+) {
+    let joined = loop {
+        match tokio::time::timeout(KEEPALIVE, &mut work).await {
+            Ok(joined) => break joined,
+            Err(_elapsed) => {
+                if body_tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    for frame in tool_outcome_frames(joined, &meta) {
+        let _ = body_tx.send(frame);
+    }
+}
+
 /// Стрим с инструментами: пока ответ копится — keep-alive, затем готовые кадры.
 fn tool_stream(
     provider: Arc<dyn LLMProvider>,
@@ -662,30 +710,8 @@ fn tool_stream(
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
     sse_stream_response(move |body_tx| async move {
-        // Гард: ушедший клиент гасит и задачу ответа, а не оставляет её сиротой.
-        let mut work = crate::util::AbortOnDrop::spawn(async move {
-            run_tool_completion(&provider, &request, &bridge).await
-        });
-        let joined = loop {
-            match tokio::time::timeout(KEEPALIVE, &mut work).await {
-                Ok(joined) => break joined,
-                Err(_elapsed) => {
-                    if body_tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() {
-                        return;
-                    }
-                }
-            }
-        };
-        let frames = match joined {
-            Ok(Ok((reply, finish))) => tool_frames(reply, &finish, &meta),
-            Ok(Err(error)) => vec![error.frame()],
-            Err(join_error) => {
-                vec![UpstreamError::task_failed("the completion task", &join_error).frame()]
-            }
-        };
-        for frame in frames {
-            let _ = body_tx.send(frame);
-        }
+        let work = spawn_tool_work(provider, request, bridge);
+        finish_tool_stream(work, meta, body_tx).await;
     })
 }
 
@@ -763,7 +789,13 @@ fn stream_completion(
     include_usage: bool,
 ) -> Response<ApiBody> {
     sse_stream_response(move |body_tx| async move {
-        let pump = Pump::new(VecDeque::new(), include_usage, &meta);
+        // Прежний путь расход не ждёт: берётся только уже пришедший.
+        let pump = Pump::new(
+            VecDeque::new(),
+            include_usage,
+            &meta,
+            std::time::Duration::ZERO,
+        );
         chat_bridge(Upstream::start(provider, request), pump, meta, body_tx).await;
     })
 }
@@ -776,25 +808,49 @@ async fn held_stream_completion(
     meta: CompletionMeta,
     include_usage: bool,
 ) -> Response<ApiBody> {
+    let pump_meta = meta.clone();
+    held_sse(
+        provider,
+        request,
+        include_usage,
+        &pump_meta,
+        move |upstream, pump, body_tx| chat_bridge(upstream, pump, meta, body_tx),
+    )
+    .await
+}
+
+/// Удержание до первого чанка для любого SSE-диалекта: диалект даёт только мост.
+async fn held_sse<F, Fut>(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    include_usage: bool,
+    meta: &CompletionMeta,
+    bridge: F,
+) -> Response<ApiBody>
+where
+    F: FnOnce(Upstream, Pump, tokio::sync::mpsc::UnboundedSender<Bytes>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let mut upstream = Upstream::start(provider, request);
     let backlog = match await_first(&mut upstream).await {
         Ok(backlog) => backlog,
         Err(error) => return error.response(),
     };
-    let pump = Pump::new(backlog, include_usage, &meta);
-    sse_stream_response(move |body_tx| chat_bridge(upstream, pump, meta, body_tx))
+    let pump = Pump::new(backlog, include_usage, meta, USAGE_WAIT_ROUTED);
+    sse_stream_response(move |body_tx| bridge(upstream, pump, body_tx))
 }
 
-/// Ответ с инструментами через шлюз: копится целиком и уходит одним ответом, поэтому отказ
-/// остаётся честным кодом, а переход на запасной аккаунт виден в заголовках.
+/// Ответ с инструментами через шлюз: если он готов в пределах порога, отказ остаётся честным
+/// кодом; дольше порога — SSE с keep-alive (заголовки называют аккаунт текущей попытки).
 async fn tool_stream_held(
     provider: Arc<dyn LLMProvider>,
     request: CompletionRequest,
     bridge: ToolBridge,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    match run_tool_completion(&provider, &request, &bridge).await {
-        Ok((reply, finish)) => {
+    let mut work = spawn_tool_work(provider, request, bridge);
+    match tokio::time::timeout(TOOL_HOLD, &mut work).await {
+        Ok(Ok(Ok((reply, finish)))) => {
             let mut body = Vec::new();
             for frame in tool_frames(reply, &finish, &meta) {
                 body.extend_from_slice(&frame);
@@ -806,9 +862,23 @@ async fn tool_stream_held(
                 .body(full_body(body))
                 .expect("static response parts are valid")
         }
-        Err(error) => error.response(),
+        Ok(Ok(Err(error))) => error.response(),
+        Ok(Err(join_error)) => {
+            UpstreamError::task_failed("the completion task", &join_error).response()
+        }
+        Err(_elapsed) => sse_stream_response(move |body_tx| async move {
+            // Первые байты уходят сразу: клиент видит, что соединение живо.
+            let _ = body_tx.send(Bytes::from_static(KEEPALIVE_FRAME));
+            finish_tool_stream(work, meta, body_tx).await;
+        }),
     }
 }
+
+/// Сколько держим ответ с инструментами ради честного кода, прежде чем начать keep-alive.
+#[cfg(not(test))]
+const TOOL_HOLD: std::time::Duration = KEEPALIVE;
+#[cfg(test)]
+const TOOL_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Задача апстрима, её канал чанков и уборка за ней.
 struct Upstream {
@@ -867,17 +937,24 @@ async fn await_first(upstream: &mut Upstream) -> Result<VecDeque<CompletionChunk
 /// Кадр расхода для клиента, который его просил.
 type UsageFrame = Box<dyn FnOnce(&Usage) -> Bytes + Send>;
 
-/// Что насосу известно сверх канала: снятые при удержании чанки и кадр расхода.
+/// Что насосу известно сверх канала: снятые при удержании чанки, кадр расхода и сколько ждать расход.
 struct Pump {
     backlog: VecDeque<CompletionChunk>,
     usage_frame: Option<UsageFrame>,
+    usage_wait: std::time::Duration,
 }
 
 impl Pump {
-    fn new(backlog: VecDeque<CompletionChunk>, include_usage: bool, meta: &CompletionMeta) -> Self {
+    fn new(
+        backlog: VecDeque<CompletionChunk>,
+        include_usage: bool,
+        meta: &CompletionMeta,
+        usage_wait: std::time::Duration,
+    ) -> Self {
         let meta = meta.clone();
         Self {
             backlog,
+            usage_wait,
             usage_frame: include_usage.then(|| {
                 Box::new(move |usage: &Usage| {
                     // Как у OpenAI: последний чанк с пустым `choices` и полем `usage`.
@@ -894,12 +971,13 @@ impl Pump {
         Self {
             backlog: VecDeque::new(),
             usage_frame: None,
+            usage_wait: std::time::Duration::ZERO,
         }
     }
 }
 
-/// Сколько после `finish_reason` ждать чанк расхода, если клиент его просил.
-const USAGE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Через шлюз расход идёт отдельным чанком сразу за концом: ждём его недолго, и только если просили.
+const USAGE_WAIT_ROUTED: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Respond immediately with an SSE body fed by a detached bridge task —
 /// the channel/poll_fn/header scaffolding both dialects used to duplicate.
@@ -989,7 +1067,7 @@ async fn drive_sse_bridge(
             Some(chunk) => chunk,
             None => {
                 let wait = match finish_seen {
-                    Some(seen) => USAGE_WAIT.saturating_sub(seen.elapsed()),
+                    Some(seen) => pump.usage_wait.saturating_sub(seen.elapsed()),
                     None => STREAM_IDLE_TIMEOUT,
                 };
                 tokio::select! {
@@ -1068,31 +1146,28 @@ async fn drive_sse_bridge(
         if let Some(frame) = tail_frame(&reasoning, &content, !sent_any) {
             let _ = body_tx.send(frame);
         }
-        // После финиша ответ уже весь: шлюз, держащий соединение, не держит нас.
-        let joined = match &finish_reason {
-            Some(_) => tokio::time::timeout(AFTER_STOP_GRACE, &mut task)
-                .await
-                .unwrap_or(Ok(Ok(()))),
-            None => (&mut task).await,
-        };
-        let failure = upstream_failure(joined);
         match finish_reason.as_deref() {
             // Причина конца пришла — ответ целый, поздняя ошибка его не портит.
             Some(reason) => {
-                if let Some(failure) = failure {
-                    tracing::debug!(
-                        "server: upstream failed after finishing: {}",
-                        failure.message
-                    );
-                }
                 let _ = body_tx.send(final_frame(&content, reason));
                 if let (Some(make), Some(usage)) = (pump.usage_frame.take(), usage.as_ref()) {
                     let _ = body_tx.send(make(usage));
                 }
                 let _ = body_tx.send(Bytes::from_static(DONE_FRAME));
+                // Клиент получил всё: поток закрывается сразу, а задача апстрима дописывает учёт.
+                drop(body_tx);
+                if let Ok(joined) = tokio::time::timeout(AFTER_STOP_GRACE, &mut task).await
+                    && let Some(failure) = upstream_failure(joined)
+                {
+                    tracing::debug!(
+                        "server: upstream failed after finishing: {}",
+                        failure.message
+                    );
+                }
             }
             None => {
-                let failure = failure.unwrap_or_else(UpstreamError::closed_early);
+                let failure =
+                    upstream_failure((&mut task).await).unwrap_or_else(UpstreamError::closed_early);
                 let _ = body_tx.send(failure.frame());
             }
         }
@@ -1201,10 +1276,10 @@ async fn legacy_completions(
     let streaming = internal.stream;
 
     let observer = Arc::clone(&provider);
-    let mut response = if streaming {
-        legacy_stream(provider, internal, meta)
-    } else {
-        legacy_blocking(provider, &prompt, internal, meta).await
+    let mut response = match (streaming, routed) {
+        (true, true) => legacy_held_stream(provider, internal, meta).await,
+        (true, false) => legacy_stream(provider, internal, meta),
+        (false, _) => legacy_blocking(provider, &prompt, internal, meta).await,
     };
     if routed {
         add_route_headers(&mut response, &observer);
@@ -1259,16 +1334,40 @@ fn legacy_stream(
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    sse_stream_response(move |body_tx| bridge_legacy_stream(provider, request, meta, body_tx))
+    sse_stream_response(move |body_tx| {
+        legacy_bridge(
+            Upstream::start(provider, request),
+            Pump::none(),
+            meta,
+            body_tx,
+        )
+    })
+}
+
+/// Тот же поток через шлюз: с удержанием до первого чанка и честным кодом отказа.
+async fn legacy_held_stream(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    let pump_meta = meta.clone();
+    held_sse(
+        provider,
+        request,
+        false,
+        &pump_meta,
+        move |upstream, pump, body_tx| legacy_bridge(upstream, pump, meta, body_tx),
+    )
+    .await
 }
 
 /// Legacy `text_completion` frame shaping over [`drive_sse_bridge`].
 /// Reasoning is dropped (the legacy shape has no field for it), so only
 /// the post-`<think>` content is streamed as `text`; the splitter's tail
 /// rides in the final frame together with the finish reason.
-async fn bridge_legacy_stream(
-    provider: Arc<dyn LLMProvider>,
-    request: CompletionRequest,
+async fn legacy_bridge(
+    upstream: Upstream,
+    pump: Pump,
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) {
@@ -1282,8 +1381,8 @@ async fn bridge_legacy_stream(
         }))
     };
     drive_sse_bridge(
-        Upstream::start(provider, request),
-        Pump::none(),
+        upstream,
+        pump,
         body_tx,
         |_reasoning, content, _is_first| {
             if content.is_empty() {

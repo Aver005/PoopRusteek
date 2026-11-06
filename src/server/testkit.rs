@@ -32,6 +32,10 @@ pub(crate) enum Script {
     Break(&'static str),
     /// Прочитать запрос и молчать, пока клиент не закроет соединение (ни одного байта ответа).
     Silent,
+    /// Куски и конец ответа, потом соединение остаётся открытым (без `[DONE]`) до ухода клиента.
+    Linger(Vec<&'static str>),
+    /// Подождать столько миллисекунд и выполнить вложенный сценарий.
+    Slow(u64, Box<Script>),
     /// Каталог моделей `GET /models`.
     Models(Vec<&'static str>),
     /// Обычный JSON-ответ с кодом 200 на произвольный POST (эмбеддинги и т. п.).
@@ -194,6 +198,26 @@ async fn answer(
         }
         Script::Hang(first) => {
             let out = format!("{}{}", stream_head(&[]), sse_chunk(first, None));
+            let _ = socket.write_all(out.as_bytes()).await;
+            let mut sink = [0u8; 256];
+            loop {
+                match socket.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            closed.fetch_add(1, Ordering::SeqCst);
+        }
+        Script::Slow(millis, inner) => {
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            Box::pin(answer(socket, *inner, seen, closed)).await;
+        }
+        Script::Linger(chunks) => {
+            let mut out = stream_head(&[]);
+            for piece in &chunks {
+                out.push_str(&sse_chunk(piece, None));
+            }
+            out.push_str(&sse_chunk("", Some("stop")));
             let _ = socket.write_all(out.as_bytes()).await;
             let mut sink = [0u8; 256];
             loop {

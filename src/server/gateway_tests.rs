@@ -1152,3 +1152,239 @@ async fn the_trimmed_status_hides_subscription_accounts_and_routes() {
         .collect();
     assert!(ids.contains(&"sub") && ids.contains(&"a"), "{ids:?}");
 }
+
+// ── Уход клиента до первого байта ───────────────────────────────────────
+
+/// Отправляет запрос сырым сокетом и закрывает его, не дождавшись ответа.
+async fn send_and_hang_up(stand: &Stand, body: serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+    let addr = stand.base.trim_start_matches("http://").to_string();
+    let mut socket = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let payload = body.to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+        payload.len()
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    drop(socket);
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_before_the_first_byte_cancels_the_upstream_at_once() {
+    for stream in [true, false] {
+        let (stand, up) = stand(vec![("/a/", vec![Script::Silent])]).await;
+        send_and_hang_up(
+            &stand,
+            serde_json::json!({
+                "model": "a/m", "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        assert!(
+            eventually(|| up.closed.load(std::sync::atomic::Ordering::SeqCst) == 1).await,
+            "stream={stream}: the upstream kept generating for a client that was gone"
+        );
+        let ledger = stand.cell.get().ledger();
+        assert!(
+            eventually(|| ledger
+                .totals(&LedgerQuery::default())
+                .iter()
+                .map(|r| r.calls)
+                .sum::<u64>()
+                == 1)
+            .await,
+            "stream={stream}: {:?}",
+            ledger.totals(&LedgerQuery::default())
+        );
+        let rows = ledger.totals(&LedgerQuery::default());
+        assert_eq!(rows[0].failed, 0, "a leaving client is not a failure");
+    }
+}
+
+// ── Расход в потоке: клиента не задерживаем ─────────────────────────────
+
+async fn stream_with_usage(
+    stand: &Stand,
+    model: &str,
+    include_usage: bool,
+) -> (String, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let body = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", stand.base))
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": true,
+            "stream_options": {"include_usage": include_usage},
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    (body, started.elapsed())
+}
+
+#[tokio::test]
+async fn behind_the_gateway_a_lingering_upstream_delays_the_client_by_a_second_at_most() {
+    let (stand, up) = stand(vec![("/a/", vec![Script::Linger(vec!["done"])])]).await;
+    for include_usage in [true, false] {
+        let (body, took) = stream_with_usage(&stand, "a/m", include_usage).await;
+        assert!(body.contains("data: [DONE]"), "{body}");
+        assert!(
+            !body.contains("\"usage\""),
+            "the upstream never sent any: {body}"
+        );
+        let limit = if include_usage { 1800 } else { 1000 };
+        assert!(
+            took.as_millis() < limit,
+            "include_usage={include_usage}: the client waited {took:?}"
+        );
+    }
+    // Клиент ушёл, а учёт остаётся ровно по одной записи на запрос.
+    let ledger = stand.cell.get().ledger();
+    assert!(
+        eventually(|| ledger
+            .totals(&LedgerQuery::default())
+            .iter()
+            .map(|r| r.calls)
+            .sum::<u64>()
+            == 2)
+        .await,
+        "{:?}",
+        ledger.totals(&LedgerQuery::default())
+    );
+    drop(up);
+}
+
+#[tokio::test]
+async fn with_the_gateway_off_include_usage_adds_no_waiting() {
+    let up = upstream(vec![("/legacy/", vec![Script::Linger(vec!["done"])])]).await;
+    let mut s = settings(
+        Arc::new(crate::gateway::handle::DisabledGateway::new()),
+        None,
+        "127.0.0.1",
+    );
+    s.entries = vec![crate::config::ProviderEntry {
+        name: "old".to_string(),
+        base_url: format!("http://127.0.0.1:{}/legacy", up.port),
+        api_key: None,
+        model: "m".to_string(),
+        protocol: crate::config::ProviderProtocol::Openai,
+        tools: Default::default(),
+    }];
+    let stand = start_with(s).await;
+    for include_usage in [true, false] {
+        let (body, took) = stream_with_usage(&stand, "old/m", include_usage).await;
+        assert!(body.contains("data: [DONE]"), "{body}");
+        assert!(
+            took.as_millis() < 1500,
+            "include_usage={include_usage}: the client waited {took:?}"
+        );
+    }
+}
+
+// ── Потоковый `/v1/completions` и ответы с инструментами ────────────────
+
+async fn legacy_post(stand: &Stand, model: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/completions", stand.base))
+        .json(&serde_json::json!({"model": model, "prompt": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_streaming_legacy_completion_falls_back_and_reports_the_account() {
+    let (stand, up) = stand(vec![
+        ("/a/", vec![Script::RateLimited]),
+        ("/b/", vec![text_stream(&["old ", "style"])]),
+    ])
+    .await;
+    let response = legacy_post(&stand, "auto/main").await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        header(&response, "x-pooprusteek-account").as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        header(&response, "x-pooprusteek-fallback").as_deref(),
+        Some("a")
+    );
+    let body = response.text().await.unwrap();
+    let text: String = frames(&body)
+        .iter()
+        .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+        .filter_map(|v| v["choices"][0]["text"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(text, "old style");
+    assert_eq!((up.hits("/a/"), up.hits("/b/")), (1, 1));
+}
+
+#[tokio::test]
+async fn a_streaming_legacy_completion_fails_with_a_real_status() {
+    let (stand, _up) = stand(vec![
+        ("/a/", vec![Script::RateLimited]),
+        ("/b/", vec![Script::RateLimited]),
+    ])
+    .await;
+    let response = legacy_post(&stand, "auto/main").await;
+    assert_eq!(response.status(), 429);
+    assert!(header(&response, "retry-after").is_some());
+}
+
+fn tool_request(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "stream": true,
+        "messages": [{"role": "user", "content": "write it"}],
+        "tools": [{"type": "function", "function": {
+            "name": "write",
+            "description": "write a file",
+            "parameters": {"type": "object", "properties": {}},
+        }}],
+    })
+}
+
+#[tokio::test]
+async fn a_slow_tool_reply_keeps_the_connection_alive_and_a_fast_failure_keeps_its_status() {
+    let call = "<tool_use><name>write</name><arguments>{}</arguments></tool_use>";
+    let (stand, _up) = stand(vec![
+        (
+            "/a/",
+            vec![Script::Slow(700, Box::new(text_stream(&[call])))],
+        ),
+        ("/b/", vec![Script::RateLimited]),
+    ])
+    .await;
+    let mut response = post_body(&stand, tool_request("a/m")).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        header(&response, "x-pooprusteek-account").as_deref(),
+        Some("a")
+    );
+    let first = response
+        .chunk()
+        .await
+        .unwrap()
+        .expect("bytes before the reply is ready");
+    assert!(
+        String::from_utf8_lossy(&first).starts_with(": keep-alive"),
+        "{:?}",
+        String::from_utf8_lossy(&first)
+    );
+    let mut rest = String::new();
+    while let Some(piece) = response.chunk().await.unwrap() {
+        rest.push_str(&String::from_utf8_lossy(&piece));
+    }
+    assert!(rest.contains("tool_calls"), "{rest}");
+    assert!(rest.contains("data: [DONE]"), "{rest}");
+
+    // Отказ раньше порога остаётся настоящим кодом.
+    let failed = post_body(&stand, tool_request("b/m")).await;
+    assert_eq!(failed.status(), 429);
+}
