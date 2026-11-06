@@ -257,3 +257,100 @@ fn resolve_wasm_path() -> Option<PathBuf> {
         .map(|dir| dir.join(WASM_ASSET_NAME))
         .filter(|path| path.exists())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Настоящий challenge сервера от 2026-11-06, срок истёк, подпись заменена.
+    /// Ответ `REAL_ANSWER` сервер принял: выдуманный challenge решения не имеет.
+    fn fixture(difficulty: &str) -> PowChallengeData {
+        PowChallengeData {
+            algorithm: "DeepSeekHashV1".to_string(),
+            challenge: "94dde891b5194abb18cb9231a20a0739c513ea9ead898cc0d24144081979ef81"
+                .to_string(),
+            difficulty: difficulty.to_string(),
+            salt: "92c82ac4b447dfee7c8c".to_string(),
+            signature: "fixture-signature".to_string(),
+            target_path: "/api/v0/chat/completion".to_string(),
+            expire_at: 1_793_982_788_658,
+        }
+    }
+
+    const REAL_ANSWER: u64 = 79_277;
+
+    #[test]
+    fn real_challenge_gets_the_answer_the_server_accepted() {
+        let solution = solve_pow(&fixture("144000")).expect("солвер обязан найти ответ");
+        assert_eq!(solution.answer, REAL_ANSWER);
+    }
+
+    #[test]
+    fn a_changed_challenge_or_salt_has_no_answer() {
+        let mut changed_challenge = fixture("144000");
+        changed_challenge.challenge.replace_range(0..1, "0");
+        assert!(solve_pow(&changed_challenge).is_none());
+
+        let mut changed_salt = fixture("144000");
+        changed_salt.salt.replace_range(0..1, "0");
+        assert!(solve_pow(&changed_salt).is_none());
+    }
+
+    /// Поиск ограничен сложностью: ниже ответа он не должен его находить.
+    #[test]
+    fn difficulty_below_the_answer_finds_nothing() {
+        assert!(solve_pow(&fixture("1000")).is_none());
+    }
+
+    /// Неверные входы отвергаются до запуска wasm.
+    #[test]
+    fn unknown_algorithm_and_bad_difficulty_are_rejected() {
+        let mut wrong_algorithm = fixture("100000");
+        wrong_algorithm.algorithm = "OtherAlgorithmV1".to_string();
+        assert!(solve_pow(&wrong_algorithm).is_none());
+
+        let mut bad_difficulty = fixture("not-a-number");
+        bad_difficulty.algorithm = "DeepSeekHashV1".to_string();
+        assert!(solve_pow(&bad_difficulty).is_none());
+    }
+
+    /// Тело решения для сервера: base64 от JSON с ровно теми полями, что
+    /// ждёт DeepSeek, и подмена ответа меняет payload.
+    #[test]
+    fn encoded_solution_matches_the_server_contract() {
+        let challenge = fixture("100000");
+        let solution = PowSolution {
+            algorithm: challenge.algorithm.clone(),
+            answer: 42,
+            challenge: challenge.challenge.clone(),
+            difficulty: challenge.difficulty.clone(),
+            expire_at: challenge.expire_at,
+            salt: challenge.salt.clone(),
+            signature: challenge.signature.clone(),
+            target_path: challenge.target_path.clone(),
+        };
+
+        let encoded = encode_solution(&solution).expect("encode_solution");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .expect("payload разбирается как base64");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).expect("payload — JSON");
+
+        assert_eq!(value["algorithm"], "DeepSeekHashV1");
+        assert_eq!(value["answer"].as_u64(), Some(42));
+        assert_eq!(value["challenge"], challenge.challenge);
+        assert_eq!(value["difficulty"], challenge.difficulty);
+        assert_eq!(value["expire_at"].as_u64(), Some(challenge.expire_at));
+        assert_eq!(value["salt"], challenge.salt);
+        assert_eq!(value["signature"], challenge.signature);
+        assert_eq!(value["target_path"], challenge.target_path);
+
+        // Неверный ответ даёт другой payload — сервер его не примет.
+        let wrong = PowSolution {
+            answer: 43,
+            ..solution
+        };
+        let wrong_encoded = encode_solution(&wrong).expect("encode_solution");
+        assert_ne!(encoded, wrong_encoded);
+    }
+}

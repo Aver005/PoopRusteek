@@ -12,48 +12,7 @@ use std::collections::HashMap;
 
 const SERVICE: &str = "pooprusteek-mcp";
 
-/// Register a default credential store with `keyring-core` ourselves,
-/// bypassing `keyring` 4.1.3's own auto-init in `v1::Entry::new`.
-///
-/// That auto-init is broken: it gates calling its internal
-/// `set_credential_store()` behind
-/// `SET_CREDENTIAL_STORE.compare_exchange(false, true, ..) == Ok(true)`, but
-/// `compare_exchange`'s `Ok` variant carries the *previous* value — a
-/// successful CAS starting from `false` always returns `Ok(false)`, never
-/// `Ok(true)` — so that branch can never run. No store ever gets
-/// registered, and every `Entry::new` fails with
-/// `Error::NoDefaultStore` ("No default store has been set..."), forever,
-/// since the same `AtomicBool` still flips to `true` as a side effect and
-/// blocks any retry. Verified directly against `keyring-4.1.3/src/v1.rs`.
-///
-/// Worked around here with the same one-time-init idea, done correctly via
-/// `std::sync::Once`, using the exact backend crates `keyring`'s own `v1`
-/// feature already compiles in per target (see `Cargo.toml`'s
-/// `[target...]` tables) — so this adds no new dependency edges, just names
-/// them directly so `keyring_core::set_default_store` can be called.
-fn ensure_default_store() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        #[cfg(target_os = "windows")]
-        if let Ok(store) = windows_native_keyring_store::Store::new() {
-            keyring_core::set_default_store(store);
-        }
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Ok(store) = apple_native_keyring_store::keychain::Store::new() {
-            keyring_core::set_default_store(store);
-        }
-        #[cfg(all(
-            unix,
-            not(any(target_os = "macos", target_os = "ios", target_os = "android"))
-        ))]
-        if let Ok(store) = zbus_secret_service_keyring_store::Store::new() {
-            keyring_core::set_default_store(store);
-        }
-    });
-}
-
 fn entry(server_name: &str) -> AppResult<keyring::Entry> {
-    ensure_default_store();
     keyring::Entry::new(SERVICE, server_name)
         .map_err(|e| AppError::Mcp(format!("Keyring unavailable for '{server_name}': {e}")))
 }
@@ -124,4 +83,26 @@ pub async fn with_bearer_header(
         format!("Bearer {}", tokens.access_token),
     );
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Круг записать–прочитать–удалить в настоящем хранилище ОС.
+    #[test]
+    #[ignore = "нужно настоящее хранилище ОС и живая сессия пользователя"]
+    fn keyring_round_trip() {
+        let name = format!("pooprusteek-selftest-{}", std::process::id());
+        let entry = entry(&name).expect("запись keyring должна открываться");
+
+        entry.set_password("self-test").expect("запись");
+        assert_eq!(entry.get_password().expect("чтение"), "self-test");
+
+        entry.delete_credential().expect("удаление");
+        assert!(
+            entry.get_password().is_err(),
+            "после удаления записи быть не должно"
+        );
+    }
 }
