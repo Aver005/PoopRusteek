@@ -1,5 +1,6 @@
-//! Маскировка секретов в коротких строках для экрана (панель работы). Простая
-//! копия правил будущего `secrets/redact.rs`; ведущий потом объединит их.
+//! Маскировка секретов в коротких строках для экрана (панель работы, заголовок
+//! окна подтверждения). Сначала общая `secrets::redact` (известные значения и
+//! типичные формы ключей), затем правила по именам: флаги, присваивания, заголовки.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -41,7 +42,8 @@ static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Заменить значения секретов маской: токены в заголовках, флагах, присваиваниях.
 pub(crate) fn redact_secrets(text: &str) -> String {
-    let text = BEARER.replace_all(text, format!("Bearer {MASK}"));
+    let text = crate::secrets::redact::redact(text);
+    let text = BEARER.replace_all(&text, format!("Bearer {MASK}"));
     let text = AUTH_HEADER.replace_all(&text, format!("${{1}}{MASK}"));
     let text = FLAG.replace_all(&text, format!("${{1}}${{2}}{MASK}"));
     ASSIGNMENT
@@ -115,6 +117,16 @@ mod tests {
         let masked = redact_secrets(r#"{"password": "hunter2", "user": "bob"}"#);
         assert!(!masked.contains("hunter2"), "{masked}");
         assert!(masked.contains("bob"));
+    }
+
+    #[test]
+    fn key_shapes_and_registered_values_go_through_the_shared_redactor() {
+        let masked = redact_secrets("run --verbose sk-proj-abcdefghijklmnopqrstuvwx now");
+        assert!(!masked.contains("sk-proj"), "{masked}");
+        crate::secrets::redact::register(&crate::secrets::secret::Secret::new(
+            "summary-canary-value-1",
+        ));
+        assert!(!redact_secrets("echo summary-canary-value-1").contains("canary"));
     }
 
     #[test]
