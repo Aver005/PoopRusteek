@@ -114,6 +114,7 @@ pub(super) fn render_onboarding(
     let cursor = Some((input_inner.x + cursor_col, input_inner.y));
 
     // ── 8. Model selector ────────────────────────────────────────
+    let glyph = crate::tui::glyphs::get();
     let (chat_style, reasoner_style, chat_dot, reasoner_dot) = if ob.model_reasoner {
         (
             Style::default().fg(theme.text_dim).bg(theme.bg),
@@ -121,8 +122,8 @@ pub(super) fn render_onboarding(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
                 .bg(theme.bg),
-            "○",
-            "●",
+            glyph.radio_off,
+            glyph.radio_on,
         )
     } else {
         (
@@ -131,8 +132,8 @@ pub(super) fn render_onboarding(
                 .add_modifier(Modifier::BOLD)
                 .bg(theme.bg),
             Style::default().fg(theme.text_dim).bg(theme.bg),
-            "●",
-            "○",
+            glyph.radio_on,
+            glyph.radio_off,
         )
     };
     let model_line = Line::from(vec![

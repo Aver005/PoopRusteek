@@ -356,7 +356,7 @@ mod tests {
         // produced for this (non-adversarial) input.
         let (left, gap, right) = mcp_row_layout("filesystem", 3, true, 34);
         assert_eq!(left, " - filesystem");
-        assert_eq!(right, " 3 \u{2713}");
+        assert_eq!(right, format!(" 3 {}", crate::tui::glyphs::UNICODE.check));
         assert_eq!(gap, 13);
         assert!(left.chars().count() + gap + right.chars().count() <= 34);
     }

@@ -44,8 +44,6 @@ use ratatui::style::Style;
 use ratatui::widgets::Block;
 use std::cell::RefCell;
 
-const BRAND_TITLE: &str = "PoopRusteek \u{1F9FB}";
-
 /// Меньше этого интерфейс не рисуется: рамки и ввод разъезжаются.
 const MIN_COLS: u16 = 40;
 const MIN_ROWS: u16 = 10;
@@ -61,12 +59,17 @@ thread_local! {
     static LAST_WINDOW_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+/// Название окна: заголовок терминала не рисуется в ячейках, знак можно любой.
+fn brand_title() -> String {
+    format!("PoopRusteek {}", crate::tui::glyphs::UNICODE.brand)
+}
+
 /// The window title for the current app state: the brand on the landing /
 /// onboarding / management screens, a truncated chat title (from the
 /// chat's first real message) once a conversation has content.
 fn window_title(state: &AppState) -> String {
     if state.view != View::Chat {
-        return BRAND_TITLE.to_string();
+        return brand_title();
     }
     let title = state
         .focused()
@@ -92,7 +95,7 @@ fn window_title(state: &AppState) -> String {
         });
     match title {
         Some(title) if !title.is_empty() => title,
-        _ => BRAND_TITLE.to_string(),
+        _ => brand_title(),
     }
 }
 

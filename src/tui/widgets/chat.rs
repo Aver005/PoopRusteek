@@ -189,7 +189,11 @@ fn meta_line(msg: &ChatMessage, tokens: u32, theme: &Theme) -> Line<'static> {
         parts.push(format!("think {:.1}s", msg.think_elapsed_secs));
     }
     if msg.references_count > 0 {
-        parts.push(format!("\u{1F4CE}{}", msg.references_count));
+        parts.push(format!(
+            "{}{}",
+            crate::tui::glyphs::get().clip,
+            msg.references_count
+        ));
     }
     let meta = parts.join("  ");
     Line::from(vec![Span::styled(

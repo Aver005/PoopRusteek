@@ -131,6 +131,20 @@ fn scenes() -> Vec<Scene> {
             themes: DEFAULT_THEME,
             first_run: false,
         },
+        Scene {
+            name: "onboarding",
+            build: onboarding,
+            sizes: &[(80, 24)],
+            themes: DEFAULT_THEME,
+            first_run: true,
+        },
+        Scene {
+            name: "search",
+            build: search,
+            sizes: &[(80, 24)],
+            themes: DEFAULT_THEME,
+            first_run: true,
+        },
         // Панель работы: очередь сообщений, много суб-агентов, ASCII-знаки.
         Scene {
             name: "dock-agents",
@@ -570,6 +584,20 @@ fn providers(config: &mut Config) -> AppState {
     state
 }
 
+fn onboarding(config: &mut Config) -> AppState {
+    let theme = config.ui.theme.clone();
+    let mut state = base(config, &theme);
+    state.view = View::Onboarding;
+    state
+}
+
+fn search(config: &mut Config) -> AppState {
+    let theme = config.ui.theme.clone();
+    let mut state = base(config, &theme);
+    state.view = View::Search;
+    state
+}
+
 fn mcp_view(config: &mut Config) -> AppState {
     let theme = config.ui.theme.clone();
     let mut state = base(config, &theme);
@@ -934,4 +962,43 @@ fn capture_screens() {
     }
     std::fs::write(out.join("manifest.tsv"), manifest).expect("manifest");
     let _ = std::fs::remove_dir_all(&data);
+}
+
+/// ASCII-режим не рисует ни одного знака, который старая консоль покажет
+/// квадратом: проходим по всем сценам, включая онбординг, поиск и темы.
+#[test]
+fn ascii_mode_draws_only_console_safe_characters() {
+    let template = Config::default();
+    let mut offenders = Vec::new();
+    for scene in scenes() {
+        for theme in scene.themes.iter().take(1) {
+            let mut config = template.clone();
+            config.ui.theme = (*theme).to_string();
+            let mut state = (scene.build)(&mut config);
+            config.ui.glyphs = GlyphMode::Ascii;
+            let (width, height) = (100, 30);
+            state.terminal_rows = height;
+            state.terminal_cols = width;
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+            terminal
+                .draw(|frame| {
+                    crate::tui::render::draw_frame(frame, &state, &config);
+                })
+                .expect("draw frame");
+            let buffer = terminal.backend().buffer();
+            for y in 0..height {
+                for x in 0..width {
+                    let symbol = buffer[(x, y)].symbol();
+                    if let Some(bad) = symbol
+                        .chars()
+                        .find(|ch| !crate::tui::glyphs::is_console_safe(*ch))
+                    {
+                        offenders.push(format!("{} ({x},{y}): {bad:?}", scene.name));
+                    }
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "{offenders:#?}");
 }

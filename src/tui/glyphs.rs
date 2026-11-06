@@ -17,6 +17,8 @@ pub struct Glyphs {
     pub clip: &'static str,
     pub alarm: &'static str,
     /// Толстая линия заголовков разделов.
+    /// Знак рядом с названием в заголовке окна и в предпросмотре темы.
+    pub brand: &'static str,
     pub heavy_rule: &'static str,
     /// Полоса слева от ответа ассистента.
     pub bar: &'static str,
@@ -40,6 +42,7 @@ pub static UNICODE: Glyphs = Glyphs {
     tool: "\u{2692}",
     clip: "\u{1F4CE}",
     alarm: "\u{23F0}",
+    brand: "\u{1F9FB}",
     heavy_rule: "\u{2501}",
     bar: "\u{258D}",
     quote_bar: "\u{258F}",
@@ -66,6 +69,7 @@ pub static ASCII: Glyphs = Glyphs {
     tool: "*",
     clip: "&",
     alarm: "~",
+    brand: "",
     heavy_rule: "\u{2500}",
     bar: "|",
     quote_bar: "|",
@@ -133,12 +137,99 @@ impl Glyphs {
     }
 }
 
+/// Знаки вне ASCII, которые безопасны в консоли со шрифтом по умолчанию:
+/// есть в CP437 или в обычных шрифтах (рамки, `·`, `…`, `—`, стрелки, блоки шкалы).
+#[cfg(test)]
+pub(crate) const CONSOLE_SAFE: &[char] = &[
+    '\u{2500}', '\u{2502}', '\u{250C}', '\u{2510}', '\u{2514}', '\u{2518}', '\u{251C}', '\u{2524}',
+    '\u{252C}', '\u{2534}', '\u{253C}', '\u{00B7}', '\u{2022}', '\u{2026}', '\u{2014}', '\u{2191}',
+    '\u{2193}', '\u{2192}', '\u{2588}', '\u{2591}',
+];
+
+/// Символ можно показывать в ASCII-режиме: ASCII, кириллица (текст самих
+/// фикстур) или знак из [`CONSOLE_SAFE`].
+#[cfg(test)]
+pub(crate) fn is_console_safe(ch: char) -> bool {
+    ch.is_ascii()
+        || ('\u{A0}'..='\u{FF}').contains(&ch)
+        || ('\u{400}'..='\u{4FF}').contains(&ch)
+        || CONSOLE_SAFE.contains(&ch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     /// Знаки вне ASCII, которые безопасны в консоли со шрифтом по умолчанию.
-    const SAFE_NON_ASCII: &[char] = &['\u{2500}', '\u{2502}', '\u{251C}', '\u{2514}', '\u{00B7}'];
+    const SAFE_NON_ASCII: &[char] = CONSOLE_SAFE;
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Новый знак вне этого модуля не появится: экран, который пишет `✓`, `●`
+    /// или `\u{26A0}` в литерале, нарисует квадрат на старой консоли.
+    #[test]
+    fn no_screen_hardcodes_a_glyph_outside_this_module() {
+        let mut files = Vec::new();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        rust_files(&src.join("tui"), &mut files);
+        files.push(src.join("app/view_state.rs"));
+        let mut offenders = Vec::new();
+        for file in files {
+            let name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            // Здесь и в фикстурах снимков знаки на месте.
+            if name == "glyphs.rs" || name == "capture.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("source file");
+            // Тесты самих файлов не рисуются: их данные могут быть любыми.
+            let code_only = text.split("#[cfg(test)]\nmod ").next().unwrap_or(&text);
+            for (number, line) in code_only.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let code = line.split(" // ").next().unwrap_or(line);
+                let mut bad: Vec<String> = Vec::new();
+                let mut rest = code;
+                while let Some(start) = rest.find("\\u{") {
+                    let after = &rest[start + 3..];
+                    if let Some(end) = after.find('}')
+                        && let Ok(value) = u32::from_str_radix(&after[..end], 16)
+                        && let Some(ch) = char::from_u32(value)
+                        && !is_console_safe(ch)
+                    {
+                        bad.push(format!("\\u{{{:X}}}", value));
+                    }
+                    rest = &rest[start + 3..];
+                }
+                bad.extend(
+                    code.chars()
+                        .filter(|ch| {
+                            let o = *ch as u32;
+                            !is_console_safe(*ch)
+                                && ((0x2190..=0x2BFF).contains(&o) || o >= 0x1F000 || o == 0xFE0F)
+                        })
+                        .map(String::from),
+                );
+                if !bad.is_empty() {
+                    offenders.push(format!("{name}:{}: {bad:?}", number + 1));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "знаки вне glyphs.rs: {offenders:#?}");
+    }
 
     fn all_glyphs(set: &Glyphs) -> Vec<&'static str> {
         let mut all = vec![
@@ -149,6 +240,7 @@ mod tests {
             set.tool,
             set.clip,
             set.alarm,
+            set.brand,
             set.heavy_rule,
             set.bar,
             set.quote_bar,
@@ -179,7 +271,7 @@ mod tests {
     fn both_sets_fill_every_slot() {
         for set in [&UNICODE, &ASCII] {
             for glyph in all_glyphs(set) {
-                assert!(!glyph.is_empty());
+                assert!(glyph.is_empty() == (glyph == set.brand && set.ascii));
             }
             assert!(!set.spinner.is_empty());
         }
