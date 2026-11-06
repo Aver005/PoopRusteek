@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod capture;
+pub mod glyphs;
 pub mod markdown;
 pub mod render;
 pub mod theme;
