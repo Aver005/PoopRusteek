@@ -16,6 +16,10 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
+    if max == 0 {
+        // Нулевая ширина: многоточие шириной в одну клетку вышло бы за предел.
+        return String::new();
+    }
     let budget = max.saturating_sub(1);
     let mut out = String::new();
     let mut used = 0;
@@ -195,6 +199,13 @@ pub(super) fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_to_zero_width_gives_nothing_not_an_ellipsis() {
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("", 0), "");
+        assert_eq!(truncate("abc", 1), "\u{2026}");
+    }
 
     #[test]
     fn fit_col_pads_short_and_truncates_long() {

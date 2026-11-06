@@ -25,7 +25,8 @@ const HIGHLIGHT_CACHE_MAX_BYTES: usize = 256 * 1024;
 /// Сколько байт первой строки идёт в ключ.
 const PROGRESS_KEY_HEAD_BYTES: usize = 80;
 
-type ProgressKey = (String, Color, String);
+/// Язык, цвет `warning`, первая строка и номер блока в сообщении.
+type ProgressKey = (String, Color, String, usize);
 
 /// Что известно о блоке кода после обработки его законченных строк.
 struct HighlightProgress {
@@ -138,6 +139,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut in_code_block = false;
+    let mut code_blocks = 0usize;
     let mut code_block_lang = String::new();
     let mut code_buffer: Vec<String> = Vec::new();
     // Таблица собирается целиком: ширина колонок известна только в конце.
@@ -244,8 +246,13 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     if !code_buffer.is_empty() {
-                        let highlighted =
-                            highlight_code(&code_buffer.join("\n"), &code_block_lang, theme);
+                        let highlighted = highlight_code(
+                            &code_buffer.join("\n"),
+                            &code_block_lang,
+                            theme,
+                            code_blocks,
+                        );
+                        code_blocks += 1;
                         lines.extend(code_block_lines(&code_block_lang, highlighted, theme));
                     }
                     in_code_block = false;
@@ -434,13 +441,15 @@ fn fresh_progress(syntax: &SyntaxReference, syn_theme: &SynTheme) -> HighlightPr
     }
 }
 
-fn progress_key(code: &str, lang: &str, theme: &Theme) -> ProgressKey {
+/// Номер блока различает два блока с одной первой строкой (`cargo test` в двух
+/// bash-блоках): без него они вытесняли бы прогресс друг друга на каждом кадре.
+fn progress_key(code: &str, lang: &str, theme: &Theme, ordinal: usize) -> ProgressKey {
     let head = code.lines().next().unwrap_or("");
     let head = crate::util::truncate_at_char_boundary(head, PROGRESS_KEY_HEAD_BYTES);
-    (lang.to_string(), theme.warning, head.to_string())
+    (lang.to_string(), theme.warning, head.to_string(), ordinal)
 }
 
-fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
+fn highlight_code(code: &str, lang: &str, theme: &Theme, ordinal: usize) -> Vec<Line<'static>> {
     if lang.is_empty() {
         return plain_code_lines(code, theme);
     }
@@ -465,7 +474,13 @@ fn highlight_code(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
         return continue_highlight(code, &mut progress, ss, syn_theme, theme.warning);
     }
 
-    let key = progress_key(code, lang, theme);
+    // Пока нет ни одной законченной строки, запоминать нечего, а первая строка
+    // ещё растёт: ключ менялся бы с каждым токеном и забивал кэш мусором.
+    if !code.contains('\n') {
+        let mut progress = fresh_progress(syntax, syn_theme);
+        return continue_highlight(code, &mut progress, ss, syn_theme, theme.warning);
+    }
+    let key = progress_key(code, lang, theme, ordinal);
     // Берём запись из карты на время подсветки: замок не держим на разборе.
     let stored = HIGHLIGHT_PROGRESS
         .lock()
@@ -601,7 +616,7 @@ mod tests {
             end = (end + 3).min(RUST_SNIPPET.len());
             let prefix = &RUST_SNIPPET[..end];
             assert_eq!(
-                highlight_code(prefix, "rust", &theme),
+                highlight_code(prefix, "rust", &theme, 0),
                 highlight_fresh(prefix),
                 "prefix of {end} bytes"
             );
@@ -611,8 +626,8 @@ mod tests {
     #[test]
     fn repeating_the_same_block_gives_the_same_lines() {
         let theme = Theme::default_dark();
-        let first = highlight_code(RUST_SNIPPET, "rust", &theme);
-        let second = highlight_code(RUST_SNIPPET, "rust", &theme);
+        let first = highlight_code(RUST_SNIPPET, "rust", &theme, 0);
+        let second = highlight_code(RUST_SNIPPET, "rust", &theme, 0);
         assert_eq!(first, second);
         assert_eq!(first.len(), 4);
     }
@@ -620,11 +635,27 @@ mod tests {
     #[test]
     fn a_rewritten_block_with_the_same_first_line_is_not_served_stale() {
         let theme = Theme::default_dark();
-        let _ = highlight_code("fn a() {\n    1\n}\n", "rust", &theme);
+        let _ = highlight_code("fn a() {\n    1\n}\n", "rust", &theme, 0);
         let rewritten = "fn a() {\n    2\n}\n";
         assert_eq!(
-            highlight_code(rewritten, "rust", &theme),
+            highlight_code(rewritten, "rust", &theme, 0),
             highlight_fresh(rewritten)
         );
+    }
+
+    /// Два блока с одной первой строкой получают разные ключи и не вытесняют друг друга.
+    #[test]
+    fn two_blocks_with_the_same_first_line_do_not_share_progress() {
+        let theme = Theme::default_dark();
+        let code = "cargo test\nls\n";
+        assert_ne!(
+            progress_key(code, "bash", &theme, 0),
+            progress_key(code, "bash", &theme, 1)
+        );
+        // Вывод при этом тот же, что у подсветки с нуля.
+        let text = format!("```bash\n{code}```\n\n```bash\n{code}```\n");
+        let first = render_markdown(&text, &theme);
+        let second = render_markdown(&text, &theme);
+        assert_eq!(first, second);
     }
 }
