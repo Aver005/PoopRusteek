@@ -42,7 +42,13 @@ pub(super) fn dim_backdrop(frame: &mut ratatui::Frame, area: Rect, theme: &Theme
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.fg = dim_color(cell.fg, theme.bg);
+                // Цвет по умолчанию тоже приглушается: ячейки без явного цвета оставались яркими.
+                let fg = if cell.fg == Color::Reset {
+                    theme.fg
+                } else {
+                    cell.fg
+                };
+                cell.fg = dim_color(fg, theme.bg);
             }
         }
     }

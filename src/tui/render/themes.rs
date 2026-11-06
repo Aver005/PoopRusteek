@@ -92,7 +92,7 @@ fn render_theme_list(
         );
         let label_style = match row.kind {
             _ if selected => Style::default()
-                .fg(theme.accent)
+                .fg(theme.fg)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
             ThemeRowKind::Create => Style::default().fg(theme.accent_soft),
@@ -102,7 +102,7 @@ fn render_theme_list(
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(theme.success).bg(bg)),
             Span::styled(
-                if selected { glyph.pointer } else { " " },
+                if selected { glyph.sel_bar } else { " " },
                 Style::default().fg(theme.accent).bg(bg),
             ),
             Span::styled(row.label.clone(), label_style),

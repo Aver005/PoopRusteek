@@ -115,10 +115,12 @@ fn render_filter_bar(frame: &mut Frame, area: Rect, view: &SearchViewState, them
             "off"
         },
     ));
-    spans.push(Span::styled(
-        format!("  ·  {right}"),
-        Style::default().fg(theme.text_dim),
-    ));
+    if !right.is_empty() {
+        spans.push(Span::styled(
+            format!("  ·  {right}"),
+            Style::default().fg(theme.text_dim),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -128,7 +130,7 @@ fn render_results(frame: &mut Frame, area: Rect, view: &SearchViewState, theme: 
         let message = if view.searching {
             "Searching…"
         } else if view.matches.is_empty() && view.last_query.is_empty() {
-            "Type a query and press Enter — semantic + keyword search over all saved sessions."
+            "Type a query and press Enter to search all saved sessions."
         } else {
             "Nothing to show (adjust the query or filters)."
         };

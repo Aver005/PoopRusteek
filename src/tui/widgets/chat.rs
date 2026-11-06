@@ -182,9 +182,10 @@ fn format_time(rfc3339: &str) -> String {
     }
 }
 
-fn meta_line(msg: &ChatMessage, tokens: u32, theme: &Theme) -> Line<'static> {
+/// `lead` выравнивает подпись по тексту: у пользователя текст с полем в пробел, у ответа без.
+fn meta_line(msg: &ChatMessage, tokens: u32, theme: &Theme, lead: &str) -> Line<'static> {
     let time = format_time(&msg.created_at);
-    let mut parts = vec![format!(" {}  {}t ", time, tokens)];
+    let mut parts = vec![format!("{lead}{time}  {tokens} tok")];
     if msg.think_elapsed_secs > 0.0 {
         parts.push(format!("think {:.1}s", msg.think_elapsed_secs));
     }
@@ -245,7 +246,7 @@ fn with_assistant_cached<R>(
         };
         let wrapped_rows = wrapped_row_count(rendered_lines.clone(), wrap_width as usize);
         let meta_rows = wrapped_row_count(
-            vec![meta_line(msg, token_estimate, theme)],
+            vec![meta_line(msg, token_estimate, theme, "")],
             wrap_width as usize,
         );
 
@@ -298,7 +299,7 @@ fn build_segment_lines(
                 )]));
             }
             let tokens = cached_token_estimate(conversation_id, index, msg);
-            lines.push(meta_line(msg, tokens, theme));
+            lines.push(meta_line(msg, tokens, theme, " "));
         }
         Role::Assistant => {
             // Only the empty-content placeholder goes through here; the
@@ -309,6 +310,19 @@ fn build_segment_lines(
                 Style::default().fg(theme.text_dim),
             ));
             lines.push(Line::from(head));
+        }
+        Role::System if msg.status.as_deref() == Some(crate::app::gateway_view::SEAM_STATUS) => {
+            // Шов: тонкая строка о смене аккаунта, чтобы человек видел, кто отвечал.
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " \u{2500}\u{2500} ",
+                    Style::default().fg(theme.border).bg(theme.bg),
+                ),
+                Span::styled(
+                    msg.visible_content().to_string(),
+                    Style::default().fg(theme.text_soft).bg(theme.bg),
+                ),
+            ]));
         }
         Role::System => {
             let body = msg.visible_content();
@@ -340,7 +354,7 @@ fn build_segment_lines(
                 }
             }
         }
-        Role::Tool => lines.extend(tool_lines(msg, theme)),
+        Role::Tool => lines.extend(super::tool_block::tool_lines(msg, theme)),
     }
     lines
 }
@@ -371,88 +385,6 @@ fn assistant_header(msg: &ChatMessage, theme: &Theme) -> Vec<Span<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ]
-}
-
-/// Сколько строк тела результата инструмента видно, пока он не ошибся.
-const TOOL_BODY_PREVIEW_LINES: usize = 3;
-/// Потолок строк ошибки: ошибка раскрыта, но не бесконечна.
-const TOOL_ERROR_MAX_LINES: usize = 40;
-
-/// Результат инструмента: заголовок `✓ имя` и тело, свёрнутое до трёх строк.
-/// Ошибка раскрыта целиком (до потолка). Заливки нет — меньше шума.
-fn tool_lines(msg: &ChatMessage, theme: &Theme) -> Vec<Line<'static>> {
-    let glyph = crate::tui::glyphs::get();
-    let tool_name = msg.name.as_deref().unwrap_or("unknown");
-    let status_color = if msg.tool_error {
-        theme.error
-    } else {
-        theme.success
-    };
-    let body = msg.visible_content();
-    let body_lines: Vec<&str> = body.lines().collect();
-    let empty = body_lines.iter().all(|l| l.trim().is_empty());
-    let total = body_lines.len();
-
-    let mut head = vec![
-        Span::styled(
-            format!(" {} ", glyph.outcome(msg.tool_error)),
-            Style::default()
-                .fg(status_color)
-                .bg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            tool_name.to_string(),
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if msg.tool_error {
-        head.push(Span::styled(
-            " failed",
-            Style::default().fg(theme.error).bg(theme.bg),
-        ));
-    }
-    let mut lines = vec![Line::from(head)];
-
-    if empty {
-        lines.push(Line::from(Span::styled(
-            "   (no output)",
-            Style::default().fg(theme.text_dim).bg(theme.bg),
-        )));
-        return lines;
-    }
-    let shown = if msg.tool_error {
-        total.min(TOOL_ERROR_MAX_LINES)
-    } else {
-        total.min(TOOL_BODY_PREVIEW_LINES)
-    };
-    let text_color = if msg.tool_error {
-        theme.error
-    } else {
-        theme.text_soft
-    };
-    for line_text in &body_lines[..shown] {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "   \u{2502} ",
-                Style::default().fg(theme.text_dim).bg(theme.bg),
-            ),
-            Span::styled(
-                (*line_text).to_string(),
-                Style::default().fg(text_color).bg(theme.bg),
-            ),
-        ]));
-    }
-    if total > shown {
-        lines.push(Line::from(Span::styled(
-            format!("   \u{2026} {} more lines", total - shown),
-            Style::default().fg(theme.text_dim).bg(theme.bg),
-        )));
-    }
-    lines
 }
 
 /// Whether `msg` renders through the cached-markdown assistant path (true)
@@ -565,8 +497,21 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 |cached, tokens| (cached.lines.clone(), tokens),
             );
             lines.push(Line::from(assistant_header(msg, theme)));
+            let mut md_lines = md_lines;
+            let writing = index + 1 == messages.len() && state.focused().generation.active;
+            if writing
+                && state.focused().generation.animation_tick.is_multiple_of(2)
+                && let Some(last) = md_lines.last_mut()
+                && last.width() < usize::from(wrap_width)
+            {
+                // Курсор «пишу» в конце текста; в строку без запаса не ставится, чтобы не сдвинуть счёт рядов.
+                last.spans.push(Span::styled(
+                    crate::tui::glyphs::get().caret,
+                    Style::default().fg(theme.accent),
+                ));
+            }
             lines.extend(md_lines);
-            lines.push(meta_line(msg, tokens, theme));
+            lines.push(meta_line(msg, tokens, theme, ""));
         } else {
             lines.extend(build_segment_lines(conversation_id, index, msg, theme));
         }

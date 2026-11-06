@@ -7,11 +7,12 @@
 //! Данные детерминированы: время сообщений, сессии и счётчики зафиксированы,
 //! папка данных временная, токена и сети нет.
 
+use super::capture_accounts as accounts;
 use crate::app::AppState;
 use crate::app::conversation::{Conversation, ConversationKind, QueuedMessage, ToolRun};
 use crate::app::events::{GoalStage, View};
 use crate::app::view_state::{Grant, Modal, PickerItem, PickerKind, PickerMode, PickerState};
-use crate::config::{Config, GlyphMode, ProviderEntry, ProviderProtocol};
+use crate::config::{Config, GlyphMode};
 use crate::mcp::types::ServerDisplayInfo;
 use crate::provider::ChatMessage;
 use ratatui::Terminal;
@@ -44,6 +45,8 @@ struct Scene {
 }
 
 const DEFAULT_THEME: &[&str] = &["default"];
+const THEMES_THREE: &[&str] = &["default", "nord", "paper"];
+const SIZES_ACCOUNTS: &[Size] = &[(80, 24), (120, 40)];
 
 fn scenes() -> Vec<Scene> {
     vec![
@@ -111,10 +114,115 @@ fn scenes() -> Vec<Scene> {
             first_run: false,
         },
         Scene {
-            name: "providers",
-            build: providers,
-            sizes: SIZES_MAIN,
+            name: "accounts",
+            build: |c| with_base(c, accounts::accounts),
+            sizes: SIZES_ACCOUNTS,
+            themes: THEMES_THREE,
+            first_run: false,
+        },
+        Scene {
+            name: "accounts-second",
+            build: |c| with_base(c, accounts::accounts_second_selected),
+            sizes: SIZES_ACCOUNTS,
             themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "accounts-details",
+            build: |c| with_base(c, accounts::accounts_details),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "accounts-routes",
+            build: |c| with_base(c, accounts::accounts_routes),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "accounts-off",
+            build: |c| with_base(c, accounts::accounts_off),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "landing-accounts",
+            build: |c| with_base(c, accounts::landing_accounts),
+            sizes: SIZES_ACCOUNTS,
+            themes: THEMES_THREE,
+            first_run: false,
+        },
+        Scene {
+            name: "landing-pick",
+            build: landing,
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "wizard-kind",
+            build: |c| with_base(c, accounts::wizard_kind),
+            sizes: SIZES_ACCOUNTS,
+            themes: THEMES_THREE,
+            first_run: false,
+        },
+        Scene {
+            name: "wizard-confirm",
+            build: |c| with_base(c, accounts::wizard_confirm),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "wizard-secret",
+            build: |c| with_base(c, accounts::wizard_secret),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "wizard-direct",
+            build: |c| with_base(c, accounts::wizard_direct),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "limits-form",
+            build: |c| with_base(c, accounts::limits_form),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "secret-prompt",
+            build: |c| with_base(c, accounts::secret_prompt),
+            sizes: SIZES_ACCOUNTS,
+            themes: THEMES_THREE,
+            first_run: false,
+        },
+        Scene {
+            name: "trust",
+            build: |c| with_base(c, accounts::trust),
+            sizes: SIZES_ACCOUNTS,
+            themes: THEMES_THREE,
+            first_run: false,
+        },
+        Scene {
+            name: "usage",
+            build: |c| with_base(c, accounts::usage),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "seam",
+            build: |c| with_base(c, accounts::seam),
+            sizes: SIZES_ACCOUNTS,
+            themes: THEMES_THREE,
             first_run: false,
         },
         Scene {
@@ -272,7 +380,8 @@ fn chat_messages() -> Vec<ChatMessage> {
         tool(
             "bash",
             "c1",
-            "$ cargo test items::range\nrunning 3 tests\ntest items::range::empty ... FAILED\ntest items::range::single ... ok\ntest items::range::pair ... ok\n\nfailures:\n    items::range::empty\n\ntest result: FAILED. 2 passed; 1 failed",
+            "$ cargo test items::range\nrunning 3 tests\ntest items::range::empty ... FAILED\ntest items::range::single ... ok\ntest items::range::pair ... ok\n\nfailures:\n    items::range::empty\n\ntest result: FAILED. 2 passed; 1 failed
+[exit code 101]",
             "14:02:34",
             false,
         ),
@@ -343,6 +452,13 @@ fn mcp_servers(state: &mut AppState) {
     ];
     state.mcp_status.server_count = 3;
     state.mcp_status.connected_count = 2;
+}
+
+/// Основа сцены и доработка из `capture_accounts`.
+fn with_base(config: &mut Config, build: fn(AppState, &mut Config) -> AppState) -> AppState {
+    let theme = config.ui.theme.clone();
+    let state = base(config, &theme);
+    build(state, config)
 }
 
 fn landing(config: &mut Config) -> AppState {
@@ -545,42 +661,6 @@ fn models_picker(config: &mut Config) -> AppState {
         PickerMode::Single,
         PickerKind::Models,
     )));
-    state
-}
-
-fn providers(config: &mut Config) -> AppState {
-    let theme = config.ui.theme.clone();
-    let mut state = base(config, &theme);
-    let entry = |name: &str, url: &str, model: &str, protocol: ProviderProtocol| ProviderEntry {
-        name: name.to_string(),
-        base_url: url.to_string(),
-        api_key: Some("sk-demo".to_string()),
-        model: model.to_string(),
-        protocol,
-        tools: Default::default(),
-    };
-    config.providers = vec![
-        entry(
-            "lm-studio",
-            "http://localhost:1234/v1",
-            "qwen3-coder-30b",
-            ProviderProtocol::Openai,
-        ),
-        entry(
-            "claude",
-            "https://api.anthropic.com/v1",
-            "claude-sonnet-5-5",
-            ProviderProtocol::Anthropic,
-        ),
-        entry(
-            "openrouter",
-            "https://openrouter.ai/api/v1",
-            "",
-            ProviderProtocol::Openai,
-        ),
-    ];
-    state.view = View::Providers;
-    state.providers_view.selected = 1;
     state
 }
 
@@ -885,6 +965,10 @@ fn capture(
     state
         .landing
         .apply(crate::session::list_sessions().unwrap_or_default());
+    if scene.name == "landing-pick" {
+        state.landing.step_down();
+        state.landing.step_down();
+    }
 
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     let mut cursor = None;
@@ -896,7 +980,7 @@ fn capture(
         && !state.focused().generation.active
         && !matches!(
             state.view,
-            View::Mcp | View::Providers | View::Search | View::Themes
+            View::Mcp | View::Accounts | View::Search | View::Themes
         );
     let cursor = cursor.filter(|_| cursor_visible);
 

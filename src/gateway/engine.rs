@@ -551,7 +551,10 @@ impl Core {
             let kept = runtimes
                 .get(&account.id)
                 .filter(|runtime| {
-                    runtime.connection == connection_of(account) && runtime.invalid == invalid
+                    // Недоступный аккаунт собирается заново при любой правке: так он оживает без перезапуска.
+                    runtime.backend.is_ok()
+                        && runtime.connection == connection_of(account)
+                        && runtime.invalid == invalid
                 })
                 .cloned();
             let runtime = match kept {

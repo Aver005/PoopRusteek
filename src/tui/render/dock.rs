@@ -17,8 +17,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-/// Больше строк панель не занимает: остальное уходит в «+N».
+/// Меньше всего строк панели: на низком окне остальное уходит в «+N».
 pub(crate) const MAX_DOCK_ROWS: u16 = 4;
+
+/// Потолок панели зависит от высоты окна: на высоком экране параллельная работа видна целиком.
+pub(crate) fn max_rows(window_rows: u16) -> u16 {
+    match window_rows {
+        0..30 => MAX_DOCK_ROWS,
+        30..40 => 6,
+        _ => 8,
+    }
+}
 /// Сколько символов сообщения из очереди показываем.
 const QUEUE_PREVIEW_CHARS: usize = 60;
 
@@ -49,8 +58,8 @@ struct DockModel {
     children: Vec<ChildRow>,
     /// Сколько сообщений ждёт, что первое, и стоит ли очередь после упавшего хода.
     queue: Option<(usize, String, bool)>,
-    /// Сколько агентов не поместилось. Показаны строкой очереди, а если очереди
-    /// нет — отдельной строкой дерева; со сводкой GOAL они не смешиваются.
+    /// Сколько агентов не поместилось. Показаны отдельной строкой дерева;
+    /// ни с очередью, ни со сводкой GOAL они не смешиваются.
     hidden_agents: usize,
     summary: Vec<SummaryItem>,
 }
@@ -64,9 +73,9 @@ struct SummaryItem {
 }
 
 impl DockModel {
-    /// Отдельная строка «+N агентов»: когда скрытые есть, а очереди для них нет.
+    /// Отдельная строка «+N агентов»: когда скрытые есть.
     fn overflow_row(&self) -> bool {
-        self.hidden_agents > 0 && self.queue.is_none()
+        self.hidden_agents > 0
     }
 
     fn rows(&self) -> u16 {
@@ -209,11 +218,11 @@ fn model(state: &AppState) -> DockModel {
 
     let main_rows = usize::from(main.is_some());
     let queue_rows = usize::from(queue.is_some());
-    let max_rows = usize::from(MAX_DOCK_ROWS);
+    let max_rows = usize::from(max_rows(state.terminal_rows));
     let mut budget =
         max_rows.saturating_sub(main_rows + queue_rows + usize::from(!summary.is_empty()));
-    // Скрытые агенты без очереди получают свою строку — её место отнимается у списка.
-    if running_children.len() > budget && queue.is_none() {
+    // Скрытые агенты получают свою строку — её место отнимается у списка.
+    if running_children.len() > budget {
         budget = budget.saturating_sub(1);
     }
     let shown = running_children.len().min(budget);
@@ -244,7 +253,7 @@ fn model(state: &AppState) -> DockModel {
 
 /// Сколько строк займёт панель в этом состоянии (0 в простое).
 pub(crate) fn height(state: &AppState) -> u16 {
-    model(state).rows().min(MAX_DOCK_ROWS)
+    model(state).rows().min(max_rows(state.terminal_rows))
 }
 
 /// `m:ss`.
@@ -359,19 +368,7 @@ fn child_line<'a>(row: &ChildRow, last: bool, width: usize, theme: &Theme) -> Li
     two_sided(width, lead, &lead_text, &right, theme)
 }
 
-fn queue_line<'a>(
-    count: usize,
-    next: &str,
-    paused: bool,
-    hidden_agents: usize,
-    width: usize,
-    theme: &Theme,
-) -> Line<'a> {
-    let more = if hidden_agents > 0 {
-        format!("+{hidden_agents} more agents ")
-    } else {
-        String::new()
-    };
+fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &Theme) -> Line<'a> {
     if paused {
         // Ход упал, а сообщения ждут решения человека.
         let text = format!(
@@ -384,7 +381,7 @@ fn queue_line<'a>(
                 .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
         )];
-        return two_sided(width, lead, &lead_text, &more, theme);
+        return two_sided(width, lead, &lead_text, "", theme);
     }
     let lead_text = format!(" queued {count} \u{00B7} next: {next}");
     let lead = vec![
@@ -397,7 +394,7 @@ fn queue_line<'a>(
             Style::default().fg(theme.text_soft),
         ),
     ];
-    two_sided(width, lead, &lead_text, &more, theme)
+    two_sided(width, lead, &lead_text, "", theme)
 }
 
 fn tone_style(tone: Tone, theme: &Theme) -> Style {
@@ -461,14 +458,7 @@ pub(crate) fn render_dock(frame: &mut Frame, area: Rect, state: &AppState, theme
         ]));
     }
     if let Some((count, next, paused)) = &model.queue {
-        lines.push(queue_line(
-            *count,
-            next,
-            *paused,
-            model.hidden_agents,
-            width,
-            theme,
-        ));
+        lines.push(queue_line(*count, next, *paused, width, theme));
     }
     if !model.summary.is_empty() {
         lines.push(summary_line(&model.summary, width, theme));
@@ -593,7 +583,7 @@ mod tests {
 
     /// Есть очередь — «+N агентов» уходит в её строку, отдельной строки нет.
     #[test]
-    fn hidden_agents_ride_on_the_queue_row_when_there_is_one() {
+    fn hidden_agents_get_their_own_row_even_when_there_is_a_queue() {
         let mut state = idle_state();
         state.focused_mut().generation.active = true;
         state
@@ -609,7 +599,26 @@ mod tests {
         }
         let model = model(&state);
         assert!(model.hidden_agents > 0);
-        assert!(!model.overflow_row());
+        assert!(
+            model.overflow_row(),
+            "«+N more agents» is not part of the queue row"
+        );
         assert!(model.rows() <= MAX_DOCK_ROWS);
+    }
+
+    #[test]
+    fn a_tall_window_shows_more_parallel_work() {
+        let mut state = idle_state();
+        state.focused_mut().generation.active = true;
+        for index in 0..6 {
+            start_agent(&mut state, &format!("agent {index}"));
+        }
+        state.terminal_rows = 24;
+        let low = model(&state);
+        state.terminal_rows = 50;
+        let tall = model(&state);
+        assert!(tall.children.len() > low.children.len());
+        assert_eq!(tall.hidden_agents, 0, "six agents fit in a tall window");
+        assert!(tall.rows() <= max_rows(50));
     }
 }

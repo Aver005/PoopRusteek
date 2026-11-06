@@ -9,6 +9,7 @@
 //! - [`dock`], [`composer`], [`footer`], [`welcome`], [`onboarding`], [`mcp`],
 //!   [`modals`] — the actual views; [`draw_frame`] below only dispatches.
 
+mod accounts;
 mod approval;
 mod attach;
 mod chrome;
@@ -20,7 +21,6 @@ mod mcp;
 mod modals;
 mod onboarding;
 mod popup;
-mod providers;
 mod search;
 mod segments;
 mod themes;
@@ -263,8 +263,15 @@ pub(crate) fn draw_frame(
         }
     } else if state.view == View::Mcp {
         mcp::render_mcp_view(frame, area, &state.mcp_status.view, &theme);
-    } else if state.view == View::Providers {
-        providers::render_providers_view(frame, area, &state.providers_view, config, &theme);
+    } else if state.view == View::Accounts {
+        accounts::render_accounts_view(
+            frame,
+            area,
+            &state.gateway_view,
+            state.gateway_view.enabled,
+            config,
+            &theme,
+        );
     } else if state.view == View::Search {
         search::render_search_view(frame, area, &state.search, &theme);
     } else if state.view == View::Themes {

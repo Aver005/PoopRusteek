@@ -52,6 +52,22 @@ fn status_worth_showing(state: &AppState) -> bool {
     !(state.focused().generation.active && message.starts_with("Running "))
 }
 
+/// Кто отвечает сейчас: `● claude-max +2`, а у закреплённого чата — `pinned claude-max`.
+/// Одного аккаунта и выключенного шлюза нет в подвале вовсе.
+fn account_indicator(state: &AppState) -> Option<String> {
+    let focused = state.conversations.focused_id();
+    if let Some(label) = state.gateway_view.pins.get(&focused) {
+        return Some(format!("pinned {label}"));
+    }
+    let (mark, _, label, others) = super::accounts::footer_account(&state.gateway_view)?;
+    let glyph = super::accounts::footer_glyph(mark);
+    Some(if others > 0 {
+        format!("{glyph} {label} +{others}")
+    } else {
+        format!("{glyph} {label}")
+    })
+}
+
 fn left_segments(state: &AppState, config: &Config, dock_visible: bool) -> Vec<Segment> {
     let model = config.active_model();
     let mut left = vec![
@@ -62,6 +78,9 @@ fn left_segments(state: &AppState, config: &Config, dock_visible: bool) -> Vec<S
         )
         .or_short(format!(" {model}")),
     ];
+    if let Some(account) = account_indicator(state) {
+        left.push(Segment::new(2, Tone::Plain, format!(" \u{00B7} {account}")));
+    }
     if !dock_visible && let Some(goal) = goal_label(state) {
         left.push(Segment::new(2, Tone::Accent, format!(" \u{00B7} {goal}")));
     }

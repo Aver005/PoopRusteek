@@ -42,10 +42,8 @@ impl App {
                 return Ok(true);
             }
             CommandResult::ResetProvider => {
-                if let Ok(config) = crate::config::load() {
-                    self.config = config;
-                }
-                self.rebuild_provider();
+                // Конфиг читается вне цикла событий; провайдер пересобирается по ответу.
+                self.reload_config_async();
             }
             CommandResult::TtlUpdate(ttl) => {
                 self.config.mcp.cache_ttl = ttl;
@@ -176,51 +174,39 @@ impl App {
             CommandResult::SwitchModel(id) => {
                 self.request_models(Some(id));
             }
-            CommandResult::OpenProviders => {
-                self.state.view = View::Providers;
-                self.state.providers_view.selected = 0;
-                self.state.providers_view.status_message.clear();
+            CommandResult::OpenAccounts(focus) => self.open_accounts(focus),
+            CommandResult::EnableGateway => {
+                self.open_accounts(crate::app::gateway_view::Focus::Accounts);
+                self.enable_gateway();
             }
             CommandResult::SetProviderTools { name, tools } => {
-                self.apply_provider_tools(&name, tools);
+                self.set_account_tools(&name, tools);
             }
-            CommandResult::OpenProviderAdd(args) => match args {
-                None => {
-                    self.state.modal = Some(Modal::ProviderAdd(Box::new(
-                        crate::app::providers::ProviderAddState::new(),
-                    )));
-                }
-                Some(raw) => {
-                    match crate::app::providers::parse_quick_add(&raw, &self.config) {
+            CommandResult::OpenAccountAdd(args) => {
+                let wizard = match args.as_deref() {
+                    None => crate::app::gateway_view::wizard::AccountWizard::new(),
+                    Some(raw) => match crate::app::providers::parse_quick_add(raw, &self.config) {
                         Ok(entry) => {
-                            let name = entry.name.clone();
-                            self.config.providers.push(entry.clone());
-                            match crate::config::save_or_message(&self.config) {
-                                Ok(()) => {
-                                    // Pull its model list right away so the
-                                    // API catalog knows the new backend.
-                                    self.fetch_models_for_new_entry(&entry);
-                                    self.state.push_system(&format!(
-                                        "Provider '{name}' added. Open /providers and press Enter on it to activate."
-                                    ));
-                                }
-                                Err(message) => {
-                                    self.config.providers.pop();
-                                    self.state.push_system(&message);
-                                }
-                            }
+                            crate::app::gateway_view::wizard::AccountWizard::from_quick(&entry)
                         }
                         Err(reason) => {
-                            self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                                &format!("Couldn't parse \"/providers add {raw}\" ({reason}) \u{2014} opening the wizard:"),
+                            self.state.push_ui_system(&format!(
+                                "Couldn't parse \"{raw}\" ({reason}) - opening the wizard:"
                             ));
-                            self.state.modal = Some(Modal::ProviderAdd(Box::new(
-                                crate::app::providers::ProviderAddState::new(),
-                            )));
+                            crate::app::gateway_view::wizard::AccountWizard::new()
                         }
-                    }
-                }
-            },
+                    },
+                };
+                self.state.modal = Some(Modal::AccountWizard(Box::new(wizard)));
+            }
+            CommandResult::Pin(arg) => self.pin_chat(&arg),
+            CommandResult::ShowUsage => self.show_usage(),
+            CommandResult::PromptSecret(name) => {
+                self.state.modal = Some(Modal::SecretPrompt(Box::new(
+                    crate::app::gateway_view::forms::SecretPrompt::named(&name),
+                )));
+            }
+            CommandResult::ReloadConfig => self.reload_config_async(),
             CommandResult::Rag(action) => self.apply_rag_action(action),
             CommandResult::Instructions(enabled) => self.apply_instructions_action(enabled),
             CommandResult::ConfirmUndo {

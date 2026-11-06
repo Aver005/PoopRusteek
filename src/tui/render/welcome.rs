@@ -3,7 +3,6 @@
 //! здесь не рисуется — оно общее со всеми экранами и стоит внизу (`layout`).
 
 use super::onboarding::pulsing_title;
-use super::segments::{Segment, Tone, fit_segments};
 use super::util::{fit_col, format_date, provider_label, truncate};
 use crate::app::AppState;
 use crate::app::landing::SHOWN_SESSIONS;
@@ -25,16 +24,18 @@ const MODEL_W: usize = 16;
 const DATE_W: usize = 12;
 const GAP: usize = 2;
 
-/// Что умещается в `height` строк: карточка, сессии, подсказки.
+/// Что умещается в `height` строк: карточка и сессии. Подсказки клавиш живут
+/// в правиле над вводом, здесь их не дублируем.
 #[derive(Debug, PartialEq, Eq)]
 struct WelcomePlan {
     card: bool,
     session_rows: usize,
-    tips: bool,
+    /// Строка аккаунтов с лимитами над полем ввода.
+    accounts: bool,
 }
 
-/// Разделить высоту между частями. Карточка важнее сессий, сессии — подсказок.
-fn plan(height: u16, sessions: usize) -> WelcomePlan {
+/// Разделить высоту между частями. Карточка важнее сессий.
+fn plan(height: u16, sessions: usize, has_accounts: bool) -> WelcomePlan {
     let height = usize::from(height);
     let card_rows = if height >= usize::from(CARD_H) + 2 {
         usize::from(CARD_H)
@@ -43,9 +44,9 @@ fn plan(height: u16, sessions: usize) -> WelcomePlan {
     };
     let card = card_rows == usize::from(CARD_H);
     let mut left = height.saturating_sub(card_rows);
-    // Подсказки — последняя строка области, прямо над полем ввода.
-    let tips = left >= 2;
-    if tips {
+    // Строка аккаунтов — последняя строка области, прямо над полем ввода.
+    let accounts = has_accounts && left >= 2;
+    if accounts {
         left -= 1;
     }
     // Пустая строка перед сессиями и их заголовок.
@@ -57,7 +58,7 @@ fn plan(height: u16, sessions: usize) -> WelcomePlan {
     WelcomePlan {
         card,
         session_rows,
-        tips,
+        accounts,
     }
 }
 
@@ -114,51 +115,37 @@ fn session_rows(state: &AppState, rows: usize, width: usize, theme: &Theme) -> V
     let fixed = 2 + GAP + DATE_W + 1 + if with_model { MODEL_W + GAP } else { 0 };
     let title_w = width.saturating_sub(fixed).max(8);
     let mut lines = vec![Line::from(Span::styled(
-        " Recent sessions",
+        " Recent sessions - Down to pick, Enter to open",
         Style::default().fg(theme.text_dim).bg(theme.bg),
     ))];
-    for session in state.landing.recent().iter().take(rows) {
+    for (index, session) in state.landing.recent().iter().take(rows).enumerate() {
+        let picked = state.landing.cursor() == Some(index);
+        let bg = if picked { theme.selection } else { theme.bg };
         let mut spans = vec![
-            Span::raw("   "),
+            Span::styled(
+                format!(" {} ", if picked { glyphs::get().sel_bar } else { " " }),
+                Style::default().fg(theme.accent).bg(bg),
+            ),
             Span::styled(
                 fit_col(&session.title, title_w),
-                Style::default().fg(theme.fg).bg(theme.bg),
+                Style::default().fg(theme.fg).bg(bg),
             ),
-            Span::raw(" ".repeat(GAP)),
+            Span::styled(" ".repeat(GAP), Style::default().bg(bg)),
         ];
         if with_model {
             spans.push(Span::styled(
                 fit_col(&session.model_type, MODEL_W),
-                Style::default().fg(theme.accent_soft).bg(theme.bg),
+                Style::default().fg(theme.accent_soft).bg(bg),
             ));
-            spans.push(Span::raw(" ".repeat(GAP)));
+            spans.push(Span::styled(" ".repeat(GAP), Style::default().bg(bg)));
         }
         spans.push(Span::styled(
             fit_col(&format_date(&session.updated_at), DATE_W),
-            Style::default().fg(theme.text_dim).bg(theme.bg),
+            Style::default().fg(theme.text_dim).bg(bg),
         ));
         lines.push(Line::from(spans));
     }
     lines
-}
-
-fn tips_line(width: usize, theme: &Theme) -> Line<'static> {
-    let dot = "\u{00B7}";
-    let tips = vec![
-        Segment::new(1, Tone::Dim, format!("/ commands {dot} ")),
-        Segment::new(2, Tone::Dim, format!("@file attach {dot} ")),
-        Segment::new(3, Tone::Dim, "/sessions open one"),
-    ];
-    let (parts, _) = fit_segments(width.saturating_sub(2), tips, Vec::new());
-    let mut text: String = parts.iter().map(|part| part.text.as_str()).collect();
-    // Висящий разделитель на конце не нужен.
-    if let Some(stripped) = text.strip_suffix(&format!(" {dot} ")) {
-        text = stripped.to_string();
-    }
-    Line::from(Span::styled(
-        format!(" {text}"),
-        Style::default().fg(theme.text_dim).bg(theme.bg),
-    ))
 }
 
 /// Нарисовать приветствие в области переписки.
@@ -174,7 +161,9 @@ pub(super) fn render_welcome(
     }
     let content_w = area.width.saturating_sub(2);
     let content = Rect::new(area.x + 1, area.y, content_w, area.height);
-    let plan = plan(area.height, state.landing.recent().len());
+    let chips =
+        super::accounts::account_chips(&state.gateway_view, usize::from(content.width), theme);
+    let plan = plan(area.height, state.landing.recent().len(), chips.is_some());
     let width = usize::from(content.width);
 
     let mut y = content.y;
@@ -215,10 +204,11 @@ pub(super) fn render_welcome(
             Rect::new(content.x, y, content.width, height),
         );
     }
-    if plan.tips && area.height > 0 {
-        // Пустота между сессиями и подсказками — честная: ввод всегда внизу.
+    if plan.accounts
+        && let Some(line) = chips
+    {
         frame.render_widget(
-            Paragraph::new(tips_line(width, theme)),
+            Paragraph::new(line).style(Style::default().bg(theme.bg)),
             Rect::new(content.x, area.bottom() - 1, content.width, 1),
         );
     }
@@ -230,22 +220,22 @@ mod tests {
 
     #[test]
     fn a_tall_area_fits_everything() {
-        let plan = plan(24, 4);
+        let plan = plan(24, 4, true);
         assert_eq!(
             plan,
             WelcomePlan {
                 card: true,
                 session_rows: 4,
-                tips: true
+                accounts: true,
             }
         );
     }
 
     #[test]
     fn a_short_area_drops_sessions_before_the_card() {
-        let short = plan(6, 4);
+        let short = plan(6, 4, false);
         assert!(short.card && short.session_rows == 0);
-        let tiny = plan(3, 4);
+        let tiny = plan(3, 4, false);
         assert!(!tiny.card);
     }
 
@@ -253,15 +243,14 @@ mod tests {
     fn the_plan_never_asks_for_more_rows_than_it_has() {
         for height in 0..40u16 {
             for sessions in 0..8 {
-                let plan = plan(height, sessions);
+                let plan = plan(height, sessions, true);
                 let card = if plan.card { usize::from(CARD_H) } else { 1 };
                 let sessions_block = if plan.session_rows > 0 {
                     plan.session_rows + 2
                 } else {
                     0
                 };
-                let tips = usize::from(plan.tips);
-                let used = card + sessions_block + tips;
+                let used = card + sessions_block + usize::from(plan.accounts);
                 assert!(
                     used <= usize::from(height).max(1),
                     "height {height}, sessions {sessions}, used {used}"
@@ -272,6 +261,6 @@ mod tests {
 
     #[test]
     fn at_most_the_shown_number_of_sessions_is_planned() {
-        assert!(plan(60, 20).session_rows <= SHOWN_SESSIONS);
+        assert!(plan(60, 20, true).session_rows <= SHOWN_SESSIONS);
     }
 }

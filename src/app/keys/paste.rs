@@ -17,7 +17,6 @@
 use crate::app::App;
 use crate::app::events::{Modal, View};
 use crate::app::mcp_add::{McpAddState, WizardStep};
-use crate::app::providers::ProviderWizardStep;
 use crate::app::search::SearchFocus;
 use crate::app::themes::ThemeWizardStep;
 
@@ -88,16 +87,20 @@ impl App {
                     },
                     McpAddState::ChooseMethod { .. } => {}
                 },
-                Modal::ProviderAdd(wiz) => {
+                Modal::AccountWizard(wiz) => {
+                    use crate::app::gateway_view::wizard::Step;
                     let clean = sanitize(&text, false);
                     match wiz.step {
-                        ProviderWizardStep::Name => wiz.name.insert_str(&clean),
-                        ProviderWizardStep::BaseUrl => wiz.base_url.insert_str(&clean),
-                        ProviderWizardStep::ApiKey => wiz.api_key.insert_str(&clean),
-                        ProviderWizardStep::Model => wiz.model.insert_str(&clean),
-                        ProviderWizardStep::Protocol | ProviderWizardStep::Confirm => {}
+                        Step::Label => wiz.label.insert_str(&clean),
+                        Step::BaseUrl => wiz.base_url.insert_str(&clean),
+                        Step::Model => wiz.model.insert_str(&clean),
+                        Step::Secret => wiz.secret.push_str(&clean),
+                        _ => {}
                     }
                 }
+                // Вставка секрета идёт мимо поля ввода и истории: только в скрытое поле.
+                Modal::SecretPrompt(prompt) => prompt.value.push_str(&sanitize(&text, false)),
+                Modal::AccountLimits(form) => form.current().insert_str(&sanitize(&text, false)),
                 // No text field: tool-approval, delete-sessions, confirm, and a
                 // non-custom (option-list) question.
                 _ => {}
@@ -124,7 +127,7 @@ impl App {
             }
             // Providers/Mcp management screens open their text entry as a modal
             // (handled above); their base views are list navigation only.
-            View::Providers | View::Mcp => {}
+            View::Accounts | View::Mcp => {}
             _ => {
                 // Перетащенные мышью файлы: терминал вставляет их пути.
                 if let Some(paths) = crate::app::dropped_paths::parse(&text) {

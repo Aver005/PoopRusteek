@@ -16,6 +16,7 @@
 //! `events::handle_picker_key` family) so it stays testable without an
 //! `App`.
 
+mod accounts;
 mod autocomplete;
 mod chat;
 mod dispatch;
@@ -24,7 +25,6 @@ mod modal;
 mod mouse;
 mod onboarding;
 mod paste;
-mod providers;
 mod search;
 mod themes;
 
@@ -104,8 +104,8 @@ impl App {
             return self.handle_mcp_key(key).await;
         }
 
-        if self.state.view == View::Providers {
-            return self.handle_providers_key(key).await;
+        if self.state.view == View::Accounts {
+            return self.handle_accounts_key(key).await;
         }
 
         if self.state.view == View::Search {

@@ -4,6 +4,7 @@ pub mod conversation;
 pub mod dropped_paths;
 pub mod events;
 mod file_scan;
+pub mod gateway_view;
 pub mod generation;
 mod goal;
 pub mod input;
@@ -217,15 +218,16 @@ pub(crate) fn start_gateway(
 ) {
     let settings = crate::gateway::engine::gateway_config(config);
     if !settings.gateway.enabled {
-        let deps = crate::gateway::engine::EngineDeps::for_config(config);
+        let deps = gateway_view::engine_deps(config, event_tx);
         return (crate::gateway::engine::build_gateway(settings, deps), None);
     }
     let pending = crate::gateway::pending::PendingGateway::new(settings.clone());
     let config = config.clone();
     let tx = event_tx.clone();
+    let persist_tx = event_tx.clone();
     tokio::spawn(async move {
         let built = tokio::task::spawn_blocking(move || {
-            let deps = crate::gateway::engine::EngineDeps::for_config(&config);
+            let deps = gateway_view::engine_deps(&config, &persist_tx);
             crate::gateway::engine::build_gateway(settings, deps)
         })
         .await
@@ -370,7 +372,7 @@ pub struct AppState {
     pub view: View,
     pub onboarding: OnboardingState,
     pub mcp_status: mcp_status::McpStatus,
-    pub providers_view: providers::ProvidersViewState,
+    pub gateway_view: gateway_view::GatewayView,
     pub search: search::SearchViewState,
     pub themes: themes::ThemesViewState,
     pub workspace_path: String,
@@ -474,7 +476,7 @@ impl AppState {
             view: View::Chat,
             onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
-            providers_view: providers::ProvidersViewState::default(),
+            gateway_view: gateway_view::GatewayView::default(),
             search: search::SearchViewState::default(),
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
@@ -721,6 +723,12 @@ impl App {
             provider_window_epoch,
             gateway,
             pending_gateway,
+        })
+        .map(|mut app| {
+            // Проектный слой ждёт решения: спрашиваем сразу, не пряча молчаливый отказ в заметке.
+            app.refresh_gateway_view();
+            app.open_trust_dialog_if_needed();
+            app
         })
     }
 
@@ -1110,6 +1118,10 @@ impl App {
                 conversation,
                 title,
             } => self.on_chat_title(conversation, title),
+            AppEvent::GatewayPersist(next) => self.on_gateway_persist(*next),
+            AppEvent::AccountStored(plan) => self.on_account_stored(*plan),
+            AppEvent::ConfigReloaded(loaded) => self.on_config_reloaded(*loaded),
+            AppEvent::ProjectConfigStamp(stamp) => self.on_project_stamp(stamp),
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
@@ -1143,6 +1155,8 @@ impl App {
                 );
                 self.state.status_message =
                     gateway_startup_note(&self.gateway).unwrap_or_else(|| "Gateway ready".into());
+                self.refresh_gateway_view();
+                self.adopt_provider_after_edit();
             }
             Err(reason) => {
                 pending.fail(reason.clone());
@@ -1157,11 +1171,12 @@ impl App {
         use crate::gateway::handle::GatewayEvent;
         if let GatewayEvent::FallbackTaken {
             from, to, class, ..
-        } = event
+        } = &event
         {
             self.state.status_message =
                 format!("{from} failed ({}), switched to {to}", class.code());
         }
+        self.on_gateway_event_view(&event);
     }
 
     /// Такт анимации и периодическая дозагрузка моделей.
@@ -1171,6 +1186,7 @@ impl App {
             generation.animation_tick = generation.animation_tick.wrapping_add(1);
         }
         self.maybe_refetch_provider_models();
+        self.tick_gateway_view();
         // Главный экран показывает сессии: держим список свежим, не трогая диск в кадре.
         if self.state.view == View::Chat && self.state.focused().messages.is_empty() {
             self.state.landing.refresh_if_stale(&self.event_tx);
@@ -1469,7 +1485,7 @@ impl App {
         // Живой шлюз держит аккаунты и разрешённые секреты из стёртого конфига: пересобираем.
         self.gateway = crate::gateway::engine::build_gateway(
             crate::gateway::engine::gateway_config(&self.config),
-            crate::gateway::engine::EngineDeps::for_config(&self.config),
+            gateway_view::engine_deps(&self.config, &self.event_tx),
         );
         // Сборка, которая шла в этот момент, больше не нужна: конфиг стёрт.
         self.pending_gateway = None;

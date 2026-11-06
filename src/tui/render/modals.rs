@@ -46,9 +46,14 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
         Modal::DeleteSessions(st) => render_delete_sessions(frame, area, st, theme),
         Modal::Confirm(cs) => render_confirm(frame, area, cs, theme),
         Modal::McpAdd(state) => super::mcp::render_mcp_add(frame, area, state, theme),
-        Modal::ProviderAdd(state) => {
-            super::providers::render_provider_add(frame, area, state, theme)
+        Modal::AccountWizard(state) => {
+            super::accounts::render_account_wizard(frame, area, state, theme)
         }
+        Modal::SecretPrompt(state) => {
+            super::accounts::render_secret_prompt(frame, area, state, theme)
+        }
+        Modal::AccountLimits(state) => super::accounts::render_limits(frame, area, state, theme),
+        Modal::Trust(state) => super::accounts::render_trust(frame, area, state, theme),
     }
 }
 
@@ -308,7 +313,10 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         picker.search.clone()
     };
     lines.push(Line::from(vec![
-        Span::styled(" ? ", Style::default().fg(theme.text_dim).bg(theme.panel)),
+        Span::styled(
+            format!(" {} ", crate::tui::glyphs::get().prompt),
+            Style::default().fg(theme.text_dim).bg(theme.panel),
+        ),
         Span::styled(
             search_display,
             Style::default()
@@ -342,7 +350,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
                 glyph.unchecked
             }
         } else {
-            if is_cursor { glyph.pointer } else { " " }
+            if is_cursor { glyph.sel_bar } else { " " }
         };
 
         let item = &picker.items[i];
@@ -522,7 +530,7 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
             };
             let fg = if is_cursor { theme.fg } else { theme.text_soft };
 
-            let indicator = if is_cursor { glyph.pointer } else { " " };
+            let indicator = if is_cursor { glyph.sel_bar } else { " " };
             let label = if is_custom_entry {
                 "Custom...".to_string()
             } else {
@@ -629,7 +637,7 @@ pub(super) fn render_autocomplete(
     frame.render_widget(Clear, popup_area);
     frame.render_widget(block, popup_area);
 
-    let pointer = crate::tui::glyphs::get().pointer;
+    let pointer = crate::tui::glyphs::get().sel_bar;
     let lines: Vec<Line> = vis_items
         .iter()
         .enumerate()

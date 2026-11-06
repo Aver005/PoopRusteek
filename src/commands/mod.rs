@@ -145,13 +145,21 @@ pub enum CommandResult {
     },
     /// `/logout` and `/wipe` — open the generic confirmation modal.
     OpenConfirm(crate::app::events::ConfirmAction),
-    /// `/providers` — open the provider-management panel.
-    OpenProviders,
-    /// `/providers add [args]` — with no args, open the step-by-step
-    /// wizard; with args, the handler tries the quick
-    /// `<name> <base_url> [model] [api_key]` form and falls back to the
-    /// wizard on parse failure.
-    OpenProviderAdd(Option<String>),
+    /// `/accounts`, `/routes`, `/roles`, `/providers` — экран аккаунтов с нужным фокусом.
+    OpenAccounts(crate::app::gateway_view::Focus),
+    /// `/accounts add`, `/providers add [args]` — мастер аккаунта; в быстрой форме
+    /// `<name> <base_url> [model] [api_key]` поля заполнены, при ошибке мастер пустой.
+    OpenAccountAdd(Option<String>),
+    /// `/accounts enable` — включить шлюз: старые записи становятся аккаунтами.
+    EnableGateway,
+    /// `/pin <аккаунт>` и `/pin off`.
+    Pin(String),
+    /// `/usage` — расход за сутки.
+    ShowUsage,
+    /// `/secrets set <имя>` без значения — скрытый ввод в модалке.
+    PromptSecret(String),
+    /// Перечитать конфиг вне цикла событий (после правки, `/cd`).
+    ReloadConfig,
     /// `/providers tools <name> <native|prompt>` — как запись объявляет инструменты.
     SetProviderTools {
         name: String,
@@ -275,6 +283,11 @@ impl CommandRegistry {
         self.register(Box::new(defs::rate::RateCommand));
         self.register(Box::new(defs::retry::RetryCommand));
         self.register(Box::new(defs::mcp::McpCommand));
+        self.register(Box::new(defs::accounts::AccountsCommand));
+        self.register(Box::new(defs::routes::RoutesCommand));
+        self.register(Box::new(defs::roles::RolesCommand));
+        self.register(Box::new(defs::usage::UsageCommand));
+        self.register(Box::new(defs::pin::PinCommand));
         self.register(Box::new(defs::providers::ProvidersCommand));
         self.register(Box::new(defs::models::ModelsCommand));
         self.register(Box::new(defs::tools::ToolsCommand));

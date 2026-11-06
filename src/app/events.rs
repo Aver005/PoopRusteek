@@ -342,6 +342,14 @@ pub enum AppEvent {
         conversation: ConversationId,
         title: String,
     },
+    /// Движок принял правку: новый конфиг шлюза нужно сохранить (очередь записи конфига).
+    GatewayPersist(Box<crate::gateway::types::GatewayConfig>),
+    /// Мастер аккаунта: секрет записан в хранилище вне цикла событий, можно править шлюз.
+    AccountStored(Box<crate::app::gateway_view::AccountPlan>),
+    /// Конфиг перечитан вне цикла событий (после команды, `/cd`, подтверждения проекта).
+    ConfigReloaded(Box<Result<crate::config::Config, String>>),
+    /// Время изменения файла проектного слоя (`None` — файла нет).
+    ProjectConfigStamp(Option<std::time::SystemTime>),
 
     /// A self-update pass (manual `/update` or the startup auto-check)
     /// finished — see `crate::update`. With `notable: false` (startup check
@@ -442,8 +450,8 @@ pub enum View {
     Chat,
     Mcp,
     Onboarding,
-    /// `/providers` — the provider-management panel.
-    Providers,
+    /// `/accounts` (и `/providers`) — аккаунты, маршруты, роли.
+    Accounts,
     /// `/search` — the history-search screen.
     Search,
     /// `/themes` — the theme gallery + create wizard.
