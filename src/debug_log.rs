@@ -46,9 +46,15 @@ impl DebugLogger {
             std::fs::create_dir_all(parent).map_err(|e| AppError::Custom(e.to_string()))?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // Журнал хранит ответы модели целиком: на unix он только для владельца.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&path)
             .map_err(|e| AppError::Custom(e.to_string()))?;
 
@@ -62,6 +68,10 @@ impl DebugLogger {
     /// `payload` is the already-rendered body: a message string in human
     /// mode, a JSON value in JSONL mode.
     fn write_record(&self, action: &str, payload: Payload<'_>) {
+        // Один вход для всех записей: ключ, который модель прочитала из `.env`
+        // или который ушёл в заголовок, не должен оказаться в журнале.
+        let payload = redact_payload(payload);
+        let payload = payload.as_payload();
         let Ok(mut file) = self.file.lock() else {
             return;
         };
@@ -108,6 +118,39 @@ impl DebugLogger {
 enum Payload<'a> {
     Message(&'a str),
     Data(&'a serde_json::Value),
+}
+
+/// Запись после вычёркивания секретов; владеет текстом, только если что-то заменено.
+enum Redacted<'a> {
+    Message(std::borrow::Cow<'a, str>),
+    Data(serde_json::Value),
+    Original(&'a serde_json::Value),
+}
+
+impl Redacted<'_> {
+    fn as_payload(&self) -> Payload<'_> {
+        match self {
+            Redacted::Message(text) => Payload::Message(text),
+            Redacted::Data(value) => Payload::Data(value),
+            Redacted::Original(value) => Payload::Data(value),
+        }
+    }
+}
+
+fn redact_payload(payload: Payload<'_>) -> Redacted<'_> {
+    match payload {
+        Payload::Message(text) => Redacted::Message(crate::secrets::redact::redact(text)),
+        Payload::Data(value) => {
+            let text = value.to_string();
+            match crate::secrets::redact::redact(&text) {
+                std::borrow::Cow::Borrowed(_) => Redacted::Original(value),
+                std::borrow::Cow::Owned(clean) => serde_json::from_str(&clean).map_or_else(
+                    |_| Redacted::Data(serde_json::Value::String(clean)),
+                    Redacted::Data,
+                ),
+            }
+        }
+    }
 }
 
 /// Lazily opens the log file on first use and reuses it afterward, so
@@ -195,5 +238,46 @@ pub fn log_json<T: Serialize>(action: &str, value: &T) {
             }
         }
         Err(error) => log(action, format!("failed to serialize json: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::Secret;
+
+    #[test]
+    fn a_registered_secret_never_reaches_the_log_text() {
+        crate::secrets::redact::register(&Secret::new("canary-debug-log-secret-1"));
+        let Redacted::Message(text) = redact_payload(Payload::Message(
+            "tool read .env: KEY=canary-debug-log-secret-1",
+        )) else {
+            panic!("a message stays a message");
+        };
+        assert!(!text.contains("canary-debug-log-secret-1"), "{text}");
+    }
+
+    #[test]
+    fn json_payloads_are_cleaned_and_stay_valid_json() {
+        let value = serde_json::json!({
+            "full_response": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123",
+            "arguments": {"path": "sk-proj-abcdefghijklmnopqrstuvwx"},
+            "ok": 1
+        });
+        let Redacted::Data(clean) = redact_payload(Payload::Data(&value)) else {
+            panic!("a payload with secrets is replaced");
+        };
+        let shown = clean.to_string();
+        assert!(!shown.contains("abcdefghijklmnop"), "{shown}");
+        assert_eq!(clean["ok"], 1);
+    }
+
+    #[test]
+    fn a_clean_payload_is_passed_through_without_a_copy() {
+        let value = serde_json::json!({"step": 3});
+        assert!(matches!(
+            redact_payload(Payload::Data(&value)),
+            Redacted::Original(_)
+        ));
     }
 }

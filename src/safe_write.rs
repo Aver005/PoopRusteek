@@ -96,17 +96,20 @@ pub fn refuse_protected(target: &Path, shown_as: &str) -> Result<(), String> {
         ));
     }
 
-    let guarded = [
-        Some(crate::config::Config::data_dir()),
-        crate::config::Config::path()
-            .parent()
-            .map(Path::to_path_buf),
-        crate::instructions::global_dir(),
-    ];
-    for dir in guarded.into_iter().flatten() {
+    // Папки и отдельные файлы конфигурации агента, в том числе старые места и `--config`.
+    for file in crate::config::protect::protected_files() {
+        if resolve_for_compare(target) == resolve_for_compare(&file) {
+            return Err(format!(
+                "Refusing to write {shown_as}: it belongs to this agent's own configuration. Use the slash commands (/mcp, /providers, /secrets, /whitelist) instead."
+            ));
+        }
+    }
+    let mut guarded: Vec<PathBuf> = crate::config::protect::protected_dirs();
+    guarded.extend(crate::instructions::global_dir());
+    for dir in guarded {
         if is_inside(target, &dir) {
             return Err(format!(
-                "Refusing to write {shown_as}: it belongs to this agent's own configuration. Use the slash commands (/mcp, /providers, /whitelist) instead."
+                "Refusing to write {shown_as}: it belongs to this agent's own configuration. Use the slash commands (/mcp, /providers, /secrets, /whitelist) instead."
             ));
         }
     }
@@ -282,5 +285,14 @@ mod tests {
         perms.set_readonly(false);
         std::fs::set_permissions(&path, perms).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Общий конфиг и его папка закрыты для записи моделью, как и данные агента.
+    #[test]
+    fn the_shared_config_folder_and_data_dir_are_protected() {
+        let config = crate::config::Config::global_path();
+        assert!(refuse_protected(&config, "config.toml").is_err());
+        let data = crate::config::Config::data_dir().join("whitelist.json");
+        assert!(refuse_protected(&data, "whitelist.json").is_err());
     }
 }

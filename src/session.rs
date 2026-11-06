@@ -307,10 +307,41 @@ pub fn load_history() -> Vec<String> {
     if !path.exists() {
         return Vec::new();
     }
-    std::fs::read_to_string(&path)
+    let mut history: Vec<String> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Старые записи с ключами (`/providers … <ключ>`) вычищаем из файла.
+    let before = history.len();
+    history.retain(|entry| !is_sensitive_input(entry));
+    if history.len() != before {
+        write_history(&history);
+    }
+    history
+}
+
+/// Ввод, которого нет смысла и нельзя хранить в истории: команды, куда вписывают
+/// ключ, и всё, что похоже на ключ. История нужна для стрелки вверх, не для архива.
+pub fn is_sensitive_input(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    let Some(command) = trimmed.strip_prefix('/') else {
+        return crate::secrets::redact::looks_like_secret(trimmed);
+    };
+    let mut parts = command.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let rest: Vec<&str> = parts.collect();
+    match name {
+        "secrets" => true,
+        // `/providers add …` и быстрая форма с ключом последним аргументом.
+        "providers" => {
+            rest.first() == Some(&"add") && rest.len() > 1
+                || rest.len() >= 4
+                || rest.iter().any(|t| crate::config::looks_like_key(t))
+        }
+        // Одна строка добавления сервера несёт `env` и заголовки с токенами.
+        "mcp" => rest.first() == Some(&"add") && rest.len() > 1,
+        _ => crate::secrets::redact::looks_like_secret(trimmed),
+    }
 }
 
 /// Append `input` to an in-memory history list with the file's rules:
@@ -319,6 +350,9 @@ pub fn load_history() -> Vec<String> {
 /// up-arrow must see the new entry immediately) while the file write runs
 /// on the persist worker.
 pub fn push_history_entry(history: &mut Vec<String>, input: &str) {
+    if is_sensitive_input(input) {
+        return;
+    }
     if history.last().map(|s| s.as_str()) != Some(input) {
         history.push(input.to_string());
     }
@@ -337,8 +371,11 @@ pub const MAX_HISTORY_ENTRIES: usize = 500;
 pub fn write_history(history: &[String]) {
     match serde_json::to_string(history) {
         Ok(json) => {
-            if let Err(error) = crate::util::atomic_write(&history_path(), json.as_bytes()) {
-                tracing::warn!("prompt-history write failed: {error}");
+            let path = history_path();
+            match crate::util::atomic_write(&path, json.as_bytes()) {
+                // В истории бывают куски кода и пути: читать её нужно только владельцу.
+                Ok(()) => crate::config::restrict_to_owner(&path),
+                Err(error) => tracing::warn!("prompt-history write failed: {error}"),
             }
         }
         Err(error) => tracing::warn!("prompt-history serialize failed: {error}"),
@@ -573,5 +610,50 @@ mod tests {
         let session = loaded.expect("the session must load back");
         assert_eq!(session.provider_session_id, None);
         assert_eq!(session.provider_parent_message_id, None);
+    }
+}
+
+#[cfg(test)]
+mod history_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn commands_that_carry_a_key_are_sensitive() {
+        for input in [
+            "/providers add lm http://localhost:1234/v1 qwen sk-secret-key-0000",
+            "/providers lm http://localhost:1234/v1 qwen mykey",
+            "/providers add lm http://x/v1",
+            "/providers lm openai http://x/v1 m abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+            "/secrets set global/x value",
+            "/secrets list",
+            "/mcp add {\"command\":\"x\",\"env\":{\"K\":\"v\"}}",
+            "use sk-proj-abcdefghijklmnopqrstuvwxyz please",
+        ] {
+            assert!(is_sensitive_input(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn ordinary_input_is_kept() {
+        for input in [
+            "/providers",
+            "/models qwen",
+            "/mcp reload",
+            "fix the failing test",
+            "/rate 500",
+        ] {
+            assert!(!is_sensitive_input(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn a_sensitive_line_never_enters_the_recall_list() {
+        let mut history = vec!["hello".to_string()];
+        push_history_entry(
+            &mut history,
+            "/providers add a http://x/v1 m sk-key-aaaaaaaaaaaaaaaa",
+        );
+        push_history_entry(&mut history, "world");
+        assert_eq!(history, ["hello", "world"]);
     }
 }

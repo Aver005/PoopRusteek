@@ -221,7 +221,7 @@ impl From<SecretRef> for String {
 }
 
 /// Чем аккаунт входит. Собирается из плоских полей `Account` (`Account::credential`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Credential {
     /// Секрет не нужен: локальный сервер или CLI без своей папки.
@@ -233,6 +233,18 @@ pub enum Credential {
     CliHome(PathBuf),
     /// Токен подписки, выданный вне CLI. Только вручную и только не для Claude.
     DirectToken(SecretRef),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::ApiKey(_) => f.write_str("ApiKey(<secret>)"),
+            Self::SecretRef(reference) => f.debug_tuple("SecretRef").field(reference).finish(),
+            Self::CliHome(home) => f.debug_tuple("CliHome").field(home).finish(),
+            Self::DirectToken(reference) => f.debug_tuple("DirectToken").field(reference).finish(),
+        }
+    }
 }
 
 // ── Аккаунт ─────────────────────────────────────────────────────────────
@@ -265,7 +277,8 @@ fn is_prompt(tools: &ToolProtocol) -> bool {
 }
 
 /// Одно подключение: API-ключ, DeepSeek web или официальный CLI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Account {
     pub id: AccountId,
     /// Отображаемое имя; можно менять свободно.
@@ -301,6 +314,28 @@ pub struct Account {
     /// Владелец прочитал предупреждение о прямом токене.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct_token_ack: bool,
+}
+
+impl std::fmt::Debug for Account {
+    /// Ключ в `Debug` не попадает: журнал и паника не должны его печатать.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("enabled", &self.enabled)
+            .field("favorites", &self.favorites)
+            .field("limits", &self.limits)
+            .field("tools", &self.tools)
+            .field("secret", &self.secret)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<secret>"))
+            .field("home", &self.home)
+            .field("direct_token", &self.direct_token)
+            .field("direct_token_ack", &self.direct_token_ack)
+            .finish()
+    }
 }
 
 impl Account {
@@ -456,6 +491,7 @@ pub struct Step {
 
 /// Цепочка аккаунтов. Порядок шагов — и есть приоритет.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     pub id: RouteId,
     #[serde(default)]
@@ -550,6 +586,7 @@ impl Roles {
 
 /// Секция `[gateway]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewaySettings {
     #[serde(default = "one")]
     pub schema: u32,
@@ -571,8 +608,9 @@ impl Default for GatewaySettings {
     }
 }
 
-/// Все четыре таблицы шлюза. Встраивается в `Config` следующей волной.
+/// Все четыре таблицы шлюза. Встроены в `Config` (`gateway`, `accounts`, `routes`, `roles`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     #[serde(default)]
     pub gateway: GatewaySettings,
@@ -649,6 +687,24 @@ impl GatewayConfig {
                 message,
             })
         };
+
+        if self.gateway.schema > crate::config::GATEWAY_SCHEMA {
+            add(
+                Severity::Error,
+                "gateway".into(),
+                format!(
+                    "schema {} is newer than this build understands ({})",
+                    self.gateway.schema,
+                    crate::config::GATEWAY_SCHEMA
+                ),
+            );
+        } else if self.gateway.schema == 0 {
+            add(
+                Severity::Error,
+                "gateway".into(),
+                "schema must be at least 1".into(),
+            );
+        }
 
         let mut seen: BTreeSet<&AccountId> = BTreeSet::new();
         let mut deepseek = 0;

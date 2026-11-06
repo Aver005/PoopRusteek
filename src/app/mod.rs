@@ -1152,6 +1152,15 @@ impl App {
             .await;
         let roots = wipe_roots();
         let mut errors: Vec<String> = Vec::new();
+        // Ключи в системном хранилище, токены MCP и файлы конфига: папки их не содержат.
+        let config_snapshot = self.config.clone();
+        let leftovers = tokio::task::spawn_blocking(move || {
+            let servers: Vec<String> = crate::mcp::config::load_mcp_config().into_keys().collect();
+            crate::config::wipe_secrets_and_files(&config_snapshot, &servers)
+        })
+        .await
+        .unwrap_or_default();
+        errors.extend(leftovers);
         for root in &roots {
             match std::fs::remove_dir_all(root) {
                 Ok(()) => {}
@@ -1313,15 +1322,16 @@ async fn gather_paste_burst(
     burst.coalesce(batch, started, std::time::Instant::now())
 }
 
-/// Returns the deduplicated list of directories that own all app-owned data.
-/// On Windows config and data typically live in the same parent; on Linux they
-/// may differ (XDG_CONFIG_HOME vs XDG_DATA_HOME).
+/// Папки, чьё содержимое принадлежит приложению: данные и старые места конфига и данных.
+/// `~/.pooprusteek` сюда не входит — там лежат правила пользователя (`AGENTS.md`);
+/// файлы конфига удаляет `config::wipe_secrets_and_files`.
 fn wipe_roots() -> Vec<std::path::PathBuf> {
-    let config_dir = crate::config::Config::path()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(crate::config::Config::path);
-    let mut roots = vec![config_dir, crate::config::Config::data_dir()];
+    let mut roots = vec![crate::config::Config::data_dir()];
+    roots.extend(crate::config::legacy_data_dir());
+    roots.extend(
+        crate::config::legacy_config_file()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf)),
+    );
     roots.sort();
     roots.dedup();
     roots
