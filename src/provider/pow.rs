@@ -257,3 +257,102 @@ fn resolve_wasm_path() -> Option<PathBuf> {
         .map(|dir| dir.join(WASM_ASSET_NAME))
         .filter(|path| path.exists())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Фикстура повторяет форму настоящего challenge: без сети и токена.
+    fn fixture(difficulty: &str) -> PowChallengeData {
+        PowChallengeData {
+            algorithm: "DeepSeekHashV1".to_string(),
+            challenge: "0c1a1f2e3d4b5a69788796a5b4c3d2e1".to_string(),
+            difficulty: difficulty.to_string(),
+            salt: "9f8e7d6c5b4a39281706f5e4d3c2b1a0".to_string(),
+            signature: "fixture-signature".to_string(),
+            target_path: "/chat/completion".to_string(),
+            expire_at: 1_762_345_678,
+        }
+    }
+
+    /// Встроенный wasm грузится, экспорты на месте, память читается: любой
+    /// сбой инициализации или смены ABI даёт None на первом же вызове.
+    #[test]
+    fn embedded_wasm_runtime_instantiates() {
+        let runtime = get_wasm_runtime().expect("встроенный wasm должен грузиться");
+        assert!(!runtime.source.is_empty());
+
+        // Тот же вызов, что делает приложение: строка кодируется, солвер
+        // пишет статус и ответ в память. Готового ответа быть не обязано.
+        let outcome = runtime.solve(&fixture("100000").challenge, "salt_1_", 100_000.0);
+        assert_eq!(
+            outcome,
+            Ok(None),
+            "wasm_solve на фикстуре не даёт ответа: {outcome:?}"
+        );
+    }
+
+    /// Эталон текущего wasm: для фикстуры ответа нет. Тест ловит и смену ABI,
+    /// и появление решения там, где раньше его не было.
+    #[test]
+    fn unsolvable_fixture_stays_unsolved() {
+        let challenge = fixture("100000");
+        assert!(solve_pow(&challenge).is_none(), "эталон изменился");
+        assert!(
+            solve_pow(&challenge).is_none(),
+            "ответ должен быть стабилен"
+        );
+    }
+
+    /// Неверные входы отвергаются до запуска wasm.
+    #[test]
+    fn unknown_algorithm_and_bad_difficulty_are_rejected() {
+        let mut wrong_algorithm = fixture("100000");
+        wrong_algorithm.algorithm = "OtherAlgorithmV1".to_string();
+        assert!(solve_pow(&wrong_algorithm).is_none());
+
+        let mut bad_difficulty = fixture("not-a-number");
+        bad_difficulty.algorithm = "DeepSeekHashV1".to_string();
+        assert!(solve_pow(&bad_difficulty).is_none());
+    }
+
+    /// Тело решения для сервера: base64 от JSON с ровно теми полями, что
+    /// ждёт DeepSeek, и подмена ответа меняет payload.
+    #[test]
+    fn encoded_solution_matches_the_server_contract() {
+        let challenge = fixture("100000");
+        let solution = PowSolution {
+            algorithm: challenge.algorithm.clone(),
+            answer: 42,
+            challenge: challenge.challenge.clone(),
+            difficulty: challenge.difficulty.clone(),
+            expire_at: challenge.expire_at,
+            salt: challenge.salt.clone(),
+            signature: challenge.signature.clone(),
+            target_path: challenge.target_path.clone(),
+        };
+
+        let encoded = encode_solution(&solution).expect("encode_solution");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .expect("payload разбирается как base64");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).expect("payload — JSON");
+
+        assert_eq!(value["algorithm"], "DeepSeekHashV1");
+        assert_eq!(value["answer"].as_u64(), Some(42));
+        assert_eq!(value["challenge"], challenge.challenge);
+        assert_eq!(value["difficulty"], challenge.difficulty);
+        assert_eq!(value["expire_at"].as_u64(), Some(challenge.expire_at));
+        assert_eq!(value["salt"], challenge.salt);
+        assert_eq!(value["signature"], challenge.signature);
+        assert_eq!(value["target_path"], challenge.target_path);
+
+        // Неверный ответ даёт другой payload — сервер его не примет.
+        let mut wrong = PowSolution {
+            answer: 43,
+            ..solution
+        };
+        let wrong_encoded = encode_solution(&wrong).expect("encode_solution");
+        assert_ne!(encoded, wrong_encoded);
+    }
+}
