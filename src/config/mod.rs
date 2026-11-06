@@ -21,11 +21,11 @@ pub const GATEWAY_SCHEMA: u32 = 1;
 pub use layers::{Layer, LayerInfo, LayerStatus, looks_like_key};
 pub use load::{
     ConfigSource, SecretsConfig, TrustConfig, TrustRequest, bind_secret_host, file_references,
-    inline_secret_labels, link_secret_reference, project_key, trust_project, untrust_project,
-    wipe_secrets_and_files,
+    inline_secret_labels, link_secret_reference, project_key, sha256_hex, trust_project,
+    untrust_project, wipe_secrets_and_files,
 };
 pub use paths::{
-    is_isolated, legacy_config_path as legacy_config_file, legacy_data_dir,
+    global_dir, is_isolated, legacy_config_path as legacy_config_file, legacy_data_dir,
     set_explicit_config as mark_explicit_config,
 };
 pub use queue::{enable_background_saves, flush_saves};
@@ -213,7 +213,8 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Имена, по которым к серверу на loopback обращаются кроме `127.0.0.1`, `localhost`, `[::1]`
-    /// (заголовок `Host`; защита от DNS rebinding). Пусто — только они.
+    /// (заголовок `Host`; защита от DNS rebinding) и чьим страницам разрешено слать запросы из
+    /// браузера (заголовок `Origin`; защита от CSRF). Пусто — только свои.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_hosts: Vec<String>,
 }
@@ -1033,6 +1034,11 @@ impl Config {
     pub fn sessions_dir() -> PathBuf {
         Self::data_dir().join("sessions")
     }
+}
+
+/// Папка данных задана флагом `--data-dir` (а не выбрана при старте).
+pub fn data_dir_is_overridden() -> bool {
+    paths::DATA_DIR_OVERRIDE.get().is_some()
 }
 
 /// Увести пользовательские данные процесса в другую папку. Зовётся из `main`

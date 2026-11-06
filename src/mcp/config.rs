@@ -73,18 +73,85 @@ struct VSCodeMCPServer {
     headers: Option<HashMap<String, String>>,
 }
 
+/// Откуда читать чужие файлы пользователя; в тестах подменяется папками-заглушками.
+pub(crate) struct Roots {
+    pub home: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
+}
+
+impl Roots {
+    pub fn system() -> Self {
+        Self {
+            home: dirs::home_dir(),
+            config_dir: dirs::config_dir(),
+        }
+    }
+}
+
+/// Все восемь источников в порядке приоритета (первый, занявший имя, побеждает).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Own,
+    Project,
+    Global,
+    Opencode,
+    ClaudeCli,
+    ClaudeDesktop,
+    Vscode,
+    Cursor,
+}
+
+/// Какие источники читать. Прогон с `--config`/`--data-dir` герметичен: файлы пользователя
+/// (`~/.cursor`, Claude, VS Code, opencode…) не читаются; свой `mcp.json` — только из заданной
+/// папки данных, а файлы проекта — только подтверждённые.
+pub(crate) fn active_sources(isolated: bool, data_dir_overridden: bool) -> Vec<Source> {
+    use Source::*;
+    if isolated {
+        let mut sources = Vec::new();
+        if data_dir_overridden {
+            sources.push(Own);
+        }
+        sources.push(Project);
+        return sources;
+    }
+    vec![
+        Own,
+        Project,
+        Global,
+        Opencode,
+        ClaudeCli,
+        ClaudeDesktop,
+        Vscode,
+        Cursor,
+    ]
+}
+
 pub fn load_mcp_config() -> HashMap<String, MCPServerConfig> {
+    let sources = active_sources(
+        crate::config::is_isolated(),
+        crate::config::data_dir_is_overridden(),
+    );
+    load_sources(&sources, &Roots::system(), &super::project::trusted_texts())
+}
+
+pub(crate) fn load_sources(
+    sources: &[Source],
+    roots: &Roots,
+    project: &[(PathBuf, String)],
+) -> HashMap<String, MCPServerConfig> {
     let mut configs = HashMap::new();
-
-    load_own_config(&mut configs);
-    load_workspace_config(&mut configs);
-    load_global_config(&mut configs);
-    load_opencode_config(&mut configs);
-    load_claude_cli_config(&mut configs);
-    load_claude_desktop_config(&mut configs);
-    load_vscode_config(&mut configs);
-    load_cursor_config(&mut configs);
-
+    for source in sources {
+        match source {
+            Source::Own => load_own_config(&mut configs),
+            Source::Project => load_project_config(project, &mut configs),
+            Source::Global => load_global_config(roots, &mut configs),
+            Source::Opencode => load_opencode_config(roots, &mut configs),
+            Source::ClaudeCli => load_claude_cli_config(roots, &mut configs),
+            Source::ClaudeDesktop => load_claude_desktop_config(roots, &mut configs),
+            Source::Vscode => load_vscode_config(roots, &mut configs),
+            Source::Cursor => load_cursor_config(roots, &mut configs),
+        }
+    }
     configs
 }
 
@@ -213,33 +280,42 @@ fn merge_parsed(
     }
 }
 
-fn load_workspace_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let paths = [
-        PathBuf::from("mcp.config.json"),
-        PathBuf::from(".vscode/mcp.json"),
-    ];
-
-    for path in &paths {
-        load_from_path(path, parse_mcp_json, configs);
+/// Файлы проекта: только подтверждённые человеком, по тексту, с которого посчитан хэш.
+fn load_project_config(
+    project: &[(PathBuf, String)],
+    configs: &mut HashMap<String, MCPServerConfig>,
+) {
+    for (_, text) in project {
+        if let Ok(parsed) = parse_mcp_json(text) {
+            merge_parsed(parsed, configs);
+        }
     }
 }
 
-fn load_global_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("pooprusteek")
-        .join("mcp.config.json");
-
-    load_from_path(&config_dir, parse_mcp_json, configs);
+fn load_global_config(roots: &Roots, configs: &mut HashMap<String, MCPServerConfig>) {
+    // Нет папки конфига — нет и файла: путь «от текущей папки» был бы чужим файлом проекта.
+    let Some(dir) = &roots.config_dir else {
+        return;
+    };
+    load_from_path(
+        &dir.join("pooprusteek").join("mcp.config.json"),
+        parse_mcp_json,
+        configs,
+    );
 }
 
-fn load_claude_desktop_config(configs: &mut HashMap<String, MCPServerConfig>) {
+fn load_claude_desktop_config(roots: &Roots, configs: &mut HashMap<String, MCPServerConfig>) {
     let config_path = if cfg!(target_os = "macos") {
-        dirs::home_dir()
+        roots
+            .home
+            .as_ref()
             .map(|h| h.join("Library/Application Support/Claude/claude_desktop_config.json"))
     } else {
         // Windows and Linux both keep it under the platform config dir.
-        dirs::config_dir().map(|c| c.join("Claude/claude_desktop_config.json"))
+        roots
+            .config_dir
+            .as_ref()
+            .map(|c| c.join("Claude/claude_desktop_config.json"))
     };
 
     if let Some(path) = config_path {
@@ -268,8 +344,11 @@ fn parse_claude_desktop_json(
         .collect())
 }
 
-fn load_vscode_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let settings_path = dirs::config_dir().map(|c| c.join("Code/User/settings.json"));
+fn load_vscode_config(roots: &Roots, configs: &mut HashMap<String, MCPServerConfig>) {
+    let settings_path = roots
+        .config_dir
+        .as_ref()
+        .map(|c| c.join("Code/User/settings.json"));
 
     if let Some(path) = settings_path {
         load_from_path(&path, parse_vscode_settings, configs);
@@ -312,16 +391,19 @@ fn parse_vscode_settings(
     Ok(configs)
 }
 
-fn load_cursor_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let cursor_path = dirs::home_dir().map(|h| h.join(".cursor/mcp.json"));
+fn load_cursor_config(roots: &Roots, configs: &mut HashMap<String, MCPServerConfig>) {
+    let cursor_path = roots.home.as_ref().map(|h| h.join(".cursor/mcp.json"));
 
     if let Some(path) = cursor_path {
         load_from_path(&path, parse_mcp_json, configs);
     }
 }
 
-fn load_opencode_config(configs: &mut HashMap<String, MCPServerConfig>) {
-    let base = dirs::home_dir().map(|h| h.join(".config").join("opencode"));
+fn load_opencode_config(roots: &Roots, configs: &mut HashMap<String, MCPServerConfig>) {
+    let base = roots
+        .home
+        .as_ref()
+        .map(|h| h.join(".config").join("opencode"));
     let Some(base) = base else { return };
 
     // Check opencode.json (canonical), then other possible names
@@ -427,12 +509,18 @@ fn parse_opencode_json(
     Ok(configs)
 }
 
-fn load_claude_cli_config(configs: &mut HashMap<String, MCPServerConfig>) {
+fn load_claude_cli_config(roots: &Roots, configs: &mut HashMap<String, MCPServerConfig>) {
     let candidates = [
         // ~/.claude/mcp.json (standard Claude CLI location)
-        dirs::home_dir().map(|h| h.join(".claude").join("mcp.json")),
+        roots
+            .home
+            .as_ref()
+            .map(|h| h.join(".claude").join("mcp.json")),
         // Also check XDG-like ~/.config/claude/mcp.json
-        dirs::config_dir().map(|c| c.join("claude").join("mcp.json")),
+        roots
+            .config_dir
+            .as_ref()
+            .map(|c| c.join("claude").join("mcp.json")),
     ];
 
     for candidate in candidates.iter().flatten() {
@@ -443,7 +531,9 @@ fn load_claude_cli_config(configs: &mut HashMap<String, MCPServerConfig>) {
     }
 }
 
-fn parse_mcp_json(content: &str) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
+pub(crate) fn parse_mcp_json(
+    content: &str,
+) -> Result<HashMap<String, MCPServerConfig>, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(content)?;
     let mut configs = HashMap::new();
 
@@ -747,5 +837,100 @@ mod tests {
         }"#;
         let configs = parse_opencode_json(json).unwrap();
         assert!(!configs.contains_key("mystery"));
+    }
+
+    fn user_files() -> (PathBuf, Roots) {
+        let root = std::env::temp_dir().join(format!(
+            "pooprusteek-mcproots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let config_dir = root.join("cfg");
+        for (dir, name) in [
+            (home.join(".cursor"), "mcp.json"),
+            (home.join(".claude"), "mcp.json"),
+            (config_dir.join("pooprusteek"), "mcp.config.json"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            let server = dir.file_name().unwrap().to_string_lossy().into_owned();
+            std::fs::write(
+                dir.join(name),
+                format!(r#"{{"mcpServers":{{"user-{server}":{{"command":"node"}}}}}}"#),
+            )
+            .unwrap();
+        }
+        let roots = Roots {
+            home: Some(home),
+            config_dir: Some(config_dir),
+        };
+        (root, roots)
+    }
+
+    /// Прогон с `--config`/`--data-dir` не читает MCP-файлы пользователя; обычный запуск читает.
+    #[test]
+    fn an_isolated_run_reads_no_user_mcp_sources() {
+        let (root, roots) = user_files();
+        let user = [Source::Global, Source::ClaudeCli, Source::Cursor];
+
+        let normal = load_sources(&user, &roots, &[]);
+        assert_eq!(
+            normal.len(),
+            3,
+            "an ordinary run sees the user's servers: {normal:?}"
+        );
+
+        for data_dir_overridden in [false, true] {
+            let sources = active_sources(true, data_dir_overridden);
+            assert!(
+                sources
+                    .iter()
+                    .all(|s| matches!(s, Source::Own | Source::Project)),
+                "{sources:?}"
+            );
+            // Own не читаем в тесте: это настоящий mcp.json процесса.
+            let without_own: Vec<_> = sources.into_iter().filter(|s| *s != Source::Own).collect();
+            assert!(load_sources(&without_own, &roots, &[]).is_empty());
+        }
+        // Свой `mcp.json` — только из заданной папки данных, не из настоящей.
+        assert!(!active_sources(true, false).contains(&Source::Own));
+        assert!(active_sources(true, true).contains(&Source::Own));
+        assert_eq!(active_sources(false, false).len(), 8);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Без папки конфига глобальный источник не превращается в файл «от текущей папки».
+    #[test]
+    fn a_missing_config_dir_is_not_a_relative_path() {
+        let roots = Roots {
+            home: None,
+            config_dir: None,
+        };
+        let sources = [
+            Source::Global,
+            Source::Cursor,
+            Source::ClaudeCli,
+            Source::Vscode,
+        ];
+        assert!(load_sources(&sources, &roots, &[]).is_empty());
+    }
+
+    /// Файлы проекта попадают в менеджер только как подтверждённые тексты.
+    #[test]
+    fn project_servers_come_only_from_confirmed_texts() {
+        let roots = Roots {
+            home: None,
+            config_dir: None,
+        };
+        assert!(load_sources(&[Source::Project], &roots, &[]).is_empty());
+        let confirmed = vec![(
+            PathBuf::from(".vscode/mcp.json"),
+            r#"{"servers":{"ok":{"command":"node"}}}"#.to_string(),
+        )];
+        let loaded = load_sources(&[Source::Project], &roots, &confirmed);
+        assert!(loaded.contains_key("ok"));
     }
 }

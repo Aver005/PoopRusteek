@@ -625,9 +625,9 @@ impl Roles {
 
 // ── Корень ──────────────────────────────────────────────────────────────
 
-/// Секция `[gateway]`.
+/// Секция `[gateway]`. Незнакомые ключи терпим: файл с полем из другой сборки не должен
+/// обнулять весь конфиг (они остаются в файле, сохранение пишет только разницу).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GatewaySettings {
     #[serde(default = "one")]
     pub schema: u32,

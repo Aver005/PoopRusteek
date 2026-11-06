@@ -1,11 +1,11 @@
 //! `pooprusteek secrets` — задать, удалить, посмотреть секреты, не показывая значений.
 //!
 //! Значение никогда не идёт через аргументы командной строки: `ps` показывает argv.
-//! Оно читается из stdin (канал) или со скрытого ввода в терминале.
+//! `set`, `rm` и `bind` выполняет только человек за терминалом: канал и запуск из инструмента отказывают.
 
 use crate::secrets::{Secret, ops, process_store};
 use clap::{Args, Subcommand};
-use std::io::{IsTerminal, Read, Write};
+use std::io::Write;
 
 #[derive(Args, Debug)]
 pub struct SecretsArgs {
@@ -17,7 +17,7 @@ pub struct SecretsArgs {
 pub enum SecretsAction {
     /// Names, references and state of every secret the config uses (no values).
     List,
-    /// Store a secret: reads the value from stdin or a hidden prompt.
+    /// Store a secret: reads the value from a hidden prompt (needs a real terminal).
     Set {
         /// Account or provider name (`openai`), or an entry like `global/team-key`.
         name: String,
@@ -34,16 +34,20 @@ pub enum SecretsAction {
     },
 }
 
-/// Читает значение без эха. В канале — одна строка stdin; в терминале — скрытый ввод.
-fn read_value(prompt: &str) -> Result<Secret, String> {
-    if !std::io::stdin().is_terminal() {
-        let mut text = String::new();
-        std::io::stdin()
-            .take(70_000)
-            .read_to_string(&mut text)
-            .map_err(|e| format!("cannot read stdin: {}", e.kind()))?;
-        return Ok(Secret::new(text.lines().next().unwrap_or("").trim()));
+impl SecretsAction {
+    /// Название действия, если оно меняет секреты или привязки и потому требует человека.
+    fn human_only(&self) -> Option<&'static str> {
+        match self {
+            Self::Set { .. } => Some("pooprusteek secrets set"),
+            Self::Rm { .. } => Some("pooprusteek secrets rm"),
+            Self::Bind { .. } => Some("pooprusteek secrets bind"),
+            Self::List | Self::Test => None,
+        }
     }
+}
+
+/// Читает значение со скрытого ввода; терминал уже проверен `require_human`.
+fn read_value(prompt: &str) -> Result<Secret, String> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     eprint!("{prompt}");
@@ -76,6 +80,16 @@ fn read_value(prompt: &str) -> Result<Secret, String> {
 
 /// Возвращает код выхода процесса.
 pub fn run(args: SecretsArgs) -> i32 {
+    run_with(args, &crate::secrets::human::require_human)
+}
+
+fn run_with(args: SecretsArgs, gate: &dyn Fn(&str) -> Result<(), String>) -> i32 {
+    if let Some(what) = args.action.human_only()
+        && let Err(message) = gate(what)
+    {
+        eprintln!("Error: {message}");
+        return 1;
+    }
     let store = process_store();
     let result: Result<Vec<String>, String> = match args.action {
         SecretsAction::List => {
@@ -109,5 +123,51 @@ pub fn run(args: SecretsArgs) -> i32 {
             eprintln!("Error: {message}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refuse(what: &str) -> Result<(), String> {
+        Err(format!("{what}: no terminal"))
+    }
+
+    #[test]
+    fn bind_without_a_person_writes_no_binding() {
+        let code = run_with(
+            SecretsArgs {
+                action: SecretsAction::Bind {
+                    reference: "env:POOP_M2_CANARY".into(),
+                    host: "m2-attacker.example".into(),
+                },
+            },
+            &refuse,
+        );
+        assert_eq!(code, 1);
+        let text = std::fs::read_to_string(crate::config::Config::path()).unwrap_or_default();
+        assert!(!text.contains("m2-attacker.example"), "{text}");
+    }
+
+    #[test]
+    fn set_and_rm_are_refused_before_touching_input_or_store() {
+        for action in [
+            SecretsAction::Set { name: "m2".into() },
+            SecretsAction::Rm { name: "m2".into() },
+        ] {
+            assert_eq!(run_with(SecretsArgs { action }, &refuse), 1);
+        }
+    }
+
+    #[test]
+    fn only_reading_actions_skip_the_gate() {
+        assert!(SecretsAction::List.human_only().is_none());
+        assert!(SecretsAction::Test.human_only().is_none());
+        let bind = SecretsAction::Bind {
+            reference: "env:X".into(),
+            host: "h".into(),
+        };
+        assert!(bind.human_only().is_some());
     }
 }

@@ -4,6 +4,7 @@ pub mod history_search;
 pub mod question;
 pub mod read_file;
 pub mod registry;
+pub mod sensitive;
 pub mod shell;
 pub mod shell_control;
 pub mod skill;
@@ -13,6 +14,7 @@ pub mod todo;
 pub mod tool_search;
 
 use async_trait::async_trait;
+pub use sensitive::sensitive_shell_reason;
 use serde_json::Value;
 use std::path::Path;
 

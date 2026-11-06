@@ -147,12 +147,12 @@ pub fn build(config: &Config, store: &SecretStore) -> Report {
             format!("the config was not loaded as it is, so nothing is saved: {reason}"),
         );
     }
-    if let Some(request) = &config.source.pending_trust {
+    for request in config.pending_trust_requests() {
         report.add(
             Level::Warn,
             "trust",
             format!(
-                "{} proposes changes to where requests go and is NOT applied; your global settings are in force. Proposed: {}. Review the file, then run `pooprusteek trust`",
+                "{} proposes changes (where requests go, or MCP servers to run) and is NOT applied; your global settings are in force. Proposed: {}. Review the file, then run `pooprusteek trust`",
                 request.config_path.display(),
                 request.held_back.join("; ")
             ),

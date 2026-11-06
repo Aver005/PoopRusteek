@@ -90,11 +90,13 @@ pub fn write_target() -> PathBuf {
 /// Корень проекта для слоя `.pooprusteek/`: вверх от `start` до корня git;
 /// вне git — только сама папка запуска. Возвращает папку с `.pooprusteek/config.toml`.
 pub fn find_project_layer(start: &Path) -> Option<PathBuf> {
-    let global = global_dir();
+    let global = crate::safe_write::resolve_for_compare(&global_dir());
     let mut cursor = Some(start);
     while let Some(dir) = cursor {
         let candidate = dir.join(".pooprusteek");
-        if candidate != global && candidate.join("config.toml").is_file() {
+        if crate::safe_write::resolve_for_compare(&candidate) != global
+            && candidate.join("config.toml").is_file()
+        {
             return Some(candidate);
         }
         if dir.join(".git").exists() {

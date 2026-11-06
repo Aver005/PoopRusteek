@@ -70,6 +70,13 @@ fn is_config_like(path: &Path) -> bool {
     name.strip_suffix(".pre-gateway").unwrap_or(&name) == "config.toml"
 }
 
+/// Лежит ли файл прямо в папке с таким именем (`.../opencode/auth.json`).
+fn has_parent_named(path: &Path, name: &str) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|parent| parent.to_string_lossy().eq_ignore_ascii_case(name))
+}
+
 fn mcp_holds_secrets(text: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return true;
@@ -103,7 +110,14 @@ pub fn read_refusal(path: &Path) -> Option<String> {
     if inside(path, &super::Config::data_dir().join("secrets")) {
         return refuse("it is in the agent's secrets folder");
     }
+    // Входы CLI-аккаунтов и токены подписок: утекли бы провайдеру модели вместе с ответом.
+    if inside(path, &paths::global_dir().join("accounts")) {
+        return refuse("it is in an account's CLI login folder");
+    }
     let name = file_name(path);
+    if name == ".credentials.json" || (name == "auth.json" && has_parent_named(path, "opencode")) {
+        return refuse("it holds a CLI login token");
+    }
     let is_mcp = name == "mcp.json"
         && (inside(path, &super::Config::data_dir())
             || paths::legacy_data_dir().is_some_and(|d| inside(path, &d)));
@@ -200,6 +214,27 @@ api_key = \"canary-key-000000\"
         assert!(read_refusal(&path).is_none());
         register_secret_file(path.clone());
         assert!(read_refusal(&path).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_login_files_are_refused_and_lookalikes_are_not() {
+        // Файлы не читаются: отказ выдаётся по пути, их может и не быть.
+        let accounts = paths::global_dir().join("accounts").join("work");
+        assert!(read_refusal(&accounts.join("anything.txt")).is_some());
+        let root = dir("logins");
+        for refused in [
+            root.join(".claude").join(".credentials.json"),
+            root.join("opencode").join("auth.json"),
+        ] {
+            assert!(read_refusal(&refused).is_some(), "{}", refused.display());
+        }
+        for fine in [
+            root.join("auth.json"),
+            root.join("notes").join("credentials.json"),
+        ] {
+            assert!(read_refusal(&fine).is_none(), "{}", fine.display());
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
