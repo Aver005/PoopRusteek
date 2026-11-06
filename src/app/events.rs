@@ -336,6 +336,13 @@ pub enum AppEvent {
     /// Движок шлюза собран на `spawn_blocking`: секреты прочитаны вне цикла событий.
     GatewayBuilt(BuiltGateway),
 
+    /// Короткий заголовок чата из служебной модели (`[roles] title`). Приходит
+    /// из фоновой задачи; пустая строка не приходит никогда.
+    ChatTitle {
+        conversation: ConversationId,
+        title: String,
+    },
+
     /// A self-update pass (manual `/update` or the startup auto-check)
     /// finished — see `crate::update`. With `notable: false` (startup check
     /// found nothing to do) only the status line changes; otherwise the

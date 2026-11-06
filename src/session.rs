@@ -16,6 +16,10 @@ pub struct Session {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tag: Option<String>,
+    /// Короткий заголовок из служебной модели (`[roles] title`). Нет его —
+    /// список берёт запасной `derive_title`. Старые файлы читаются без поля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The DeepSeek-side (remote) session id this local file last
     /// successfully synced with, so a future load can try to continue the
     /// same server-side thread instead of silently starting a new one.
@@ -95,6 +99,8 @@ pub struct SessionMeta {
     pub remote: RemoteLink,
     /// Цель шлюза на момент сохранения; `None` — не знаем, прежнее значение остаётся.
     pub route: Option<crate::gateway::state::RouteState>,
+    /// Заголовок чата; `None` — не знаем, сохранённый в файле остаётся.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +163,7 @@ pub fn save_session(
         provider_parent_message_id,
         broken: meta.broken,
         route_state: meta.route.clone().or_else(|| stored_route(&path)),
+        title: meta.title.clone().or_else(|| stored_title(&path)),
     };
 
     let json = serde_json::to_string_pretty(&session)?;
@@ -173,6 +180,17 @@ fn stored_route(path: &std::path::Path) -> Option<crate::gateway::state::RouteSt
     }
     let json = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<StoredRoute>(&json).ok()?.route_state
+}
+
+/// Заголовок, уже лежащий в файле: «не знаю» не затирает придуманный моделью.
+fn stored_title(path: &std::path::Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct StoredTitle {
+        #[serde(default)]
+        title: Option<String>,
+    }
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<StoredTitle>(&json).ok()?.title
 }
 
 /// Связь с серверной сессией, уже лежащая в файле. Отсутствие файла или
@@ -247,7 +265,11 @@ pub fn list_sessions() -> AppResult<Vec<SessionSummary>> {
                 continue;
             }
         };
-        let title = derive_title(&session.messages);
+        let title = session
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| derive_title(&session.messages));
         sessions.push(SessionSummary {
             id: session.id,
             created_at: session.created_at,
@@ -483,6 +505,7 @@ mod tests {
                 parent_message_id: Some(9),
             },
             route: None,
+            title: None,
         };
 
         save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &meta)
@@ -538,6 +561,92 @@ mod tests {
         assert!(
             !json.contains("route_state"),
             "an absent state is not written: {json}"
+        );
+    }
+
+    /// Старый файл без заголовка грузится, а сохранение, которое заголовка не
+    /// знает, не стирает уже придуманный (как `route_state`).
+    #[test]
+    fn a_title_loads_from_old_files_and_survives_an_unaware_save() {
+        let id = "pooprusteek_test_session_title";
+        let config = Config::default();
+        let known = SessionMeta {
+            title: Some("Сборка проекта".to_string()),
+            ..SessionMeta::default()
+        };
+        save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &known).unwrap();
+        // Автосейв следующего хода о заголовке не знает.
+        save_session(
+            id,
+            "2020-01-01T00:00:00Z",
+            &[ChatMessage::user("ещё вопрос")],
+            &config,
+            "/tmp",
+            &SessionMeta::default(),
+        )
+        .unwrap();
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+        let loaded = load_local(id, &config);
+        cleanup(&path);
+        assert_eq!(loaded.unwrap().title.as_deref(), Some("Сборка проекта"));
+
+        // Файл, написанный до появления поля.
+        let old = r#"{"version":1,"id":"x","created_at":"a","updated_at":"b","workspace_root":"/","model_type":"m","messages":[]}"#;
+        let session: Session = serde_json::from_str(old).unwrap();
+        assert!(session.title.is_none());
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(
+            !json.contains("\"title\""),
+            "an absent title is not written: {json}"
+        );
+    }
+
+    /// В списке сессий служебный заголовок важнее запасного из первой реплики.
+    #[test]
+    fn the_session_list_prefers_the_service_title_over_the_fallback() {
+        let config = Config::default();
+        let titled = "pooprusteek_test_session_list_title";
+        let fallback = "pooprusteek_test_session_list_fallback";
+        let meta = |title: Option<&str>| SessionMeta {
+            title: title.map(str::to_string),
+            ..SessionMeta::default()
+        };
+        save_session(
+            titled,
+            "2020-01-01T00:00:00Z",
+            &[ChatMessage::user("как собрать проект?")],
+            &config,
+            "/tmp",
+            &meta(Some("Сборка проекта")),
+        )
+        .unwrap();
+        save_session(
+            fallback,
+            "2020-01-01T00:00:00Z",
+            &[ChatMessage::user("как собрать проект?")],
+            &config,
+            "/tmp",
+            &meta(None),
+        )
+        .unwrap();
+
+        let listed = list_sessions().expect("the list reads");
+        let by_id = |id: &str| {
+            listed
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.title.clone())
+                .expect("the session is listed")
+        };
+        let titled_row = by_id(titled);
+        let fallback_row = by_id(fallback);
+        for id in [titled, fallback] {
+            cleanup(&Config::sessions_dir().join(format!("{id}.json")));
+        }
+        assert_eq!(titled_row, "Сборка проекта");
+        assert_eq!(
+            fallback_row, "как собрать проект?",
+            "no service title leaves the heuristic in charge"
         );
     }
 

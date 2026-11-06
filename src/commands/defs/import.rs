@@ -51,6 +51,7 @@ impl Command for ImportCommand {
                 model_type: config.provider.model.clone(),
                 messages: messages.clone(),
                 tag: Some("Imported".to_string()),
+                title: None,
                 provider_session_id: None,
                 provider_parent_message_id: None,
                 broken: false,

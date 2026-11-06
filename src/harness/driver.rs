@@ -1458,6 +1458,7 @@ fn persist(
         broken: conversation.broken && (interrupted || !remote.is_established()),
         remote,
         route: provider.route_state(),
+        title: (!conversation.title.trim().is_empty()).then(|| conversation.title.clone()),
     };
     match crate::session::save_session(
         &conversation.session_id,
@@ -2031,6 +2032,7 @@ model = \"m\"
             model_type: "m".to_string(),
             messages: history_with_native_calls(),
             tag: None,
+            title: None,
             provider_session_id: None,
             provider_parent_message_id: None,
             broken: false,
