@@ -3,6 +3,7 @@ pub mod background_stats;
 pub mod conversation;
 pub mod dropped_paths;
 pub mod events;
+mod file_scan;
 pub mod generation;
 mod goal;
 pub mod input;
@@ -248,6 +249,8 @@ pub struct AppState {
     /// …and the ones parked behind it, FIFO. See `present_next_interaction`.
     pub pending_interactions: std::collections::VecDeque<PendingInteraction>,
     pub autocomplete: AutocompleteState,
+    /// Сканы папок для `@путь`: живёт отдельно, чтобы сброс меню не терял идущий скан.
+    pub(crate) file_scans: file_scan::ScanTracker,
     /// Недавние сессии для главного экрана; читает фоновая задача.
     pub landing: landing::LandingSessions,
     pub view: View,
@@ -338,6 +341,7 @@ impl AppState {
             pending_question: None,
             pending_interactions: std::collections::VecDeque::new(),
             autocomplete: AutocompleteState::default(),
+            file_scans: file_scan::ScanTracker::default(),
             landing: landing::LandingSessions::default(),
             view: View::Chat,
             onboarding: OnboardingState::default(),
@@ -405,13 +409,6 @@ pub struct AutocompleteState {
     pub items: Vec<CommandSuggestion>,
     pub cursor: list::ListCursor,
     pub file_mode: bool,
-    /// Номер скана папки, чей ответ ждём (0 — никакой). Ответ с другим
-    /// номером устарел; см. `AppEvent::AutocompleteReady`.
-    pub wanted: u64,
-    /// Скан папки идёт: новые нажатия лишь помечают `rescan`, а не плодят задачи.
-    pub scanning: bool,
-    /// Пока шёл скан, ввод изменился.
-    pub rescan: bool,
 }
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;
