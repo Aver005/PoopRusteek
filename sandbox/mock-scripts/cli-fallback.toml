@@ -1,0 +1,4 @@
+# CLI → API fallback: only the API account talks to the mock (the CLI one is `mock-cli`).
+[[reply]]
+account = "api"
+content = "Four."
