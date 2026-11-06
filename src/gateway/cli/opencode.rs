@@ -3,8 +3,8 @@
 
 use super::classify::classify_opencode;
 use super::dialect::{
-    Dialect, Failure, Feed, ModelSource, Parser, Plan, Success, Terminal, json_u32,
-    require_empty_cwd,
+    Dialect, Failure, Feed, ModelSource, Parser, Plan, Success, Terminal, attached_value,
+    check_model, count_arg, json_u32, require_empty_cwd, require_exact, require_once, value_after,
 };
 use super::launch::{Launch, child_env, forward_slashes, has_prefix};
 use super::process::Limits;
@@ -21,6 +21,54 @@ use std::time::Duration;
 const AGENT: &str = "plain";
 
 pub struct OpencodeDialect;
+
+/// Общий вход: эти каталоги OpenCode берёт из окружения пользователя, как есть.
+const SHARED_XDG: [&str; 3] = ["XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"];
+
+/// Все `XDG_*`, которые вообще бывают у ребёнка.
+const ALLOWED_XDG: [&str; 5] = [
+    "XDG_CONFIG_HOME",
+    "XDG_CONFIG_DIRS",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+];
+
+/// Аргументы режима модели; модель слитно, `--model=<m>`.
+fn own_args(model: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["run", "--format", "json", "--standalone", "--agent", AGENT]
+        .map(OsString::from)
+        .to_vec();
+    if !model.is_empty() {
+        args.push(format!("--model={model}").into());
+    }
+    args
+}
+
+/// Папка конфигурации пуста и единственная, `OPENCODE_*` и посторонних `XDG_*` нет.
+fn verify_env(launch: &Launch) -> Result<(), String> {
+    let names = launch.env_names();
+    if let Some(name) = names.iter().find(|name| {
+        (has_prefix(name, "XDG_") && !ALLOWED_XDG.iter().any(|ok| name.eq_ignore_ascii_case(ok)))
+            || (has_prefix(name, "OPENCODE_")
+                && !name.eq_ignore_ascii_case("OPENCODE_CONFIG_CONTENT"))
+    }) {
+        return Err(format!(
+            "parent variable {name} leaked into the opencode environment"
+        ));
+    }
+    let missing = |what: &str| format!("opencode launch lacks {what}: refusing to start");
+    let config_home = launch
+        .env_value("XDG_CONFIG_HOME")
+        .ok_or_else(|| missing("XDG_CONFIG_HOME"))?;
+    if launch.env_value("XDG_CONFIG_DIRS") != Some(config_home) {
+        return Err(missing("XDG_CONFIG_DIRS equal to the empty config folder"));
+    }
+    if std::fs::read_dir(config_home).is_ok_and(|mut entries| entries.next().is_some()) {
+        return Err("XDG_CONFIG_HOME is not empty: user config would leak in".to_string());
+    }
+    Ok(())
+}
 
 /// Конфиг, передаваемый переменной `OPENCODE_CONFIG_CONTENT`. Промпт — файлом (`{file:…}`),
 /// чтобы длинный системный текст не упёрся в предел переменной окружения.
@@ -68,32 +116,46 @@ impl Dialect for OpencodeDialect {
 
     fn launch(&self, plan: &Plan<'_>) -> Launch {
         let mut args: Vec<OsString> = plan.program.prefix.clone();
-        args.extend(
-            ["run", "--format", "json", "--standalone", "--agent", AGENT].map(OsString::from),
-        );
-        if !plan.model.is_empty() {
-            args.extend(["-m".into(), plan.model.into()]);
-        }
+        let prefix_len = args.len();
+        args.extend(own_args(plan.model));
+        let config = plan.scratch.config_dir().into_os_string();
         let mut set: Vec<(&str, OsString)> = vec![
-            (
-                "XDG_CONFIG_HOME",
-                plan.scratch.config_dir().into_os_string(),
-            ),
+            ("XDG_CONFIG_HOME", config.clone()),
+            // Системные каталоги конфигов (unix) подменяем той же пустой папкой.
+            ("XDG_CONFIG_DIRS", config),
             (
                 "OPENCODE_CONFIG_CONTENT",
                 config_content(plan.system_file).into(),
             ),
         ];
-        if let Some(home) = plan.home {
-            set.push(("XDG_DATA_HOME", home.as_os_str().to_owned()));
+        match plan.home {
+            // Свой вход: данные, кэш и состояние только в папке аккаунта.
+            Some(home) => set.extend([
+                ("XDG_DATA_HOME", home.as_os_str().to_owned()),
+                ("XDG_CACHE_HOME", home.join("xdg-cache").into_os_string()),
+                ("XDG_STATE_HOME", home.join("xdg-state").into_os_string()),
+            ]),
+            // Общий вход: там, где пользователь держит свои данные, — ровно как у него в окружении.
+            None => {
+                for name in SHARED_XDG {
+                    if let Some((_, value)) = plan
+                        .parent_env
+                        .iter()
+                        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+                    {
+                        set.push((name, value.clone()));
+                    }
+                }
+            }
         }
         Launch {
             program: plan.program.path.clone(),
             args,
-            // Свои `OPENCODE_*` родителя (конфиг, сервер) в режим модели не пускаем.
+            prefix_len,
+            // Свои `OPENCODE_*` и любые `XDG_*` родителя в режим модели не пускаем.
             env: child_env(
                 plan.parent_env.clone(),
-                |name| has_prefix(name, "OPENCODE_"),
+                |name| has_prefix(name, "OPENCODE_") || has_prefix(name, "XDG_"),
                 set,
             ),
             cwd: plan.scratch.work_dir(),
@@ -102,17 +164,22 @@ impl Dialect for OpencodeDialect {
     }
 
     fn verify(&self, launch: &Launch) -> Result<(), String> {
+        let own = launch.own_args();
         let missing = |what: &str| format!("opencode launch lacks {what}: refusing to start");
         // Без `--standalone` команда уходит в службу пользователя и обходит запреты.
-        if !launch.has_arg("--standalone") {
-            return Err(missing("--standalone"));
-        }
-        if launch
-            .arg_after("--agent")
-            .is_none_or(|agent| agent != AGENT)
-        {
+        require_once(own, "opencode", &["--standalone", "--agent", "run"])?;
+        if value_after(own, "--agent").is_none_or(|agent| agent != AGENT) {
             return Err(missing("--agent plain"));
         }
+        if count_arg(own, "--model") + count_arg(own, "-m") > 0 {
+            return Err(
+                "opencode launch passes the model as a separate argument: refusing to start"
+                    .to_string(),
+            );
+        }
+        let model = attached_value(own, "--model")?.unwrap_or_default();
+        check_model(&model)?;
+        require_exact(own, &own_args(&model), "opencode")?;
         let config: Value = launch
             .env_value("OPENCODE_CONFIG_CONTENT")
             .and_then(|raw| serde_json::from_str(&raw.to_string_lossy()).ok())
@@ -125,12 +192,16 @@ impl Dialect for OpencodeDialect {
         if !denied {
             return Err(missing("a deny-all permission block"));
         }
-        let config_home = launch
-            .env_value("XDG_CONFIG_HOME")
-            .ok_or_else(|| missing("XDG_CONFIG_HOME"))?;
-        if std::fs::read_dir(config_home).is_ok_and(|mut entries| entries.next().is_some()) {
-            return Err("XDG_CONFIG_HOME is not empty: user config would leak in".to_string());
-        }
+        verify_env(launch)?;
+        require_empty_cwd(launch)
+    }
+
+    fn verify_side(&self, launch: &Launch, command: &[&str]) -> Result<(), String> {
+        let expected: Vec<OsString> = command.iter().map(OsString::from).collect();
+        require_exact(launch.own_args(), &expected, "opencode")?;
+        // Побочная команда тоже ходит со своей изоляцией, а не через службу пользователя.
+        require_once(launch.own_args(), "opencode", &["--standalone"])?;
+        verify_env(launch)?;
         require_empty_cwd(launch)
     }
 
@@ -139,7 +210,7 @@ impl Dialect for OpencodeDialect {
     }
 
     fn models(&self) -> ModelSource {
-        ModelSource::Command(&["models"])
+        ModelSource::Command(&["models", "--standalone"])
     }
 }
 
@@ -195,6 +266,7 @@ impl OpencodeParser {
             context_window: None,
             upstream_id: self.session.clone(),
             limits: None,
+            note: None,
         }));
         Feed::done(std::mem::take(&mut self.step_text))
     }

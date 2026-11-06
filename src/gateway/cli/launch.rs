@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<OsString>,
+    /// Сколько первых аргументов — префикс подмены (`mock-cli`, …): охранные флаги идут после него.
+    pub prefix_len: usize,
     /// Полное окружение ребёнка (родительское уже отфильтровано).
     pub env: Vec<(OsString, OsString)>,
     pub cwd: PathBuf,
@@ -21,6 +23,7 @@ impl std::fmt::Debug for Launch {
         f.debug_struct("Launch")
             .field("program", &self.program)
             .field("args", &self.args)
+            .field("prefix_len", &self.prefix_len)
             .field("env_names", &self.env_names())
             .field("cwd", &self.cwd)
             .field("stdin_bytes", &self.stdin.len())
@@ -29,6 +32,11 @@ impl std::fmt::Debug for Launch {
 }
 
 impl Launch {
+    /// Аргументы без префикса подмены: то, что собрал диалект.
+    pub fn own_args(&self) -> &[OsString] {
+        &self.args[self.prefix_len.min(self.args.len())..]
+    }
+
     pub fn env_names(&self) -> Vec<String> {
         self.env
             .iter()
@@ -184,6 +192,7 @@ mod tests {
         let launch = Launch {
             program: "x".into(),
             args: vec![],
+            prefix_len: 0,
             env: vec![pair("SECRET_TOKEN", "hunter2")],
             cwd: ".".into(),
             stdin: b"private prompt".to_vec(),

@@ -34,6 +34,8 @@ pub struct Success {
     pub context_window: Option<u32>,
     pub upstream_id: Option<String>,
     pub limits: Option<LimitSnapshot>,
+    /// Заметка для журнала: ответ принят, но CLI сообщил что-то непонятное.
+    pub note: Option<String>,
 }
 
 /// Отказ по сообщению самого CLI.
@@ -87,6 +89,19 @@ pub trait Dialect: Send + Sync {
 
     /// Страховка перед запуском: запрет инструментов нельзя потерять молча (инвариант 11).
     fn verify(&self, launch: &Launch) -> Result<(), String>;
+
+    /// То же для побочной команды (`models`, `auth status`): точный argv и изоляция окружения.
+    fn verify_side(&self, launch: &Launch, command: &[&str]) -> Result<(), String>;
+
+    /// Побочная команда в окружении вызова: те же папки и очистка, другие аргументы, пустой ввод.
+    fn launch_side(&self, plan: &Plan<'_>, command: &[&str]) -> Launch {
+        let mut launch = self.launch(plan);
+        launch.args = plan.program.prefix.clone();
+        launch.args.extend(command.iter().map(OsString::from));
+        launch.stdin.clear();
+        launch
+    }
+
     fn parser(&self, account: &AccountId) -> Box<dyn Parser>;
 
     /// Дешёвая проверка входа без токенов, если у CLI она есть: аргументы и разбор вывода.
@@ -108,6 +123,75 @@ pub enum ModelSource {
 pub struct AuthCheck {
     pub args: &'static [&'static str],
     pub parse: fn(&str) -> crate::gateway::backend::AuthState,
+}
+
+/// Модель уходит в argv: пустая — модель по умолчанию, остальное без `-` в начале, пробелов и управляющих.
+pub fn check_model(model: &str) -> Result<(), String> {
+    let bad = model.starts_with('-')
+        || model.chars().count() > MAX_MODEL_LEN
+        || model.chars().any(|c| c.is_whitespace() || c.is_control());
+    if bad {
+        return Err(format!(
+            "model id {:?} is not allowed in a command line: refusing to start",
+            crate::util::truncate_at_char_boundary(model, 60)
+        ));
+    }
+    Ok(())
+}
+
+/// Длиннее любого настоящего идентификатора модели.
+const MAX_MODEL_LEN: usize = 200;
+
+/// Сколько раз аргумент встречается ровно в таком виде.
+pub fn count_arg(args: &[OsString], flag: &str) -> usize {
+    args.iter().filter(|a| *a == flag).count()
+}
+
+/// Значение флага: аргумент сразу за единственным вхождением.
+pub fn value_after<'a>(args: &'a [OsString], flag: &str) -> Option<&'a std::ffi::OsStr> {
+    let at = args.iter().position(|a| a == flag)?;
+    args.get(at + 1).map(OsString::as_os_str)
+}
+
+/// Значение формы `--флаг=значение`; несколько таких — ошибка.
+pub fn attached_value(args: &[OsString], flag: &str) -> Result<Option<String>, String> {
+    let prefix = format!("{flag}=");
+    let mut found = args.iter().filter_map(|a| {
+        a.to_str()?
+            .strip_prefix(prefix.as_str())
+            .map(str::to_string)
+    });
+    let first = found.next();
+    if found.next().is_some() {
+        return Err(format!("{flag} appears more than once: refusing to start"));
+    }
+    Ok(first)
+}
+
+/// Каждый охранный флаг ровно один раз: пропажа и дубль одинаково опасны.
+pub fn require_once(args: &[OsString], tool: &str, flags: &[&str]) -> Result<(), String> {
+    for flag in flags {
+        match count_arg(args, flag) {
+            1 => {}
+            0 => return Err(format!("{tool} launch lacks {flag}: refusing to start")),
+            n => {
+                return Err(format!(
+                    "{tool} launch repeats {flag} ({n} times): refusing to start"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Аргументы запуска побуквенно равны ожидаемым: ничто лишнее не перекрывает запрет.
+pub fn require_exact(own: &[OsString], expected: &[OsString], tool: &str) -> Result<(), String> {
+    if own == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "{tool} launch deviates from the expected command line: refusing to start"
+    ))
 }
 
 /// Рабочая папка запуска пуста: проекта модель не видит.

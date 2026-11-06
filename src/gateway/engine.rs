@@ -276,6 +276,11 @@ pub fn build_gateway(gateway: GatewayConfig, deps: EngineDeps) -> GatewayHandle 
     Arc::new(Engine::new(gateway, deps))
 }
 
+/// Подписки CLI только для себя: в `/serve` в этом релизе их нет (ни Claude, ни OpenCode).
+fn closed_to_serve(source: CallSource, provider: AccountProvider) -> bool {
+    source == CallSource::Serve && provider.is_cli()
+}
+
 // ── Внутреннее устройство ───────────────────────────────────────────────
 
 /// Аккаунт в работе: адаптер, семафор, состояние.
@@ -608,7 +613,7 @@ impl Core {
                 class: class.clone(),
             });
         }
-        if query.source == CallSource::Serve && account.provider == AccountProvider::CliClaude {
+        if closed_to_serve(query.source, account.provider) {
             return skip(SkipReason::NotForServe);
         }
         let Some(runtime) = self.runtime(&account.id) else {
@@ -1271,14 +1276,13 @@ impl Gateway for Engine {
         }
         let unknown = || ResolveError::Unknown(id.to_string());
         let binding = self.resolve(id).ok_or_else(unknown)?;
-        // Подписка Claude наружу не раздаётся: такой адрес для `/serve` не существует.
-        if source == CallSource::Serve
-            && let Binding::Fixed(target) = &binding
+        // Подписки CLI наружу не раздаются: такой адрес для `/serve` не существует.
+        if let Binding::Fixed(target) = &binding
             && self
                 .core
                 .config()
                 .account(&target.account)
-                .is_some_and(|a| a.provider == AccountProvider::CliClaude)
+                .is_some_and(|a| closed_to_serve(source, a.provider))
         {
             return Err(unknown());
         }

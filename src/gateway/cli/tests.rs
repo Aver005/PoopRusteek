@@ -309,8 +309,7 @@ async fn claude_runs_with_exactly_the_contract_argv_and_environment() {
         "--no-session-persistence",
         "--system-prompt-file",
         "<system>",
-        "--model",
-        "haiku",
+        "--model=haiku",
     ];
     assert_eq!(got, expected);
     assert_eq!(
@@ -409,8 +408,7 @@ async fn opencode_runs_standalone_with_an_empty_config_a_deny_block_and_its_own_
             "--standalone",
             "--agent",
             "plain",
-            "-m",
-            "opencode-go/deepseek-v4.1-flash"
+            "--model=opencode-go/deepseek-v4.1-flash"
         ]
     );
     assert_eq!(
@@ -435,6 +433,22 @@ async fn opencode_runs_standalone_with_an_empty_config_a_deny_block_and_its_own_
 
 /// Запуск настоящего диалекта на пустых папках; `tweak` ломает его, как мог бы сломать рефакторинг.
 fn launch_of(dialect: &dyn Dialect, scratch: &Scratch, home: Option<&Path>) -> Launch {
+    launch_with(
+        dialect,
+        scratch,
+        home,
+        "m",
+        vec![("PATH".into(), "x".into())],
+    )
+}
+
+fn launch_with(
+    dialect: &dyn Dialect,
+    scratch: &Scratch,
+    home: Option<&Path>,
+    model: &str,
+    parent_env: Vec<(OsString, OsString)>,
+) -> Launch {
     let system = scratch.write_system("s").unwrap();
     let program = Program {
         path: "tool".into(),
@@ -444,11 +458,11 @@ fn launch_of(dialect: &dyn Dialect, scratch: &Scratch, home: Option<&Path>) -> L
     dialect.launch(&Plan {
         program: &program,
         home,
-        model: "m",
+        model,
         system_file: &system,
         prompt: "p".into(),
         scratch,
-        parent_env: vec![("PATH".into(), "x".into())],
+        parent_env,
     })
 }
 
@@ -563,40 +577,63 @@ fn the_real_opencode_launch_passes_verification_and_each_lost_guard_is_refused()
     let _ = std::fs::remove_dir_all(base);
 }
 
-/// Диалект, потерявший `--restricted` при сборке: страховка обязана остановить запуск.
-struct Careless;
+/// Диалект, который портит запуск после сборки, как мог бы испортить рефакторинг.
+struct Mutating {
+    inner: Arc<dyn Dialect>,
+    mutate: fn(&mut Launch),
+}
 
-impl Dialect for Careless {
+impl Dialect for Mutating {
     fn tool(&self) -> crate::gateway::types::CliTool {
-        ClaudeDialect.tool()
+        self.inner.tool()
     }
     fn capabilities(&self) -> crate::gateway::backend::Capabilities {
-        ClaudeDialect.capabilities()
+        self.inner.capabilities()
     }
     fn limits(&self) -> Limits {
-        ClaudeDialect.limits()
+        self.inner.limits()
     }
     fn launch(&self, plan: &Plan<'_>) -> Launch {
-        let mut launch = ClaudeDialect.launch(plan);
-        launch.args.retain(|arg| arg != "--restricted");
+        let mut launch = self.inner.launch(plan);
+        (self.mutate)(&mut launch);
+        launch
+    }
+    fn launch_side(&self, plan: &Plan<'_>, command: &[&str]) -> Launch {
+        let mut launch = self.inner.launch_side(plan, command);
+        (self.mutate)(&mut launch);
         launch
     }
     fn verify(&self, launch: &Launch) -> Result<(), String> {
-        ClaudeDialect.verify(launch)
+        self.inner.verify(launch)
+    }
+    fn verify_side(&self, launch: &Launch, command: &[&str]) -> Result<(), String> {
+        self.inner.verify_side(launch, command)
     }
     fn parser(&self, account: &AccountId) -> Box<dyn super::dialect::Parser> {
-        ClaudeDialect.parser(account)
+        self.inner.parser(account)
     }
     fn models(&self) -> super::dialect::ModelSource {
-        ClaudeDialect.models()
+        self.inner.models()
     }
+    fn auth_check(&self) -> Option<super::dialect::AuthCheck> {
+        self.inner.auth_check()
+    }
+}
+
+fn mutating(inner: impl Dialect + 'static, mutate: fn(&mut Launch)) -> Arc<dyn Dialect> {
+    Arc::new(Mutating {
+        inner: Arc::new(inner),
+        mutate,
+    })
 }
 
 #[tokio::test]
 async fn a_launch_that_lost_the_tool_ban_never_starts_the_process() {
     let rig = Rig::new("careless");
     let backend = backend(
-        Arc::new(Careless),
+        mutating(ClaudeDialect, |launch| {
+            launch.args.retain(|arg| arg != "--restricted")
+        }),
         "claude",
         "success",
         &rig,
@@ -1036,6 +1073,467 @@ fn the_engine_says_why_codex_is_skipped_and_still_shows_the_account() {
     );
     let view = engine.snapshot().accounts.into_iter().next().unwrap();
     assert!(!view.capabilities.unwrap().pure_model);
+}
+
+// ── F1: модель из id не может стать флагом; /serve закрыт для всех cli:* ─────────────────
+
+#[test]
+fn a_model_id_that_could_pose_as_a_flag_is_refused_but_real_ones_pass() {
+    use super::dialect::check_model;
+    for ok in [
+        "",
+        "haiku",
+        "claude-haiku-5-5",
+        "opencode-go/deepseek-v4.1-flash",
+        "a:b@c#high",
+    ] {
+        assert_eq!(check_model(ok), Ok(()), "{ok}");
+    }
+    let long = "m".repeat(201);
+    for bad in [
+        "--standalone",
+        "-m",
+        "-",
+        "a b",
+        "a\tb",
+        "a\nb",
+        "a\u{0}b",
+        " x",
+        "x ",
+        long.as_str(),
+    ] {
+        let refusal = check_model(bad).unwrap_err();
+        assert!(refusal.contains("refusing to start"), "{bad:?}: {refusal}");
+    }
+}
+
+#[test]
+fn verify_refuses_a_flag_like_or_separate_model_for_both_clis() {
+    let (scratch, base) = scratch("model");
+    for dialect in [&ClaudeDialect as &dyn Dialect, &OpencodeDialect] {
+        for bad in ["--standalone", "-m", "x y"] {
+            let launch = launch_with(dialect, &scratch, None, bad, vec![]);
+            let refusal = dialect.verify(&launch).unwrap_err();
+            assert!(refusal.contains("model id"), "{bad}: {refusal}");
+        }
+        // Модель отдельным аргументом: следующий за ней флаг мог бы быть съеден как значение.
+        let mut split = launch_with(dialect, &scratch, None, "m", vec![]);
+        let at = split
+            .args
+            .iter()
+            .position(|a| a.to_string_lossy().starts_with("--model="))
+            .unwrap();
+        split.args[at] = "--model".into();
+        split.args.insert(at + 1, "m".into());
+        assert!(dialect.verify(&split).unwrap_err().contains("separate"));
+        let mut short = launch_with(dialect, &scratch, None, "m", vec![]);
+        short.args.push("-m".into());
+        assert!(dialect.verify(&short).is_err());
+        let fine = launch_with(dialect, &scratch, None, "m", vec![]);
+        assert_eq!(dialect.verify(&fine), Ok(()));
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn a_flag_like_model_never_starts_the_process() {
+    for (flavor, dialect) in [
+        ("claude", Arc::new(ClaudeDialect) as Arc<dyn Dialect>),
+        ("opencode", Arc::new(OpencodeDialect) as Arc<dyn Dialect>),
+    ] {
+        let rig = Rig::new(&format!("model-{flavor}"));
+        let backend = backend(dialect, flavor, "success", &rig, None, limits(30_000));
+        let answer = ask(&backend, "--standalone").await;
+        let error = answer.error();
+        assert_eq!(error.class, FailureClass::BadRequest);
+        assert!(error.message.contains("refusing to start") && !error.emitted);
+        assert!(
+            !rig.record.exists(),
+            "{flavor}: the CLI must not have been started"
+        );
+        assert!(ask(&backend, "fine-model").await.result.is_ok());
+    }
+}
+
+#[test]
+fn an_account_whose_default_model_is_a_flag_is_unavailable() {
+    let rig = Rig::new("factory-model");
+    let mut account = cli_account(AccountProvider::CliOpencode);
+    account.model = Some("--standalone".into());
+    let refusal = factory(lookup_json("opencode", "success"), &rig)
+        .build_for(&account)
+        .err()
+        .expect("a flag is not a model");
+    assert!(refusal.contains("account model") && refusal.contains("refusing to start"));
+    account.model = Some("mock/model".into());
+    assert!(
+        factory(lookup_json("opencode", "success"), &rig)
+            .build_for(&account)
+            .is_ok()
+    );
+}
+
+/// Шлюз с одним CLI-аккаунтом `x`, собранным на мок-процессе.
+fn cli_engine(provider: &str, flavor: &str, rig: &Rig) -> Engine {
+    let config = crate::gateway::testkit::parse(&format!(
+        r#"
+        [gateway]
+        enabled = true
+
+        [[accounts]]
+        id = "x"
+        provider = "{provider}"
+        model = "mock/model"
+
+        [[routes]]
+        id = "main"
+        steps = [{{ account = "x" }}]
+
+        [roles]
+        main = "main"
+        "#
+    ));
+    Engine::new(
+        config,
+        EngineDeps {
+            data_dir: None,
+            clock: Arc::new(crate::gateway::clock::SystemClock),
+            resolver: Arc::new(EnvOnlyResolver),
+            factories: vec![Arc::new(factory(lookup_json(flavor, "success"), rig))],
+            persist: None,
+        },
+    )
+}
+
+fn decide_for(engine: &Engine, source: CallSource) -> crate::gateway::handle::Decision {
+    engine.decide(&DecisionQuery {
+        role: Role::Main,
+        source,
+        tool_mode: ToolMode::Prompt,
+        input_tokens: None,
+        pinned: None,
+        sticky: None,
+        failed: Vec::new(),
+    })
+}
+
+#[test]
+fn no_cli_subscription_is_served_outside_but_every_one_works_for_the_owner() {
+    for (provider, flavor) in [("cli:claude", "claude"), ("cli:opencode", "opencode")] {
+        let rig = Rig::new(&format!("serve-{flavor}"));
+        let engine = cli_engine(provider, flavor, &rig);
+        let served = decide_for(&engine, CallSource::Serve);
+        assert!(served.target.is_none(), "{provider}: {}", served.explain());
+        assert!(
+            served
+                .skipped
+                .iter()
+                .any(|s| s.reason == SkipReason::NotForServe),
+            "{provider}"
+        );
+        assert!(
+            decide_for(&engine, CallSource::Chat).target.is_some(),
+            "{provider}: the owner's own chat still works"
+        );
+        // Адрес `account/model` для /serve тоже не существует; для чата он есть.
+        assert!(
+            engine
+                .provider_for_model_id("x/mock/model", CallSource::Serve)
+                .is_err(),
+            "{provider}"
+        );
+        assert!(
+            engine
+                .provider_for_model_id("x/mock/model", CallSource::Chat)
+                .is_ok(),
+            "{provider}"
+        );
+    }
+}
+
+// ── F3: охранные флаги ровно по одному, лишнее не перекрывает запрет ─────────────────────
+
+fn args_of(launch: &Launch) -> Vec<String> {
+    launch
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn push(launch: &mut Launch, extra: &[&str]) {
+    launch.args.extend(extra.iter().map(OsString::from));
+}
+
+#[test]
+fn a_second_copy_or_an_override_of_a_guard_flag_is_refused_for_claude() {
+    let (scratch, base) = scratch("claude-dups");
+    let good = launch_of(&ClaudeDialect, &scratch, None);
+    assert_eq!(ClaudeDialect.verify(&good), Ok(()));
+    let cases: [&[&str]; 8] = [
+        &["--tools", "Bash"],
+        &["--tools=Bash"],
+        &["--restricted"],
+        &["--strict-mcp-config"],
+        &["--disable-slash-commands"],
+        &["--permission-mode", "acceptEdits"],
+        &["--allowedTools", "Bash"],
+        &["--dangerously-skip-permissions"],
+    ];
+    for extra in cases {
+        let mut broken = good.clone();
+        push(&mut broken, extra);
+        let refusal = ClaudeDialect.verify(&broken).unwrap_err();
+        assert!(
+            refusal.contains("refusing to start"),
+            "{extra:?}: {refusal}"
+        );
+    }
+    // Префикс подмены не считается: охранные флаги ищутся после него.
+    let mut prefixed = good.clone();
+    prefixed.args.insert(0, "--tools".into());
+    prefixed.prefix_len = 1;
+    assert_eq!(ClaudeDialect.verify(&prefixed), Ok(()));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_second_copy_or_an_override_of_a_guard_flag_is_refused_for_opencode() {
+    let (scratch, base) = scratch("opencode-dups");
+    let good = launch_of(&OpencodeDialect, &scratch, None);
+    assert_eq!(OpencodeDialect.verify(&good), Ok(()));
+    let cases: [&[&str]; 5] = [
+        &["--standalone"],
+        &["--agent", "build"],
+        &["--agent=build"],
+        &["--dangerously-skip-permissions"],
+        &["run"],
+    ];
+    for extra in cases {
+        let mut broken = good.clone();
+        push(&mut broken, extra);
+        let refusal = OpencodeDialect.verify(&broken).unwrap_err();
+        assert!(
+            refusal.contains("refusing to start"),
+            "{extra:?}: {refusal}"
+        );
+    }
+    assert!(args_of(&good).contains(&"--model=m".to_string()));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// ── F4: побочные команды идут проверенным запуском ──────────────────────────────────────
+
+#[tokio::test]
+async fn opencode_models_runs_standalone_in_the_checked_environment() {
+    let rig = Rig::new("side-opencode");
+    let home = rig.dir.join("oc-home");
+    let backend = backend(
+        Arc::new(OpencodeDialect),
+        "opencode",
+        "success",
+        &rig,
+        Some(home.clone()),
+        limits(30_000),
+    );
+    backend.list_models().await.unwrap();
+    let record = rig.record();
+    assert_eq!(argv(&record), ["models", "--standalone"]);
+    assert_eq!(record["cwd_entries"], 0);
+    assert_eq!(
+        record["env"]["XDG_DATA_HOME"],
+        home.to_string_lossy().as_ref()
+    );
+    assert!(
+        !record["env"]["XDG_CONFIG_HOME"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn claude_login_check_is_exactly_auth_status_in_the_account_folder() {
+    let rig = Rig::new("side-claude");
+    let home = rig.dir.join("cl-home");
+    let backend = backend(
+        Arc::new(ClaudeDialect),
+        "claude",
+        "success",
+        &rig,
+        Some(home.clone()),
+        limits(30_000),
+    );
+    backend.probe().await;
+    let record = rig.record();
+    assert_eq!(argv(&record), ["auth", "status"]);
+    assert_eq!(
+        record["env"]["CLAUDE_CONFIG_DIR"],
+        home.to_string_lossy().as_ref()
+    );
+}
+
+#[tokio::test]
+async fn a_side_command_that_lost_standalone_is_refused_before_it_starts() {
+    let rig = Rig::new("side-careless");
+    let sabotaged = mutating(OpencodeDialect, |launch| {
+        launch.args.retain(|a| a != "--standalone")
+    });
+    let backend = backend(sabotaged, "opencode", "success", &rig, None, limits(30_000));
+    let error = backend.list_models().await.unwrap_err();
+    assert!(
+        error.message.contains("refusing to start"),
+        "{}",
+        error.message
+    );
+    assert!(!rig.record.exists(), "the CLI must not have been started");
+}
+
+// ── F5/F6: окружение ребёнка ────────────────────────────────────────────────────────────
+
+fn pair(name: &str, value: &str) -> (OsString, OsString) {
+    (name.into(), value.into())
+}
+
+fn env_of(launch: &Launch, name: &str) -> Option<String> {
+    launch
+        .env_value(name)
+        .map(|v| v.to_string_lossy().into_owned())
+}
+
+#[test]
+fn nothing_from_the_anthropic_or_claude_family_survives_into_claude() {
+    let (scratch, base) = scratch("claude-env");
+    let parent = vec![
+        pair("PATH", "p"),
+        pair("HTTPS_PROXY", "http://proxy"),
+        pair("ANTHROPIC_API_KEY", "k"),
+        pair("ANTHROPIC_AUTH_TOKEN", "t"),
+        pair("ANTHROPIC_MODEL", "opus"),
+        pair("ANTHROPIC_CUSTOM_HEADERS", "authorization: Bearer x"),
+        pair("ANTHROPIC_VERTEX_PROJECT_ID", "v"),
+        pair("ANTHROPIC_BEDROCK_BASE_URL", "b"),
+        pair("anthropic_lowercase", "l"),
+        pair("CLAUDE_CODE_OAUTH_TOKEN", "o"),
+        pair("CLAUDE_CODE_USE_VERTEX", "1"),
+        pair("CLAUDECODE", "1"),
+    ];
+    let home = base.join("home");
+    let launch = launch_with(&ClaudeDialect, &scratch, Some(&home), "m", parent);
+    assert_eq!(ClaudeDialect.verify(&launch), Ok(()));
+    let names = launch.env_names();
+    assert!(
+        !names.iter().any(|n| {
+            let up = n.to_ascii_uppercase();
+            up.starts_with("ANTHROPIC_") || (up.starts_with("CLAUDE") && up != "CLAUDE_CONFIG_DIR")
+        }),
+        "{names:?}"
+    );
+    assert!(names.contains(&"PATH".to_string()) && names.contains(&"HTTPS_PROXY".to_string()));
+    assert!(names.contains(&"CLAUDE_CONFIG_DIR".to_string()));
+    let mut leaky = launch.clone();
+    leaky.env.push(pair("ANTHROPIC_MODEL", "opus"));
+    assert!(
+        ClaudeDialect
+            .verify(&leaky)
+            .unwrap_err()
+            .contains("ANTHROPIC_MODEL")
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn opencode_with_its_own_home_keeps_data_cache_and_state_inside_it() {
+    let (scratch, base) = scratch("oc-env-home");
+    let parent = vec![
+        pair("PATH", "p"),
+        pair("XDG_DATA_HOME", "/their/data"),
+        pair("XDG_CACHE_HOME", "/their/cache"),
+        pair("XDG_STATE_HOME", "/their/state"),
+        pair("XDG_CONFIG_HOME", "/their/config"),
+        pair("XDG_DATA_DIRS", "/usr/share"),
+        pair("XDG_RUNTIME_DIR", "/run/user/1"),
+        pair("OPENCODE_CONFIG", "/their/opencode.json"),
+    ];
+    let home = base.join("account-home");
+    let launch = launch_with(&OpencodeDialect, &scratch, Some(&home), "m", parent);
+    assert_eq!(OpencodeDialect.verify(&launch), Ok(()));
+    assert_eq!(
+        env_of(&launch, "XDG_DATA_HOME"),
+        Some(home.to_string_lossy().into_owned())
+    );
+    for (name, sub) in [
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_STATE_HOME", "xdg-state"),
+    ] {
+        let value = PathBuf::from(env_of(&launch, name).unwrap());
+        assert!(
+            value.starts_with(&home) && value.ends_with(sub),
+            "{name}: {value:?}"
+        );
+    }
+    let config = env_of(&launch, "XDG_CONFIG_HOME").unwrap();
+    assert!(Path::new(&config).starts_with(&base) && config != "/their/config");
+    assert_eq!(env_of(&launch, "XDG_CONFIG_DIRS"), Some(config));
+    let names = launch.env_names();
+    for gone in ["XDG_DATA_DIRS", "XDG_RUNTIME_DIR", "OPENCODE_CONFIG"] {
+        assert!(!names.contains(&gone.to_string()), "{gone} leaked");
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn opencode_on_the_shared_login_passes_the_users_own_dirs_through_and_nothing_else() {
+    let (scratch, base) = scratch("oc-env-shared");
+    let parent = vec![
+        pair("XDG_DATA_HOME", "/their/data"),
+        pair("XDG_CACHE_HOME", "/their/cache"),
+        pair("XDG_CONFIG_HOME", "/their/config"),
+        pair("XDG_CONFIG_DIRS", "/etc/xdg"),
+        pair("XDG_DATA_DIRS", "/usr/share"),
+    ];
+    let launch = launch_with(&OpencodeDialect, &scratch, None, "m", parent);
+    assert_eq!(OpencodeDialect.verify(&launch), Ok(()));
+    assert_eq!(
+        env_of(&launch, "XDG_DATA_HOME").as_deref(),
+        Some("/their/data")
+    );
+    assert_eq!(
+        env_of(&launch, "XDG_CACHE_HOME").as_deref(),
+        Some("/their/cache")
+    );
+    assert!(
+        env_of(&launch, "XDG_STATE_HOME").is_none(),
+        "unset stays unset"
+    );
+    assert_ne!(
+        env_of(&launch, "XDG_CONFIG_HOME").as_deref(),
+        Some("/their/config")
+    );
+    assert_ne!(
+        env_of(&launch, "XDG_CONFIG_DIRS").as_deref(),
+        Some("/etc/xdg")
+    );
+    assert!(!launch.env_names().contains(&"XDG_DATA_DIRS".to_string()));
+    let mut stray = launch.clone();
+    stray.env.push(pair("XDG_DATA_DIRS", "/usr/share"));
+    assert!(
+        OpencodeDialect
+            .verify(&stray)
+            .unwrap_err()
+            .contains("XDG_DATA_DIRS")
+    );
+    let mut stray = launch.clone();
+    stray
+        .env
+        .push(pair("OPENCODE_CONFIG", "/their/opencode.json"));
+    assert!(
+        OpencodeDialect
+            .verify(&stray)
+            .unwrap_err()
+            .contains("OPENCODE_CONFIG")
+    );
+    let _ = std::fs::remove_dir_all(base);
 }
 
 // ── Настоящие CLI: приманка (`--ignored`, расходует крошечный запрос на аккаунт) ─────────

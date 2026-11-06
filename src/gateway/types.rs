@@ -157,6 +157,11 @@ impl AccountProvider {
         }
     }
 
+    /// Любой `cli:*`: подписка, которую шлюз не раздаёт наружу.
+    pub fn is_cli(self) -> bool {
+        self.cli_tool().is_some()
+    }
+
     /// Протокол провода для HTTP-аккаунтов; у CLI и DeepSeek его нет.
     pub fn protocol(self) -> Option<ProviderProtocol> {
         match self {

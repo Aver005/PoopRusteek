@@ -4,6 +4,7 @@
 use super::adapter::{CliBackend, CliSetup};
 use super::claude::{ClaudeDialect, MIN_VERSION};
 use super::codex::CodexBackend;
+use super::dialect::check_model;
 use super::discover::{Lookup, find, read_version};
 use super::opencode::OpencodeDialect;
 use crate::gateway::backend::Backend;
@@ -65,6 +66,9 @@ impl CliFactory {
         };
         if tool == CliTool::Codex {
             return Ok(Arc::new(CodexBackend));
+        }
+        if let Some(model) = &account.model {
+            check_model(model).map_err(|reason| format!("account model: {reason}"))?;
         }
         // Забытые папки аварийных выходов убираем один раз за процесс, когда CLI реально нужен.
         static SWEPT: std::sync::Once = std::sync::Once::new();

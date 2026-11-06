@@ -3,8 +3,9 @@
 
 use super::classify::classify_claude;
 use super::dialect::{
-    AuthCheck, Dialect, Failure, Feed, ModelSource, Parser, Plan, Success, Terminal, epoch_to_time,
-    json_u32, require_empty_cwd,
+    AuthCheck, Dialect, Failure, Feed, ModelSource, Parser, Plan, Success, Terminal,
+    attached_value, check_model, count_arg, epoch_to_time, json_u32, require_empty_cwd,
+    require_exact, require_once, value_after,
 };
 use super::discover::Version;
 use super::launch::{Launch, child_env, has_prefix};
@@ -15,6 +16,7 @@ use crate::gateway::types::{AccountId, CliTool};
 use crate::provider::Usage;
 use serde_json::Value;
 use std::ffi::OsString;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 /// С этой версии есть `--restricted`; на старых вместо него был бы только `--safe-mode`.
@@ -24,6 +26,64 @@ pub const MIN_VERSION: Version = Version(2, 1, 248);
 pub const MODEL_ALIASES: [&str; 3] = ["haiku", "sonnet", "opus"];
 
 pub struct ClaudeDialect;
+
+/// Флаги, без которых запуск не стартует и которые не должны повторяться.
+const GUARDS: [&str; 3] = [
+    "--restricted",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+];
+
+/// Всё, что подставляет окружение родителя вместо входа аккаунта: `CLAUDE_*`, `ANTHROPIC_*`.
+/// Подписке из этого префикса не нужно ничего (токен, ключ, заголовки, модель, облака).
+fn is_inherited_auth(name: &str) -> bool {
+    has_prefix(name, "CLAUDE_")
+        || has_prefix(name, "ANTHROPIC_")
+        || name.eq_ignore_ascii_case("CLAUDECODE")
+}
+
+/// Аргументы режима модели строго в контрактном порядке; модель слитно, `--model=<m>`.
+fn own_args(system_file: &Path, model: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--restricted",
+        "--tools",
+        "",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--permission-mode",
+        "dontAsk",
+        "--permission-prompts",
+        "none",
+        "--no-session-persistence",
+        "--system-prompt-file",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    args.push(system_file.into());
+    if !model.is_empty() {
+        args.push(format!("--model={model}").into());
+    }
+    args
+}
+
+/// В окружении нет ничего унаследованного от родителя, кроме папки входа аккаунта.
+fn verify_env(launch: &Launch) -> Result<(), String> {
+    match launch
+        .env_names()
+        .into_iter()
+        .find(|name| is_inherited_auth(name) && !name.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR"))
+    {
+        Some(name) => Err(format!(
+            "parent variable {name} leaked into the claude environment"
+        )),
+        None => Ok(()),
+    }
+}
 
 impl Dialect for ClaudeDialect {
     fn tool(&self) -> CliTool {
@@ -54,43 +114,9 @@ impl Dialect for ClaudeDialect {
 
     fn launch(&self, plan: &Plan<'_>) -> Launch {
         let mut args: Vec<OsString> = plan.program.prefix.clone();
-        args.extend(
-            [
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-                "--restricted",
-                "--tools",
-                "",
-                "--disable-slash-commands",
-                "--strict-mcp-config",
-                "--permission-mode",
-                "dontAsk",
-                "--permission-prompts",
-                "none",
-                "--no-session-persistence",
-                "--system-prompt-file",
-            ]
-            .map(OsString::from),
-        );
-        args.push(plan.system_file.into());
-        if !plan.model.is_empty() {
-            args.extend(["--model".into(), plan.model.into()]);
-        }
-        // Чужой вход через переменные родителя и платный ключ вместо подписки не допускаем.
-        let strip = |name: &str| {
-            has_prefix(name, "CLAUDE_")
-                || [
-                    "CLAUDECODE",
-                    "ANTHROPIC_API_KEY",
-                    "ANTHROPIC_AUTH_TOKEN",
-                    "ANTHROPIC_BASE_URL",
-                ]
-                .iter()
-                .any(|own| name.eq_ignore_ascii_case(own))
-        };
+        let prefix_len = args.len();
+        args.extend(own_args(plan.system_file, plan.model));
+        // Чужой вход из окружения родителя и платный ключ вместо подписки не допускаем.
         let set = plan
             .home
             .map(|home| vec![("CLAUDE_CONFIG_DIR", home.as_os_str().to_owned())])
@@ -98,43 +124,55 @@ impl Dialect for ClaudeDialect {
         Launch {
             program: plan.program.path.clone(),
             args,
-            env: child_env(plan.parent_env.clone(), strip, set),
+            prefix_len,
+            env: child_env(plan.parent_env.clone(), is_inherited_auth, set),
             cwd: plan.scratch.work_dir(),
             stdin: plan.prompt.clone().into_bytes(),
         }
     }
 
     fn verify(&self, launch: &Launch) -> Result<(), String> {
-        let missing = |flag: &str| format!("claude launch lacks {flag}: refusing to start");
-        for flag in [
-            "--restricted",
-            "--disable-slash-commands",
-            "--strict-mcp-config",
-        ] {
-            if !launch.has_arg(flag) {
-                return Err(missing(flag));
-            }
-        }
+        let own = launch.own_args();
+        require_once(
+            own,
+            "claude",
+            &[
+                GUARDS.as_slice(),
+                &["--tools", "--permission-mode", "--system-prompt-file"],
+            ]
+            .concat(),
+        )?;
         // Пустое значение `--tools` — именно отсутствие инструментов, не «по умолчанию».
-        if launch
-            .arg_after("--tools")
-            .is_none_or(|value| !value.is_empty())
+        if attached_value(own, "--tools")?.is_some()
+            || value_after(own, "--tools").is_none_or(|v| !v.is_empty())
         {
-            return Err(missing("an empty --tools"));
+            return Err("claude launch lacks an empty --tools: refusing to start".to_string());
         }
-        if launch
-            .arg_after("--permission-mode")
-            .is_none_or(|v| v != "dontAsk")
-        {
-            return Err(missing("--permission-mode dontAsk"));
+        if value_after(own, "--permission-mode").is_none_or(|v| v != "dontAsk") {
+            return Err(
+                "claude launch lacks --permission-mode dontAsk: refusing to start".to_string(),
+            );
         }
-        if let Some(name) = launch.env_names().into_iter().find(|name| {
-            has_prefix(name, "CLAUDE_") && !name.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR")
-        }) {
-            return Err(format!(
-                "parent variable {name} leaked into the claude environment"
-            ));
+        // Модель только слитной формой: значение с `-` не станет флагом.
+        if count_arg(own, "--model") + count_arg(own, "-m") > 0 {
+            return Err(
+                "claude launch passes the model as a separate argument: refusing to start"
+                    .to_string(),
+            );
         }
+        let model = attached_value(own, "--model")?.unwrap_or_default();
+        check_model(&model)?;
+        let system = value_after(own, "--system-prompt-file")
+            .ok_or("claude launch lacks --system-prompt-file: refusing to start")?;
+        require_exact(own, &own_args(Path::new(system), &model), "claude")?;
+        verify_env(launch)?;
+        require_empty_cwd(launch)
+    }
+
+    fn verify_side(&self, launch: &Launch, command: &[&str]) -> Result<(), String> {
+        let expected: Vec<OsString> = command.iter().map(OsString::from).collect();
+        require_exact(launch.own_args(), &expected, "claude")?;
+        verify_env(launch)?;
         require_empty_cwd(launch)
     }
 
@@ -288,6 +326,7 @@ impl ClaudeParser {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             limits: self.limits.clone(),
+            note: None,
         }));
         // Дельт не было (нет `--include-partial-messages` в потоке): берём готовый текст.
         let tail = if self.streamed { String::new() } else { text };

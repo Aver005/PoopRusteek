@@ -2,7 +2,7 @@
 //! Отмена хода (уроненный вызов) убивает дерево сразу и не считается отказом аккаунта.
 
 use super::classify::cap_message;
-use super::dialect::{Dialect, ModelSource, Plan};
+use super::dialect::{Dialect, ModelSource, Plan, check_model};
 use super::discover::{Program, Version};
 use super::launch::Scratch;
 use super::process::{Captured, End, Flow, Limits, run_captured, run_streaming};
@@ -122,35 +122,25 @@ impl CliBackend {
         }
     }
 
-    /// Запуск для побочной команды: то же окружение и папки, другие аргументы, пустой ввод.
-    fn side_launch(
-        &self,
-        scratch: &Scratch,
-        args: &[&str],
-    ) -> Result<super::launch::Launch, String> {
+    /// Побочная команда в окружении вызова: тот же проверенный запуск, другие аргументы, пустой ввод.
+    async fn side_command(&self, command: &[&str]) -> Result<Captured, String> {
+        let setup = self.setup();
+        let scratch = Scratch::create(&setup.scratch_root).map_err(|e| e.to_string())?;
         let system = scratch
             .write_system(FALLBACK_SYSTEM)
             .map_err(|e| e.to_string())?;
         let plan = Plan {
-            program: &self.setup().program,
-            home: self.setup().home.as_deref(),
+            program: &setup.program,
+            home: setup.home.as_deref(),
             model: "",
             system_file: &system,
             prompt: String::new(),
-            scratch,
+            scratch: &scratch,
             parent_env: std::env::vars_os().collect(),
         };
-        let mut launch = self.setup().dialect.launch(&plan);
-        launch.args = self.setup().program.prefix.clone();
-        launch
-            .args
-            .extend(args.iter().map(std::ffi::OsString::from));
-        Ok(launch)
-    }
-
-    async fn side_command(&self, args: &[&str]) -> Result<Captured, String> {
-        let scratch = Scratch::create(&self.setup().scratch_root).map_err(|e| e.to_string())?;
-        let launch = self.side_launch(&scratch, args)?;
+        let launch = setup.dialect.launch_side(&plan, command);
+        setup.dialect.verify_side(&launch, command)?;
+        // Асинхронный процесс под сроком: цикл событий не блокируется.
         Ok(run_captured(&launch, SIDE_COMMAND_TIMEOUT).await)
     }
 }
@@ -238,6 +228,10 @@ impl Backend for CliBackend {
         let started = Instant::now();
         let setup = self.setup();
         let model = self.model_for(context);
+        if let Err(reason) = check_model(&model) {
+            crate::debug_log::log("gateway.cli.refused", &reason);
+            return Err(self.error(FailureClass::BadRequest, reason, false));
+        }
         let (system, rest) = split_system_prompt(&request.messages);
         let system = if system.trim().is_empty() {
             FALLBACK_SYSTEM.to_string()

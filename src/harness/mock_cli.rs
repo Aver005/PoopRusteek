@@ -434,12 +434,13 @@ pub fn play(args: &MockCliArgs) -> i32 {
     }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    if let Some(code) = answer_side_call(args, &mut out) {
-        return code;
-    }
     let stdin = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+    // Запись и для побочных команд: тест видит их argv и окружение так же, как у вызова.
     if let Some(path) = &args.record {
         write_record(path, &args.argv, &stdin);
+    }
+    if let Some(code) = answer_side_call(args, &mut out) {
+        return code;
     }
     let Some(script) = script(&args.flavor, &args.scenario) else {
         let _ = writeln!(
