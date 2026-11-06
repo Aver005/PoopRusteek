@@ -90,6 +90,15 @@ impl FileLock {
     }
 }
 
+impl FileLock {
+    /// Пульс долгой работы под замком: свежее время файла не даёт другому счесть замок брошенным.
+    pub fn touch(&self) {
+        if let Ok(file) = OpenOptions::new().write(true).open(&self.path) {
+            let _ = file.set_modified(SystemTime::now());
+        }
+    }
+}
+
 impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
