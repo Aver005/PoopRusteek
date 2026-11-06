@@ -50,43 +50,71 @@ pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// Жёсткий перенос строки из цветных кусков: режет ровно по ширине, чтобы
-/// ни один символ команды не потерялся. Продолжение начинается с `hang`
+/// Перенос строки из цветных кусков: предпочитает границу слова (после
+/// пробела), а слово без пробелов режет ровно по ширине. Пробелы остаются на
+/// концах строк — ни один символ не теряется. Продолжение начинается с `hang`
 /// пробелов (не больше половины ширины).
 pub fn wrap_spans(spans: &[Span<'static>], width: usize, hang: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let hang = hang.min(width / 2);
-    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let indent: Vec<(char, Style)> = vec![(' ', Style::default()); hang];
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut row: Vec<(char, Style)> = Vec::new();
     let mut used = 0usize;
+    // Сколько ячеек в начале строки — отступ продолжения (резать там нечего).
+    let mut floor = 0usize;
     for span in spans {
-        let mut chunk = String::new();
         for ch in span.content.chars() {
             let w = cell_width(ch);
-            if used + w > width && used > hang_floor(rows.len(), hang) {
-                flush_chunk(rows.last_mut(), &mut chunk, span.style);
-                rows.push(vec![Span::raw(" ".repeat(hang))]);
-                used = hang;
+            // `while`: перенесённый хвост вместе с отступом тоже мог не влезть.
+            while used + w > width && row.len() > floor {
+                // Граница слова: после последнего пробела, но не слишком рано —
+                // иначе строка получилась бы почти пустой.
+                let cut = row
+                    .iter()
+                    .rposition(|(c, _)| *c == ' ')
+                    .filter(|index| *index >= floor && row_width(&row[..=*index]) * 3 >= width);
+                let carry: Vec<(char, Style)> = match cut {
+                    Some(index) if index + 1 < row.len() => row.split_off(index + 1),
+                    _ => Vec::new(),
+                };
+                rows.push(std::mem::take(&mut row));
+                row = indent.clone();
+                floor = hang;
+                row.extend(carry);
+                used = row_width(&row);
             }
-            chunk.push(ch);
+            row.push((ch, span.style));
             used += w;
         }
-        flush_chunk(rows.last_mut(), &mut chunk, span.style);
     }
-    rows
+    rows.push(row);
+    rows.into_iter().map(group_cells).collect()
 }
 
-/// На продолжении строки отступ уже занял место: новый разрез допустим, только если после него что-то есть.
-fn hang_floor(row_count: usize, hang: usize) -> usize {
-    if row_count > 1 { hang } else { 0 }
+fn row_width(cells: &[(char, Style)]) -> usize {
+    cells.iter().map(|(c, _)| cell_width(*c)).sum()
 }
 
-fn flush_chunk(row: Option<&mut Vec<Span<'static>>>, chunk: &mut String, style: Style) {
-    if chunk.is_empty() {
-        return;
+/// Подряд идущие клетки одного стиля — один кусок.
+fn group_cells(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut style = None;
+    for (ch, cell_style) in cells {
+        if style.is_some_and(|current| current != cell_style) {
+            if let Some(current) = style {
+                spans.push(Span::styled(std::mem::take(&mut text), current));
+            }
+            style = None;
+        }
+        style.get_or_insert(cell_style);
+        text.push(ch);
     }
-    if let Some(row) = row {
-        row.push(Span::styled(std::mem::take(chunk), style));
+    if let Some(current) = style {
+        spans.push(Span::styled(text, current));
     }
+    spans
 }
 
 #[cfg(test)]
@@ -128,18 +156,15 @@ mod tests {
         let style = Style::default();
         let text = "x".repeat(50);
         let rows = wrap_spans(&[Span::styled(text.clone(), style)], 12, 2);
+        let rows = text_of(&rows);
         let joined: String = rows
             .iter()
-            .flat_map(|row| row.iter().map(|s| s.content.as_ref()))
-            .filter(|s| !s.trim().is_empty())
+            .enumerate()
+            .map(|(index, row)| if index == 0 { row.as_str() } else { &row[2..] })
             .collect();
         assert_eq!(joined, text);
         for row in &rows {
-            let width: usize = row
-                .iter()
-                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-                .sum();
-            assert!(width <= 12, "row is {width} cells");
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 12, "{row}");
         }
     }
 
@@ -149,5 +174,53 @@ mod tests {
         let rows = wrap_spans(&[Span::styled("aaaaaa", red), Span::raw("bbbbbb")], 8, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].style, red);
+    }
+
+    fn text_of(rows: &[Vec<Span<'static>>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn spans_prefer_a_word_boundary_and_keep_the_space() {
+        let rows = wrap_spans(&[Span::raw("hello world foo bar")], 12, 0);
+        let rows = text_of(&rows);
+        assert_eq!(rows, vec!["hello world ", "foo bar"]);
+        assert_eq!(rows.concat(), "hello world foo bar", "ничего не потеряно");
+    }
+
+    #[test]
+    fn a_word_longer_than_the_row_is_still_cut_by_width() {
+        let rows = wrap_spans(&[Span::raw("aaaaaaaaaaaaaaaaaaaa")], 8, 0);
+        let rows = text_of(&rows);
+        assert!(rows.len() >= 3);
+        assert_eq!(rows.concat(), "aaaaaaaaaaaaaaaaaaaa");
+        for row in &rows {
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 8, "{row}");
+        }
+    }
+
+    #[test]
+    fn a_break_that_would_leave_a_nearly_empty_row_is_not_taken() {
+        // Пробел в самом начале: резать после него — почти пустая строка, режем по ширине.
+        let rows = text_of(&wrap_spans(&[Span::raw("a bbbbbbbbbbbbbbbbbbbb")], 8, 0));
+        assert_eq!(rows[0].chars().count(), 8, "{rows:?}");
+        assert_eq!(rows.concat(), "a bbbbbbbbbbbbbbbbbbbb");
+    }
+
+    #[test]
+    fn a_continuation_keeps_its_hang_and_every_character() {
+        let source = "command: cargo test --bin x items::range -- --nocapture && git diff";
+        let rows = text_of(&wrap_spans(&[Span::raw(source)], 24, 4));
+        let joined: String = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| if index == 0 { row.as_str() } else { &row[4..] })
+            .collect();
+        assert_eq!(joined, source);
+        for row in rows.iter().skip(1) {
+            assert!(row.starts_with("    "), "{row:?}");
+        }
     }
 }

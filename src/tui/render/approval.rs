@@ -11,6 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// Самое широкое окно: дальше строки трудно читать.
 const MAX_POPUP_W: u16 = 100;
@@ -109,6 +110,92 @@ pub(crate) fn viewport(cols: u16, rows: u16, shape: &ApprovalShape<'_>) -> Appro
     }
 }
 
+/// Команды, после которых стоит остановиться и перечитать вызов.
+const DANGER_COMMANDS: [&str; 14] = [
+    "rm",
+    "rmdir",
+    "del",
+    "erase",
+    "rd",
+    "remove-item",
+    "mkfs",
+    "dd",
+    "sudo",
+    "shutdown",
+    "reboot",
+    "format",
+    "kill",
+    "taskkill",
+];
+/// Флаги, которые делают вызов необратимым или грубым.
+const DANGER_FLAGS: [&str; 8] = [
+    "--force",
+    "-force",
+    "-rf",
+    "-fr",
+    "--hard",
+    "--no-preserve-root",
+    "-recurse",
+    "--delete",
+];
+
+/// Слово из команды опасное: сама команда (без пути и знаков вокруг) или флаг.
+fn is_danger_token(token: &str) -> bool {
+    let word = token.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '"' | '\'' | '`')
+    });
+    let name = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .to_lowercase();
+    let name = name.trim_end_matches(".exe");
+    DANGER_COMMANDS.contains(&name) || DANGER_FLAGS.contains(&name)
+}
+
+/// Короткий итог вызова для заголовка: команда, путь или запрос. Секреты
+/// замаскированы (полный текст виден ниже, в аргументах).
+fn call_summary(arguments: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) if value.is_object() => crate::agent::tool_call_summary(&value),
+        _ => crate::util::one_line_label(
+            arguments
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(""),
+            120,
+        ),
+    }
+}
+
+/// Заголовок окна: `⚠ Tool call · bash · <итог>`; опасные слова итога красные и жирные.
+fn title_line(tool_name: &str, arguments: &str, popup_w: usize, theme: &Theme) -> Line<'static> {
+    let warn = Style::default()
+        .fg(theme.warning)
+        .add_modifier(Modifier::BOLD);
+    let danger = Style::default()
+        .fg(theme.error)
+        .add_modifier(Modifier::BOLD);
+    let head = format!(
+        " {} Tool call \u{00B7} {tool_name} ",
+        crate::tui::glyphs::get().warn
+    );
+    let room = popup_w
+        .saturating_sub(UnicodeWidthStr::width(head.as_str()) + 4)
+        .max(8);
+    let summary = super::util::truncate(&call_summary(arguments), room);
+    let mut spans = vec![Span::styled(head, warn)];
+    if !summary.is_empty() {
+        spans.push(Span::styled("\u{00B7} ", warn));
+        for token in summary.split_inclusive(' ') {
+            let style = if is_danger_token(token) { danger } else { warn };
+            spans.push(Span::styled(token.to_string(), style));
+        }
+        spans.push(Span::styled(" ", warn));
+    }
+    Line::from(spans)
+}
+
 /// Состояние окна одним аргументом.
 pub(super) struct ToolApprovalView<'a> {
     pub tool_name: &'a str,
@@ -146,7 +233,7 @@ pub(super) fn render_tool_approval(
         vp.popup_h.min(area.height),
     );
     let block = modal_block(
-        format!(" {} Tool call ", crate::tui::glyphs::get().warn),
+        title_line(tool_name, arguments, vp.popup_w as usize, theme),
         theme.warning,
         theme,
     );
@@ -295,6 +382,71 @@ mod tests {
                 vp.body_w
             );
         }
+    }
+
+    #[test]
+    fn dangerous_words_are_recognised_without_false_alarms() {
+        for token in [
+            "rm",
+            "-rf",
+            "--force",
+            "sudo",
+            "/bin/rm",
+            "Remove-Item",
+            "rm;",
+            "\"dd\"",
+            "RM.EXE",
+        ] {
+            assert!(is_danger_token(token), "{token}");
+        }
+        for token in [
+            "cargo", "test", "--bin", "form", "remote", "-f", "firm", "--forced",
+        ] {
+            assert!(!is_danger_token(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn the_title_names_the_tool_and_marks_the_dangerous_words() {
+        let theme = Theme::default_dark();
+        let arguments = "{\n  \"command\": \"rm -rf node_modules && echo done\"\n}";
+        let title = title_line("bash", arguments, 100, &theme);
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("bash") && text.contains("rm -rf node_modules"),
+            "{text}"
+        );
+        let danger_style = |word: &str| {
+            title
+                .spans
+                .iter()
+                .find(|s| s.content.trim() == word)
+                .map(|s| s.style.fg)
+        };
+        assert_eq!(danger_style("rm"), Some(Some(theme.error)));
+        assert_eq!(danger_style("-rf"), Some(Some(theme.error)));
+        assert_eq!(danger_style("echo"), Some(Some(theme.warning)));
+    }
+
+    #[test]
+    fn a_long_summary_is_cut_to_the_window_and_a_secret_stays_masked() {
+        let theme = Theme::default_dark();
+        let long = format!(
+            "{{\"command\": \"deploy --token s3cr3t {}\"}}",
+            "x".repeat(300)
+        );
+        let title = title_line("bash", &long, 60, &theme);
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 60, "{text}");
+        assert!(!text.contains("s3cr3t"), "{text}");
+    }
+
+    #[test]
+    fn non_json_arguments_still_give_a_title() {
+        let theme = Theme::default_dark();
+        let title = title_line("write", "path: /tmp/x.txt\n\n+ hello", 80, &theme);
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("path: /tmp/x.txt"), "{text}");
     }
 
     #[test]

@@ -183,7 +183,7 @@ const SUMMARY_CHARS: usize = 100;
 /// Одна короткая строка про вызов для панели работы: команда, путь, запрос.
 /// Значения секретных полей не берутся, а в самой строке секреты маскируются.
 /// Пусто, если в аргументах нет ни одной подходящей строки.
-fn tool_call_summary(arguments: &serde_json::Value) -> String {
+pub(crate) fn tool_call_summary(arguments: &serde_json::Value) -> String {
     let text = SUMMARY_KEYS
         .iter()
         .find_map(|key| arguments.get(key).and_then(|value| value.as_str()))

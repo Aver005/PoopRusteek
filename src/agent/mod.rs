@@ -7,4 +7,5 @@ pub mod sub_agent;
 pub use sub_agent::SUB_AGENT_MAX_STEPS;
 pub mod tool_parser;
 mod tools_step;
+pub(crate) use tools_step::tool_call_summary;
 mod trace;
