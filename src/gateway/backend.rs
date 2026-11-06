@@ -9,9 +9,11 @@
 use super::handle::LimitSnapshot;
 use super::types::{AccountId, CliTool, CliTransport, ToolMode};
 use crate::config::ProviderProtocol;
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
 use crate::provider::failure::FailureClass;
-use crate::provider::{CompletionChunk, CompletionRequest, Usage};
+use crate::provider::{
+    ChatMessage, CompletionChunk, CompletionRequest, RemoteSessionInfo, SessionLiveness, Usage,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -247,6 +249,44 @@ pub trait Backend: Send + Sync {
 
     /// Удалить серверную сессию одноразового форка.
     async fn discard_session(&self) {}
+
+    /// Приложит ли адаптер этот файл сам (DeepSeek: PDF, картинки).
+    fn accepts_attachment(&self, _path: &std::path::Path) -> bool {
+        false
+    }
+
+    /// Окно контекста модели, если каталог аккаунта его называет.
+    async fn context_window(&self, _model: &str) -> Option<u32> {
+        None
+    }
+
+    /// Серверные сессии (`/delete`, `/load`): только у адаптера с `server_side_session`.
+    async fn list_remote_sessions(&self) -> AppResult<Vec<RemoteSessionInfo>> {
+        Err(unsupported("Remote session listing"))
+    }
+
+    async fn delete_remote_session_by_id(&self, _session_id: &str) -> AppResult<()> {
+        Err(unsupported("Remote session deletion"))
+    }
+
+    async fn fetch_remote_session_messages(
+        &self,
+        _session_id: &str,
+    ) -> AppResult<Vec<ChatMessage>> {
+        Err(unsupported("Remote session fetching"))
+    }
+
+    async fn check_session(&self, _session_id: &str) -> SessionLiveness {
+        SessionLiveness::Unknown("this account does not track server-side sessions".into())
+    }
+
+    async fn adopt_session(&self, _session_id: &str, _parent: Option<i64>) -> AppResult<()> {
+        Ok(())
+    }
+}
+
+fn unsupported(what: &str) -> AppError {
+    AppError::Custom(format!("{what} not supported by this account"))
 }
 
 #[cfg(test)]

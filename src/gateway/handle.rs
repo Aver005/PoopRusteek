@@ -228,6 +228,13 @@ pub enum SkipReason {
         used_pct: f32,
         age: Duration,
     },
+    /// Выше жёсткого порога (`hard_pct`) по свежему снимку.
+    OverHardLimit {
+        used_pct: f32,
+        age: Duration,
+    },
+    /// Подписка Claude наружу через `/serve` не раздаётся.
+    NotForServe,
     /// Уже упал в этом вызове.
     FailedThisCall {
         class: String,
@@ -307,6 +314,13 @@ impl SkipReason {
             Self::OverSoftLimit { used_pct, age } => {
                 format!("at {used_pct:.0}% (reading {}s old)", age.as_secs())
             }
+            Self::OverHardLimit { used_pct, age } => {
+                format!(
+                    "over its hard limit at {used_pct:.0}% (reading {}s old)",
+                    age.as_secs()
+                )
+            }
+            Self::NotForServe => "not served to outside clients".into(),
             Self::FailedThisCall { class } => format!("just failed ({class})"),
             Self::PinnedElsewhere => "another account is pinned".into(),
         }
@@ -531,6 +545,11 @@ pub trait Gateway: Send + Sync {
     fn apply_edit(&self, edit: ConfigEdit) -> Result<(), EditError>;
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<GatewayEvent>;
     fn ledger(&self) -> Arc<dyn Ledger>;
+
+    /// Живой адаптер аккаунта: каталог моделей (`model_cache`), проба. `None` у выключенного.
+    fn backend_for(&self, _account: &AccountId) -> Option<Arc<dyn super::backend::Backend>> {
+        None
+    }
 }
 
 pub type GatewayHandle = Arc<dyn Gateway>;
