@@ -17,8 +17,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-/// Самая широкая карточка: дальше строки теряются на пустом поле.
-const MAX_CONTENT_W: u16 = 100;
 /// Карточка: две строки текста и рамка.
 const CARD_H: u16 = 4;
 /// Ниже этого окна сессий нет места, показываем только заголовок.
@@ -45,9 +43,10 @@ fn plan(height: u16, sessions: usize) -> WelcomePlan {
     };
     let card = card_rows == usize::from(CARD_H);
     let mut left = height.saturating_sub(card_rows);
+    // Подсказки — последняя строка области, прямо над полем ввода.
     let tips = left >= 2;
     if tips {
-        left -= 2;
+        left -= 1;
     }
     // Пустая строка перед сессиями и их заголовок.
     let session_rows = if sessions > 0 && left >= 3 {
@@ -148,8 +147,7 @@ fn tips_line(width: usize, theme: &Theme) -> Line<'static> {
     let tips = vec![
         Segment::new(1, Tone::Dim, format!("/ commands {dot} ")),
         Segment::new(2, Tone::Dim, format!("@file attach {dot} ")),
-        Segment::new(3, Tone::Dim, format!("/sessions open one {dot} ")),
-        Segment::new(4, Tone::Dim, "Ctrl+P panel"),
+        Segment::new(3, Tone::Dim, "/sessions open one"),
     ];
     let (parts, _) = fit_segments(width.saturating_sub(2), tips, Vec::new());
     let mut text: String = parts.iter().map(|part| part.text.as_str()).collect();
@@ -174,7 +172,7 @@ pub(super) fn render_welcome(
     if area.height == 0 || area.width < 8 {
         return;
     }
-    let content_w = area.width.saturating_sub(2).min(MAX_CONTENT_W);
+    let content_w = area.width.saturating_sub(2);
     let content = Rect::new(area.x + 1, area.y, content_w, area.height);
     let plan = plan(area.height, state.landing.recent().len());
     let width = usize::from(content.width);
@@ -216,16 +214,13 @@ pub(super) fn render_welcome(
             Paragraph::new(lines).style(Style::default().bg(theme.bg)),
             Rect::new(content.x, y, content.width, height),
         );
-        y += height;
     }
-    if plan.tips {
-        y += 1;
-        if y < area.bottom() {
-            frame.render_widget(
-                Paragraph::new(tips_line(width, theme)),
-                Rect::new(content.x, y, content.width, 1),
-            );
-        }
+    if plan.tips && area.height > 0 {
+        // Пустота между сессиями и подсказками — честная: ввод всегда внизу.
+        frame.render_widget(
+            Paragraph::new(tips_line(width, theme)),
+            Rect::new(content.x, area.bottom() - 1, content.width, 1),
+        );
     }
 }
 
@@ -265,7 +260,7 @@ mod tests {
                 } else {
                     0
                 };
-                let tips = if plan.tips { 2 } else { 0 };
+                let tips = usize::from(plan.tips);
                 let used = card + sessions_block + tips;
                 assert!(
                     used <= usize::from(height).max(1),

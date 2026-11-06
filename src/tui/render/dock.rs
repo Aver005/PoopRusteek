@@ -49,6 +49,9 @@ struct DockModel {
     children: Vec<ChildRow>,
     /// Сколько сообщений ждёт, что первое, и стоит ли очередь после упавшего хода.
     queue: Option<(usize, String, bool)>,
+    /// Сколько агентов не поместилось. Показаны строкой очереди, а если очереди
+    /// нет — отдельной строкой дерева; со сводкой GOAL они не смешиваются.
+    hidden_agents: usize,
     summary: Vec<SummaryItem>,
 }
 
@@ -61,9 +64,15 @@ struct SummaryItem {
 }
 
 impl DockModel {
+    /// Отдельная строка «+N агентов»: когда скрытые есть, а очереди для них нет.
+    fn overflow_row(&self) -> bool {
+        self.hidden_agents > 0 && self.queue.is_none()
+    }
+
     fn rows(&self) -> u16 {
         let rows = usize::from(self.main.is_some())
             + self.children.len()
+            + usize::from(self.overflow_row())
             + usize::from(self.queue.is_some())
             + usize::from(!self.summary.is_empty());
         rows as u16
@@ -200,28 +209,15 @@ fn model(state: &AppState) -> DockModel {
 
     let main_rows = usize::from(main.is_some());
     let queue_rows = usize::from(queue.is_some());
-    let mut has_summary = !summary.is_empty();
     let max_rows = usize::from(MAX_DOCK_ROWS);
-    let mut budget = max_rows.saturating_sub(main_rows + queue_rows + usize::from(has_summary));
-    if running_children.len() > budget && !has_summary {
-        has_summary = true;
+    let mut budget =
+        max_rows.saturating_sub(main_rows + queue_rows + usize::from(!summary.is_empty()));
+    // Скрытые агенты без очереди получают свою строку — её место отнимается у списка.
+    if running_children.len() > budget && queue.is_none() {
         budget = budget.saturating_sub(1);
     }
     let shown = running_children.len().min(budget);
-    let hidden = running_children.len() - shown;
-    if hidden > 0 {
-        let text = format!("+{hidden} more");
-        summary.insert(
-            0,
-            SummaryItem {
-                priority: 1,
-                tone: Tone::Plain,
-                long: text.clone(),
-                short: text,
-            },
-        );
-    }
-    debug_assert!(has_summary || hidden == 0);
+    let hidden_agents = running_children.len() - shown;
 
     let children = running_children
         .iter()
@@ -241,6 +237,7 @@ fn model(state: &AppState) -> DockModel {
         main,
         children,
         queue,
+        hidden_agents,
         summary,
     }
 }
@@ -362,7 +359,19 @@ fn child_line<'a>(row: &ChildRow, last: bool, width: usize, theme: &Theme) -> Li
     two_sided(width, lead, &lead_text, &right, theme)
 }
 
-fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &Theme) -> Line<'a> {
+fn queue_line<'a>(
+    count: usize,
+    next: &str,
+    paused: bool,
+    hidden_agents: usize,
+    width: usize,
+    theme: &Theme,
+) -> Line<'a> {
+    let more = if hidden_agents > 0 {
+        format!("+{hidden_agents} more agents ")
+    } else {
+        String::new()
+    };
     if paused {
         // Ход упал, а сообщения ждут решения человека.
         let text = format!(
@@ -375,7 +384,7 @@ fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &
                 .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
         )];
-        return two_sided(width, lead, &lead_text, "", theme);
+        return two_sided(width, lead, &lead_text, &more, theme);
     }
     let lead_text = format!(" queued {count} \u{00B7} next: {next}");
     let lead = vec![
@@ -388,7 +397,7 @@ fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &
             Style::default().fg(theme.text_soft),
         ),
     ];
-    two_sided(width, lead, &lead_text, "", theme)
+    two_sided(width, lead, &lead_text, &more, theme)
 }
 
 fn tone_style(tone: Tone, theme: &Theme) -> Style {
@@ -436,11 +445,30 @@ pub(crate) fn render_dock(frame: &mut Frame, area: Rect, state: &AppState, theme
         lines.push(main_line(main, width, theme));
     }
     let child_count = model.children.len();
+    let overflow = model.overflow_row();
     for (index, child) in model.children.iter().enumerate() {
-        lines.push(child_line(child, index + 1 == child_count, width, theme));
+        let last = index + 1 == child_count && !overflow;
+        lines.push(child_line(child, last, width, theme));
+    }
+    if overflow {
+        let branch = "\u{2514}";
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {branch} "), Style::default().fg(theme.text_dim)),
+            Span::styled(
+                format!("+{} more agents", model.hidden_agents),
+                Style::default().fg(theme.text_dim),
+            ),
+        ]));
     }
     if let Some((count, next, paused)) = &model.queue {
-        lines.push(queue_line(*count, next, *paused, width, theme));
+        lines.push(queue_line(
+            *count,
+            next,
+            *paused,
+            model.hidden_agents,
+            width,
+            theme,
+        ));
     }
     if !model.summary.is_empty() {
         lines.push(summary_line(&model.summary, width, theme));
@@ -503,9 +531,10 @@ mod tests {
         assert_eq!(height(&state), MAX_DOCK_ROWS);
         let model = model(&state);
         assert!(model.children.len() < 6);
+        assert!(model.hidden_agents > 0 && model.overflow_row());
         assert!(
-            model.summary.iter().any(|item| item.long.starts_with("+")),
-            "скрытые агенты считаются в сводке"
+            model.summary.iter().all(|item| !item.long.starts_with('+')),
+            "скрытые агенты не смешиваются со сводкой GOAL"
         );
     }
 
@@ -560,5 +589,27 @@ mod tests {
         assert_eq!(height(&state), 1);
         let model = model(&state);
         assert_eq!(model.queue.map(|(_, _, paused)| paused), Some(true));
+    }
+
+    /// Есть очередь — «+N агентов» уходит в её строку, отдельной строки нет.
+    #[test]
+    fn hidden_agents_ride_on_the_queue_row_when_there_is_one() {
+        let mut state = idle_state();
+        state.focused_mut().generation.active = true;
+        state
+            .focused_mut()
+            .queued
+            .push_back(crate::app::conversation::QueuedMessage {
+                text: "next".to_string(),
+                chips: Vec::new(),
+                named: Vec::new(),
+            });
+        for index in 0..6 {
+            start_agent(&mut state, &format!("agent {index}"));
+        }
+        let model = model(&state);
+        assert!(model.hidden_agents > 0);
+        assert!(!model.overflow_row());
+        assert!(model.rows() <= MAX_DOCK_ROWS);
     }
 }

@@ -140,8 +140,10 @@ fn right_segments(
     }
     // Заполнение окна показываем, только когда размер окна известен: выдуманный
     // процент от угаданного окна хуже, чем его отсутствие.
+    // И пока в чате нет сообщений: на приветствии окно ещё ничем не занято.
     let budget = crate::context::spec::budget_from_config(config, state.provider_context_window);
-    if let Some(snapshot) = budget.snapshot(state.focused().context_used) {
+    let snapshot = budget.snapshot(state.focused().context_used);
+    if let Some(snapshot) = snapshot.filter(|_| !state.focused().messages.is_empty()) {
         let percent = snapshot.percent_used();
         let server = match &state.focused().provider {
             Some(provider) if provider.keeps_server_side_history() => " srv",
@@ -304,5 +306,20 @@ mod tests {
         assert!(!status_worth_showing(&state));
         state.status_message = "Approve tool bash?".to_string();
         assert!(status_worth_showing(&state));
+    }
+
+    #[test]
+    fn the_context_gauge_waits_for_the_first_message() {
+        let mut config = Config::default();
+        config.context.context_window = 32_000;
+        let mut state = state();
+        let empty = footer_parts(&state, &config, 120, false, "14:02");
+        assert!(!line(&empty).contains("ctx"), "{}", line(&empty));
+        state
+            .focused_mut()
+            .messages
+            .push(crate::provider::ChatMessage::user("hi"));
+        let started = footer_parts(&state, &config, 120, false, "14:02");
+        assert!(line(&started).contains("ctx"), "{}", line(&started));
     }
 }
