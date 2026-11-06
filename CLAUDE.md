@@ -7,13 +7,17 @@ Guidance for Claude Code (and any other agent) working in this repository.
 Pooprusteek is a Rust TUI coding agent that talks to DeepSeek's reverse-engineered
 web API (no paid API key — cookie/token auth, local SHA-3 proof-of-work) instead
 of an official LLM API, with optional extra providers (OpenAI-compatible /
-Anthropic Messages / Gemini endpoints via `/providers`). Built on `tokio` +
-`ratatui`, it runs a single event-driven terminal UI supporting parallel
-conversations, sub-agents, an iterative GOAL worker/evaluator loop, MCP
-(stdio/HTTP/SSE tool servers with OAuth), markdown skills, and a **fully local
-semantic (RAG) layer** — multilingual-e5-small ONNX embeddings + stemmed TF-IDF
-+ RRF over three corpora: skills, MCP tools, and persistent message history —
-a free, terminal-native alternative to Claude Code.
+Anthropic Messages / Gemini endpoints via `/providers`). A gateway layer
+(`src/gateway/`) keeps several API keys and official-CLI subscriptions in one
+place with routes, roles, limits and an explainable choice of account; secrets
+live in the OS keyring and the config is a shared `~/.pooprusteek/config.toml`
+plus an optional untrusted project layer. Built on `tokio` + `ratatui`, it runs
+a single event-driven terminal UI supporting parallel conversations, sub-agents,
+an iterative GOAL worker/evaluator loop, MCP (stdio/HTTP/SSE tool servers with
+OAuth), markdown skills, and a **fully local semantic (RAG) layer** —
+multilingual-e5-small ONNX embeddings + stemmed TF-IDF + RRF over three corpora:
+skills, MCP tools, and persistent message history — a free, terminal-native
+alternative to Claude Code.
 
 ## Read first
 
@@ -90,7 +94,16 @@ override on Windows). Both flags are forwarded to the children `scenario` and
 Inside Docker: `sandbox/README.md` (`./sandbox.ps1 suite live -Repeat 5`).
 `sandbox/scenarios/mock/` runs against `mock-provider` for deterministic
 regressions — the only reliable way to reach failure paths the live model
-produces by accident.
+produces by accident. Gateway scenarios (`falls-back-after-429`,
+`cli-refusal-falls-back-to-api`) additionally need a script from
+`sandbox/mock-scripts/` and a config from `sandbox/gateway/`; mapping in
+`.memories/reference/HARNESS.md` §7.5.
+
+**Before accepting a branch or worktree, run `git ls-files --others --ignored --exclude-standard -- src`.**
+`.gitignore` once matched `src/cli/secrets.rs` and `src/commands/defs/secrets.rs`
+via `secrets.*`; the track built and tested locally because the files were on
+disk, then the merge produced a tree that could not compile. A clean clone and a
+build from it are the real gate; the ignored-file listing is the fast check.
 
 Build flake to know about: parallel rustc + ort linking can exhaust the
 Windows pagefile (`STATUS_STACK_BUFFER_OVERRUN` / os error 1455, "paging file
@@ -132,7 +145,28 @@ Key subsystems added on top of that core:
 - **`src/provider/` — multi-protocol.** The built-in DeepSeek web client
   (PoW + SSE) plus `/providers`-managed entries speaking OpenAI Chat
   Completions, Anthropic Messages, or Gemini. All implement `LLMProvider`
-  with `fork()` for per-conversation session isolation.
+  with `fork()` for per-conversation session isolation. `provider/failure.rs`
+  types every upstream refusal once (`FailureClass`, `Retry-After`, limit
+  headers) and is the single source of truth for the gateway and `/serve`.
+- **`src/gateway/` — accounts, routes, roles.** `Gateway` (facade,
+  `gateway/handle.rs`) selects an account for every call with an explainable
+  `Decision`; `RoutedProvider` is the `LLMProvider` the app and `/serve` see —
+  it falls back only before the first visible chunk, forks per conversation,
+  enforces per-account cooldown and concurrency, and records usage. `Backend`
+  adapters cover API endpoints (`api_backend.rs`), the built-in DeepSeek web
+  client (`deepseek_backend.rs`) and the Claude Code / OpenCode CLIs in plain
+  model mode (`cli/`); Codex is direct-token only. Roles (`title`, `summary`,
+  `evaluator`) are separate forked calls on their own routes. The gateway is
+  off by default and then `main_provider` builds the old provider unchanged.
+  Full reference: `.memories/reference/GATEWAY.md`.
+- **`src/secrets/` + layered `src/config/` — credentials and settings.** Keys
+  live in the OS keyring and appear in the file only as references
+  (`keyring:`, `env:`, `cmd:`, `file:`, `none`). Config has a shared layer
+  (`~/.pooprusteek/config.toml`) and an untrusted project layer
+  (`.pooprusteek/config.toml`); changes to request targets wait for
+  `pooprusteek trust`, and project account keys need `secrets bind`. Saves go
+  through `toml_edit` as a diff, on one worker thread, never on the event loop.
+  Reference: `.memories/reference/CONFIG.md`, `.docs/secrets-and-config.md`.
 - **`src/mcp/` — servers + OAuth.** 8-source config discovery, `/mcp add`
   (JSON / wizard / one-liner), RFC 9728/8414/7591 + PKCE authorization with
   OS-keyring token storage.
@@ -164,6 +198,9 @@ Key subsystems added on top of that core:
 10. **Never print to stdout/stderr while the app runs** — the TUI owns the terminal and `--acp` owns stdout for JSON-RPC. `tracing` goes to the data-dir log file (set up in `main.rs`); ad-hoc debugging goes through `debug_log`. This includes dependencies: fastembed's download progress bar is explicitly disabled for this reason.
 11. **The harness must never add instrumentation to the agent loop, and never bypass tool approval** — telemetry goes through the existing `debug_log` call sites (a parallel stream drifts), and every tool call (sub-agents included) is answered by the run's `ApprovePolicy`; `TurnSpec.auto_approve` was removed for exactly this reason (it let `task` launder approval).
 12. **The semantic layer must degrade, never block features** — every entry point returns empty/falls back to lexical when the embedder is disabled, still initializing, or failed. Deferred MCP schemas are only allowed when semantic matching is enabled (`App::effective_mcp_schema_mode` forces `Full` otherwise); session files remain the source of truth for the history index (it is a wipeable cache).
+13. **Gateway edits go one way: `snapshot()` in, `apply_edit()` out.** The accounts screen and its modals read `Gateway::snapshot()` and never mutate gateway state; every change is a `ConfigEdit` validated by `GatewayConfig::validate()`, persisted as a full `GatewayConfig` through `AppEvent::GatewayPersist` and `config::save`. A new setting must be readable from the snapshot (or explicitly fetched from `Config`), never reached for through a shared provider.
+14. **Secrets are resolved at the adapter edge, never during config parse, and never on the event loop.** A secret field is a `SecretRef`; `SecretResolver::resolve` touches the keyring/`cmd:`/files and blocks, so it runs from `spawn_blocking` (that is why the gateway build is `gateway::pending`). Do not print a secret, do not put one in `Debug`, do not add a path that writes one back into the file. Wrong-form TOML errors must print the message and position, never the source line.
+15. **A gateway target change never deletes the user's server-side session.** `RoutedProvider` may discard the fresh fork of a failed attempt only when it emitted nothing (`!error.emitted`); an adopted session (`/load`, `--resume`) and the user's own `/delete` must reach the server untouched. `history::flatten_for_switch` rewrites foreign calls into text before a new backend sees them — do not carry `provider_state` or tool-call ids across accounts.
 
 ## Conventions
 

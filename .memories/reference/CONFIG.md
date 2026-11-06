@@ -1,157 +1,306 @@
-# REFERENCE: Config, Storage & Sessions
-> Where everything lives on disk. Source: `src/config/mod.rs`, `src/session.rs`.
-> Last updated: 2026-09-13 (added `[update]` — stable/dev channel config; fixed the debug-log row: build-dependent path + the actual `--debug-log` flag spelling). Before: 2026-07-06 (added `[server]` — the API-gateway section behind `--serve`/`/serve`/`/server <port>`). Before: 2026-07-04 (added `agent.rate_limit_per_minute`; debug log is now runtime-toggleable via `/debug`, not just the CLI flag)
+# REFERENCE: Config, storage and sessions
 
-## FILE LOCATIONS (`config/mod.rs:100`)
+> Where everything lives and how the config is assembled.
+> Source: `src/config/` (`paths`, `layers`, `load`, `write`, `queue`, `migrate`,
+> `startup`, `fields`, `describe`), `src/session.rs`, `src/gateway/types.rs`.
+> Описание для людей: `.docs/secrets-and-config.md`. Пример: `config.example.toml`.
+> Last updated: 2026-11-07 (новая схема шлюза, два слоя, перенос и откат).
 
-Paths come from the `dirs` crate, so they are **platform-specific**:
+## ГДЕ ЧТО ЛЕЖИТ
 
-| Item | Code | Linux | Windows | macOS |
-|------|------|-------|---------|-------|
-| Config | `config_dir()/pooprusteek/config.toml` | `~/.config/pooprusteek/config.toml` | `%APPDATA%\pooprusteek\config.toml` | `~/Library/Application Support/pooprusteek/config.toml` |
-| Data dir | `data_dir()/pooprusteek/` | `~/.local/share/pooprusteek/` | `%APPDATA%\pooprusteek\` | `~/Library/Application Support/pooprusteek/` |
-| Sessions | `{data}/sessions/{id}.json` | … | … | … |
-| History | `{data}/history.json` | … | … | … |
-| MCP own config | `{data}/mcp.json` | … | … | … |
-| Approval rules | `{data}/whitelist.json` | … | … | … |
-| Undo journal | `{data}/checkpoints.jsonl` + `{data}/checkpoints/` | … | … | … |
-| Debug log | Debug build: `.dev/debug.log` (relative to CWD). Release build: `{data}/debug.log`. Enabled by `--debug-log` at startup or toggled at runtime via `/debug` | — | — | — |
+| Что | Где | Как получается |
+|---|---|---|
+| Общий конфиг | `~/.pooprusteek/config.toml` | `paths::global_dir()` = `home_dir()/.pooprusteek` |
+| Проектный слой | `.pooprusteek/config.toml` | `paths::find_project_layer(start)`: вверх до `.git`; вне git только папка запуска |
+| Файл из `--config` | любой путь | заменяет оба слоя; `Config::path()` = `--config`, иначе общий файл |
+| Данные и кэш | `dirs::data_local_dir()/pooprusteek` | `paths::default_data_dir()`; на Windows `%LOCALAPPDATA%`, не roaming |
+| Старый конфиг | `dirs::config_dir()/pooprusteek/config.toml` | `paths::legacy_config_path()` — только источник переноса и отката |
+| Старая папка данных | `dirs::data_dir()/pooprusteek` | `paths::legacy_data_dir()` — источник переноса |
+| Копия перед первой правкой | `config.toml.pre-gateway` рядом с конфигом | `migrate::backup_path` |
+| Метка переноса данных | `data_dir/.migrated-from-legacy` | `paths::DATA_MARKER` |
 
-> On this machine (Windows), config + data both resolve under `%APPDATA%\Roaming\pooprusteek\`.
+Платформы:
 
-> Two global flags move those roots for one process: `--config <file>` (read
-> settings from there instead of the user's own) and `--data-dir <dir>`
-> (everything in the `{data}` rows above lands there instead). `--data-dir` is
-> set in `main` before `logging::setup` and `checkpoints::Store::init` — both
-> read `Config::data_dir()` at startup — and the path is absolutised at once,
-> because the harness chdirs into a scenario's workspace. Harness runs must
-> pass it: on Windows `dirs` has no env override, so without it a test run
-> writes into live user data (`reference/HARNESS.md` §10).
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| Новый конфиг | `~/.pooprusteek/config.toml` | `%USERPROFILE%\.pooprusteek\config.toml` | `~/.pooprusteek/config.toml` |
+| Новые данные | `~/.local/share/pooprusteek` | `%LOCALAPPDATA%\pooprusteek` | `~/Library/Application Support/pooprusteek` |
+| Старый конфиг | `~/.config/pooprusteek/config.toml` | `%APPDATA%\pooprusteek\config.toml` | `~/Library/Application Support/pooprusteek/config.toml` |
+| Старые данные | `~/.local/share/pooprusteek` | `%APPDATA%\pooprusteek` | `~/Library/Application Support/pooprusteek` |
 
-**`whitelist.json`** — auto-approval rules, one object per rule:
+На Windows и macOS старый конфиг лежит **внутри** старой папки данных. Поэтому
+перенос данных идёт по явному списку, а не «всё, кроме»: иначе открытые ключи
+уехали бы в новую папку вместе с настройками.
+
+## ДВА СЛОЯ
+
+`config::load_from_optional` читает общий слой, затем проектный и сливает их:
+
+- скалярные ключи: проект переопределяет общий;
+- `[[accounts]]` и `[[routes]]`: массивы сливаются по `id` (аккаунт или
+  маршрут с тем же `id` заменяется/дополняется, порядок — из общего слоя);
+- `[trust]` проект менять не может;
+- `Config.source` помнит, откуда взято каждое значение (`origins`), какие слои
+  применены или отвергнуты (`layers`) и что ждёт подтверждения
+  (`pending_trust`).
+
+Проектный слой недоверенный, потому что может приехать из чужого репозитория.
+
+**Запрещено целиком** (слой не применяется, причина в `doctor` и в заметке при
+запуске): `[server]`, `[update]`, `[instructions]`, `[[providers]]`,
+`active_provider`, `[secrets]`, `[trust]`, `provider.{token,base_url,kind,client_version}`,
+`skills.paths`; у аккаунтов — `api_key`, `direct_token`,
+`direct_token_ack`, `home`, `secret` вида `cmd:`/`file:` или литерал; смена
+`base_url`/`provider` у аккаунта с известным общим `id`; любое значение,
+похожее на ключ.
+
+**Ждёт подтверждения** (fail closed): `[gateway]`, `[[accounts]]`, `[[routes]]`,
+`[roles]` — всё, что меняет, куда уходят запросы. До подтверждения действуют
+общие значения, остальное из проекта (тема, лимиты агента) применяется.
+`pooprusteek trust` пишет путь и SHA-256 файла в `[trust.projects]` общего
+конфига; изменение файла меняет хэш и спрашивает снова. `pooprusteek trust
+--revoke` снимает подтверждение.
+
+Подтверждение файла не даёт ключ. Аккаунт из проекта получает секрет только для
+подтверждённого хоста: `pooprusteek secrets bind <ссылка> <хост>` (или
+`/secrets bind`). Привязка держится за схему: голый `host` — это
+`https://host`, для http надо писать `http://host`. Проектный аккаунт без
+`base_url` ключа не получает.
+
+> Форма подтверждения и то, что именно считается «изменением, куда уходят
+> запросы», названы итоговым намерением релиза. Отдельная правка перед
+> слиянием может их уточнить — сверить с `JOURNAL/2026-11-07-fix-*.md`; пока
+> таких журналов нет.
+
+## СЕКРЕТЫ
+
+Поле секрета — ссылка, а не значение:
+
+| Ссылка | Что делает | Где разрешена |
+|---|---|---|
+| `keyring:global/имя` | системное хранилище, служба `pooprusteek` | оба слоя |
+| `env:ИМЯ` | переменная окружения | оба слоя |
+| `cmd:["op","read","…"]` | вывод команды без оболочки, 10 с | только общий слой |
+| `file:/путь` | файл с ключом, на unix 0600 | только общий слой |
+| `none` | секрет не нужен | оба слоя |
+
+Любая другая строка — ошибка загрузки, а не «просто строка». Значение читается
+при сборке адаптера (`SecretResolver` / `StoreResolver`), а старые открытые поля
+(`provider.token`, `providers[].api_key`, `server.api_key`) разворачиваются в
+память при загрузке, чтобы остальной код не менялся. В файл они не
+возвращаются: `config::save` пишет только разницу.
+
+Длинное значение режется на куски по 900 байт (предел Windows — 2560 байт,
+пароль хранится в UTF-16). Перезапись идёт в новое поколение кусков, заголовок
+переключается последним; падение на любом шаге оставляет читаемым либо старое
+значение целиком, либо новое, но не смесь.
+
+`SecretResolver::resolve` блокирует (хранилище, `cmd:`, файл), поэтому его зовут
+с `spawn_blocking`, не с цикла событий. Сборка шлюза это и делает
+(`gateway::pending`).
+
+## СХЕМА
+
+```toml
+[gateway]
+schema = 1                 # конфиг новее нашей схемы читается только на чтение
+enabled = false            # true включает аккаунты, маршруты и роли
+
+[[accounts]]
+id = "openai-work"         # не меняется никогда
+label = "OpenAI (work)"    # можно править
+provider = "openai"        # openai | anthropic | gemini | custom
+                           # | cli:claude | cli:opencode | cli:codex
+base_url = "https://api.openai.com/v1"
+secret = "keyring:global/openai-work"
+model = "gpt-5.5"
+enabled = true
+favorites = ["gpt-5.5"]
+tools = "prompt"           # prompt | native
+home = "~/.pooprusteek/accounts/openai-work"   # только CLI
+direct_token = "keyring:global/…"              # только не-Claude и с ack
+direct_token_ack = false
+
+[accounts.limits]
+soft_pct = 85              # с этого процента аккаунт уходит вниз по списку
+hard_pct = 97              # с этого — не берётся
+requests_per_minute = 30
+budget_usd_month = 50      # заявлен, но в релизе не применяется
+max_concurrency = 4        # CLI и DeepSeek 1, API 4
+
+[[routes]]
+id = "coding"
+strategy = "ordered"       # в релизе только ordered
+switch_at_pct = 90
+on = ["rate_limit", "quota", "spend_cap", "overloaded", "timeout", "server_error", "auth"]
+allow_mixed_tools = false
+steps = [{ account = "claude-work", model = "claude-opus-5-5" }, { account = "openai-work" }]
+
+[roles]
+main = "coding"
+title = "cheap"
+summary = "cheap"
+evaluator = "cheap"
+
+[secrets.bindings]
+"keyring:global/openai-work" = ["api.openai.com"]
+
+[trust.projects]
+"E:\\repo" = "sha256:…"    # пишет только pooprusteek trust
+```
+
+`Account`, `Route`, `GatewaySettings`, `GatewayConfig` — `deny_unknown_fields`:
+опечатка в ключе шлюза — ошибка, а не молчаливое игнорирование. `GatewayConfig::validate()`
+проверяет ссылки на несуществующие аккаунты, пустые маршруты, `hard_pct < soft_pct`,
+смесь инструментов без `allow_mixed_tools`, модель у API-шага, `max_concurrency = 0`,
+две одинаковые `home` у одного CLI и запрет прямого токена для Claude.
+
+Старый `[[providers]]` продолжает **читаться** (и зеркалится в `[[accounts]]`
+при первом запуске), но больше не пишется: `Config.providers` помечен
+`skip_serializing_if`. `active_provider` работает только при выключенном шлюзе.
+
+Остальные секции: `[provider]` (DeepSeek web), `[ui]` (theme, glyphs),
+`[agent]`, `[context]`, `[mcp]`, `[skills]`, `[instructions]`, `[semantic]`,
+`[server]`, `[provider_models]`, `[update]`.
+
+## ПЕРЕНОС
+
+### Данные
+
+`config::choose_data_dir()` при старте:
+
+1. `--data-dir` выигрывает сразу; переноса нет.
+2. Есть `data_dir/.migrated-from-legacy` — работаем с новой папкой.
+3. Иначе `migrate::migrate_data_dir(old, new)` копирует по списку:
+   `history.json`, `whitelist.json`, `checkpoints.jsonl`,
+   `checkpoints-undone.jsonl`, `mcp.json` и папки `sessions/`, `checkpoints/`,
+   `tool-output/`, `exports/`, `skills/`.
+4. Всё остальное остаётся в старой папке и перечисляется в заметке при запуске:
+   там могут лежать ключи от старого конфига. Модель, семантический индекс,
+   `provider_models.json` и журналы не переносятся — перекачиваются и
+   пересоздаются.
+5. Если файл есть в обеих папках и различается, остаётся более свежий по
+   времени изменения, проигравший ложится рядом как `имя.legacy`
+   (`.legacy.2`, …). Повторный запуск копий не плодит.
+6. Метка `.migrated-from-legacy` ставится только после полного успеха. До этого
+   работаем со старой папкой; старая папка не удаляется никогда.
+
+### Конфиг
+
+1. `migrate::copy_legacy_config` копирует старый файл в новый, пока нового нет,
+   и проверяет, что прочиталось то же самое.
+2. `migrate::run` переносит открытые ключи в хранилище: запись → чтение мимо
+   кэша → сравнение. Только после этого в новом файле на месте значения
+   появляется ссылка.
+3. `[[providers]]` зеркалятся в `[[accounts]]` (`GatewayConfig::from_legacy`) с
+   общей записью хранилища; `[gateway] schema = 1, enabled = false`.
+4. Перед первой правкой делается `config.toml.pre-gateway`.
+5. Когда для каждой ссылки хранилище отдаёт то же значение, старый файл
+   чистится через `toml_edit`: значения секретов — пустой строкой, ключи
+   `[[providers]]` — убраны. Настройки, комментарии и `[server]` остаются.
+   Копия `config.toml.pre-gateway` чистится после запуска, где все ссылки
+   читаются.
+6. Любое сомнение (хранилище не подтверждает значение, новый файл не читается)
+   — старый файл не трогается.
+
+### Откат
+
+Старый бинарь читает только старый файл. Он остаётся на месте, настройки в нём
+целы, ключи заменены пустыми значениями. После отката старая версия попросит
+токен заново: токен лежит в хранилище и старой версии недоступен. Старая папка
+данных остаётся целиком. Новый `~/.pooprusteek/config.toml` старый бинарь не
+читает.
+
+### Флаг `--config`
+
+`config::mark_explicit_config` закрепляет файл: запись идёт только в него,
+настоящий конфиг, хранилище, переносы и настоящие папки не трогаются
+(`config::is_isolated`). Харнесс обязан передавать `--config` и `--data-dir`
+(см. `reference/HARNESS.md` §10).
+
+## ЗАПИСЬ КОНФИГА
+
+`config::save` не переписывает файл целиком: сравнивает загруженное состояние с
+текущим и применяет разницу через `toml_edit`. Комментарии, порядок и незнакомые
+ключи остаются. Запись идёт под блокировкой `config.toml.lock` с перечитыванием
+файла внутри неё; замок считается брошенным через 60 с, ожидание — 75 с.
+
+В TUI запись не ждёт замок и диск на цикле событий: `config::save` ставит
+задание в очередь одного рабочего потока и возвращается сразу, порядок правок
+сохраняется, ошибка приходит событием в чат. Перед выходом, `/wipe` и
+перезагрузкой конфига очередь сбрасывается. В CLI и тестах запись идёт на месте.
+Файл, который не читается как TOML или как конфиг, не затирается.
+
+## СЕССИИ (`src/session.rs`)
+
+- **`Session`**: `version(=1), id, created_at, updated_at, workspace_root,
+  model_type, messages, tag?, title?, provider_session_id?,
+  provider_parent_message_id?, broken, route_state?`.
+- `title` — служебный заголовок от роли `title`; `None` — запасной
+  `derive_title` по первой реплике.
+- `route_state` — на каком аккаунте/модели идёт беседа. `save_session` при
+  `None` в метаданных берёт значение из файла, поэтому автосейв не затирает
+  известную цель.
+- **ID**: `{YYYY-MM-DDTHH-MM-SS-fff}Z-{uuid8}` — сортируется по времени.
+- **Сохранение**: `save_session(id, created_at, messages, config, workspace_root,
+  meta: &SessionMeta)`. `SessionMeta { tag, broken, remote: RemoteLink, route,
+  title }`. Красивый JSON в `{sessions}/{id}.json`.
+- **Загрузка**: `load_local(id)` → `SessionNotFound`; `list_sessions()` даёт
+  `SessionSummary` (заголовок: сохранённый служебный, иначе `derive_title`).
+- **Автосейв**: `App::auto_save_session()` после каждого хода. Берёт
+  `Conversation.tag/broken`, `provider.session_identity()` и `route_state()`,
+  а `title` — из беседы. `RemoteLink::Unknown` не стирает сохранённую ссылку на
+  серверный тред; стирает только явная перезапись
+  (`finalize_broken_session`).
+- **Особые теги**: `__goal_system__` (сессии оценщика, скрыты из `/sessions`),
+  `Imported`.
+- **История ввода** `{data}/history.json`: до 500 строк, соседние дубликаты
+  схлопнуты; строки с ключами и команды, принимающие секрет, не пишутся.
+
+### Серверная сессия DeepSeek
+
+`session_identity()` — живая пара `(session_id, parent_message_id)`;
+`check_session()` — три состояния `Alive/Gone/Unknown`; `adopt_session()`
+подхватывает известную серверную сессию вместо создания новой. Только `Gone`
+(API ответил именно про эту сессию и отказал) даёт право стереть ссылку;
+`Unknown` (сеть, протухший токен, HTML вместо JSON) файл не трогает. Подробности
+и история дефектов — `reference/PROVIDER.md` и `BUGS.md`.
+
+## ПРАВИЛА АВТООДОБРЕНИЯ
+
+`whitelist.json` — массив правил:
 
 ```json
 [
   { "tool": "read_file" },
   { "tool": "bash",  "scope": { "command": ["cargo", "test"] } },
-  { "tool": "edit",  "scope": { "path": "E:\Projects\Me\pooprusteek\src" } }
+  { "tool": "edit",  "scope": { "path": "E:\\Projects\\Me\\pooprusteek\\src" } }
 ]
 ```
 
-A rule without `scope` means the whole tool. The **old format** — a bare array
-of tool names, `["bash","edit"]` — is still read and imported as tool-wide
-rules, with a one-time notice: that approval was given when no narrower option
-existed, so it should be reviewed rather than silently kept. An unparseable
-file is moved aside to `whitelist.json.bad` instead of being overwritten by the
-next write.
+Правило без `scope` — весь инструмент. Старый формат (голый массив имён)
+читается и переносится с уведомлением. Нечитаемый файл уезжает в
+`whitelist.json.bad`, а не затирается. Составная команда области не получает —
+сузить её честно нельзя, поэтому она спрашивает каждый раз (см. `BUGS.md`).
+`always_ask` у запроса отменяет белый список: такой вызов решает только человек.
 
-## CONFIG SCHEMA (`config/mod.rs:5`, TOML)
+## ОНБОРДИНГ, `/logout`, `/wipe`
 
-```toml
-[provider]
-kind = "deepseek"          # deepseek | openai | custom (only deepseek implemented)
-token = ""                 # DeepSeek web session token (required to use the agent)
-model = "deepseek-chat"    # deepseek-chat|deepseek-expert, then optional -think / -search; deepseek-reasoner = expert-think
-base_url = ""              # Option<String>, default None
-temperature = 0.7
-max_tokens = 4096
-client_version = "2.5.0"   # optional; overrides x-client-version for DeepSeek when the
-                           # server raises its floor (40005) before a new build ships
+Первый запуск без конфига или после `/logout`/`/wipe` показывает
+`View::Onboarding` (DeepSeek-токен). `/logout` убирает токен из конфига и
+открывает онбординг; запись в хранилище остаётся (удаляется `secrets rm`).
+`/wipe` чистит записи хранилища, токены MCP и файлы конфига, но не
+`~/.pooprusteek` целиком (там пользовательские правила); в прогоне с
+`--config`/`--data-dir` отключён.
 
-[ui]
-theme = "default"          # only Catppuccin Mocha exists; theme is effectively hardcoded
-show_status_bar = true
-show_line_numbers = false
-max_message_length = 4096
+## ОШИБКИ И ЖУРНАЛЫ
 
-[agent]
-max_steps_per_turn = 256   # agent loop hard cap (NOT 25)
-max_tools_per_step = 10    # tools executed per step (NOT 50)
-max_context_messages = 256
-auto_compact = true
-rate_limit_ms = 0          # set via /rate <ms>; 0 = disabled
-rate_limit_per_minute = 0  # set via /rate <N>/min; 0 = disabled; #[serde(default)] so old config.toml files without this key still load
-max_retries = 0            # set via /retry; -1 = infinite
-
-[mcp]
-cache_ttl = 300            # MCP tools/list cache TTL secs; set via /mcp ttl
-
-[skills]
-enabled = []               # list of enabled skill names
-paths = []                 # extra skill search dirs
-injection = "auto"         # auto | full | summary — how enabled skills reach the system prompt (SkillInjectionMode, added 2026-07-13).
-                           # full = inline content (old behavior); summary = compact `slug — description` list, model loads on demand via the
-                           # `skill` tool (per-turn semantic hint suggests the match); auto = full while combined content ≤ 8 KB (AUTO_FULL_BUDGET_BYTES), summary beyond
-
-[instructions]             # project rule files — AGENTS.md and kin (src/instructions.rs, /instructions)
-enabled = true             # off stops sending them entirely; the text comes from whatever repo was cloned, so this is a
-                           # safety switch, not a preference
-max_bytes = 16384          # cap on the WHOLE section (global rules + the whole directory chain), not per file. Twice the
-                           # skills budget, half of Codex's 32 KiB. The envelope (untrusted-source notice + nonce markers +
-                           # the re-assertion of the absolute rules) costs ~1830 B on top, and only when files were found.
-
-[server]                   # API gateway (src/server/) — /serve, /server <port>, --serve, --proxy
-host = "127.0.0.1"         # loopback by default; widen deliberately
-port = 7667                # persisted by /server <port> ("poop" on T9)
-api = "openai"             # openai | anthropic | gemini — wire dialect; only openai implemented (others answer 501)
-# api_key = "…"            # optional; when set every request needs Authorization: Bearer <api_key>
-
-[[providers]]              # extra endpoints (/providers); one table per entry
-name = "lmstudio"
-base_url = "http://localhost:1234/v1"
-model = "qwen2.5-coder"
-protocol = "openai"        # openai | anthropic | gemini
-tools = "prompt"           # prompt (<tool_use> in the text, default) | native (API `tools` field; /providers tools <name> native)
-
-[provider_models]          # per-entry model lists (provider/model_cache.rs) — feed /v1/models + routing
-refetch_ms = 180000        # background refetch period; /refetch-providers <ms|off>; 0 = off
-cache_ms = 180000          # persisted-cache validity across restarts; /cache-providers <ms|off>; 0 = off
-
-[update]                   # self-updater (src/update/) — /update, /autoupdate
-auto = false               # /autoupdate on|off — check + install on every TUI startup
-channel = "stable"         # stable | dev — /update channel [stable|dev]; UpdateChannel
-```
-
-- `ProviderEntry.model` may be **empty** (wizard's Model step is optional): the API catalog
-  then serves the fetched list only, bare `<name>` routes to the first fetched model, and
-  activating the entry in the TUI auto-opens the `/models` picker.
-- Fetched lists persist in `data_dir/provider_models.json` (atomic_write; rebuildable cache).
-
-- `load()` returns `Config::default()` if the file is missing (no crash). `save()` writes pretty TOML, creating parent dirs.
-- Unknown fields are ignored (serde defaults). `ProviderKind` is serde-lowercase.
-
-## SESSIONS (`src/session.rs`)
-
-- **`Session`**: `version(=1), id, created_at, updated_at, workspace_root, model_type, messages, tag?, provider_session_id?, provider_parent_message_id?, broken`. The last three (`#[serde(default)]`, added 2026-07-04) mirror the DeepSeek-side session identity so a reload can attempt to continue the same remote thread — see "Remote session resume" below.
-- **ID format**: `{YYYY-MM-DDTHH-MM-SS-fff}Z-{uuid8}` → naturally sortable by time. This is a purely local id — historically **unrelated** to DeepSeek's own `chat_session.id`, which is why remote continuity needed its own fields rather than reusing this one.
-- **Save**: `save_session(id, created_at, messages, config, workspace_root, meta: &SessionMeta)`. `SessionMeta { tag, broken, provider_session_id, provider_parent_message_id }` bundles the non-derived fields so the function doesn't grow a new positional arg each time one is added. Pretty JSON at `{sessions}/{id}.json`; refreshes `updated_at`.
-- **Load**: `load_local(id)` errors `SessionNotFound` if absent. `list_sessions()` enumerates `*.json`, sorts by `updated_at` desc → `Vec<SessionSummary>` (title derived from first non-empty message, ≤80 chars; `broken` passed through for the `/sessions` picker).
-- **Auto-save**: `App::auto_save_session()` after every agent turn. Reads `conv.tag`/`conv.broken` (mirrored on `Conversation`, not re-derived from disk) and `provider.session_identity()` (sync, in-memory) to build the `SessionMeta` — this is also what fixed a latent bug where any auto-save after `/load`/`/import` silently wiped the file's `tag` back to `None`.
-- **Special tags**: `__goal_system__` (GOAL evaluator sessions, hidden from `/sessions`), `Imported` (`/import`).
-- **History file** `{data}/history.json`: JSON array of input strings, capped at **500**, consecutive dups deduped.
-
-### Remote session resume (2026-07-04)
-
-Bug: every local-session load called `provider.reset()` unconditionally, and the DeepSeek-side `SessionState` (`provider/deepseek/session.rs`) was never persisted anywhere — so reopening the app (or `/load`ing an old session) always silently created a **brand-new** remote `chat_session`, even though the old one was still live on DeepSeek's servers.
-
-Fix — `LLMProvider` gained three methods (`provider/mod.rs`, defaults are no-ops so only DeepSeek implements them for real):
-- `session_identity() -> Option<(String, Option<i64>)>` — sync read of the live `(session_id, parent_message_id)`, sampled by `auto_save_session` every turn.
-- `check_session(session_id) -> SessionLiveness` — three-state check via `fetch_remote_history_biz` (`GET chat/history_messages`). `Alive` / `Gone(reason)` (the API refused *this session*: `data.biz_code != 0`) / `Unknown(reason)` (non-2xx, network, HTML, expired token — the check never happened). **Only `Gone` may erase the stored link**; `Unknown` leaves the session file untouched and tells the user the link could not be verified. Was a `bool` until 2026-09-06, and "couldn't verify" then meant "gone", which wiped healthy links off disk — see `BUGS.md`.
-- `adopt_session(session_id, parent_message_id)` — sets `SessionState` directly (`system_sent_for_session = true`, since the remote thread already has the system prompt/history) instead of calling `chat_session/create`. History is not replayed, but `held_system_prompt = None`: which prompt that thread holds is unknown (a skill may have been enabled between runs), so the first send re-sends the current one as `### SYSTEM PROMPT UPDATE` (~5K tokens, once per resume).
-
-`App::handle_load_session` (`app/mod.rs`): if the loaded `Session` has a `provider_session_id`, spawns `check_session` off the event loop (never blocks the TUI) and reacts via `AppEvent::SessionAvailabilityChecked` → `apply_session_availability`: `Alive` → `adopt_session` (silent, continues the same thread); `Unknown` (the check could not be made) → `provider.reset()` only — the file on disk is left alone and the user is told the link could not be verified; `Gone` (the API refused this session) → `provider.reset()` + `finalize_broken_session` (sets `broken = true`, clears the remote pointer, saves, pushes a system message, and — because the reset session has `system_sent_for_session = false` — the **next** message automatically replays full local history as one flattened prompt via the existing first-turn `build_prompt` logic, no new code needed for that part). No known remote id → just `reset()`, unchanged default behavior. `broken` clears itself again once `auto_save_session` next observes a live `session_identity()` — it reflects current status, not a permanent scar. **A save never erases the stored link:** `session_identity() == None` means "this turn established nothing", so `SessionMeta.remote` is `RemoteLink::Unknown` and `save_session` carries the file's existing `provider_session_id`/`provider_parent_message_id` forward. Erasing is a separate act with a separate door — a full `save_local` rewrite (`finalize_broken_session`). Until 2026-09-06 a single failed turn (an expired token was enough) wrote that `None` through and silently cost a healthy session its remote thread — see `BUGS.md`.
-
-`/sessions` (`commands/defs/session_list.rs`) flags `broken` entries with `PickerItem::warn(true)` (⚠ prefix + yellow text, `tui/render.rs::render_picker` reads `item.warn`).
-
-Known gap: the *other* remote-import path (`apply_fetched_session`, triggered when `/load <id>` misses locally and falls back to fetching a remote session by id) does **not** attempt resume — `fetch_remote_history`'s parsing of `chat/history` never extracts a message id, so there's no reliable `parent_message_id` to adopt. It still saves `provider_session_id: None`, falling back to default fresh-session behavior.
-
-## ONBOARDING (`View::Onboarding`)
-
-First launch (no config, or after `/logout`/`/wipe`): in-TUI full-screen onboarding (`View::Onboarding`). The former CLI prompt (`src/cli/onboarding.rs`) is **deleted**. Shows an animated `pulsing_title` logo (shared with the landing screen), a steps panel, a token input field, and a deepseek-chat/reasoner selector. Keys handled by `handle_onboarding_key` (`src/app/keys.rs`), rendered by `render_onboarding` (`src/tui/render.rs`). State tracked in `OnboardingState` (`src/app/events.rs`). On submit: saves config, hot-creates `DeepseekProvider` (init failure shows an error on-screen — does not proceed), then calls `Conversation::fresh_main` to swap in a new main conversation.
-
-`/logout` clears `provider.token`, saves config, and transitions to `View::Onboarding` via `reset_to_onboarding`. `/wipe` factory-resets all app-owned paths (config-file parent dir + data dir, via `wipe_roots()`, deduped) plus in-memory state, then transitions to onboarding. Neither command touches foreign configs (`~/.claude`, `~/.cursor`, VS Code, etc.).
-
-## ERRORS & LOGGING
-
-- **`AppError`** (`src/error.rs:3`): `Io | Http | Json | Config(String) | Provider(String) | Mcp(String) | Join | SessionNotFound(String) | Custom(String)`. Alias `AppResult<T>`.
-- **Debug log** (`src/debug_log.rs`): enabled by `--debug-log`; writes timestamped `[action] message` lines to `.dev/debug.log` (debug build) or `{data}/debug.log` (release build) via a `Mutex<File>` `OnceLock`. `log()` and `log_json()`.
+- `AppError` (`src/error.rs`): `Io | Http | Json | Config | Provider | Mcp |
+  Join | SessionNotFound | Upstream(Box<ProviderFailure>) | Custom`.
+  `AppError::failure_class()` и `retry_after()` — единственный разбор отказов для
+  шлюза и `/serve`.
+- `Config::startup_problem()`: конфиг не загружен как есть или токен не
+  прочитался — онбординг не открывать.
+- `debug_log` — JSONL или человеческие строки; включается `--debug-log` или
+  `/debug`. Путь: `.dev/debug.log` в debug-сборке, `{data}/debug.log` в release.
+  Записи проходят `secrets::redact`; `errors.log` и stderr — нет.

@@ -1,11 +1,31 @@
 # GLOSSARY
-> Project-specific terms a fresh agent will hit. Last updated: 2026-06-30 (added conversation/sub-agent/controller terms)
+> Project-specific terms a fresh agent will hit. Last updated: 2026-11-07 (шлюз, аккаунты, маршруты, роли, секреты, слои конфига). Before: 2026-06-30 (added conversation/sub-agent/controller terms)
 
 | Term | Meaning |
 |------|---------|
 | **Pooprusteek / Пупра́стик** | This project: a Rust TUI coding agent powered by DeepSeek's web API. Rust rewrite of **Poopseek** (TS). |
 | **Poopseek** | The original TypeScript project this is forked/rewritten from. Repo: github.com/aver005/poopseek. |
-| **Provider** | An `LLMProvider` impl. Only `DeepseekProvider` is real; `FakeProvider` is a `#[cfg(test)]` double. |
+| **Provider** | An `LLMProvider` impl: DeepSeek web, an OpenAI-compatible/Anthropic/Gemini `CompatClient`, `FakeProvider` in tests, or the gateway's `RoutedProvider`. |
+| **`RoutedProvider`** | The `LLMProvider` the app sees when the gateway is on. Chooses an account, falls back before the first emitted chunk, forks per conversation, records usage. |
+| **Gateway** | The account/route layer (`src/gateway/`). Off by default (`[gateway] enabled = false`); when on, `main_provider` returns a `RoutedProvider`. |
+| **Account** | One destination with its own credential: an API endpoint, the built-in DeepSeek web client, or a CLI subscription. `id` never changes; `label` is the display name. |
+| **Route** | An ordered chain of `Step`s. A step is an `account` plus an optional `model`. The first step that is ready answers. |
+| **Step** | One element of a route (`{ account, model? }`). No nested routes. |
+| **Fallback trigger** | The failure classes that allow moving to the next step (`rate_limit`, `quota`, `spend_cap`, `overloaded`, `timeout`, `server_error`, `auth`). An empty `on` means all of them. |
+| **Cooldown** | An account's temporary block after a failure, derived from `Retry-After` or backoff. Survives a restart only as a hint in `state.json`. |
+| **Soft / hard limit** | `soft_pct` moves an account down the order; `hard_pct` removes it from selection. Both only from a fresh `Header`/`CliEvent` snapshot. |
+| **Role** | A service call with its own route: `main`, `title` (chat names), `summary` (`/compact`), `evaluator` (GOAL). A role without its own route inherits `main`. |
+| **`/pin`** | A chat-level binding to one account/model (`Binding::Fixed`); it does not change the route. |
+| **Seam** | The `ui_only` history line inserted on a fallback: `── switched A → B: reason`. Never sent to the model. |
+| **CLI account** | A subscription reached through the official binary (`cli:claude`, `cli:opencode`, `cli:codex`). Runs as a **plain model**: our loop, our tools, our approvals. Agent mode is a later release. |
+| **Plain model** | The CLI only produces text/tool calls; it does not execute its own tools. Enforced by flags and `Dialect::verify`. |
+| **Secret reference** | `keyring:global/name`, `env:NAME`, `cmd:["op","read",…]`, `file:/path` or `none`. A literal key in the shared file is migrated into the keyring. |
+| **Secret store** | The OS credential store (Credential Manager / Keychain / Secret Service), service `pooprusteek`; accessed through `SecretStore`. |
+| **Project layer** | `<repo>/.pooprusteek/config.toml`. Untrusted: may not hold keys or request targets until `pooprusteek trust`; account keys need `secrets bind`. |
+| **`trust`** | `pooprusteek trust` records the project file's path and SHA-256 in the shared config. Editing the file asks again. |
+| **Ledger** | Usage accounting at `data_dir/gateway/usage.json`, merged every ~30 s; `/usage` reads it. |
+| **`mock-provider`** | Scripted OpenAI-compatible endpoint (`pooprusteek mock-provider --port … --script …`) for deterministic scenarios. |
+| **`mock-cli`** | Scripted stand-in for `claude`/`opencode`, used through `POOPRUSTEEK_CLI_*` in the harness. |
 | **Conversation** | One independent chat thread (`app/conversation.rs`): owns its messages, **its own forked provider/session**, generation status, and agent task. Kinds: `Main`, `Session`, `Sidechat`, `SubAgent`. |
 | **Conversations** | The store of all open conversations + a `focused` id. No live/parked split — every conversation is a full record; switching focus is just changing an id. |
 | **Focused conversation** | The one currently rendered and targeted by input/abort. `state.focused()/focused_mut()`. Others are **background** — they keep streaming into their own buffers. |

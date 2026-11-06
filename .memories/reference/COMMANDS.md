@@ -1,22 +1,51 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-09-13 (`/update` gained a `channel [stable|dev]` subcommand and now checks a manifest-driven stable/dev release, not the old `latest` tag). Before: 2026-07-07 (added the 4 rows this file had been missing — /providers, /models, /delete, /delete-local — verified against `src/commands/defs/`; count corrected to 44 distinct). Before: 2026-07-06 session 3 (added /refetch-providers + /cache-providers — provider model-list freshness; earlier today: /serve + /server — API-server control). Before: 2026-07-05 (added /themes — theme gallery with live preview + custom-theme wizard; earlier: /rag — semantic-matching status/on/off/reload); 2026-07-04 (added /debug; /rate gained a per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
+> Last updated: 2026-11-07 (accounts, routes, roles, pin, usage, secrets, doctor;
+> `/providers` is now an alias for `/accounts`). Before: 2026-09-13 (`/update`
+> gained a `channel [stable|dev]` subcommand and now checks a manifest-driven
+> stable/dev release, not the old `latest` tag). Before: 2026-07-07 (added the 4
+> rows this file had been missing — /providers, /models, /delete,
+> /delete-local — verified against `src/commands/defs/`; count corrected to 44
+> distinct). Before: 2026-07-06 session 3 (added /refetch-providers +
+> /cache-providers — provider model-list freshness; earlier today: /serve +
+> /server — API-server control). Before: 2026-07-05 (added /themes — theme
+> gallery with live preview + custom-theme wizard; earlier: /rag — semantic
+> matching status/on/off/reload); 2026-07-04 (added /debug; /rate gained a
+> per-minute mode + bare-`/rate`-shows-current-settings + change confirmation)
 
 ## HOW COMMANDS WORK
 
 - **Trait** `Command` → `src/commands/mod.rs` — methods: `name()`, `description()`, `usage()`, `execute(args, state, config)`.
-- **Registry** `CommandRegistry` → `src/commands/mod.rs:7` — HashMap by name. `register_defaults()` (~:58) registers every built-in.
-- **Dispatch** `CommandRegistry::execute()` → `src/commands/mod.rs:91` — parses `/{command} [args]`, returns a `CommandResult`.
-- Input NOT starting with `/` → returns `CommandResult::NeedsAgent(text)` → goes to the agent loop.
+- **Registry** `CommandRegistry` → `src/commands/mod.rs` — HashMap by name. `register_defaults()` registers every built-in.
+- **Dispatch** `CommandRegistry::execute()` — parses `/{command} [args]`, returns a `CommandResult`.
+- Input NOT starting with `/` → goes to the agent loop.
 - Command files live in `src/commands/defs/` (one file per command).
 
-### `CommandResult` variants (`src/commands/mod.rs:26`)
-`Handled` · `NeedsAgent(String)` · `LoadSession(String)` · `ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` · `ShowTools` · `Jobs(JobCommandAction)` · `OpenWhitelist` · `ShowSkills` · `ToggleSkill(String,bool)` · `OpenConfirm(ConfirmAction)`
+### `CommandResult` variants (`src/commands/mod.rs`)
+`Handled` · `Detached(fn)` · `NeedsAgent(String)` · `LoadSession(String)` ·
+`ResetProvider` · `Quit` · `Error(String)` · `TtlUpdate(u64)` · `ReloadMcp` ·
+`OpenMcpAuth` · `OpenMcpAdd` · `ShowTools` · `Jobs` · `Timers` ·
+`OpenWhitelist` · `ShowSkills` · `ToggleSkill` · `Sidechat` · `Compact` ·
+`NewChat` · `OpenChats` · `SpawnAgent` · `OpenAgents` · `OpenDeleteSessions` ·
+`OpenConfirm` · `OpenAccounts(Focus)` · `OpenAccountAdd` · `EnableGateway` ·
+`Pin` · `ShowUsage` · `PromptSecret` · `ReloadConfig` · `SetProviderTools` ·
+`OpenModels` · `SwitchModel` · `Rag` · `ConfirmUndo` · `Instructions` ·
+`SearchHistory` · `OpenThemes` · `OpenThemeWizard` · `SetTheme` · `Serve` ·
+`Update` · `ProviderModels` · `ResetProvider`…
+`Detached` is how blocking work (keyring, files) leaves the event loop: the
+closure runs on `spawn_blocking` and its text comes back as an event.
 
-## FULL COMMAND LIST (44 distinct commands, +2 `/cwd` aliases = 46 registered names)
+## FULL COMMAND LIST (57 distinct commands + 2 `/cwd` aliases = 59 registered names)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
+| `/accounts` | `/providers` (bare) | `[add\|enable]` | Accounts, route chains, roles and their limits. Bare opens the screen; `add` opens the add-account wizard; `enable` turns the gateway on and turns old `[[providers]]` plus the DeepSeek token into accounts. Screen keys: `a` add, `Enter` details, `Space` on/off, `e` limits and favourites, `d` remove (with `y/n`), `r` join/leave the main route, `p` pin the chat, `u` rebuild an unavailable account, `K`/`J` move, `h` decision history, `Tab` cycles Accounts → Routes → Roles | `defs/accounts.rs` |
+| `/routes` | — | — | The same screen focused on route chains. `←`/`→` switch route, `K`/`J` move a step, `x` removes one | `defs/routes.rs` |
+| `/roles` | — | — | The same screen focused on roles (`main`, `title`, `summary`, `evaluator`). `←`/`→` cycles the route a role uses | `defs/roles.rs` |
+| `/pin` | — | `<account>[/model]\|off` | Keep this chat on one account (a `Fixed` binding) without changing the global route; the footer shows `pinned <name>` | `defs/pin.rs` |
+| `/usage` | — | — | Table for the last 24 hours per account: calls, failures, fallbacks, tokens, cache share; estimates are marked `~` | `defs/usage.rs` |
+| `/secrets` | — | `[list\|set <name>\|rm <name>\|bind <ref> <host>]` | Secret names and state (never values). `set` without a value opens a masked input; `bind` trusts a reference for a project account's host. The same operations exist as `pooprusteek secrets …` | `defs/secrets.rs` |
+| `/doctor` | — | — | Config layers and origins, which secrets resolve, what the project layer holds back, `GatewayConfig::validate()` problems, file modes | `defs/doctor.rs` |
 | `/help` | — | — | List available commands | `defs/help.rs` |
 | `/version` | — | — | Show version info | `defs/version.rs` |
 | `/clear` | — | — | Clear chat history | `defs/clear.rs` |
@@ -61,7 +90,7 @@
 | `/cache-providers` | — | `<ms\|off>` | How long persisted model lists (`data_dir/provider_models.json`) stay valid across restarts → `config.provider_models.cache_ms` (default 180000; off = every startup re-fetches). Bare = same status as `/refetch-providers` | `defs/provider_models.rs` |
 | `/update` | — | `[channel [stable\|dev]]` | Self-update on the configured channel (`config.update.channel`): **stable** (default) is the latest non-prerelease GitHub release, tagged `vX.Y.Z`, installed only if its version is newer (semver); **dev** is the rolling `dev` prerelease tag published on every `develop` push, installed on a SHA-256 mismatch. Every release carries a `manifest.json` (version, tag, per-asset hashes) the updater reads instead of a raw `SHA256SUMS` file. On a match it downloads the platform asset, verifies its hash, **stages it at `<exe>.new`, then swaps** (Unix atomic rename; Windows move-to-`.old`+rename; applies on next launch). Bare `/update` runs the check now; `channel` (no value) shows the current channel; `channel <stable\|dev>` switches it. In a **debug/`cargo run`** build (`cfg!(debug_assertions)`) running it opens a confirm modal first (`ConfirmAction::Update`) — a dev binary always mismatches a released hash. All work off-loop (`app::spawn_update_task` → `AppEvent::UpdateStatus`); an `update_in_flight` AtomicBool blocks concurrent passes. **Contract points** (asset names ↔ CI, manifest shape) in `reference/AUTO-UPDATE.md` | `defs/update.rs` (`UpdateCommand`), `src/update/` |
 | `/autoupdate` | — | `[on\|off]` | Startup auto-update switch → `config.update.auto` (default off). When on, every TUI launch runs the same check/install in the background — quiet if already current (status line only), chat message on install/failure. Bare = status + explanation. Intents: `CommandResult::Update(UpdateAction)` → `apply_update_action` (keys/dispatch.rs) | `defs/update.rs` (`AutoUpdateCommand`) |
-| `/providers` | — | `[add [<name> [openai\|anthropic] <base_url> [model] [api_key]]] \| tools <name> <native\|prompt>` | Manage LLM providers: built-in DeepSeek + extra OpenAI-compatible / Anthropic / Gemini endpoints. Bare opens the providers view/picker; `add` runs a wizard (no args) or a one-liner; `tools` switches how an entry declares tools (native API field vs `<tool_use>` in the prompt; `App::apply_provider_tools`, rebuilds the provider when the entry is active). Persists provider entries to config | `defs/providers.rs` |
+| `/providers` | `/accounts` | `[add [<name> [openai\|anthropic] <base_url> [model] [api_key]]] \| tools <name> <native\|prompt>` | The old name for the accounts screen; a bare `/providers` opens `/accounts`. `add` opens the account wizard (the quick one-liner fills it and stops at confirmation; a parse error opens an empty wizard with an explanation). `tools` switches how an account declares tools. The `[[providers]]` config list is read but no longer written | `defs/providers.rs` |
 | `/models` | — | `[<model_id>]` | List the active provider's available models (picker), or switch directly to `<model_id>` | `defs/models.rs` |
 | `/delete` | — | `[session_id]` | Delete sessions both remotely (DeepSeek account) **and** their local copies; opens a picker when no id given | `defs/delete.rs` |
 | `/delete-local` | — | `[session_id]` | Delete only the local session file(s); the DeepSeek account copy is left intact | `defs/delete.rs` |
@@ -74,6 +103,26 @@
 - The model can also spawn a sub-agent itself via the `task` tool (special-cased in `run_agent_loop`), independent of `/agent`.
 
 - `/jobs` and `/ps` were added in commit `e801dbe` (2026-06-28) alongside GOAL mode.
+- **Gateway commands (2026-11-06).** `/accounts`, `/routes`, `/roles`, `/pin` and
+  `/usage` are thin intents; the screen reads only `Gateway::snapshot()` and
+  writes only `Gateway::apply_edit()`. Every save goes through `ConfigPersist` →
+  `AppEvent::GatewayPersist` → `config::save` (the same save queue as SECRETS),
+  so a failed write is shown on the screen and in the status line. `/pin` binds
+  the focused chat, not the route; a new chat is unpinned. `/usage` reads the
+  ledger, so a run with `--data-dir` has its own table.
+- `/secrets set <name> <value>` still accepts the value on the command line for
+  compatibility, but the line is filtered out of input history. Prefer the
+  masked modal (no value) or `pooprusteek secrets set`, whose value never enters
+  `argv`.
+- `/routes` and `/roles` are not separate screens: they set `Focus` on the same
+  `View::Accounts`, so `Tab` keeps working between them.
+- `/providers` with the gateway **off**: bare opens the screen that explains how
+  to enable it; `add` still opens the wizard, but the account only takes effect
+  after the gateway is enabled. The final intent after the release fix is that
+  adding an account turns the gateway on; уточнить при слиянии.
+- `always_ask` on an approval request bypasses `whitelist` and always shows the
+  modal. The release may change the default approval flow — уточнить при
+  слиянии (`.memories/JOURNAL/2026-11-07-fix-*.md`).
 - `/goal`'s `name()` returns `"/goal"` (with leading slash) — minor inconsistency vs. other commands; harmless because dispatch strips the slash.
 - `/import` always overwrites the tag with `"Imported"` — original export metadata is lost.
 - `/mcp ttl <secs>` persists to `config.mcp.cache_ttl`; `/mcp reload` forces a fresh `tools/list` on all servers.

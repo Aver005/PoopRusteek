@@ -79,14 +79,14 @@ trace per run plus a `report.json` per scenario.
 | `exec "<prompt>" [args…]` | One turn, one trace. Extra args pass through to `pooprusteek exec`. |
 | `scenario <name> [-Repeat N]` | One scenario file, repeated, with expectations checked. |
 | `suite [live\|mock\|dev\|all] [-Repeat N]` | Every scenario in that directory. Exit code 4 means expectations failed. |
-
-`dev` is the set that matters most: real developer tasks (build a static
-page, fix a failing test, follow explicit constraints, answer without
-editing), each in a fresh scratch workspace, each judged on the files that
-came out rather than on how confident the answer sounded.
 | `mine [-Sessions]` | Rank failure patterns across every trace, and optionally the saved sessions. |
 | `mock <script>` | Start the scripted provider with `mock-scripts/<script>.toml`. |
 | `stop` / `report` / `reset` | Tear down / list recent verdicts / wipe volumes and out. |
+
+The `dev` set is the one that matters most: real developer tasks (build a static
+page, fix a failing test, follow explicit constraints, answer without editing),
+each in a fresh scratch workspace, each judged on the files that came out rather
+than on how confident the answer sounded.
 
 ## How a scenario works
 
@@ -168,6 +168,45 @@ plants under a fresh id per repeat, so repeats never continue each other.
 ./sandbox.ps1 scenario resumes-a-session -Repeat 2
 ```
 
+### Gateway scenarios (accounts, routes, CLI adapters)
+
+Three directories cooperate, and the scenario file names neither of the other
+two — the operator passes them:
+
+| Role | Directory |
+|---|---|
+| Scenario (prompt + expectations) | `scenarios/mock/` |
+| Scripted replies | `mock-scripts/` |
+| Config loaded by `--config` | `gateway/` |
+
+Two pairs exist:
+
+| Scenario | Script | Config | What it proves |
+|---|---|---|---|
+| `falls-back-after-429` | `gateway-fallback` | `gateway/two-mock-accounts.toml` | two API accounts, first 429, exactly one hand-over |
+| `cli-refusal-falls-back-to-api` | `cli-fallback` | `gateway/cli-then-api.toml` | a `cli:claude` refused with 429, the API account answers |
+
+The CLI scenario uses our own binary as the "CLI":
+`POOPRUSTEEK_CLI_CLAUDE=mock:throttled` launches `pooprusteek mock-cli
+throttled`, which prints a 429 stream. That override only works under
+`cfg!(test)` or on a harness run with an explicit `--config`; `mock-cli` has
+scenarios for success, limits, silence, cut-off streams, grandchildren, exit
+codes and an old version. Use `throttled`, not `rate-limit`: a rejected window
+leaves an `Exhausted` hint in `state.json`, and the next repeat starts on the
+API account — the run then passes for the wrong reason.
+
+On the host, `mock-provider` defaults to `127.0.0.1:811`; the committed gateway
+configs name the compose service (`mock:811`), so copy the config to a temporary
+file and replace `mock` with `127.0.0.1` (choosing a free port if 811 is busy).
+Mapping and full commands: `.memories/reference/HARNESS.md` §7.5.
+
+### What a scenario cannot prove here
+
+A mock proves routing, fallback, the trace and the adapter's process handling.
+It cannot prove that two real subscriptions have separate logins, that the real
+CLIs accept every flag on a live subscription, or that an exhausted real limit
+is classified correctly — there are still no captured samples of that.
+
 ## Reading a trace
 
 One JSON object per line, `{seq, ts, action, message|data}`. The interesting
@@ -184,6 +223,9 @@ actions:
 | `agent.tool.call.payload` / `.result.payload` | Tool name, arguments, result, `is_error` |
 | `agent.semantic_hint` | What retrieval injected |
 | `agent.turn.done` / `.error` | How the turn ended |
+| `gateway.decision` | Target, `Decision::explain()`, skipped accounts with reasons |
+| `gateway.fallback` | From account, to account, failure class |
+| `gateway.cli.finished` / `.refused` / `.unrecognized_failure` | CLI adapter outcome, refused launch, raw unclassified text |
 | `pow.solver.solve`, `completion.stream.*` | Proof-of-work and SSE detail |
 
 ```bash
@@ -211,10 +253,12 @@ Everything works on the host too, which is how you debug the harness itself:
 
 ```powershell
 cargo build --bin pooprusteek
-./target/debug/pooprusteek --config path\to\config.toml exec "prompt" --trace .dev\t.jsonl
+./target/debug/pooprusteek --config path\to\config.toml --data-dir D:\tmp\pooprusteek\run exec "prompt" --trace .dev\t.jsonl
 ```
 
 `--config` exists for exactly this: it keeps a harness run off your real
-config and token. Note that the *data* dir (sessions, semantic index) is
-still the real one on Windows — `dirs::data_dir()` has no env override there.
-Inside the container `XDG_DATA_HOME` handles it.
+config and token. `--data-dir` keeps sessions, logs, the semantic index and the
+checkpoints off your real data — on Windows `dirs` has no environment override,
+so without the flag a run writes into live user data. Both flags are forwarded
+to the child processes a scenario spawns. Use throwaway files only; a harness
+run executes real tools under a policy.

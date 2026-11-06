@@ -1,6 +1,41 @@
 # LEARNINGS
 > Hard-won technical knowledge. Gotchas. Patterns. (Deep detail lives in `reference/`.)
-> Last updated: 2026-09-24 (DeepSeek web API: version gate, JSON refusals, login walls). Before: 2026-09-13 (asset resolution row: release builds now embed only, debug reads the source checkout). Before: 2026-06-30 (added refactor + conversation/fork learnings)
+> Last updated: 2026-11-07 (`.gitignore` hid source files; migration must read
+> back; harness expectations can race a background driver event). Before:
+> 2026-09-24 (DeepSeek web API: version gate, JSON refusals, login walls).
+> Before: 2026-09-13 (asset resolution row: release builds now embed only, debug
+> reads the source checkout). Before: 2026-06-30 (added refactor +
+> conversation/fork learnings)
+
+## ПРИЁМКА ВЕТКИ
+
+- **`.gitignore` может спрятать исходник, и локальная сборка этого не заметит.**
+  Шаблон `secrets.*` совпал с `src/cli/secrets.rs` и
+  `src/commands/defs/secrets.rs`; дорожка собралась и прошла тесты, потому что
+  файлы лежали на диске, а в слитом дереве их не было. Проверка перед приёмкой:
+  `git ls-files --others --ignored --exclude-standard -- src`; настоящий гейт —
+  сборка из свежего клона. Это не «мелочь гигиены»: отсутствие файла в индексе
+  не видно ни хуку, ни `cargo test` в рабочем дереве.
+- **Перенос секрета — это запись, чтение обратно и сравнение.** Не «вызвали
+  `keyring::set` и поверили». Ошибка хранилища, молчаливое усечение длинного
+  значения на Windows (пароль в UTF-16, 2560 байт) и чужая запись с тем же
+  именем выглядят одинаково успешно, пока не прочитаешь. Так же устроен
+  `SecretStore::set_verified`: только после сравнения ссылка заменяет ключ в
+  файле.
+
+## ХАРНЕСС: ОЖИДАНИЕ МОЖЕТ ОПЕРЕЖАТЬ СОБЫТИЕ
+
+- **Сценарий, который ждёт фоновое событие драйвера, может проиграть гонку, а
+  не поведение.** `rung-one-clears-tool-output` требовал
+  `harness.context.window`: запись приходит из фонового `context_window()`
+  запроса к `/models`. При быстром прогоне ход заканчивается раньше, чем
+  приходит ответ, и сценарий падает на здоровом коде. Если сценарий сам
+  называет `[context] window`, это событие ему не нужно — улика должна быть
+  про проверяемое поведение (`context.prune`), а не про удачный тайминг.
+- **Герметичная рабочая папка меняет старые ожидания.** `Scope::WorkspaceOnly`
+  не поднимается к корню репозитория и не читает глобальные правила, поэтому
+  `instructions.loaded` с одним своим `AGENTS.md` — это `files = 1`, а не 2.
+  Прежде чем «чинить» сценарий, проверь область загрузки в самом коде.
 
 ## ВЕБ-API DEEPSEEK
 

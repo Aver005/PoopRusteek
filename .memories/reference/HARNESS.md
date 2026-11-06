@@ -1,9 +1,11 @@
 # HARNESS — headless behaviour testing
 
 > Deep reference for `src/harness/` + `sandbox/`. Added 2026-08-25.
-> Last updated: 2026-09-06 (`exec --resume`, the global `--data-dir`,
-> `session_template` — §5.3, §10; hermetic workspaces, repeat spacing and
-> `[[expect.grounded]]` — §5.4, §6)
+> Last updated: 2026-11-07 (gateway scenarios, `mock-provider --port`,
+> `mock-cli`, scenario → script → config mapping; `--data-dir` is now always
+> required on a real machine). Before: 2026-09-06 (`exec --resume`, the global
+> `--data-dir`, `session_template` — §5.3, §10; hermetic workspaces, repeat
+> spacing and `[[expect.grounded]]` — §5.4, §6)
 
 ## 1. WHY IT EXISTS
 
@@ -80,14 +82,15 @@ the tree is done, so sub-agent work is inside the measured window.
 
 | File | Purpose |
 |------|---------|
-| `harness/mod.rs` | clap subcommands (`exec`, `scenario`, `suite`, `mine`, `mock-provider`) + dispatch. Returns a process exit code. |
+| `harness/mod.rs` | clap subcommands (`exec`, `scenario`, `suite`, `mine`, `mock-provider`, `mock-cli`) + dispatch. Returns a process exit code. `GlobalFlags` forwards `--config`/`--data-dir` to child runs. |
 | `harness/driver.rs` | One or more turns in one conversation (optionally continuing a saved one — `--resume`): assembles the same deps as `App::new`, spawns a `TurnSpec` per turn against one accumulating `Conversation`, services events under a single wall-clock deadline for the whole run. Also owns `ContextOverrides` (the scenario's `[context]` table, layered over the loaded config before anything reads it), asks the provider for its window in the background like `App::new` does (`ContextWindowLearned` → `harness.context.window`), and applies `AgentEvent::ToolOutputCleared` через тот же `app::reduce::apply`, что и TUI (`reduce::turn_end` для не-корневых бесед), matching by tool-call id. |
 | `harness/trace.rs` | `TraceRecord` / `Trace` — the reading side of the JSONL. |
 | `harness/metrics.rs` | `RunMetrics::from_trace` — steps, tool calls/errors, malformed count, stream timeouts, `TurnEnd`. |
 | `harness/scenario.rs` | Scenario + `Expect` TOML model, expectation checking, child-process orchestration (`ChildRun` = trace path + planted session id + inherited `GlobalFlags`), and planting `session_template` fixtures. |
 | `harness/report.rs` | `RunReport` / `ScenarioReport` / `SuiteReport`, `Stat` (min/mean/median/max), renderers. |
 | `harness/mine.rs` | Pattern mining: normalise → bucket → rank, over traces and saved sessions. |
-| `harness/mock.rs` | Scripted OpenAI-compatible endpoint. |
+| `harness/mock.rs` | Scripted OpenAI-compatible endpoint. `GET /models` reports `context_length` (32768). `[[reply]] account = "a"` restricts a reply to the `/<account>/v1/…` prefix; each account has its own cursor; `retry_after = 30` sets the header on an error reply. |
+| `harness/mock_cli.rs` | Stands in for the `claude` / `opencode` binary: `pooprusteek mock-cli <scenario>` prints a scripted stream and exits. Scenarios: `success`, `rate-limit`, `throttled`, `not-logged-in`, `cut-off`, `cut-off-silent`, `silence`, `grandchild`, `grandchild-fail`, `unknown-error`, `garbage`, `slow-exit`, `tool-step`, `old-version`. Used through `POOPRUSTEEK_CLI_CLAUDE=mock:<scenario>` (only with `--config` on a harness run, or under `cfg!(test)`). |
 
 Exit codes: `0` completed, `1` agent error, `2` timeout, `3` setup failure,
 `4` expectations not met (`scenario`/`suite`).
@@ -430,6 +433,121 @@ The mock's JSON is hand-rolled rather than reusing `openai_compat`'s
 serializers on purpose: a double that shares wire code with the thing under
 test cannot catch a wire-format bug.
 
+## 7.5 GATEWAY SCENARIOS (accounts, routes, CLI adapters)
+
+A gateway scenario needs three files that name each other, and getting the
+mapping wrong is the usual reason a run looks green without testing anything:
+
+| Role | Directory | Example |
+|---|---|---|
+| Scenario (prompt + expectations) | `sandbox/scenarios/mock/` | `falls-back-after-429.toml` |
+| Mock replies | `sandbox/mock-scripts/` | `gateway-fallback.toml` |
+| Config the run loads (`--config`) | `sandbox/gateway/` | `two-mock-accounts.toml` |
+
+The scenario file does **not** name its script or config: the operator passes
+both. Paths are relative to the repository root.
+
+### Two API accounts, first answers 429
+
+`sandbox/gateway/two-mock-accounts.toml` is an ordinary config: `[gateway]
+enabled = true`, two `[[accounts]]` with `env:` secrets, a `main` route `a → b`,
+and a `mock` provider entry. `sandbox/mock-scripts/gateway-fallback.toml` gives
+account `a` a 429 and account `b` the answer. The scenario
+`falls-back-after-429.toml` asserts `status = "completed"`, `Four`,
+`gateway.decision` ≥ 2 and exactly one `gateway.fallback`. The committed config
+points at the compose service (`http://mock:811/...`); on the host, copy it to a
+temporary file and replace `mock` with `127.0.0.1`, then start the mock on the
+port that copy names.
+
+```powershell
+# temporary copy: mock -> 127.0.0.1:18811
+./target/debug/pooprusteek mock-provider --port 18811 `
+    --script sandbox/mock-scripts/gateway-fallback.toml
+# any values: env: secrets are enough, no real key is used
+$env:POOPRUSTEEK_MOCK_KEY_A = "test-a"
+$env:POOPRUSTEEK_MOCK_KEY_B = "test-b"
+./target/debug/pooprusteek --config <temporary copy> `
+    --data-dir D:\tmp\pooprusteek\run scenario sandbox/scenarios/mock/falls-back-after-429.toml --repeat 2
+```
+
+### CLI refusal falls back to an API account
+
+`sandbox/gateway/cli-then-api.toml` puts a `cli:claude` account first and an API
+account second. The "CLI" is our own binary standing in for Claude:
+`POOPRUSTEEK_CLI_CLAUDE=mock:throttled` makes `discover` launch
+`pooprusteek mock-cli throttled`, which answers a 429. The API side is
+`sandbox/mock-scripts/cli-fallback.toml`; like the config above, the committed
+file names the compose host, so on the host replace `mock` with `127.0.0.1` in a
+temporary copy. Expect the same two decision records and one hand-over.
+
+```powershell
+./target/debug/pooprusteek mock-provider --port 18812 `
+    --script sandbox/mock-scripts/cli-fallback.toml
+$env:POOPRUSTEEK_MOCK_KEY_API = "test"
+$env:POOPRUSTEEK_CLI_CLAUDE = "mock:throttled"
+./target/debug/pooprusteek --config <temporary copy> `
+    --data-dir D:\tmp\pooprusteek\run scenario sandbox/scenarios/mock/cli-refusal-falls-back-to-api.toml --repeat 3
+```
+
+Use `throttled` (a plain 429, in-memory cooldown), not `rate-limit`: a rejected
+window writes an `Exhausted` hint into `state.json`, and the next repeat starts
+on the API account — the scenario then passes for the wrong reason. That is how
+the first run produced 1/2.
+
+### `mock-provider`
+
+```
+pooprusteek mock-provider [--host 127.0.0.1] [--port 811] [--script <file>]
+```
+
+Defaults: loopback and port **811**. It serves `GET /models` (with
+`context_length = 32768`), `POST /chat/completions` (blocking and SSE), and the
+per-account prefix `/<account>/v1/…`. Without `--script` it echoes a fixed
+acknowledgement. The script's `[[reply]]` entries run in order and the last one
+repeats; `when` filters by a substring of the last user message; `delay_ms` and
+`status` reach timeout and error paths. A reply with `account = "a"` is visible
+only through `/a/v1/…`; a reply without it is shared, and the bare endpoint
+never sees account replies.
+
+### `mock-cli`
+
+```
+pooprusteek mock-cli <scenario>
+```
+
+Emits the same stream shapes the real adapters parse. It is the only practical
+way to test process handling (cut-off streams, silence, grandchildren, exit
+codes) without a subscription. Point an adapter at it with
+`POOPRUSTEEK_CLI_CLAUDE` / `POOPRUSTEEK_CLI_OPENCODE`; the override is gated:
+only `cfg!(test)` or a harness run that has an explicit `--config`.
+
+### What these scenarios do and do not prove
+
+They prove the routing decisions, the fallback boundary, the header/trace
+records and the CLI adapter's parsing/process handling. They do **not** prove
+that two real subscriptions have separate logins, that Claude/OpenCode accept
+the real flags on a live subscription, or that a real limit event is classified
+correctly — no live samples of an exhausted CLI limit exist yet.
+
+### Two expectations that used to fail on `develop`
+
+Both were corrected on 2026-11-07 and re-run on the host against
+`mock-provider --port 8811` with a throwaway `--config` and `--data-dir`
+(3/3 each):
+
+- **`reads-project-instructions`** expected `files = 2` (its own `AGENTS.md`
+  plus the repository root's `CLAUDE.md`). That was written before the harness
+  workspace became hermetic: `instructions::Scope::WorkspaceOnly` loads **only**
+  the workspace directory, so the true count is exactly **1**, with
+  `bytes > 0`. The old expectation was therefore wrong even on `develop`; the
+  scenario now asserts `files = 1` and a non-empty section.
+- **`rung-one-clears-tool-output`** also asserted `harness.context.window`. The
+  record comes from a background `context_window()` query and can lose the race
+  with a fast turn — the scenario pins its own `[context] window`, so the rung
+  does not need the provider's answer. The expectation was removed; the rung is
+  still proven by `context.prune` + `harness.context.tool_output_cleared`. The
+  race is in the test, not in the ladder.
+
 ## 8. MINING
 
 `harness mine` ranks failure shapes across every trace (and, with
@@ -497,7 +615,7 @@ The harness works on the host, which is how you debug the harness itself:
 
 ```
 cargo build --bin pooprusteek
-./target/debug/pooprusteek --config .dev/harness-config.toml exec "prompt" --trace .dev/t.jsonl
+./target/debug/pooprusteek --config .dev/harness-config.toml --data-dir .dev/run exec "prompt" --trace .dev/t.jsonl
 ```
 
 `--config` keeps a run off the real config and token; `--data-dir` keeps it off
