@@ -158,11 +158,45 @@ impl ToolExecContext<'_> {
 
     /// «Инструмент пошёл»: три ветки исполнения шлют это одинаково, каждая
     /// перед своей работой.
-    fn emit_tool_started(&self, name: &str) {
+    fn emit_tool_started(&self, name: &str, arguments: &serde_json::Value) {
         self.emit(AgentEvent::ToolStarted {
             name: name.to_string(),
+            summary: tool_call_summary(arguments),
         });
     }
+}
+
+/// Ключи аргументов, по которым узнаётся суть вызова, по убыванию важности.
+const SUMMARY_KEYS: [&str; 8] = [
+    "command",
+    "cmd",
+    "path",
+    "file_path",
+    "pattern",
+    "query",
+    "url",
+    "prompt",
+];
+/// Длина строки сути вызова в символах.
+const SUMMARY_CHARS: usize = 100;
+
+/// Одна короткая строка про вызов для панели работы: команда, путь, запрос.
+/// Значения секретных полей не берутся, а в самой строке секреты маскируются.
+/// Пусто, если в аргументах нет ни одной подходящей строки.
+pub(crate) fn tool_call_summary(arguments: &serde_json::Value) -> String {
+    let text = SUMMARY_KEYS
+        .iter()
+        .find_map(|key| arguments.get(key).and_then(|value| value.as_str()))
+        .or_else(|| {
+            arguments
+                .as_object()?
+                .iter()
+                .filter(|(name, _)| !super::redact::is_secret_name(name))
+                .find_map(|(_, value)| value.as_str())
+        })
+        .unwrap_or_default();
+    // Сначала маска, потом усечение: обрезка не должна оставить кусок секрета.
+    crate::util::one_line_label(&super::redact::redact_secrets(text), SUMMARY_CHARS)
 }
 
 /// Человек посмотрел и отказал.
@@ -204,7 +238,7 @@ fn manage_timer(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome
         return ToolOutcome::failed("Timers are not available to background agents.");
     }
     // «Пошёл» — только для правда запущенного: отказ сводка не считает.
-    ctx.emit_tool_started(TIMER_TOOL_NAME);
+    ctx.emit_tool_started(TIMER_TOOL_NAME, &call.arguments);
     let timers = ctx.tools.timers();
     let owner = ctx.conversation.0;
     let now = chrono::Local::now();
@@ -306,7 +340,7 @@ async fn ask_the_user(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolO
     let _ = ctx
         .event_tx
         .send(AppEvent::RequestQuestion(request.clone(), qs));
-    ctx.emit_tool_started(&call.name);
+    ctx.emit_tool_started(&call.name, &call.arguments);
     let answer = request.wait().await;
     if answer.is_empty() {
         ToolOutcome::failed("User cancelled the question")
@@ -348,7 +382,7 @@ async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOut
             "Started background sub-agent: {label}. Its result will be added to this conversation when it finishes; you are not woken up for it."
         ));
     }
-    ctx.emit_tool_started(TASK_TOOL_NAME);
+    ctx.emit_tool_started(TASK_TOOL_NAME, &call.arguments);
     crate::agent::sub_agent::run_task(ctx, &label, prompt).await
 }
 
@@ -370,7 +404,7 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
     if needs_approval && !ask_person(&call, ctx, person).await {
         return ToolOutcome::failed(DENIED_BY_USER);
     }
-    ctx.emit_tool_started(&call.name);
+    ctx.emit_tool_started(&call.name, &call.arguments);
     dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments).await
 }
 
@@ -538,5 +572,31 @@ mod tests {
     #[test]
     fn an_empty_result_stays_empty() {
         assert_eq!(summarize_tool_result(""), "");
+    }
+
+    #[test]
+    fn the_summary_never_shows_a_secret_field() {
+        let args = serde_json::json!({"access_token": "tok-123", "server": "main"});
+        let summary = tool_call_summary(&args);
+        assert_eq!(summary, "main");
+        let only_secret = serde_json::json!({"password": "hunter2"});
+        assert_eq!(tool_call_summary(&only_secret), "");
+    }
+
+    #[test]
+    fn the_summary_masks_secrets_inside_a_command() {
+        let args = serde_json::json!({"command": "deploy --token s3cr3t && API_KEY=abc run"});
+        let summary = tool_call_summary(&args);
+        assert!(summary.contains("deploy"), "{summary}");
+        assert!(
+            !summary.contains("s3cr3t") && !summary.contains("abc"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn the_summary_of_a_plain_command_is_unchanged() {
+        let args = serde_json::json!({"command": "cargo test items::range"});
+        assert_eq!(tool_call_summary(&args), "cargo test items::range");
     }
 }

@@ -3,11 +3,13 @@ pub mod background_stats;
 pub mod conversation;
 pub mod dropped_paths;
 pub mod events;
+mod file_scan;
 pub mod generation;
 mod goal;
 pub mod input;
 mod interaction;
 mod keys;
+pub mod landing;
 pub mod list;
 pub mod mcp_add;
 pub mod mcp_status;
@@ -16,6 +18,7 @@ pub mod paste_burst;
 mod persist;
 mod pickers;
 pub mod providers;
+mod queue;
 pub mod reduce;
 pub(crate) mod runtime;
 pub mod search;
@@ -61,7 +64,7 @@ fn status_for(event: &AgentEvent) -> Option<String> {
         AgentEvent::Started => "Thinking...".to_string(),
         AgentEvent::Done(_) => "Ready".to_string(),
         AgentEvent::Failed(error) => error.clone(),
-        AgentEvent::ToolStarted { name } => format!("Running {name}..."),
+        AgentEvent::ToolStarted { name, .. } => format!("Running {name}..."),
         AgentEvent::ToolDone { .. } => "Tool finished".to_string(),
         AgentEvent::ToolError { error } => format!("Tool error: {error}"),
         AgentEvent::ToolOutputCleared {
@@ -317,9 +320,15 @@ pub struct AppState {
     pub error_count: usize,
     pub last_error: Option<String>,
     pub scroll_offset: u32,
+    /// Высота области переписки в прошлом кадре: от неё считается, на сколько
+    /// сдвинуть прокрутку, когда панель работы или поле ввода меняют высоту.
+    pub last_transcript_rows: u16,
     /// Высота терминала, обновляется на `Resize`. Клавиши приходят раньше
     /// отрисовки, а шаг `PageUp`/`PageDown` должен совпадать с экраном.
     pub terminal_rows: u16,
+    /// Ширина терминала, обновляется на `Resize`: окно подтверждения по ней
+    /// считает перенос строк, а клавиши прокрутки обязаны считать так же.
+    pub terminal_cols: u16,
     pub modal: Option<Modal>,
     /// Правила авто-одобрения. С областью, а не только с именем
     /// инструмента: см. `crate::whitelist`.
@@ -330,6 +339,10 @@ pub struct AppState {
     /// …and the ones parked behind it, FIFO. See `present_next_interaction`.
     pub pending_interactions: std::collections::VecDeque<PendingInteraction>,
     pub autocomplete: AutocompleteState,
+    /// Сканы папок для `@путь`: живёт отдельно, чтобы сброс меню не терял идущий скан.
+    pub(crate) file_scans: file_scan::ScanTracker,
+    /// Недавние сессии для главного экрана; читает фоновая задача.
+    pub landing: landing::LandingSessions,
     pub view: View,
     pub onboarding: OnboardingState,
     pub mcp_status: mcp_status::McpStatus,
@@ -341,13 +354,17 @@ pub struct AppState {
     /// правил. Кэш: собирается при старте, на `/cwd` и по `/instructions
     /// reload`, а не на каждый ход (инвариант 1).
     pub instructions_section: String,
-    pub show_stats_panel: bool,
+    /// Боковая панель: `None` — по ширине окна (с `SIDEBAR_AUTO_COLS` колонок
+    /// включена), `Some` — решение человека (`Ctrl+P`).
+    pub show_stats_panel: Option<bool>,
     pub attached_files: Vec<crate::provider::AttachedFile>,
 
     // Goal mode state
     pub goal: goal::GoalState,
 
     pub needs_terminal_restore: bool,
+    /// Перерисовать всё без выхода из альтернативного экрана (`Ctrl+L`).
+    pub needs_full_redraw: bool,
     pub background: background_stats::BackgroundCounters,
     /// Сколько таймеров взведено — для строки состояния. Обновляется тем же
     /// тиком, что их и будит (`app::timers`).
@@ -387,6 +404,23 @@ pub fn reload_instructions(state: &mut AppState, config: &Config) -> Option<Stri
 }
 
 impl AppState {
+    /// Показывается ли боковая панель в окне шириной `cols`.
+    pub fn stats_panel_visible(&self, cols: u16) -> bool {
+        self.show_stats_panel
+            .unwrap_or(cols >= crate::tui::render::SIDEBAR_AUTO_COLS)
+    }
+
+    /// Почему боковая панель сейчас не видна, хотя её включили: на приветствии
+    /// её нет, а узкому окну не хватает места. `None` — ничто не мешает.
+    pub fn stats_panel_blocker(&self) -> Option<String> {
+        if self.focused().messages.is_empty() && !self.focused().generation.active {
+            return Some("The side panel appears once the chat has messages".to_string());
+        }
+        let need = crate::tui::render::SIDEBAR_MIN_COLS;
+        (self.terminal_cols < need)
+            .then(|| format!("The side panel needs a window at least {need} columns wide"))
+    }
+
     /// Рабочая папка путём: от неё считаются `@file`, `/attach` и автодополнение.
     pub fn workspace(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.workspace_path)
@@ -402,13 +436,17 @@ impl AppState {
             error_count: 0,
             last_error: None,
             scroll_offset: 0,
+            last_transcript_rows: 0,
             terminal_rows: 0,
+            terminal_cols: 0,
             modal: None,
             approved_tools: crate::whitelist::Whitelist::default(),
             pending_tool_approval: None,
             pending_question: None,
             pending_interactions: std::collections::VecDeque::new(),
             autocomplete: AutocompleteState::default(),
+            file_scans: file_scan::ScanTracker::default(),
+            landing: landing::LandingSessions::default(),
             view: View::Chat,
             onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
@@ -417,11 +455,12 @@ impl AppState {
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
             instructions_section: String::new(),
-            show_stats_panel: true,
+            show_stats_panel: None,
             attached_files: Vec::new(),
             goal: goal::GoalState::default(),
             timers_pending: 0,
             needs_terminal_restore: false,
+            needs_full_redraw: false,
             background: background_stats::BackgroundCounters::default(),
             provider_context_window: 0,
         }
@@ -464,6 +503,8 @@ impl AppState {
         self.focused_mut().messages.clear();
         self.scroll_offset = 0;
         self.autocomplete = AutocompleteState::default();
+        // Очередь относится к стёртой истории; её текст не пропадает молча.
+        self.restore_queued_to_input();
     }
 }
 
@@ -662,8 +703,9 @@ impl App {
     pub async fn run(&mut self) -> AppResult<()> {
         let mut terminal = crate::tui::init()?;
         // До первого Resize размер знает только терминал.
-        if let Ok((_, rows)) = crossterm::terminal::size() {
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
             self.state.terminal_rows = rows;
+            self.state.terminal_cols = cols;
         }
         let result = self.run_loop(&mut terminal).await;
         crate::tui::restore(&mut terminal)?;
@@ -799,6 +841,10 @@ impl App {
             }
         }
 
+        // Единственный выход очереди: что бы ни освободило чат — ход,
+        // `/compact`, отмена, — следующее сообщение уходит отсюда.
+        dirty |= self.drain_idle_queue().await;
+
         if self.state.view == View::Mcp {
             dirty |= self.state.mcp_status.refresh_view(&self.mcp).await;
         }
@@ -827,10 +873,33 @@ impl App {
             dirty = true;
         }
 
+        self.keep_scroll_when_layout_changes();
+
+        if std::mem::take(&mut self.state.needs_full_redraw) {
+            // Только сброс буфера: выхода из альтернативного экрана не нужно.
+            terminal.clear()?;
+            dirty = true;
+        }
+
         if dirty {
             self.render(terminal)?;
         }
         Ok(false)
+    }
+
+    /// Человек читает историю с прокруткой вверх, а панель работы выросла или
+    /// ввод стал выше: область переписки сузилась, и без поправки текст уехал
+    /// бы на эти строки. Верхний край остаётся на месте.
+    fn keep_scroll_when_layout_changes(&mut self) {
+        let Some(rows) = crate::tui::render::transcript_rows(&self.state) else {
+            return;
+        };
+        self.state.scroll_offset = crate::tui::render::scroll_after_height_change(
+            self.state.scroll_offset,
+            self.state.last_transcript_rows,
+            rows,
+        );
+        self.state.last_transcript_rows = rows;
     }
 
     /// Does a tick actually change pixels? The spinner and elapsed-time stats
@@ -863,7 +932,10 @@ impl App {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
-            AppEvent::Resize { rows } => self.state.terminal_rows = rows,
+            AppEvent::Resize { cols, rows } => {
+                self.state.terminal_rows = rows;
+                self.state.terminal_cols = cols;
+            }
             AppEvent::Paste(text) => self.handle_paste(text),
             AppEvent::OnboardingActionDone { action, ok } => {
                 self.state.onboarding.report(action, ok);
@@ -1008,6 +1080,10 @@ impl App {
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
+            AppEvent::LandingSessionsLoaded(sessions) => self.state.landing.apply(sessions),
+            AppEvent::AutocompleteReady { generation, items } => {
+                self.on_autocomplete_ready(generation, items);
+            }
         }
         Ok(false)
     }
@@ -1053,6 +1129,10 @@ impl App {
             generation.animation_tick = generation.animation_tick.wrapping_add(1);
         }
         self.maybe_refetch_provider_models();
+        // Главный экран показывает сессии: держим список свежим, не трогая диск в кадре.
+        if self.state.view == View::Chat && self.state.focused().messages.is_empty() {
+            self.state.landing.refresh_if_stale(&self.event_tx);
+        }
     }
 
     /// Единственный вход агентских событий: историю меняет `reduce`, здесь
@@ -1136,13 +1216,18 @@ impl App {
         // чаты Esc больше не гасит.
         let killed = self.state.background.cleanup_turn_of(conversation).await;
         self.state.focused_mut().generation.active = false;
+        self.state.focused_mut().current_tool = None;
+        let queued = self.state.restore_queued_to_input();
         // The aborted task may have been a `/compact`: drop its claim here, or
         // the command stays refused for this chat forever.
         self.state.focused_mut().compacting = None;
-        self.state.status_message = if killed > 0 {
-            format!("Cancelled; killed {killed} background process(es)")
-        } else {
-            "Cancelled".to_string()
+        self.state.status_message = match (killed, queued) {
+            (0, 0) => "Cancelled".to_string(),
+            (0, n) => format!("Cancelled; {n} queued message(s) returned to the input"),
+            (k, 0) => format!("Cancelled; killed {k} background process(es)"),
+            (k, n) => format!(
+                "Cancelled; killed {k} background process(es), {n} queued message(s) returned to the input"
+            ),
         };
         self.state.needs_terminal_restore = true;
         {
@@ -1449,7 +1534,7 @@ impl App {
             }
             Event::Mouse(mouse) => AppEvent::Mouse(mouse),
             Event::Paste(text) => AppEvent::Paste(text),
-            Event::Resize(_, rows) => AppEvent::Resize { rows },
+            Event::Resize(cols, rows) => AppEvent::Resize { cols, rows },
             _ => return Ok((false, false)),
         };
         let quit = self.handle_event(app_event).await?;

@@ -4,7 +4,6 @@
 
 use crate::config::Config;
 use crate::tui::theme::Theme;
-use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -16,6 +15,10 @@ use unicode_width::UnicodeWidthStr;
 pub(super) fn truncate(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
+    }
+    if max == 0 {
+        // Нулевая ширина: многоточие шириной в одну клетку вышло бы за предел.
+        return String::new();
     }
     let budget = max.saturating_sub(1);
     let mut out = String::new();
@@ -79,20 +82,25 @@ pub(super) fn format_date(rfc3339: &str) -> String {
     }
 }
 
-pub(super) fn centered_h(area: Rect, width: u16) -> Rect {
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    Rect::new(x, area.y, width.min(area.width), area.height)
+#[cfg(test)]
+thread_local! {
+    /// Подмена часов для снимков: иначе подвал менялся бы от запуска к запуску.
+    static FIXED_CLOCK: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Padding between the left/center/right segments of the status bar, sized
-/// by display width (not byte length) so multibyte content — Cyrillic
-/// status text, emoji in the goal/MCP tags — doesn't overstate how much
-/// horizontal space a segment occupies and push `right` off-screen.
-pub(super) fn status_bar_gap(left: &str, center: &str, right: &str, width: u16) -> usize {
-    let segments_width = UnicodeWidthStr::width(left)
-        + UnicodeWidthStr::width(center)
-        + UnicodeWidthStr::width(right);
-    width.saturating_sub(segments_width as u16).max(1) as usize
+/// Зафиксировать время в подвале (только тесты и снимки).
+#[cfg(test)]
+pub(crate) fn fix_clock(text: &str) {
+    FIXED_CLOCK.with(|clock| *clock.borrow_mut() = Some(text.to_string()));
+}
+
+/// Текущее время `ЧЧ:ММ` для подвала.
+pub(super) fn clock_label() -> String {
+    #[cfg(test)]
+    if let Some(fixed) = FIXED_CLOCK.with(|clock| clock.borrow().clone()) {
+        return fixed;
+    }
+    chrono::Local::now().format("%H:%M").to_string()
 }
 
 pub(super) fn provider_label(config: &Config) -> String {
@@ -193,6 +201,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn truncate_to_zero_width_gives_nothing_not_an_ellipsis() {
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("", 0), "");
+        assert_eq!(truncate("abc", 1), "\u{2026}");
+    }
+
+    #[test]
     fn fit_col_pads_short_and_truncates_long() {
         // Short content is right-padded to the exact column width.
         assert_eq!(fit_col("ab", 5), "ab   ");
@@ -214,47 +229,6 @@ mod tests {
         let out = fit_col("世界世", 5);
         assert_eq!(out, "世界…");
         assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
-    }
-
-    #[test]
-    fn status_bar_gap_ascii_matches_byte_length_math() {
-        // Pure-ASCII case: display width equals byte length, so this should
-        // match what the old `.len()`-based formula produced.
-        let gap = status_bar_gap(" left ", " center ", " right ", 40);
-        assert_eq!(gap, 40usize.saturating_sub(6 + 8 + 7));
-    }
-
-    #[test]
-    fn status_bar_gap_multibyte_uses_display_width_not_byte_length() {
-        // Cyrillic text: each character is 2 bytes in UTF-8 but 1 display
-        // cell. A byte-length-based gap would undercount available space
-        // and push `right` further than it should.
-        let left = " статус "; // 8 chars, display width 8 cells, byte len 14 (6 Cyrillic letters x 2 bytes + 2 ASCII spaces)
-        let center = " ";
-        let right = " right ";
-        let gap_by_width = status_bar_gap(left, center, right, 40);
-
-        let byte_len_gap =
-            40usize.saturating_sub((left.len() + center.len() + right.len()).min(40));
-        assert_ne!(
-            gap_by_width, byte_len_gap,
-            "multibyte content should make the width- and byte-length-based gaps diverge"
-        );
-
-        let expected = 40usize.saturating_sub(
-            UnicodeWidthStr::width(left)
-                + UnicodeWidthStr::width(center)
-                + UnicodeWidthStr::width(right),
-        );
-        assert_eq!(gap_by_width, expected);
-    }
-
-    #[test]
-    fn status_bar_gap_never_zero() {
-        // `.max(1)` guards against a fully-collapsed gap even when segments
-        // overflow the available width.
-        let gap = status_bar_gap(&"x".repeat(100), "y", "z", 10);
-        assert_eq!(gap, 1);
     }
 
     fn theme() -> Theme {

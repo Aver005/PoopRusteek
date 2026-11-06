@@ -121,6 +121,12 @@ impl GoalState {
         matches!(self.stage, GoalStage::RunAgent1 | GoalStage::RunEvaluator)
     }
 
+    /// Идёт настройка: режим включён, а цикл ещё не запущен (ждём задачу или
+    /// цель). Esc в это время отменяет настройку, а не «ничего».
+    pub(crate) fn is_setup_pending(&self) -> bool {
+        self.mode && !self.is_running()
+    }
+
     /// Enter goal mode fresh: clear all per-run state and start two new agent
     /// sessions. Stage stays `Inactive` until the user supplies a prompt.
     pub(crate) fn activate(&mut self) {
@@ -407,6 +413,20 @@ mod tests {
         assert_eq!(g.iteration, 0);
         assert!(g.summary.is_empty());
         assert!(!g.agent2_session_id.is_empty());
+    }
+
+    #[test]
+    fn setup_is_pending_until_the_cycle_starts() {
+        let mut g = GoalState::default();
+        assert!(!g.is_setup_pending(), "режим выключен");
+        g.activate();
+        assert!(g.is_setup_pending());
+        g.stage = GoalStage::WaitForGoal;
+        assert!(g.is_setup_pending());
+        g.stage = GoalStage::RunAgent1;
+        assert!(!g.is_setup_pending(), "цикл идёт — это уже не настройка");
+        g.deactivate();
+        assert!(!g.is_setup_pending());
     }
 
     #[test]

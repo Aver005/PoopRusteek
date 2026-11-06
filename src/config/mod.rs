@@ -467,6 +467,18 @@ pub enum ToolProtocol {
 /// listings and `active_provider`.
 pub const BUILTIN_PROVIDER_NAME: &str = "deepseek";
 
+/// Какими знаками рисуется интерфейс. Консоль Windows со шрифтом по умолчанию
+/// показывает `✓ ⚠ ━` квадратами, поэтому там нужен режим только из ASCII и CP437.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GlyphMode {
+    /// Выбирается по терминалу: Windows без Windows Terminal — `ascii`.
+    #[default]
+    Auto,
+    Unicode,
+    Ascii,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     /// Active theme: a preset name from `crate::tui::theme::PRESETS` or the
@@ -477,6 +489,9 @@ pub struct UiConfig {
     /// User-made themes from the `/themes` wizard.
     #[serde(default)]
     pub custom_themes: Vec<CustomTheme>,
+    /// `auto` | `unicode` | `ascii` — см. [`GlyphMode`].
+    #[serde(default)]
+    pub glyphs: GlyphMode,
 }
 
 fn default_ui_theme() -> String {
@@ -488,6 +503,7 @@ impl Default for UiConfig {
         Self {
             theme: default_ui_theme(),
             custom_themes: Vec::new(),
+            glyphs: GlyphMode::default(),
         }
     }
 }

@@ -18,6 +18,36 @@ pub(super) fn center_popup(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+/// Доля цвета фона, которая подмешивается к уже нарисованному (в процентах).
+const BACKDROP_DIM_PERCENT: u16 = 60;
+
+/// Смешать цвет текста с фоном: чужие цвета (не RGB) остаются как есть.
+fn dim_color(color: Color, toward: Color) -> Color {
+    match (color, toward) {
+        (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) => {
+            let mix = |from: u8, to: u8| {
+                ((from as u16 * (100 - BACKDROP_DIM_PERCENT) + to as u16 * BACKDROP_DIM_PERCENT)
+                    / 100) as u8
+            };
+            Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb))
+        }
+        _ => color,
+    }
+}
+
+/// Приглушить всё, что уже нарисовано под окном: модалка не спорит за
+/// внимание с панелью и текстом чата. Зовут до отрисовки самой модалки.
+pub(super) fn dim_backdrop(frame: &mut ratatui::Frame, area: Rect, theme: &Theme) {
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.fg = dim_color(cell.fg, theme.bg);
+            }
+        }
+    }
+}
+
 /// The standard modal frame: all borders, `accent`-colored border and bold
 /// title, panel background.
 pub(super) fn modal_block(
@@ -55,21 +85,18 @@ pub(super) fn overflow_line(up: bool, theme: &Theme) -> Line<'static> {
     ))
 }
 
-/// Маркер курсора в списках вариантов. Один на все мастера: знак был записан
-/// тремя способами, а в автодополнении оказался вообще другим (U+25B8).
-pub(super) const CURSOR_MARK: &str = "\u{25B6} ";
-
-/// Строка варианта в мастере: маркер курсора плюс подпись, без фона.
+/// Строка варианта в мастере: маркер курсора (из набора глифов) плюс подпись, без фона.
 /// Четыре мастера рисовали её порознь и уже разошлись в стиле отбивки.
 pub(super) fn option_row(
     label: impl Into<String>,
     is_cursor: bool,
     theme: &Theme,
 ) -> Line<'static> {
+    let pointer = format!("{} ", crate::tui::glyphs::get().pointer);
     Line::from(vec![
         Span::styled("  ", Style::default().fg(theme.fg)),
         Span::styled(
-            if is_cursor { CURSOR_MARK } else { "  " },
+            if is_cursor { pointer } else { "  ".to_string() },
             Style::default().fg(if is_cursor {
                 theme.accent
             } else {
@@ -191,5 +218,21 @@ pub(super) fn push_text_box_lines(
                 ),
             ]));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dimming_moves_a_color_toward_the_background() {
+        let dimmed = dim_color(Color::Rgb(200, 200, 200), Color::Rgb(0, 0, 0));
+        assert_eq!(dimmed, Color::Rgb(80, 80, 80));
+    }
+
+    #[test]
+    fn dimming_leaves_terminal_default_colors_alone() {
+        assert_eq!(dim_color(Color::Reset, Color::Rgb(0, 0, 0)), Color::Reset);
     }
 }

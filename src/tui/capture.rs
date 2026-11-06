@@ -8,10 +8,10 @@
 //! папка данных временная, токена и сети нет.
 
 use crate::app::AppState;
-use crate::app::conversation::{Conversation, ConversationKind};
+use crate::app::conversation::{Conversation, ConversationKind, QueuedMessage, ToolRun};
 use crate::app::events::{GoalStage, View};
 use crate::app::view_state::{Grant, Modal, PickerItem, PickerKind, PickerMode, PickerState};
-use crate::config::{Config, ProviderEntry, ProviderProtocol};
+use crate::config::{Config, GlyphMode, ProviderEntry, ProviderProtocol};
 use crate::mcp::types::ServerDisplayInfo;
 use crate::provider::ChatMessage;
 use ratatui::Terminal;
@@ -131,12 +131,48 @@ fn scenes() -> Vec<Scene> {
             themes: DEFAULT_THEME,
             first_run: false,
         },
+        Scene {
+            name: "onboarding",
+            build: onboarding,
+            sizes: &[(80, 24)],
+            themes: DEFAULT_THEME,
+            first_run: true,
+        },
+        Scene {
+            name: "search",
+            build: search,
+            sizes: &[(80, 24)],
+            themes: DEFAULT_THEME,
+            first_run: true,
+        },
+        // Панель работы: очередь сообщений, много суб-агентов, ASCII-знаки.
+        Scene {
+            name: "dock-agents",
+            build: dock_agents,
+            sizes: SIZES_NARROW,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "chat-working-ascii",
+            build: chat_working_ascii,
+            sizes: &[(80, 24), (120, 40)],
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "chat-typing",
+            build: chat_typing,
+            sizes: &[(80, 24), (120, 40)],
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
         // Одна и та же рабочая сцена и главная в трёх других палитрах.
         Scene {
             name: "chat-working",
             build: chat_working,
             sizes: SIZES_MAIN,
-            themes: &["paper", "dracula", "matrix"],
+            themes: &["paper", "dracula", "matrix", "nord", "gruvbox"],
             first_run: false,
         },
         Scene {
@@ -162,6 +198,8 @@ fn base(config: &mut Config, theme: &str) -> AppState {
     let mut state = AppState::new(main);
     state.workspace_path = r"D:\Projects\demo-api".to_string();
     state.status_message = "Ready".to_string();
+    // Окно известно — в подвале видна шкала контекста.
+    state.provider_context_window = 42_000;
     state
 }
 
@@ -361,14 +399,27 @@ fn chat_working(config: &mut Config) -> AppState {
     state.focused_mut().context_used = 31_500;
     state.status_message = "Running bash...".to_string();
 
-    for title in ["refactor tests", "update docs"] {
-        let mut agent = Conversation::fresh_main(None);
-        agent.kind = ConversationKind::SubAgent;
-        agent.parent = Some(state.conversations.focused_id());
-        agent.title = title.to_string();
-        agent.generation.active = true;
-        state.conversations.add_background(agent);
+    state.focused_mut().current_tool = Some(ToolRun {
+        name: "bash".to_string(),
+        summary: "cargo test items::range".to_string(),
+        started: ago(47),
+    });
+    for (title, tool, summary, secs) in [
+        (
+            "refactor tests",
+            Some("edit_file"),
+            "src/items/range.rs",
+            31,
+        ),
+        ("update docs", None, "", 12),
+    ] {
+        add_agent(&mut state, title, tool, summary, secs);
     }
+    state.focused_mut().queued.push_back(QueuedMessage {
+        text: "и ещё добавь тест на пустую строку".to_string(),
+        chips: Vec::new(),
+        named: Vec::new(),
+    });
     state.background.total = 2;
     state.background.interactive = 1;
     state.background.persistent = 1;
@@ -378,7 +429,58 @@ fn chat_working(config: &mut Config) -> AppState {
     state.goal.iteration = 2;
     state.error_count = 1;
     state.last_error = Some("mcp linear: authorization required (HTTP 401)".to_string());
-    state.input.buffer = "и ещё добавь тест на пустую строку".to_string();
+    state.input.buffer = "а ещё проверь README".to_string();
+    state.input.cursor = state.input.buffer.chars().count();
+    state
+}
+
+/// Момент `secs` секунд назад: так на снимке у работы есть возраст.
+fn ago(secs: u64) -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(secs))
+        .unwrap_or_else(Instant::now)
+}
+
+/// Суб-агент в работе: свой чат, инструмент и время.
+fn add_agent(state: &mut AppState, title: &str, tool: Option<&str>, summary: &str, secs: u64) {
+    let mut agent = Conversation::fresh_main(None);
+    agent.kind = ConversationKind::SubAgent;
+    agent.parent = Some(state.conversations.focused_id());
+    agent.title = title.to_string();
+    agent.generation.active = true;
+    agent.generation.start_time = Instant::now().checked_sub(Duration::from_secs(secs));
+    agent.current_tool = tool.map(|name| ToolRun {
+        name: name.to_string(),
+        summary: summary.to_string(),
+        started: ago(secs),
+    });
+    state.conversations.add_background(agent);
+}
+
+/// Много суб-агентов сразу: панель обязана уложиться в четыре строки.
+fn dock_agents(config: &mut Config) -> AppState {
+    let mut state = chat_working(config);
+    for index in 0..4 {
+        add_agent(
+            &mut state,
+            &format!("worker {index}"),
+            Some("grep"),
+            "parse_range",
+            5 + index,
+        );
+    }
+    state
+}
+
+fn chat_working_ascii(config: &mut Config) -> AppState {
+    config.ui.glyphs = GlyphMode::Ascii;
+    chat_working(config)
+}
+
+/// Простой чат, человек печатает длинное сообщение: ввод растёт вверх.
+fn chat_typing(config: &mut Config) -> AppState {
+    let mut state = chat_long(config);
+    state.input.buffer = "Добавь тест на пустую строку,\nпроверь граничные случаи (0, 1, максимум)\nи обнови документацию API.".to_string();
     state.input.cursor = state.input.buffer.chars().count();
     state
 }
@@ -388,8 +490,15 @@ fn approval(config: &mut Config) -> AppState {
     state.status_message = "Approve tool bash?".to_string();
     state.modal = Some(Modal::ToolApproval {
         tool_name: "bash".to_string(),
-        arguments: r#"{"command":"cargo test --bin pooprusteek items::range -- --nocapture && git diff --stat","timeout":120}"#
-            .to_string(),
+        arguments: concat!(
+            "{\n",
+            "  \"command\": \"cargo test --bin pooprusteek items::range -- --nocapture",
+            " && git diff --stat && cargo clippy --bin pooprusteek -- -D warnings",
+            " && echo the-whole-command-is-visible\",\n",
+            "  \"timeout\": 120\n",
+            "}"
+        )
+        .to_string(),
         origin: Some("sub-agent: refactor tests".to_string()),
         scroll_offset: 0,
         grant: Grant::Once,
@@ -472,6 +581,20 @@ fn providers(config: &mut Config) -> AppState {
     ];
     state.view = View::Providers;
     state.providers_view.selected = 1;
+    state
+}
+
+fn onboarding(config: &mut Config) -> AppState {
+    let theme = config.ui.theme.clone();
+    let mut state = base(config, &theme);
+    state.view = View::Onboarding;
+    state
+}
+
+fn search(config: &mut Config) -> AppState {
+    let theme = config.ui.theme.clone();
+    let mut state = base(config, &theme);
+    state.view = View::Search;
     state
 }
 
@@ -754,8 +877,13 @@ fn capture(
 ) -> Shot {
     let mut config = config_template.clone();
     config.ui.theme = theme.to_string();
+    crate::tui::render::fix_clock("14:02");
     let mut state = (scene.build)(&mut config);
     state.terminal_rows = height;
+    state.terminal_cols = width;
+    state
+        .landing
+        .apply(crate::session::list_sessions().unwrap_or_default());
 
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     let mut cursor = None;
@@ -802,7 +930,9 @@ fn capture_screens() {
     let _ = std::fs::remove_dir_all(&data);
     crate::config::set_data_dir(&data).expect("data dir");
 
-    let config = Config::default();
+    let mut config = Config::default();
+    // Снимки в HTML не могут показать «квадраты» консоли, поэтому Unicode по умолчанию.
+    config.ui.glyphs = GlyphMode::Unicode;
     let selected = |scene: &Scene| only.as_deref().is_none_or(|part| scene.name.contains(part));
     let mut manifest = String::new();
     let mut record = |shot: Shot| {
@@ -823,9 +953,7 @@ fn capture_screens() {
         }
     }
 
-    // Список сессий на главной кэшируется на 3 с — ждём, пока кэш протухнет.
     plant_sessions(&config);
-    std::thread::sleep(Duration::from_millis(3300));
     for scene in all.iter().filter(|s| selected(s) && !s.first_run) {
         for theme in scene.themes {
             for size in scene.sizes {
@@ -835,4 +963,43 @@ fn capture_screens() {
     }
     std::fs::write(out.join("manifest.tsv"), manifest).expect("manifest");
     let _ = std::fs::remove_dir_all(&data);
+}
+
+/// ASCII-режим не рисует ни одного знака, который старая консоль покажет
+/// квадратом: проходим по всем сценам, включая онбординг, поиск и темы.
+#[test]
+fn ascii_mode_draws_only_console_safe_characters() {
+    let template = Config::default();
+    let mut offenders = Vec::new();
+    for scene in scenes() {
+        for theme in scene.themes.iter().take(1) {
+            let mut config = template.clone();
+            config.ui.theme = (*theme).to_string();
+            let mut state = (scene.build)(&mut config);
+            config.ui.glyphs = GlyphMode::Ascii;
+            let (width, height) = (100, 30);
+            state.terminal_rows = height;
+            state.terminal_cols = width;
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+            terminal
+                .draw(|frame| {
+                    crate::tui::render::draw_frame(frame, &state, &config);
+                })
+                .expect("draw frame");
+            let buffer = terminal.backend().buffer();
+            for y in 0..height {
+                for x in 0..width {
+                    let symbol = buffer[(x, y)].symbol();
+                    if let Some(bad) = symbol
+                        .chars()
+                        .find(|ch| !crate::tui::glyphs::is_console_safe(*ch))
+                    {
+                        offenders.push(format!("{} ({x},{y}): {bad:?}", scene.name));
+                    }
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "{offenders:#?}");
 }

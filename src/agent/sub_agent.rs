@@ -189,9 +189,10 @@ async fn relay(
     while let Some(event) = events.recv().await {
         match event {
             AppEvent::Agent { event, .. } => match event {
-                AgentEvent::ToolStarted { name } => {
+                AgentEvent::ToolStarted { name, summary } => {
                     ctx.emit(AgentEvent::ToolStarted {
                         name: format!("{label} › {name}"),
+                        summary,
                     });
                     run.started.push(name);
                     tool_running = true;
