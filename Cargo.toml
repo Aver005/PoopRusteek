@@ -52,7 +52,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Config
 toml = "1"
-dirs = "6"
+dirs = "7"
 
 # Logging / tracing
 tracing = "0.1"
