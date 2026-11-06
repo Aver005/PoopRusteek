@@ -1,0 +1,26 @@
+# Gateway settings for the fallback scenario. Until [gateway] is part of the main
+# config, the harness reads this file from POOPRUSTEEK_GATEWAY_TOML.
+# Host `mock` is the compose service; for a local mock replace it with 127.0.0.1.
+[gateway]
+enabled = true
+
+[[accounts]]
+id = "a"
+provider = "custom"
+base_url = "http://mock:811/a/v1"
+secret = "none"
+model = "mock"
+
+[[accounts]]
+id = "b"
+provider = "custom"
+base_url = "http://mock:811/b/v1"
+secret = "none"
+model = "mock"
+
+[[routes]]
+id = "main"
+steps = [{ account = "a" }, { account = "b" }]
+
+[roles]
+main = "main"

@@ -1,0 +1,11 @@
+# Gateway fallback: account "a" answers 429 with a Retry-After, account "b" answers.
+# Needs the mock on /a/v1 and /b/v1 (one script per account prefix).
+[[reply]]
+account = "a"
+content = "unused"
+status = 429
+retry_after = 30
+
+[[reply]]
+account = "b"
+content = "Four."

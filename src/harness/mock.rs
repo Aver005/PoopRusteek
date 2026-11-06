@@ -19,9 +19,9 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 type MockBody = BoxBody<Bytes, std::convert::Infallible>;
 
@@ -42,6 +42,14 @@ struct Reply {
     /// tests (429, 500, …).
     #[serde(default)]
     status: Option<u16>,
+    /// `Retry-After` in seconds on a scripted error reply.
+    #[serde(default)]
+    retry_after: Option<u64>,
+    /// Serve this reply only on the `/<account>/v1/…` prefix. Without it the
+    /// reply belongs to the bare `/v1/…` endpoint and to any account that has
+    /// no script of its own.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -53,51 +61,84 @@ struct Script {
 
 struct MockState {
     replies: Vec<Reply>,
-    /// Round-robin cursor over positional replies.
-    cursor: AtomicUsize,
+    /// Round-robin cursor over positional replies, one per account prefix
+    /// (`""` is the bare `/v1` endpoint).
+    cursors: Mutex<HashMap<String, usize>>,
 }
 
 impl MockState {
+    fn new(replies: Vec<Reply>) -> Self {
+        Self {
+            replies,
+            cursors: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The replies an account may see: its own, else the shared ones. The bare
+    /// endpoint sees only the shared ones, so older single-script files behave
+    /// exactly as before.
+    fn visible(&self, account: &str) -> Vec<&Reply> {
+        let own: Vec<&Reply> = self
+            .replies
+            .iter()
+            .filter(|reply| !account.is_empty() && reply.account.as_deref() == Some(account))
+            .collect();
+        if own.is_empty() {
+            self.replies
+                .iter()
+                .filter(|reply| reply.account.is_none())
+                .collect()
+        } else {
+            own
+        }
+    }
+
     /// Pick the reply for this request: the first still-unserved one whose
     /// `when` matches, else the next positional one, else a fixed
     /// acknowledgement so an unscripted run still completes.
-    fn next(&self, last_user_message: &str, fresh_turn: bool) -> Reply {
-        if self.replies.is_empty() {
+    fn next(&self, account: &str, last_user_message: &str, fresh_turn: bool) -> Reply {
+        let pool = self.visible(account);
+        if pool.is_empty() {
             return Reply {
                 when: None,
                 content: "Mock provider: no script loaded.".to_string(),
                 delay_ms: 0,
                 status: None,
+                retry_after: None,
+                account: None,
             };
         }
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = cursors.entry(account.to_string()).or_insert(0);
         // The service outlives a single turn, so without this a scenario run
         // with `--repeat 2` would find the cursor already at the end of the
         // script and the second repeat would skip straight to the last reply —
         // silently testing something else than the first repeat did.
         if fresh_turn {
-            self.cursor.store(0, Ordering::Relaxed);
+            *cursor = 0;
         }
         let needle = last_user_message.to_lowercase();
-        if let Some(reply) = self.replies.iter().find(|reply| {
+        if let Some(reply) = pool.iter().find(|reply| {
             reply
                 .when
                 .as_ref()
                 .is_some_and(|when| needle.contains(&when.to_lowercase()))
         }) {
-            return reply.clone();
+            return (*reply).clone();
         }
-        let index = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let positional: Vec<&Reply> = self
-            .replies
+        let index = *cursor;
+        *cursor += 1;
+        let positional: Vec<&Reply> = pool
             .iter()
+            .copied()
             .filter(|reply| reply.when.is_none())
             .collect();
         if positional.is_empty() {
-            return self.replies[index % self.replies.len()].clone();
+            return pool[index % pool.len()].clone();
         }
         // The last positional reply repeats, so a longer-than-scripted turn
         // ends instead of 404-ing mid-loop.
-        positional[index.min(positional.len() - 1)].clone()
+        (*positional[index.min(positional.len() - 1)]).clone()
     }
 }
 
@@ -106,10 +147,7 @@ pub async fn run(args: MockArgs) -> AppResult<i32> {
         Some(path) => load_script(path)?,
         None => Script::default(),
     };
-    let state = Arc::new(MockState {
-        replies: script.replies,
-        cursor: AtomicUsize::new(0),
-    });
+    let state = Arc::new(MockState::new(script.replies));
 
     let address = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&address)
@@ -161,17 +199,32 @@ async fn route(
 ) -> Result<Response<MockBody>, std::convert::Infallible> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
-    let trimmed = path.strip_prefix("/v1").unwrap_or(&path).to_string();
+    let (account, trimmed) = split_account(&path);
 
     let response = match (&method, trimmed.as_str()) {
         (&Method::GET, "/models") => json(StatusCode::OK, models_payload()),
-        (&Method::POST, "/chat/completions") => completions(request, &state).await,
+        (&Method::POST, "/chat/completions") => completions(request, &state, &account).await,
         _ => json(
             StatusCode::NOT_FOUND,
             serde_json::json!({ "error": { "message": format!("no mock route for {path}") } }),
         ),
     };
     Ok(response)
+}
+
+/// `/<account>/v1/chat/completions` → (`<account>`, `/chat/completions`). A path
+/// with no `/v1` segment, or one that starts with it, belongs to no account.
+fn split_account(path: &str) -> (String, String) {
+    let at = path
+        .find("/v1/")
+        .or_else(|| path.ends_with("/v1").then(|| path.len() - 3));
+    match at {
+        Some(at) => (
+            path[..at].trim_matches('/').to_string(),
+            path[at + 3..].to_string(),
+        ),
+        None => (String::new(), path.to_string()),
+    }
 }
 
 /// `context_length` is the field `CompatClient::context_window` reads (the
@@ -192,7 +245,11 @@ fn models_payload() -> serde_json::Value {
     })
 }
 
-async fn completions(request: Request<Incoming>, state: &Arc<MockState>) -> Response<MockBody> {
+async fn completions(
+    request: Request<Incoming>,
+    state: &Arc<MockState>,
+    account: &str,
+) -> Response<MockBody> {
     let body = match request.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(error) => {
@@ -207,17 +264,17 @@ async fn completions(request: Request<Incoming>, state: &Arc<MockState>) -> Resp
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let reply = state.next(&last_user_message(&payload), is_fresh_turn(&payload));
+    let reply = state.next(
+        account,
+        &last_user_message(&payload),
+        is_fresh_turn(&payload),
+    );
 
     if reply.delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(reply.delay_ms)).await;
     }
     if let Some(status) = reply.status {
-        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        return json(
-            code,
-            serde_json::json!({ "error": { "message": "scripted failure", "type": "mock" } }),
-        );
+        return failure_response(status, reply.retry_after);
     }
 
     if streaming {
@@ -225,6 +282,19 @@ async fn completions(request: Request<Incoming>, state: &Arc<MockState>) -> Resp
     } else {
         json(StatusCode::OK, completion_payload(&reply.content))
     }
+}
+
+/// A scripted error reply, with `Retry-After` when the script gives one.
+fn failure_response(status: u16, retry_after: Option<u64>) -> Response<MockBody> {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = serde_json::json!({ "error": { "message": "scripted failure", "type": "mock" } });
+    let mut response = json(code, body);
+    if let Some(seconds) = retry_after
+        && let Ok(value) = header::HeaderValue::from_str(&seconds.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// A turn's first request carries exactly one non-system message: the user's
@@ -332,10 +402,7 @@ mod tests {
     use super::*;
 
     fn state(replies: Vec<Reply>) -> MockState {
-        MockState {
-            replies,
-            cursor: AtomicUsize::new(0),
-        }
+        MockState::new(replies)
     }
 
     fn reply(content: &str, when: Option<&str>) -> Reply {
@@ -344,15 +411,26 @@ mod tests {
             content: content.to_string(),
             delay_ms: 0,
             status: None,
+            retry_after: None,
+            account: None,
+        }
+    }
+
+    fn account_reply(account: &str, content: &str, status: Option<u16>) -> Reply {
+        Reply {
+            account: Some(account.to_string()),
+            status,
+            retry_after: status.map(|_| 30),
+            ..reply(content, None)
         }
     }
 
     #[test]
     fn positional_replies_advance_then_repeat_the_last() {
         let state = state(vec![reply("first", None), reply("second", None)]);
-        assert_eq!(state.next("hi", false).content, "first");
-        assert_eq!(state.next("hi", false).content, "second");
-        assert_eq!(state.next("hi", false).content, "second");
+        assert_eq!(state.next("", "hi", false).content, "first");
+        assert_eq!(state.next("", "hi", false).content, "second");
+        assert_eq!(state.next("", "hi", false).content, "second");
     }
 
     #[test]
@@ -362,17 +440,17 @@ mod tests {
             reply("matched", Some("LIST files")),
         ]);
         assert_eq!(
-            state.next("please list FILES here", false).content,
+            state.next("", "please list FILES here", false).content,
             "matched"
         );
-        assert_eq!(state.next("anything else", false).content, "positional");
+        assert_eq!(state.next("", "anything else", false).content, "positional");
     }
 
     #[test]
     fn an_empty_script_still_answers() {
         assert!(
             state(Vec::new())
-                .next("hi", false)
+                .next("", "hi", false)
                 .content
                 .contains("no script")
         );
@@ -381,11 +459,11 @@ mod tests {
     #[test]
     fn a_fresh_turn_rewinds_the_script() {
         let state = state(vec![reply("first", None), reply("second", None)]);
-        assert_eq!(state.next("go", true).content, "first");
-        assert_eq!(state.next("go", false).content, "second");
+        assert_eq!(state.next("", "go", true).content, "first");
+        assert_eq!(state.next("", "go", false).content, "second");
         // A second repeat of the same scenario must see the script from the
         // top, not the tail the previous repeat left it at.
-        assert_eq!(state.next("go", true).content, "first");
+        assert_eq!(state.next("", "go", true).content, "first");
     }
 
     #[test]
@@ -429,6 +507,63 @@ mod tests {
         let entry = &models_payload()["data"][0];
         assert_eq!(entry["id"], "mock");
         assert_eq!(entry["context_length"], MOCK_CONTEXT_LENGTH);
+    }
+
+    /// Скрипты на аккаунт: у каждого свой курсор, чужие ответы не видны.
+    #[test]
+    fn each_account_has_its_own_script_and_cursor() {
+        let state = state(vec![
+            account_reply("a", "limited", Some(429)),
+            account_reply("b", "from b", None),
+            reply("shared", None),
+        ]);
+        assert_eq!(state.next("a", "hi", false).status, Some(429));
+        assert_eq!(state.next("b", "hi", false).content, "from b");
+        assert_eq!(
+            state.next("c", "hi", false).content,
+            "shared",
+            "an account without a script falls back to the shared one"
+        );
+        assert_eq!(
+            state.next("", "hi", false).content,
+            "shared",
+            "the bare endpoint never sees account scripts"
+        );
+        // Курсор a не сдвинут чужими запросами.
+        assert_eq!(state.next("a", "hi", false).status, Some(429));
+    }
+
+    #[test]
+    fn a_path_names_its_account_by_the_segment_before_v1() {
+        assert_eq!(
+            split_account("/a/v1/chat/completions"),
+            ("a".to_string(), "/chat/completions".to_string())
+        );
+        assert_eq!(
+            split_account("/v1/models"),
+            (String::new(), "/models".to_string())
+        );
+        assert_eq!(
+            split_account("/team/b/v1"),
+            ("team/b".to_string(), String::new())
+        );
+        assert_eq!(
+            split_account("/chat/completions"),
+            (String::new(), "/chat/completions".to_string())
+        );
+    }
+
+    #[test]
+    fn a_scripted_failure_can_carry_retry_after() {
+        let with = failure_response(429, Some(30));
+        assert_eq!(with.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(with.headers()[header::RETRY_AFTER], "30");
+        assert!(
+            failure_response(500, None)
+                .headers()
+                .get(header::RETRY_AFTER)
+                .is_none()
+        );
     }
 
     #[test]

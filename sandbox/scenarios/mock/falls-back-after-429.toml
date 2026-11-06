@@ -1,0 +1,23 @@
+# Needs `sandbox mock gateway-fallback` running and POOPRUSTEEK_GATEWAY_TOML set to
+# sandbox/gateway/two-mock-accounts.toml (the gateway is read from that file for now).
+name = "falls-back-after-429"
+description = "The first account answers 429, the turn completes on the second and the trace says why"
+prompt = "What is two plus two?"
+timeout = 60
+max_steps = 3
+
+[expect]
+status = "completed"
+final_matches = ['Four']
+min_pass_rate = 1.0
+
+# Two decisions: the first account, then the second after the failure.
+[[expect.trace]]
+action = "gateway.decision"
+min_count = 2
+
+# Exactly one hand-over, and it happened before anything was shown.
+[[expect.trace]]
+action = "gateway.fallback"
+min_count = 1
+max_count = 1
