@@ -138,8 +138,9 @@ fn resolve_backend(model_id: &str, context: &ServerContext) -> BackendResult {
                 Box::new(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &ErrorResponse::server_error(format!(
-                        "failed to initialize provider '{}': {error}",
-                        entry.name
+                        "failed to initialize provider '{}': {}",
+                        entry.name,
+                        routing::scrub(&error.to_string())
                     )),
                 ))
             })?
@@ -159,11 +160,13 @@ fn resolve_routed(
     model_id: &str,
     context: &ServerContext,
 ) -> BackendResult {
-    use crate::gateway::handle::{CallSource, ResolveError};
-    let snapshot = gateway.snapshot();
-    if snapshot.accounts.is_empty() && routing::is_starting(gateway) {
-        return Err(Box::new(starting_response()));
+    use crate::gateway::handle::{BuildState, CallSource, ResolveError};
+    match gateway.build_state() {
+        BuildState::Ready => {}
+        BuildState::Starting => return Err(Box::new(starting_response())),
+        BuildState::Failed(reason) => return Err(Box::new(failed_response(&reason))),
     }
+    let snapshot = gateway.snapshot();
     let address = routing::check_address(&snapshot, &context.models.snapshot(), model_id)
         .map_err(|message| Box::new(model_not_found(message)))?;
     match gateway.provider_for_model_id(&address, CallSource::Serve) {
@@ -173,6 +176,7 @@ fn resolve_routed(
             routed: true,
         }),
         Err(ResolveError::Starting) => Err(Box::new(starting_response())),
+        Err(ResolveError::Failed(reason)) => Err(Box::new(failed_response(&reason))),
         Err(ResolveError::Unknown(_)) => Err(Box::new(model_not_found(format!(
             "model '{}' not found — see GET /v1/models for what this server exposes",
             model_id.trim()
@@ -195,7 +199,11 @@ fn starting_response() -> Response<ApiBody> {
 }
 
 /// Заголовки `x-pooprusteek-*` по тому, куда ушёл вызов. Без шлюза ничего не добавляется.
+/// Ошибочный ответ их не получает: «ответил такой-то» про отказ было бы неправдой.
 fn add_route_headers(response: &mut Response<ApiBody>, provider: &Arc<dyn LLMProvider>) {
+    if !response.status().is_success() {
+        return;
+    }
     if let Some(served) = provider.served_by() {
         for (name, value) in routing::route_headers(&served) {
             response.headers_mut().insert(name, value);
@@ -205,6 +213,14 @@ fn add_route_headers(response: &mut Response<ApiBody>, provider: &Arc<dyn LLMPro
 
 fn models_response(context: &ServerContext) -> Response<ApiBody> {
     let gateway = context.gateway.get();
+    if gateway.is_enabled() {
+        // Пустой список во время сборки клиент запомнил бы как «моделей нет».
+        match gateway.build_state() {
+            crate::gateway::handle::BuildState::Ready => {}
+            crate::gateway::handle::BuildState::Starting => return starting_response(),
+            crate::gateway::handle::BuildState::Failed(reason) => return failed_response(&reason),
+        }
+    }
     let ids = if gateway.is_enabled() {
         routing::model_ids(&gateway.snapshot(), &context.models.snapshot())
     } else {
@@ -342,6 +358,8 @@ const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 const UPSTREAM_AUTH_MESSAGE: &str =
     "the upstream provider rejected this server's credentials; see the server log";
 
+const UPSTREAM_UNREACHABLE_MESSAGE: &str = "the upstream provider could not be reached";
+
 struct UpstreamError {
     status: StatusCode,
     message: String,
@@ -376,6 +394,7 @@ impl UpstreamError {
         {
             message = message.replace(url.as_str(), "<upstream>");
         }
+        // Остальное (шлюз прячет ту же ошибку в `AppError::Upstream`) скрабит `body()`.
         Self::from_class(message, error.failure_class(), error.retry_after())
     }
 
@@ -433,10 +452,14 @@ impl UpstreamError {
             FailureClass::ContentFilter | FailureClass::BadRequest => {
                 (StatusCode::BAD_REQUEST, "invalid_request_error", None)
             }
-            FailureClass::Server
-            | FailureClass::Network
-            | FailureClass::Protocol
-            | FailureClass::Cancelled => return mapped,
+            // Сетевая ошибка называет адрес аккаунта: клиенту хватает класса.
+            FailureClass::Network => {
+                mapped.message = UPSTREAM_UNREACHABLE_MESSAGE.to_string();
+                return mapped;
+            }
+            FailureClass::Server | FailureClass::Protocol | FailureClass::Cancelled => {
+                return mapped;
+            }
         };
         mapped.status = status;
         mapped.kind = kind;
@@ -483,7 +506,7 @@ impl UpstreamError {
     fn body(&self) -> ErrorResponse {
         ErrorResponse {
             error: openai_compat::ErrorBody {
-                message: self.message.clone(),
+                message: routing::scrub(&self.message),
                 kind: self.kind.to_string(),
                 code: self.code.map(str::to_string),
             },
@@ -1287,15 +1310,6 @@ async fn passthrough(
     context: &Arc<ServerContext>,
     path_suffix: &str,
 ) -> Response<ApiBody> {
-    // Эти пути ходят мимо шлюза с ключами старых записей: за шлюзом они закрыты, а не обходят выбор.
-    if context.gateway.get().is_enabled() {
-        return json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            &ErrorResponse::server_error(format!(
-                "{path_suffix} is not routed through the gateway yet"
-            )),
-        );
-    }
     let body = match read_body(request).await {
         Ok(body) => body,
         Err(response) => return *response,
@@ -1316,6 +1330,11 @@ async fn passthrough(
         );
     };
     let model_id = model_id.to_string();
+
+    let gateway = context.gateway.get();
+    if gateway.is_enabled() {
+        return routed_passthrough(&gateway, context, payload, &model_id, path_suffix).await;
+    }
 
     let resolved = match catalog::resolve_model(
         &model_id,
@@ -1381,6 +1400,71 @@ async fn passthrough(
         }
         Err(error) => failed(error),
     }
+}
+
+/// `/embeddings` и `/rerank` за шлюзом: прямо на аккаунт по `<account>/<model>`, с его адресом и
+/// ключом. Выбор аккаунта по маршруту здесь не имеет смысла, а подписки CLI не раздаются.
+async fn routed_passthrough(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    context: &ServerContext,
+    mut payload: serde_json::Value,
+    model_id: &str,
+    path_suffix: &str,
+) -> Response<ApiBody> {
+    use crate::gateway::handle::BuildState;
+    match gateway.build_state() {
+        BuildState::Ready => {}
+        BuildState::Starting => return starting_response(),
+        BuildState::Failed(reason) => return failed_response(&reason),
+    }
+    if model_id.trim().starts_with("auto/") {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(format!(
+                "{path_suffix} needs an `<account>/<model>` address: `auto/<route>` picks an account per request and is not supported here"
+            )),
+        );
+    }
+    let snapshot = gateway.snapshot();
+    let address = match routing::check_address(&snapshot, &context.models.snapshot(), model_id) {
+        Ok(address) => address,
+        Err(message) => return model_not_found(message),
+    };
+    let Some((account, model)) = address.split_once('/') else {
+        return model_not_found(format!("model '{model_id}' not found"));
+    };
+    let backend = crate::gateway::types::AccountId::parse(account)
+        .ok()
+        .and_then(|id| gateway.backend_for(&id));
+    let Some(backend) = backend else {
+        return model_not_found(format!("model '{model_id}' not found"));
+    };
+    payload["model"] = serde_json::json!(model);
+    match backend.proxy_json(path_suffix, payload).await {
+        Ok(reply) => Response::builder()
+            .status(StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(full_body(reply.body))
+            .expect("static response parts are valid"),
+        Err(error) => {
+            let mut failure = UpstreamError::from_class(error.message, Some(error.class), None);
+            // Отказ класса «неверный запрос» объясняем как есть, остальное сводится к классу.
+            if failure.status == StatusCode::BAD_REQUEST {
+                failure.kind = "invalid_request_error";
+            }
+            failure.response()
+        }
+    }
+}
+
+/// Сборка шлюза упала: повтор не поможет, пока не исправят конфиг.
+fn failed_response(reason: &str) -> Response<ApiBody> {
+    let mut error = UpstreamError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("the gateway failed to start: {reason}"),
+    );
+    error.code = Some("gateway_failed");
+    error.response()
 }
 
 #[cfg(test)]

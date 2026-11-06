@@ -8,6 +8,22 @@ use crate::gateway::handle::{AccountStatus, LedgerQuery};
 use crate::gateway::testkit::{Act, FakeBackend};
 use std::sync::Arc;
 
+/// Подписки CLI в тестах отвечает подставной адаптер: так видно, что его ни разу не вызвали.
+struct CliFactory(Arc<FakeBackend>);
+
+impl crate::gateway::engine::BackendFactory for CliFactory {
+    fn build(
+        &self,
+        account: &crate::gateway::types::Account,
+        _secrets: &dyn crate::gateway::engine::SecretResolver,
+    ) -> Option<Result<Arc<dyn crate::gateway::backend::Backend>, String>> {
+        account
+            .provider
+            .cli_tool()
+            .map(|_| Ok(Arc::clone(&self.0) as Arc<dyn crate::gateway::backend::Backend>))
+    }
+}
+
 fn text_stream(chunks: &[&'static str]) -> Script {
     Script::Stream {
         chunks: chunks.to_vec(),
@@ -245,22 +261,9 @@ async fn cli_subscriptions_are_neither_listed_nor_accepted() {
     set_keys();
     let up = upstream(vec![("/a/", vec![text_stream(&["x"])])]).await;
     let cli = FakeBackend::new(vec![Act::Reply("subscription answer")]);
-    struct Factory(Arc<FakeBackend>);
-    impl crate::gateway::engine::BackendFactory for Factory {
-        fn build(
-            &self,
-            account: &crate::gateway::types::Account,
-            _secrets: &dyn crate::gateway::engine::SecretResolver,
-        ) -> Option<Result<Arc<dyn crate::gateway::backend::Backend>, String>> {
-            account
-                .provider
-                .cli_tool()
-                .map(|_| Ok(Arc::clone(&self.0) as Arc<dyn crate::gateway::backend::Backend>))
-        }
-    }
     let gateway = engine(
         &config(up.port, true),
-        vec![Arc::new(Factory(Arc::clone(&cli)))],
+        vec![Arc::new(CliFactory(Arc::clone(&cli)))],
     );
     // Подписка собрана и готова: скрывает её именно правило раздачи, а не недоступность.
     let ready = gateway
@@ -772,4 +775,253 @@ async fn the_acp_provider_waits_for_the_gateway_to_be_built_and_then_answers() {
         .unwrap()
         .expect("and is answered");
     assert_eq!(reply.content, "ready now");
+}
+
+// ── Каталог аккаунтов шлюза без записей `[[providers]]` ─────────────────
+
+#[tokio::test]
+async fn every_gateway_account_gets_its_real_models_without_a_providers_entry() {
+    set_keys();
+    let up = upstream(vec![
+        (
+            "/a/v1/models",
+            vec![Script::Models(vec!["m", "big-model", "embed-1"])],
+        ),
+        ("/b/v1/models", vec![Script::Models(vec!["m"])]),
+        ("/a/", vec![text_stream(&["x"])]),
+        ("/b/", vec![text_stream(&["y"])]),
+    ])
+    .await;
+    let cli = FakeBackend::new(vec![Act::Reply("never")]);
+    let gateway = engine(
+        &config(up.port, true),
+        vec![Arc::new(CliFactory(Arc::clone(&cli)))],
+    );
+    let stand = start(gateway.clone(), None).await;
+    let listed = |stand: &Stand| {
+        let base = stand.base.clone();
+        async move {
+            let body: serde_json::Value = reqwest::get(format!("{base}/v1/models"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        }
+    };
+    assert!(!listed(&stand).await.contains(&"a/big-model".to_string()));
+    assert_eq!(post(&stand, "a/big-model", false).await.status(), 404);
+
+    // Так же, как приложение и прокси: кэш подключён к шлюзу, записей `[[providers]]` нет.
+    stand.models.set_gateway(gateway);
+    let outcome = stand.models.refresh(&[], 60_000, true).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+    let ids = listed(&stand).await;
+    for expected in ["a/m", "a/big-model", "a/embed-1", "b/m", "auto/main"] {
+        assert!(ids.contains(&expected.to_string()), "{expected} in {ids:?}");
+    }
+    assert!(
+        !ids.iter()
+            .any(|id| id.starts_with("sub/") || id.starts_with("oc/") || id.starts_with("cx/")),
+        "CLI models stay out of /serve even though the catalog keeps them: {ids:?}"
+    );
+    // Каталог хранит и подписки: TUI выбирает из него модель.
+    assert!(stand.models.snapshot().contains_key("sub"));
+    assert_eq!(post(&stand, "a/big-model", false).await.status(), 200);
+    assert_eq!(
+        post(&stand, "a/not-served-by-anyone", false).await.status(),
+        404
+    );
+    assert_eq!(post(&stand, "sub/listed", false).await.status(), 404);
+    assert_eq!(cli.call_count(), 0);
+}
+
+#[tokio::test]
+async fn a_refresh_during_the_build_leaves_the_cache_alone_and_a_ready_gateway_fills_it() {
+    use crate::gateway::pending::{PendingGateway, PendingHandle};
+    set_keys();
+    let up = upstream(vec![("/a/v1/models", vec![Script::Models(vec!["m"])])]).await;
+    let text = config(up.port, false);
+    let parsed = crate::config::parse(&text).unwrap();
+    let pending = PendingGateway::new(crate::gateway::engine::gateway_config(&parsed));
+    let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
+    models.set_gateway(Arc::new(PendingHandle(Arc::clone(&pending))));
+    models.refresh(&[], 0, true).await;
+    assert!(
+        models.snapshot().is_empty(),
+        "nothing to fetch while building"
+    );
+
+    models.set_gateway(engine(&text, Vec::new()));
+    models.refresh(&[], 0, true).await;
+    assert_eq!(models.snapshot().get("a").map(Vec::len), Some(1));
+}
+
+// ── `/embeddings` и `/rerank` за шлюзом ─────────────────────────────────
+
+#[tokio::test]
+async fn embeddings_go_to_the_named_account_with_its_own_key_and_address() {
+    let (stand, up) = stand(vec![
+        (
+            "/a/v1/embeddings",
+            vec![Script::Json(
+                r#"{"object":"list","data":[{"embedding":[0.5]}]}"#,
+            )],
+        ),
+        ("/a/", vec![text_stream(&["x"])]),
+    ])
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", stand.base))
+        .json(&serde_json::json!({"model": "a/m", "input": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["data"][0]["embedding"][0], 0.5);
+    let seen = up.last("/a/v1/embeddings").expect("the account was called");
+    assert_eq!(seen.auth, format!("Bearer {KEY_A}"));
+    let sent: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
+    assert_eq!(
+        sent["model"], "m",
+        "the account's own model name goes upstream"
+    );
+
+    // Маршрут выбирает аккаунт на каждый запрос, поэтому для эмбеддингов нужен адрес аккаунта.
+    let route = reqwest::Client::new()
+        .post(format!("{}/v1/rerank", stand.base))
+        .json(&serde_json::json!({"model": "auto/main", "query": "q", "documents": ["d"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(route.status(), 400);
+    let envelope: serde_json::Value = route.json().await.unwrap();
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<account>/<model>"),
+        "{envelope}"
+    );
+    let unknown = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", stand.base))
+        .json(&serde_json::json!({"model": "nosuch/m", "input": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+    assert_eq!(
+        up.hits("/a/v1/embeddings"),
+        1,
+        "refusals never reached an upstream"
+    );
+}
+
+#[tokio::test]
+async fn embeddings_never_reach_a_subscription_account() {
+    set_keys();
+    let up = upstream(vec![("/a/", vec![text_stream(&["x"])])]).await;
+    let cli = FakeBackend::new(vec![Act::Reply("never")]);
+    let gateway = engine(
+        &config(up.port, true),
+        vec![Arc::new(CliFactory(Arc::clone(&cli)))],
+    );
+    let stand = start(gateway, None).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", stand.base))
+        .json(&serde_json::json!({"model": "sub/opus", "input": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(cli.call_count(), 0);
+}
+
+// ── Ошибки сети, сборка шлюза ───────────────────────────────────────────
+
+/// Свободный порт, на котором никто не слушает.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[tokio::test]
+async fn a_network_failure_never_shows_the_accounts_address() {
+    set_keys();
+    let port = closed_port();
+    for stream in [false, true] {
+        // Свой шлюз на каждый заход: после первого отказа аккаунт остывает.
+        let stand = start(engine(&config(port, false), Vec::new()), None).await;
+        let response = post(&stand, "a/m", stream).await;
+        assert!(
+            response.status().is_server_error(),
+            "stream={stream}: {}",
+            response.status()
+        );
+        let text = response.text().await.unwrap();
+        for leaked in ["127.0.0.1", &port.to_string(), "/a/v1", "http://"] {
+            assert!(
+                !text.contains(leaked),
+                "stream={stream}: {leaked} in {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_catalog_during_a_build_is_a_503_and_a_failed_build_says_so_without_retry() {
+    use crate::gateway::pending::{PendingGateway, PendingHandle};
+    set_keys();
+    let text = config(closed_port(), false);
+    let parsed = crate::config::parse(&text).unwrap();
+    let pending = PendingGateway::new(crate::gateway::engine::gateway_config(&parsed));
+    let stand = start(Arc::new(PendingHandle(Arc::clone(&pending))), None).await;
+    let models = || async {
+        reqwest::get(format!("{}/v1/models", stand.base))
+            .await
+            .unwrap()
+    };
+
+    let starting = models().await;
+    assert_eq!(starting.status(), 503);
+    assert_eq!(header(&starting, "retry-after").as_deref(), Some("2"));
+
+    pending.fail("the secret env:MISSING is not set".to_string());
+    for response in [models().await, post(&stand, "a/m", false).await] {
+        assert_eq!(response.status(), 503);
+        assert_eq!(
+            header(&response, "retry-after"),
+            None,
+            "retrying cannot help"
+        );
+        let envelope: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(envelope["error"]["code"], "gateway_failed");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("env:MISSING"),
+            "{envelope}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_error_response_does_not_claim_that_an_account_answered() {
+    let (stand, _up) = stand(vec![
+        ("/a/", vec![Script::RateLimited]),
+        ("/b/", vec![Script::RateLimited]),
+    ])
+    .await;
+    let response = post(&stand, "auto/main", false).await;
+    assert_eq!(response.status(), 429);
+    assert_eq!(header(&response, "x-pooprusteek-account"), None);
 }

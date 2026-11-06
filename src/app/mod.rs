@@ -1024,6 +1024,14 @@ impl App {
                 self.gateway = gateway;
                 self.provider_models.set_gateway(self.gateway.clone());
                 self.sync_server_gateway();
+                // Адаптеры собраны: каталог моделей аккаунтов можно наполнять.
+                providers::spawn_models_refresh(
+                    Arc::clone(&self.provider_models),
+                    self.config.providers.clone(),
+                    self.config.provider_models.cache_ms,
+                    false,
+                    self.event_tx.clone(),
+                );
                 self.state.status_message =
                     gateway_startup_note(&self.gateway).unwrap_or_else(|| "Gateway ready".into());
             }

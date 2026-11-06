@@ -60,7 +60,7 @@ pub async fn run(config: Config) -> AppResult<()> {
         let cache_ms = config.provider_models.cache_ms;
         let refetch_ms = config.provider_models.refetch_ms;
         let event_tx = event_tx.clone();
-        if !entries.is_empty() {
+        if !entries.is_empty() || gateway_on {
             tokio::spawn(async move {
                 let outcome = models.refresh(&entries, cache_ms, false).await;
                 let _ = event_tx.send(AppEvent::ProviderModelsRefreshed {
@@ -114,7 +114,14 @@ pub async fn run(config: Config) -> AppResult<()> {
                 }
                 Some(AppEvent::ServerRequestLog { line }) => log_line(&line),
                 Some(AppEvent::GatewayBuilt(built)) => {
-                    on_gateway_built(built.0, pending.take(), &models, &handle, &event_tx);
+                    on_gateway_built(
+                        built.0,
+                        pending.take(),
+                        &models,
+                        &handle,
+                        &event_tx,
+                        (&config.providers, config.provider_models.cache_ms),
+                    );
                 }
                 Some(AppEvent::ProviderModelsRefreshed { summary, .. }) => log_line(&summary),
                 // Nothing else runs in this process, but the enum is shared
@@ -133,6 +140,7 @@ fn on_gateway_built(
     models: &Arc<ProviderModelCache>,
     handle: &super::ServerHandle,
     event_tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    refresh: (&[crate::config::ProviderEntry], u64),
 ) {
     let Some(pending) = pending else { return };
     match built {
@@ -141,6 +149,20 @@ fn on_gateway_built(
             models.set_gateway(Arc::clone(&gateway));
             handle.gateway.set(Arc::clone(&gateway));
             log_line("gateway ready");
+            // Адаптеры собраны: каталог моделей аккаунтов шлюза наполняется сразу.
+            let (models, entries, cache_ms, tx) = (
+                Arc::clone(models),
+                refresh.0.to_vec(),
+                refresh.1,
+                event_tx.clone(),
+            );
+            tokio::spawn(async move {
+                let outcome = models.refresh(&entries, cache_ms, false).await;
+                let _ = tx.send(AppEvent::ProviderModelsRefreshed {
+                    summary: outcome.summary(),
+                    failed: outcome.failed.len(),
+                });
+            });
             forward_fallbacks(&gateway, event_tx.clone());
         }
         Err(reason) => {
@@ -221,6 +243,7 @@ mod tests {
             &models,
             &stand.handle,
             &event_tx,
+            (&[], 0),
         );
         assert_eq!(ask().await, 200);
     }

@@ -49,22 +49,6 @@ impl std::fmt::Debug for GatewayCell {
     }
 }
 
-/// Шлюз ещё собирается: снимок пуст, а запросы просят подождать.
-pub fn is_starting(gateway: &GatewayHandle) -> bool {
-    use crate::gateway::handle::{CallSource, DecisionQuery};
-    use crate::gateway::types::{Role, ToolMode};
-    let query = DecisionQuery {
-        role: Role::Main,
-        source: CallSource::Serve,
-        tool_mode: ToolMode::Prompt,
-        input_tokens: None,
-        pinned: None,
-        sticky: None,
-        failed: Vec::new(),
-    };
-    gateway.decide(&query).why == Why::Starting
-}
-
 // ── Каталог ─────────────────────────────────────────────────────────────
 
 /// Отдаётся ли аккаунт наружу: не подписка CLI, включён, адаптер собран.
@@ -211,12 +195,38 @@ fn unix(time: SystemTime) -> u64 {
     crate::gateway::clock::to_unix(time)
 }
 
-/// Текст решения и причин может нести адрес из сообщения об ошибке: URL заменяются.
-fn scrub(text: &str) -> String {
+/// Всё, что уходит клиенту или в открытый статус, не должно нести адрес апстрима:
+/// URL и пары `хост:порт` заменяются.
+pub(super) fn scrub(text: &str) -> String {
     text.split(' ')
-        .map(|word| if word.contains("://") { "<url>" } else { word })
+        .map(|word| {
+            let bare = word.trim_matches(|c: char| "()[]<>\"',;".contains(c));
+            if bare.contains("://") {
+                "<url>"
+            } else if looks_like_address(bare) {
+                "<addr>"
+            } else {
+                word
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `127.0.0.1`, `10.0.0.5:8080`, `[::1]:80`, `host.internal:443`.
+fn looks_like_address(token: &str) -> bool {
+    if token.parse::<std::net::IpAddr>().is_ok() || token.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    token.rsplit_once(':').is_some_and(|(host, port)| {
+        !host.is_empty()
+            && host.contains('.')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            && !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+    })
 }
 
 fn status_json(status: &AccountStatus, detailed: bool) -> serde_json::Value {

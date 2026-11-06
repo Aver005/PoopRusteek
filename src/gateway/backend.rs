@@ -107,6 +107,13 @@ pub struct CallReport {
     pub upstream_id: Option<String>,
 }
 
+/// Ответ апстрима на прямой JSON-запрос: код и тело без разбора.
+#[derive(Debug, Clone)]
+pub struct ProxiedReply {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
 /// Итог неудачного вызова.
 #[derive(Debug, Clone)]
 pub struct BackendError {
@@ -256,6 +263,22 @@ pub trait Backend: Send + Sync {
     /// Токены текущей сессии на стороне сервера, если известны.
     fn session_tokens(&self) -> Option<u32> {
         None
+    }
+
+    /// Прямой JSON-запрос к аккаунту с его адресом и ключом (`/embeddings`, `/rerank`).
+    /// Умолчание — отказ: умеют только API-аккаунты с протоколом OpenAI.
+    async fn proxy_json(
+        &self,
+        path: &str,
+        _body: serde_json::Value,
+    ) -> Result<ProxiedReply, BackendError> {
+        Err(BackendError {
+            class: FailureClass::BadRequest,
+            status: None,
+            message: format!("{path} is not available through this account"),
+            emitted: false,
+            limits: None,
+        })
     }
 
     /// Удалить серверную сессию одноразового форка.

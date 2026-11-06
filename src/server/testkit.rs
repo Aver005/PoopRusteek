@@ -30,6 +30,12 @@ pub(crate) enum Script {
     Hang(&'static str),
     /// Первый кусок и обрыв соединения без конца ответа.
     Break(&'static str),
+    /// Прочитать запрос и молчать, пока клиент не закроет соединение (ни одного байта ответа).
+    Silent,
+    /// Каталог моделей `GET /models`.
+    Models(Vec<&'static str>),
+    /// Обычный JSON-ответ с кодом 200 на произвольный POST (эмбеддинги и т. п.).
+    Json(&'static str),
 }
 
 /// Что апстрим увидел в запросе.
@@ -198,6 +204,44 @@ async fn answer(
             }
             closed.fetch_add(1, Ordering::SeqCst);
         }
+        Script::Silent => {
+            let mut sink = [0u8; 256];
+            loop {
+                match socket.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            closed.fetch_add(1, Ordering::SeqCst);
+        }
+        Script::Models(ids) => {
+            let list: Vec<String> = ids.iter().map(|id| format!("{{\"id\":\"{id}\",\"object\":\"model\",\"created\":0,\"owned_by\":\"test\"}}")).collect();
+            let body = format!("{{\"object\":\"list\",\"data\":[{}]}}", list.join(","));
+            let reply = format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+        Script::Json(body) => {
+            let reply = format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
         Script::Break(first) => {
             let out = format!("{}{}", stream_head(&[]), sse_chunk(first, None));
             let _ = socket.write_all(out.as_bytes()).await;
@@ -269,6 +313,8 @@ pub(crate) struct Stand {
     pub base: String,
     pub cell: GatewayCell,
     pub handle: ServerHandle,
+    /// Кэш моделей сервера: тест наполняет его так же, как приложение.
+    pub models: Arc<crate::provider::model_cache::ProviderModelCache>,
     _events: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 }
 
@@ -297,7 +343,7 @@ pub(crate) async fn start_with(settings: ServerSettings) -> Stand {
     let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let cell = settings.gateway.clone();
     let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
-    let handle = spawn(settings, models, 1, event_tx);
+    let handle = spawn(settings, Arc::clone(&models), 1, event_tx);
     let addr = loop {
         match events.recv().await {
             Some(AppEvent::ServerStarted { addr, .. }) => break addr,
@@ -309,6 +355,7 @@ pub(crate) async fn start_with(settings: ServerSettings) -> Stand {
         base: format!("http://127.0.0.1:{}", addr.port()),
         cell,
         handle,
+        models,
         _events: events,
     }
 }
