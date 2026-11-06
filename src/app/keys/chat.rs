@@ -45,6 +45,11 @@ impl App {
                     self.cancel_focused_turn().await;
                 } else if self.state.autocomplete.visible {
                     self.state.autocomplete = AutocompleteState::default();
+                } else if !self.state.focused().queued.is_empty() {
+                    // Очередь, что висит без хода (упавший ход), возвращается в поле.
+                    let count = self.state.restore_queued_to_input();
+                    self.state.status_message =
+                        format!("{count} queued message(s) returned to the input");
                 } else {
                     // В простое Esc ничего не стирает и не выходит: чат чистит
                     // только `/clear`, выход — Ctrl+C.
@@ -167,6 +172,17 @@ impl App {
         // Expand any `[Pasted #N, L lines]` chips back to their real content so
         // the model (and the saved message) get the full pasted text.
         let input = self.state.input.expanded().trim().to_string();
+        // Пустое поле при стоящей очереди — «отправь следующее».
+        if input.is_empty()
+            && self.state.attached_files.is_empty()
+            && !self.state.focused().generation.active
+            && !self.state.focused().queued.is_empty()
+        {
+            self.state.focused_mut().queue_paused = false;
+            let focused = self.state.conversations.focused_id();
+            self.send_next_queued(focused).await;
+            return Ok(SubmitOutcome::Continue);
+        }
         // Одни файлы без текста — тоже сообщение, но не пустая цель.
         if input.is_empty() && (self.state.attached_files.is_empty() || self.state.goal.mode) {
             // Empty while defining a goal gets a nudge instead of silence.

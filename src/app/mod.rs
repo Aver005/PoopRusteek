@@ -394,6 +394,8 @@ impl AppState {
         self.focused_mut().messages.clear();
         self.scroll_offset = 0;
         self.autocomplete = AutocompleteState::default();
+        // Очередь относится к стёртой истории; её текст не пропадает молча.
+        self.restore_queued_to_input();
     }
 }
 

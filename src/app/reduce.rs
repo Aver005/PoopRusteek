@@ -102,6 +102,7 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
         AgentEvent::Started => {
             conversation.generation.begin(std::time::Instant::now());
             conversation.current_tool = None;
+            conversation.queue_paused = false;
             None
         }
         AgentEvent::BeginAssistantMessage => {
@@ -136,6 +137,8 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
         }
         AgentEvent::Failed(reason) => {
             conversation.current_tool = None;
+            // Упавший ход не отправляет очередь сам: решает человек.
+            conversation.queue_paused = true;
             conversation.finish_turn("ABORTED");
             // Причина остаётся в истории: строка состояния её забывала, а модель
             // следующего хода не знала, что прошлый оборвался.
@@ -481,5 +484,38 @@ mod tests {
             apply(&mut conv, &ending);
             assert!(conv.current_tool.is_none(), "{ending:?}");
         }
+    }
+
+    /// Упавший ход останавливает очередь, успешный — нет.
+    #[test]
+    fn a_failed_turn_pauses_the_queue_and_a_finished_one_does_not() {
+        use crate::app::conversation::QueuedMessage;
+        let queued = || QueuedMessage {
+            text: "next".to_string(),
+            chips: Vec::new(),
+            named: Vec::new(),
+        };
+        let done = AgentEvent::Done(AgentResult {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            truncated: None,
+        });
+
+        let mut conv = conversation();
+        apply(&mut conv, &AgentEvent::Started);
+        conv.queued.push_back(queued());
+        apply(&mut conv, &done);
+        assert!(!conv.queue_paused);
+
+        let mut failed = conversation();
+        apply(&mut failed, &AgentEvent::Started);
+        failed.queued.push_back(queued());
+        apply(&mut failed, &AgentEvent::Failed("сеть".to_string()));
+        assert!(failed.queue_paused);
+        assert!(!failed.is_busy(), "чат свободен, но очередь держит человек");
+
+        // Новый ход — новая жизнь очереди.
+        apply(&mut failed, &AgentEvent::Started);
+        assert!(!failed.queue_paused);
     }
 }

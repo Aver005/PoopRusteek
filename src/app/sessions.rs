@@ -27,6 +27,7 @@ impl App {
                 self.state.input.cursor = 0;
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = Default::default();
+                self.state.restore_queued_to_input();
                 self.state.focused_mut().generation.active = false;
                 let aborted = self.state.conversations.focused_id();
                 self.abort_turn_of(aborted);
@@ -263,6 +264,7 @@ impl App {
             self.state.input.cursor = 0;
             self.state.input.selection_anchor = None;
             self.state.autocomplete = Default::default();
+            self.state.restore_queued_to_input();
         }
         if let Some(provider) = provider {
             // Local session-state reset only — no network.

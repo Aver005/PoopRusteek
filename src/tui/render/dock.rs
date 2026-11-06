@@ -47,7 +47,8 @@ struct ChildRow {
 struct DockModel {
     main: Option<MainRow>,
     children: Vec<ChildRow>,
-    queue: Option<(usize, String)>,
+    /// Сколько сообщений ждёт, что первое, и стоит ли очередь после упавшего хода.
+    queue: Option<(usize, String, bool)>,
     summary: Vec<SummaryItem>,
 }
 
@@ -110,9 +111,14 @@ fn goal_text(state: &AppState) -> Option<(String, String)> {
     Some((long, short))
 }
 
-/// Идёт ли работа, ради которой стоит показывать панель.
+/// Идёт ли работа, ради которой стоит показывать панель. Очередь, что стоит
+/// после упавшего хода, тоже требует внимания: без панели о ней не узнать.
 fn work_is_active(state: &AppState, children_running: usize) -> bool {
-    state.focused().generation.active || children_running > 0 || state.goal.is_running()
+    let focused = state.focused();
+    focused.generation.active
+        || children_running > 0
+        || state.goal.is_running()
+        || (focused.queue_paused && !focused.queued.is_empty())
 }
 
 fn model(state: &AppState) -> DockModel {
@@ -147,7 +153,7 @@ fn model(state: &AppState) -> DockModel {
             .front()
             .map(|message| crate::util::one_line_label(&message.text, QUEUE_PREVIEW_CHARS))
             .unwrap_or_default();
-        (focused.queued.len(), next)
+        (focused.queued.len(), next, focused.queue_paused)
     });
 
     let mut summary = Vec::new();
@@ -356,15 +362,29 @@ fn child_line<'a>(row: &ChildRow, last: bool, width: usize, theme: &Theme) -> Li
     two_sided(width, lead, &lead_text, &right, theme)
 }
 
-fn queue_line<'a>(count: usize, next: &str, width: usize, theme: &Theme) -> Line<'a> {
-    let lead_text = format!(" queued {count} · next: {next}");
+fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &Theme) -> Line<'a> {
+    if paused {
+        // Ход упал, а сообщения ждут решения человека.
+        let text = format!(
+            " turn failed \u{00B7} {count} queued \u{00B7} Enter sends the next \u{00B7} Esc returns them to the input"
+        );
+        let lead_text = text.clone();
+        let lead = vec![Span::styled(
+            text,
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        )];
+        return two_sided(width, lead, &lead_text, "", theme);
+    }
+    let lead_text = format!(" queued {count} \u{00B7} next: {next}");
     let lead = vec![
         Span::styled(
             format!(" queued {count}"),
             Style::default().fg(theme.warning),
         ),
         Span::styled(
-            format!(" · next: {next}"),
+            format!(" \u{00B7} next: {next}"),
             Style::default().fg(theme.text_soft),
         ),
     ];
@@ -419,8 +439,8 @@ pub(crate) fn render_dock(frame: &mut Frame, area: Rect, state: &AppState, theme
     for (index, child) in model.children.iter().enumerate() {
         lines.push(child_line(child, index + 1 == child_count, width, theme));
     }
-    if let Some((count, next)) = &model.queue {
-        lines.push(queue_line(*count, next, width, theme));
+    if let Some((count, next, paused)) = &model.queue {
+        lines.push(queue_line(*count, next, *paused, width, theme));
     }
     if !model.summary.is_empty() {
         lines.push(summary_line(&model.summary, width, theme));
@@ -512,7 +532,7 @@ mod tests {
                 named: Vec::new(),
             });
         let model = model(&state);
-        assert_eq!(model.queue.as_ref().map(|(count, _)| *count), Some(1));
+        assert_eq!(model.queue.as_ref().map(|(count, _, _)| *count), Some(1));
         assert_eq!(height(&state), 2);
     }
 
@@ -522,5 +542,23 @@ mod tests {
         assert_eq!(clock(125), "2:05");
         assert_eq!(compact_count(999), "999");
         assert_eq!(compact_count(1840), "1.8k");
+    }
+
+    #[test]
+    fn a_queue_held_after_a_failed_turn_keeps_the_dock_open() {
+        let mut state = idle_state();
+        state
+            .focused_mut()
+            .queued
+            .push_back(crate::app::conversation::QueuedMessage {
+                text: "next".to_string(),
+                chips: Vec::new(),
+                named: Vec::new(),
+            });
+        assert_eq!(height(&state), 0, "очередь без остановки уйдёт сама");
+        state.focused_mut().queue_paused = true;
+        assert_eq!(height(&state), 1);
+        let model = model(&state);
+        assert_eq!(model.queue.map(|(_, _, paused)| paused), Some(true));
     }
 }

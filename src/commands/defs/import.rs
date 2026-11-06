@@ -73,6 +73,7 @@ impl Command for ImportCommand {
             state.input.buffer.clear();
             state.input.cursor = 0;
             state.input.selection_anchor = None;
+            state.restore_queued_to_input();
             state.focused_mut().generation.active = false;
 
             state.status_message = format!(

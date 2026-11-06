@@ -26,6 +26,13 @@ fn hint_variants(state: &AppState) -> &'static [&'static str] {
             "Esc cancel \u{00B7} Enter queue",
             "Esc cancel",
         ]
+    } else if !state.focused().queued.is_empty() {
+        // Очередь стоит без хода: подсказка про то, как с ней быть.
+        &[
+            "Enter send next queued \u{00B7} Esc return queued to input",
+            "Enter send next \u{00B7} Esc return to input",
+            "Esc return queued",
+        ]
     } else {
         &[
             "Enter send \u{00B7} Shift+Enter newline \u{00B7} / commands \u{00B7} @ file",
@@ -134,5 +141,23 @@ mod tests {
                 named: Vec::new(),
             });
         assert!(label(&state).contains("1 queued"));
+    }
+
+    #[test]
+    fn a_waiting_queue_says_how_to_send_or_return_it() {
+        let mut state = state();
+        state
+            .focused_mut()
+            .queued
+            .push_back(crate::app::conversation::QueuedMessage {
+                text: "next".to_string(),
+                chips: Vec::new(),
+                named: Vec::new(),
+            });
+        let (_, _, right) = rule_text(&state, 120);
+        assert!(
+            right.contains("Enter send next") && right.contains("Esc return"),
+            "{right}"
+        );
     }
 }
