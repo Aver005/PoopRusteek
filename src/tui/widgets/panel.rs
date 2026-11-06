@@ -1,7 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
 use crate::provider::Role;
-use crate::session;
 use crate::tui::theme::Theme;
 use ratatui::{
     Frame,
@@ -10,57 +9,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
-const PANEL_W: usize = 34;
-
-/// The number of columns the stats panel will actually occupy for a given
-/// available width, or `0` if it won't render (too narrow — see the
-/// `panel_w < 20` guard in [`render_stats_panel`]).
-///
-/// The layout in `tui::render` MUST reserve exactly this width so the chat
-/// area never overlaps the panel: the panel paints its background by
-/// *recoloring* cells (`Block`/`Paragraph` styles), which does not clear the
-/// glyphs already drawn there, so any chat text left under the panel bleeds
-/// through its blank/indented cells. Reserving a mismatched width (the old
-/// `34.min(width/4)`) is what let long chat lines climb onto the panel on
-/// terminals narrower than ~136 columns.
-pub fn panel_width(available: u16) -> u16 {
-    let w = PANEL_W.min(available as usize);
-    if w < 20 { 0 } else { w as u16 }
-}
-
-/// How long a cached session tag stays valid before `session::load_local`
-/// is asked to re-read the file. The panel repaints every frame while the
-/// UI is active, but the on-disk tag only changes on an explicit user
-/// action, so a few seconds of staleness is unobservable in practice.
-const SESSION_TAG_TTL: Duration = Duration::from_secs(5);
-
-thread_local! {
-    /// Session id -> (fetched-at, tag). Avoids re-reading and re-parsing the
-    /// whole session JSON file every frame just to show its `tag`.
-    static SESSION_TAG_CACHE: RefCell<HashMap<String, (Instant, Option<String>)>> = RefCell::new(HashMap::new());
-}
-
-/// The focused session's `tag`, read from disk at most once per
-/// [`SESSION_TAG_TTL`] window per session id.
-fn cached_session_tag(session_id: &str, config: &Config) -> Option<String> {
-    SESSION_TAG_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some((fetched_at, tag)) = cache.get(session_id)
-            && fetched_at.elapsed() < SESSION_TAG_TTL
-        {
-            return tag.clone();
-        }
-        let tag = session::load_local(session_id, config)
-            .ok()
-            .and_then(|s| s.tag);
-        cache.insert(session_id.to_string(), (Instant::now(), tag.clone()));
-        tag
-    })
-}
+/// Ширину панели задаёт раскладка: она же резервирует под неё место.
+const PANEL_W: usize = crate::tui::render::SIDEBAR_WIDTH as usize;
 
 pub fn render_stats_panel(
     frame: &mut Frame,
@@ -135,8 +87,8 @@ pub fn render_stats_panel(
 
     // ── Session ──
     section_header(&mut lines, "Session", panel_w, theme);
-    if let Some(tag) = cached_session_tag(&state.focused().session_id, config) {
-        data_row(&mut lines, "Tag", &tag, theme);
+    if let Some(tag) = state.focused().tag.as_deref() {
+        data_row(&mut lines, "Tag", tag, theme);
     }
     let started = format_time_short(&state.focused().session_started_at);
     data_row(&mut lines, "Started", &started, theme);
@@ -432,58 +384,5 @@ mod tests {
         assert_eq!(left, "");
         assert_eq!(gap, 0);
         assert!(!right.is_empty());
-    }
-
-    #[test]
-    fn panel_width_matches_drawn_width_on_normal_terminals() {
-        // On any terminal at least as wide as PANEL_W, the reserved width the
-        // layout uses must equal the fixed width the panel actually draws —
-        // this is the invariant whose violation let chat text bleed onto the
-        // panel (the old layout reserved `34.min(width/4)` instead).
-        for available in [40u16, 80, 120, 136, 200] {
-            assert_eq!(
-                panel_width(available),
-                PANEL_W as u16,
-                "available={available}"
-            );
-        }
-    }
-
-    #[test]
-    fn panel_width_never_exceeds_available() {
-        for available in 0u16..=40 {
-            assert!(panel_width(available) <= available, "available={available}");
-        }
-    }
-
-    #[test]
-    fn panel_width_is_zero_when_too_narrow_to_render() {
-        // Mirrors the `panel_w < 20` early-return in render_stats_panel: below
-        // 20 columns the panel does not draw, so nothing must be reserved.
-        for available in 0u16..20 {
-            assert_eq!(panel_width(available), 0, "available={available}");
-        }
-        assert_eq!(panel_width(20), 20);
-    }
-
-    #[test]
-    fn session_tag_cache_misses_gracefully_for_unknown_session() {
-        let config = Config::default();
-        // A session id that will never exist on disk — must return None,
-        // not panic or error out.
-        let tag = cached_session_tag("no-such-session-ever-00000000", &config);
-        assert_eq!(tag, None);
-    }
-
-    #[test]
-    fn session_tag_cache_reuses_entry_within_ttl() {
-        let config = Config::default();
-        let id = "panel-test-ttl-cache-session-id";
-        // First call populates the cache (miss on disk -> None, cached).
-        let first = cached_session_tag(id, &config);
-        // Second call within the TTL window must hit the cache rather than
-        // touching disk again; result should be identical.
-        let second = cached_session_tag(id, &config);
-        assert_eq!(first, second);
     }
 }

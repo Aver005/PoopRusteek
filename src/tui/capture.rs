@@ -831,7 +831,6 @@ fn capture_screens() {
 
     // Список сессий на главной кэшируется на 3 с — ждём, пока кэш протухнет.
     plant_sessions(&config);
-    std::thread::sleep(Duration::from_millis(3300));
     for scene in all.iter().filter(|s| selected(s) && !s.first_run) {
         for theme in scene.themes {
             for size in scene.sizes {
@@ -842,3 +841,7 @@ fn capture_screens() {
     std::fs::write(out.join("manifest.tsv"), manifest).expect("manifest");
     let _ = std::fs::remove_dir_all(&data);
 }
+    state.terminal_cols = width;
+    state
+        .landing
+        .apply(crate::session::list_sessions().unwrap_or_default());

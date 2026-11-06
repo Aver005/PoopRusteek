@@ -8,6 +8,7 @@ mod goal;
 pub mod input;
 mod interaction;
 mod keys;
+pub mod landing;
 pub mod list;
 pub mod mcp_add;
 pub mod mcp_status;
@@ -246,6 +247,8 @@ pub struct AppState {
     /// …and the ones parked behind it, FIFO. See `present_next_interaction`.
     pub pending_interactions: std::collections::VecDeque<PendingInteraction>,
     pub autocomplete: AutocompleteState,
+    /// Недавние сессии для главного экрана; читает фоновая задача.
+    pub landing: landing::LandingSessions,
     pub view: View,
     pub onboarding: OnboardingState,
     pub mcp_status: mcp_status::McpStatus,
@@ -334,6 +337,7 @@ impl AppState {
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
             instructions_section: String::new(),
+            landing: landing::LandingSessions::default(),
             show_stats_panel: true,
             attached_files: Vec::new(),
             goal: goal::GoalState::default(),
@@ -910,17 +914,21 @@ impl App {
     fn on_tick(&mut self) {
         if self.tick_is_visual() {
             let generation = &mut self.state.focused_mut().generation;
-            generation.animation_tick = generation.animation_tick.wrapping_add(1);
-        }
-        self.maybe_refetch_provider_models();
-    }
             AppEvent::LandingSessionsLoaded(sessions) => self.state.landing.apply(sessions),
             AppEvent::AutocompleteReady { generation, items } => {
                 self.on_autocomplete_ready(generation, items);
             }
+            generation.animation_tick = generation.animation_tick.wrapping_add(1);
+        }
+        self.maybe_refetch_provider_models();
+    }
 
     /// Единственный вход агентских событий: историю меняет `reduce`, здесь
     /// остаётся хвост — фон и фокус расходятся ровно в нём.
+        // Главный экран показывает сессии: держим список свежим, не трогая диск в кадре.
+        if self.state.view == View::Chat && self.state.focused().messages.is_empty() {
+            self.state.landing.refresh_if_stale(&self.event_tx);
+        }
     async fn on_agent_event(&mut self, target: conversation::ConversationId, event: AgentEvent) {
         let focused = self.state.conversations.focused_id() == target;
         let Some(conversation) = self.state.conversations.get_mut(target) else {
