@@ -5,7 +5,8 @@ use super::api_backend::estimate_prompt_tokens;
 use super::backend::{Backend, BackendError, CallContext, Capabilities, EmitTracker};
 use super::engine::{Binding, Core, Runtime};
 use super::handle::{
-    CallSource, Decision, DecisionQuery, GatewayEvent, Outcome, SkipReason, Target, UsageRecord,
+    CallSource, Decision, DecisionQuery, GatewayEvent, Outcome, ServedBy, SkipReason, Target,
+    UsageRecord,
 };
 use super::history::{carries_foreign_state, flatten_for_switch};
 use super::state::RouteState;
@@ -49,6 +50,8 @@ pub struct RoutedProvider {
     tool_mode: ToolMode,
     label: String,
     affinity: Mutex<Affinity>,
+    /// Цель текущей попытки: её читает `/serve` для заголовков ответа.
+    served: Mutex<Option<ServedBy>>,
 }
 
 /// Фактический исход одной попытки, нужный для учёта.
@@ -58,6 +61,42 @@ struct Attempt<'a> {
     request_id: &'a str,
     fallback_from: Option<AccountId>,
     started: Instant,
+}
+
+/// Вызов оборвали (ход отменён, клиент `/serve` ушёл): учёт получает одну запись «отменён»
+/// с оценкой расхода. Отказом аккаунта это не считается: cooldown не включается.
+struct CancelGuard<'a> {
+    provider: &'a RoutedProvider,
+    attempt: &'a Attempt<'a>,
+    route: Option<super::types::RouteId>,
+    tracker: EmitTracker,
+    input_tokens: u32,
+    armed: bool,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let completion = (self.tracker.emitted_chars() / 4) as u32;
+        let report = super::backend::CallReport {
+            usage: Some(crate::provider::Usage {
+                prompt_tokens: self.input_tokens,
+                completion_tokens: completion,
+                total_tokens: self.input_tokens + completion,
+                ..crate::provider::Usage::default()
+            }),
+            usage_estimated: true,
+            ..Default::default()
+        };
+        self.provider.record(
+            self.attempt,
+            self.route.take(),
+            Outcome::Cancelled,
+            Some(&report),
+        );
+    }
 }
 
 impl RoutedProvider {
@@ -83,6 +122,7 @@ impl RoutedProvider {
             tool_mode,
             label,
             affinity: Mutex::new(Affinity::default()),
+            served: Mutex::new(None),
         }
     }
 
@@ -91,6 +131,20 @@ impl RoutedProvider {
             Binding::Role(role) => *role,
             _ => Role::Main,
         }
+    }
+
+    fn publish_served(
+        &self,
+        target: &Target,
+        route: Option<super::types::RouteId>,
+        failed: &[(AccountId, String)],
+    ) {
+        let served = ServedBy {
+            target: target.clone(),
+            route,
+            failed_before: failed.to_vec(),
+        };
+        *self.served.lock().unwrap_or_else(|e| e.into_inner()) = Some(served);
     }
 
     fn affinity(&self) -> std::sync::MutexGuard<'_, Affinity> {
@@ -353,7 +407,17 @@ impl RoutedProvider {
                 tool_mode: self.tool_mode,
             };
             let tracker = EmitTracker::new(tx.clone());
+            self.publish_served(&target, route_id.clone(), &failed);
+            let mut guard = CancelGuard {
+                provider: self,
+                attempt: &attempt,
+                route: route_id.clone(),
+                tracker: tracker.clone(),
+                input_tokens,
+                armed: true,
+            };
             let result = backend.call(attempt_request, &context, tracker).await;
+            guard.armed = false;
             drop(permit);
 
             match result {
@@ -684,6 +748,13 @@ impl LLMProvider for RoutedProvider {
         }
     }
 
+    fn served_by(&self) -> Option<ServedBy> {
+        self.served
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn fork(&self) -> Arc<dyn LLMProvider> {
         Arc::new(Self {
             core: Arc::clone(&self.core),
@@ -692,6 +763,7 @@ impl LLMProvider for RoutedProvider {
             tool_mode: self.tool_mode,
             label: self.label.clone(),
             affinity: Mutex::new(Affinity::default()),
+            served: Mutex::new(None),
         })
     }
 

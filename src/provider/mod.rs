@@ -414,6 +414,11 @@ pub trait LLMProvider: Send + Sync {
     /// Подсказать шлюзу, где беседа была до перезапуска: чужую историю он развернёт в текст.
     fn seed_route_state(&self, _state: crate::gateway::state::RouteState) {}
 
+    /// Аккаунт и модель текущей попытки (заголовки `/serve`). Без шлюза — `None`.
+    fn served_by(&self) -> Option<crate::gateway::handle::ServedBy> {
+        None
+    }
+
     /// Create a sibling instance that shares this provider's configuration
     /// (and connection) but starts a **fresh session** — no shared
     /// `parent_message_id`/`session_id`. Each parallel conversation and

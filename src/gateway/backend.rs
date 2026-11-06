@@ -16,7 +16,7 @@ use crate::provider::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -107,6 +107,13 @@ pub struct CallReport {
     pub upstream_id: Option<String>,
 }
 
+/// Ответ апстрима на прямой JSON-запрос: код и тело без разбора.
+#[derive(Debug, Clone)]
+pub struct ProxiedReply {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
 /// Итог неудачного вызова.
 #[derive(Debug, Clone)]
 pub struct BackendError {
@@ -158,6 +165,8 @@ pub fn is_meaningful(chunk: &CompletionChunk) -> bool {
 pub struct EmitTracker {
     tx: UnboundedSender<CompletionChunk>,
     emitted: Arc<AtomicBool>,
+    /// Сколько символов текста ушло: оценка расхода оборванного вызова.
+    chars: Arc<AtomicUsize>,
 }
 
 impl EmitTracker {
@@ -165,21 +174,30 @@ impl EmitTracker {
         Self {
             tx,
             emitted: Arc::new(AtomicBool::new(false)),
+            chars: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Отправить чанк. `false` — получатель ушёл, вызов можно прекращать.
     pub fn send(&self, chunk: CompletionChunk) -> bool {
         let meaningful = is_meaningful(&chunk);
+        let length = chunk.content.chars().count();
         let delivered = self.tx.send(chunk).is_ok();
-        if delivered && meaningful {
-            self.emitted.store(true, Ordering::Relaxed);
+        if delivered {
+            self.chars.fetch_add(length, Ordering::Relaxed);
+            if meaningful {
+                self.emitted.store(true, Ordering::Relaxed);
+            }
         }
         delivered
     }
 
     pub fn emitted(&self) -> bool {
         self.emitted.load(Ordering::Relaxed)
+    }
+
+    pub fn emitted_chars(&self) -> usize {
+        self.chars.load(Ordering::Relaxed)
     }
 }
 
@@ -245,6 +263,22 @@ pub trait Backend: Send + Sync {
     /// Токены текущей сессии на стороне сервера, если известны.
     fn session_tokens(&self) -> Option<u32> {
         None
+    }
+
+    /// Прямой JSON-запрос к аккаунту с его адресом и ключом (`/embeddings`, `/rerank`).
+    /// Умолчание — отказ: умеют только API-аккаунты с протоколом OpenAI.
+    async fn proxy_json(
+        &self,
+        path: &str,
+        _body: serde_json::Value,
+    ) -> Result<ProxiedReply, BackendError> {
+        Err(BackendError {
+            class: FailureClass::BadRequest,
+            status: None,
+            message: format!("{path} is not available through this account"),
+            emitted: false,
+            limits: None,
+        })
     }
 
     /// Удалить серверную сессию одноразового форка.

@@ -233,7 +233,7 @@ pub enum SkipReason {
         used_pct: f32,
         age: Duration,
     },
-    /// Подписка Claude наружу через `/serve` не раздаётся.
+    /// Подписки CLI наружу через `/serve` не раздаются.
     NotForServe,
     /// Ошибка конфига: аккаунт не используется, пока её не исправят.
     InvalidConfig {
@@ -253,6 +253,15 @@ pub enum SkipReason {
 pub struct Skipped {
     pub account: AccountId,
     pub reason: SkipReason,
+}
+
+/// Кто отвечает на вызов сейчас: для заголовков `/serve`. Ни секретов, ни адресов.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServedBy {
+    pub target: Target,
+    pub route: Option<RouteId>,
+    /// Аккаунты, отказавшие раньше в этом вызове, и код класса отказа.
+    pub failed_before: Vec<(AccountId, String)>,
 }
 
 /// Причина выбора.
@@ -509,6 +518,8 @@ pub enum ResolveError {
     Disabled,
     /// Шлюз ещё собирается: повторить через мгновение.
     Starting,
+    /// Сборка не удалась; повтор не поможет, пока не исправят конфиг.
+    Failed(String),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -517,6 +528,7 @@ impl std::fmt::Display for ResolveError {
             Self::Unknown(id) => write!(f, "unknown model or account '{id}'"),
             Self::Disabled => f.write_str("the gateway is disabled"),
             Self::Starting => f.write_str("the gateway is still starting"),
+            Self::Failed(reason) => write!(f, "the gateway failed to start: {reason}"),
         }
     }
 }
@@ -542,9 +554,22 @@ pub enum GatewayEvent {
     ConfigChanged,
 }
 
+/// Готов ли шлюз: сборка идёт на `spawn_blocking`, пока она идёт или упала, снимок пуст.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildState {
+    Ready,
+    Starting,
+    Failed(String),
+}
+
 /// Фасад. Реализует движок; приложение держит `GatewayHandle`.
 pub trait Gateway: Send + Sync {
     fn is_enabled(&self) -> bool;
+
+    /// Состояние сборки. Собранный и выключенный шлюзы всегда `Ready`.
+    fn build_state(&self) -> BuildState {
+        BuildState::Ready
+    }
     fn snapshot(&self) -> GatewaySnapshot;
 
     /// Провайдер роли. Один `RoutedProvider` на вызывающего: у `fork()` общий движок и

@@ -75,8 +75,10 @@ impl App {
                 .push_system("API server is already running — see /serve.");
             return;
         }
-        let settings = server::ServerSettings::from_config(&self.config);
-        if settings.deepseek.is_none() && settings.entries.is_empty() {
+        let mut settings = server::ServerSettings::from_config(&self.config);
+        settings.gateway = server::GatewayCell::new(self.gateway.clone());
+        if settings.deepseek.is_none() && settings.entries.is_empty() && !self.gateway.is_enabled()
+        {
             self.state.push_system(
                 "Note: no providers are configured — the API will expose no models. \
                  Set up DeepSeek or add one via /providers.",
@@ -96,6 +98,13 @@ impl App {
             handle.api.label()
         ));
         self.server = Some(handle);
+    }
+
+    /// Шлюз приложения пересобран (`/wipe`, готовность после старта): сервер переходит на новый.
+    pub(crate) fn sync_server_gateway(&self) {
+        if let Some(handle) = &self.server {
+            handle.gateway.set(self.gateway.clone());
+        }
     }
 
     /// Signal the old task and immediately spawn the successor. The old
@@ -123,11 +132,15 @@ impl App {
             },
             None => format!("stopped (would bind {}:{})", config.host, config.port),
         };
-        let models = catalog::list_model_ids(
-            !self.config.provider.token.is_empty(),
-            &self.config.providers,
-            &self.provider_models.snapshot(),
-        );
+        let models = if self.gateway.is_enabled() {
+            server::routing::model_ids(&self.gateway.snapshot(), &self.provider_models.snapshot())
+        } else {
+            catalog::list_model_ids(
+                !self.config.provider.token.is_empty(),
+                &self.config.providers,
+                &self.provider_models.snapshot(),
+            )
+        };
         // Fetched lists can run long (OpenRouter ≈ hundreds) — cap the chat
         // display; the full list is one `GET /v1/models` away.
         const SHOWN: usize = 24;

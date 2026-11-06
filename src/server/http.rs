@@ -32,6 +32,11 @@ pub(super) struct LogDetail(pub String);
 /// Per-launch state shared by every connection.
 pub(super) struct ServerContext {
     pub api: ServerApi,
+    pub host: String,
+    /// Имена сверх loopback, разрешённые в `Host` (защита от DNS rebinding).
+    pub allowed_hosts: Vec<String>,
+    /// Порт, на котором сервер действительно слушает (известен после привязки).
+    pub bound_port: std::sync::atomic::AtomicU16,
     pub api_key: Option<String>,
     pub defaults: RequestDefaults,
     /// Base DeepSeek client — `fork()`ed per request — when a token is
@@ -44,6 +49,8 @@ pub(super) struct ServerContext {
     /// Reused client for endpoints proxied verbatim to an upstream
     /// (`/embeddings`, `/rerank`) — see `openai::passthrough`.
     pub http_client: reqwest::Client,
+    /// Живой шлюз: включённый ведёт все запросы, выключенный оставляет прежний путь.
+    pub gateway: super::GatewayCell,
     pub stats: Arc<ServerStats>,
     /// `Some` when per-request access-log events are wanted (proxy mode).
     pub log_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -82,12 +89,16 @@ impl ServerContext {
             .unwrap_or_default();
         Self {
             api: settings.api,
+            host: settings.host,
+            allowed_hosts: settings.allowed_hosts,
+            bound_port: std::sync::atomic::AtomicU16::new(settings.port),
             api_key: settings.api_key,
             defaults: settings.defaults,
             deepseek,
             entries: settings.entries,
             models,
             http_client,
+            gateway: settings.gateway,
             stats,
             log_tx,
         }
@@ -141,6 +152,9 @@ pub(super) async fn run(
     }
 
     let bound = listener.local_addr().ok();
+    if let Some(addr) = bound {
+        context.bound_port.store(addr.port(), Ordering::Relaxed);
+    }
     tracing::info!(
         "server: listening on {} ({} dialect)",
         bound
@@ -232,23 +246,47 @@ async fn handle_request(
 }
 
 async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Response<ApiBody> {
+    // Сервер на loopback отвечает только тем, кто назвал себя loopback-именем: иначе страница
+    // чужого сайта после DNS rebinding читала бы ответы как свои.
+    if super::is_loopback_host(&context.host) {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok());
+        let port = context.bound_port.load(Ordering::Relaxed);
+        if !super::routing::host_allowed(host, port, &context.allowed_hosts) {
+            return json_response(
+                StatusCode::FORBIDDEN,
+                &ErrorResponse::invalid_request(
+                    "unexpected Host header; add the name to [server] allowed_hosts to use it",
+                ),
+            );
+        }
+    }
+
     if request.method() == Method::OPTIONS {
         return empty_response(StatusCode::NO_CONTENT);
     }
 
     let path = request.uri().path().to_string();
     if request.method() == Method::GET && (path == "/" || path == "/health") {
+        // Открытый путь: за шлюзом имена аккаунтов наружу без ключа не идут.
+        let models = if context.gateway.get().is_enabled() {
+            Vec::new()
+        } else {
+            catalog::list_model_ids(
+                context.deepseek.is_some(),
+                &context.entries,
+                &context.models.snapshot(),
+            )
+        };
         return json_response(
             StatusCode::OK,
             &serde_json::json!({
                 "status": "ok",
                 "server": "pooprusteek",
                 "api": context.api.label(),
-                "models": catalog::list_model_ids(
-                    context.deepseek.is_some(),
-                    &context.entries,
-                    &context.models.snapshot(),
-                ),
+                "models": models,
             }),
         );
     }
@@ -275,6 +313,15 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
         }
     }
 
+    if request.method() == Method::GET
+        && matches!(
+            path.as_str(),
+            "/pooprusteek/status" | "/v1/pooprusteek/status"
+        )
+    {
+        return status_response(context);
+    }
+
     let handled = match context.api {
         ServerApi::Openai => openai::route(request, context).await,
         // Reserved dialects: the config parses, the seam exists, the
@@ -294,6 +341,32 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
             &ErrorResponse::invalid_request(format!("no route for {path}")),
         )
     })
+}
+
+/// Статус шлюза. Ключ сервера уже проверен выше; без ключа отдаётся урезанный вид и только
+/// при привязке к loopback: иначе чужой в сети увидел бы состояние чужих подписок.
+fn status_response(context: &ServerContext) -> Response<ApiBody> {
+    let gateway = context.gateway.get();
+    if !gateway.is_enabled() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &ErrorResponse::invalid_request("the gateway is disabled: nothing to report"),
+        );
+    }
+    use super::routing::{StatusAccess, status_access};
+    let access = status_access(context.api_key.is_some(), &context.host);
+    if access == StatusAccess::Forbidden {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &ErrorResponse::invalid_request(
+                "set [server] api_key to read the gateway status beyond loopback",
+            ),
+        );
+    }
+    json_response(
+        StatusCode::OK,
+        &super::routing::status_body(&gateway.snapshot(), access == StatusAccess::Detailed),
+    )
 }
 
 // ── Response helpers (shared with the dialect modules) ─────────────────
@@ -338,6 +411,8 @@ mod tests {
             deepseek: None,
             entries: Vec::new(),
             request_log: false,
+            allowed_hosts: Vec::new(),
+            gateway: Default::default(),
         }
     }
 

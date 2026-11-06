@@ -84,7 +84,7 @@ pub fn spawn_models_refresh(
     force: bool,
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::app::events::AppEvent>,
 ) {
-    if entries.is_empty() {
+    if entries.is_empty() && !cache.gateway_enabled() {
         return;
     }
     tokio::spawn(async move {
@@ -294,7 +294,7 @@ impl crate::app::App {
     /// Cheap elapsed check on the event loop; the fetch itself is spawned.
     pub(crate) fn maybe_refetch_provider_models(&mut self) {
         let period_ms = self.config.provider_models.refetch_ms;
-        if period_ms == 0 || self.config.providers.is_empty() {
+        if period_ms == 0 || (self.config.providers.is_empty() && !self.gateway.is_enabled()) {
             return;
         }
         if (self.last_models_refetch.elapsed().as_millis() as u64) < period_ms {

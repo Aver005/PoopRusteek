@@ -128,6 +128,40 @@ impl ProviderModelCache {
         gateway.backend_for(&crate::gateway::types::AccountId::parse(name).ok()?)
     }
 
+    /// Включён ли шлюз: тогда обновлять есть что и без записей `[[providers]]`.
+    pub fn gateway_enabled(&self) -> bool {
+        self.gateway
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .is_some_and(|gateway| gateway.is_enabled())
+    }
+
+    /// Аккаунты шлюза: id и живой адаптер, если он собран. Пока шлюз собирается — `None`.
+    fn gateway_accounts(&self) -> Option<Vec<GatewayAccount>> {
+        let gateway = self.gateway.lock().ok()?.clone()?;
+        if !gateway.is_enabled()
+            || gateway.build_state() != crate::gateway::handle::BuildState::Ready
+        {
+            return None;
+        }
+        let accounts = gateway.snapshot().accounts;
+        Some(
+            accounts
+                .into_iter()
+                .map(|view| GatewayAccount {
+                    // Выключенный аккаунт не опрашиваем, но его строка остаётся.
+                    backend: if view.enabled {
+                        gateway.backend_for(&view.id)
+                    } else {
+                        None
+                    },
+                    name: view.id.to_string(),
+                })
+                .collect(),
+        )
+    }
+
     #[cfg(test)]
     pub fn empty_for_tests() -> Arc<Self> {
         Arc::new(Self {
@@ -177,10 +211,17 @@ impl ProviderModelCache {
         self.persist();
     }
 
-    /// Drop cache rows for providers that no longer exist in the config.
-    fn retain_known(&self, known: &[ProviderEntry]) {
+    /// Drop cache rows for providers that no longer exist in the config. Пока шлюз
+    /// собирается, его аккаунты неизвестны, и чужие строки не трогаем.
+    fn retain_known(&self, entries: &[ProviderEntry], accounts: Option<&[GatewayAccount]>) {
+        if self.gateway_enabled() && accounts.is_none() {
+            return;
+        }
         if let Ok(mut map) = self.inner.lock() {
-            map.retain(|name, _| known.iter().any(|entry| &entry.name == name));
+            map.retain(|name, _| {
+                entries.iter().any(|entry| &entry.name == name)
+                    || accounts.is_some_and(|list| list.iter().any(|a| &a.name == name))
+            });
         }
     }
 
@@ -198,9 +239,8 @@ impl ProviderModelCache {
             Err(error) => tracing::warn!("provider model cache: serialize failed: {error}"),
         }
     }
-
-    /// Fetch model lists for `entries`, concurrently. Entries whose cache
-    /// is younger than `cache_ttl_ms` are skipped unless `force` (periodic
+    /// Fetch model lists for `entries` and for the gateway's accounts, concurrently.
+    /// Rows younger than `cache_ttl_ms` are skipped unless `force` (periodic
     /// refetch and provider-add use force; startup respects the cache).
     /// Failures keep whatever was cached before. Never panics, never holds
     /// the lock across an await.
@@ -210,7 +250,8 @@ impl ProviderModelCache {
         cache_ttl_ms: u64,
         force: bool,
     ) -> RefreshOutcome {
-        self.retain_known(entries);
+        let accounts = self.gateway_accounts();
+        self.retain_known(entries, accounts.as_deref());
         let mut outcome = RefreshOutcome::default();
         let mut jobs = Vec::new();
         for entry in entries {
@@ -218,33 +259,26 @@ impl ProviderModelCache {
                 outcome.skipped += 1;
                 continue;
             }
-            let entry = entry.clone();
-            let live = self.live_backend(&entry.name);
-            jobs.push(async move {
-                let result = match live {
-                    Some(backend) => {
-                        match tokio::time::timeout(FETCH_TIMEOUT, backend.list_models()).await {
-                            Ok(Ok(models)) => Ok(models.into_iter().map(|m| m.id).collect()),
-                            Ok(Err(error)) => Err(error.to_string()),
-                            Err(_) => Err(format!("timed out after {}s", FETCH_TIMEOUT.as_secs())),
-                        }
-                    }
-                    None => match crate::provider::build_entry_provider(&entry) {
-                        Ok(provider) => {
-                            match tokio::time::timeout(FETCH_TIMEOUT, provider.list_models()).await
-                            {
-                                Ok(Ok(models)) => Ok(models),
-                                Ok(Err(error)) => Err(error.to_string()),
-                                Err(_) => {
-                                    Err(format!("timed out after {}s", FETCH_TIMEOUT.as_secs()))
-                                }
-                            }
-                        }
-                        Err(error) => Err(error.to_string()),
-                    },
-                };
-                (entry.name, result)
-            });
+            let source = match self.live_backend(&entry.name) {
+                Some(backend) => Source::Live(backend),
+                None => Source::Entry(entry.clone()),
+            };
+            jobs.push(fetch_models(entry.name.clone(), source));
+        }
+        // Аккаунты шлюза без записи `[[providers]]` (в том числе подписки CLI: каталог их хранит,
+        // а `/serve` отфильтровывает сам).
+        for account in accounts.into_iter().flatten() {
+            if entries.iter().any(|entry| entry.name == account.name) {
+                continue;
+            }
+            let Some(backend) = account.backend else {
+                continue;
+            };
+            if !force && self.is_fresh(&account.name, cache_ttl_ms) {
+                outcome.skipped += 1;
+                continue;
+            }
+            jobs.push(fetch_models(account.name, Source::Live(backend)));
         }
         for (name, result) in futures::future::join_all(jobs).await {
             match result {
@@ -260,6 +294,42 @@ impl ProviderModelCache {
         }
         outcome
     }
+}
+
+/// Аккаунт шлюза для опроса: имя и живой адаптер, если он собран и аккаунт включён.
+struct GatewayAccount {
+    name: String,
+    backend: Option<Arc<dyn crate::gateway::backend::Backend>>,
+}
+
+/// Откуда брать список: живой адаптер шлюза или новый клиент записи.
+enum Source {
+    Live(Arc<dyn crate::gateway::backend::Backend>),
+    Entry(ProviderEntry),
+}
+
+async fn fetch_models(name: String, source: Source) -> (String, Result<Vec<String>, String>) {
+    let timed_out = || format!("timed out after {}s", FETCH_TIMEOUT.as_secs());
+    let result = match source {
+        Source::Live(backend) => {
+            match tokio::time::timeout(FETCH_TIMEOUT, backend.list_models()).await {
+                Ok(Ok(models)) => Ok(models.into_iter().map(|m| m.id).collect()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err(timed_out()),
+            }
+        }
+        Source::Entry(entry) => match crate::provider::build_entry_provider(&entry) {
+            Ok(provider) => {
+                match tokio::time::timeout(FETCH_TIMEOUT, provider.list_models()).await {
+                    Ok(Ok(models)) => Ok(models),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(_) => Err(timed_out()),
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        },
+    };
+    (name, result)
 }
 
 #[cfg(test)]
@@ -338,13 +408,14 @@ mod tests {
         );
         let cache = ProviderModelCache::empty_for_tests();
         cache.set_gateway(Arc::new(gateway.engine));
-        // "a" — аккаунт шлюза (адрес мёртвый, но адаптер подставной и отвечает);
-        // "dead" — обычная запись: идёт старым путём и падает.
+        // "a" — аккаунт шлюза (адрес мёртвый, но адаптер подставной и отвечает), "b" — аккаунт
+        // без записи: тоже опрашивается; "dead" — обычная запись: идёт старым путём и падает.
         let outcome = cache
             .refresh(&[entry("a"), entry("dead")], 60_000, true)
             .await;
         assert_eq!(cache.snapshot().get("a"), Some(&vec!["listed".to_string()]));
-        assert_eq!(outcome.fetched.len(), 1);
+        assert_eq!(cache.snapshot().get("b"), Some(&vec!["listed".to_string()]));
+        assert_eq!(outcome.fetched.len(), 2);
         assert_eq!(outcome.failed.len(), 1);
         assert_eq!(outcome.failed[0].0, "dead");
     }

@@ -3,7 +3,7 @@
 
 use super::backend::{
     AuthState, Backend, BackendError, BackendKind, CallContext, CallReport, Capabilities,
-    EmitTracker, ModelInfo, PROBE_TIMEOUT, ProbeReport, UsageSupport, is_meaningful,
+    EmitTracker, ModelInfo, PROBE_TIMEOUT, ProbeReport, ProxiedReply, UsageSupport, is_meaningful,
 };
 use super::handle::LimitSnapshot;
 use super::types::{Account, AccountId, AccountProvider, ToolMode};
@@ -152,6 +152,8 @@ struct Shared {
     native_tools: bool,
     clients: Mutex<HashMap<String, Arc<dyn LLMProvider>>>,
     limits: Mutex<Option<LimitSnapshot>>,
+    /// Клиент для прямых JSON-запросов: ключ уходит заголовком, за редиректом не идём.
+    http: reqwest::Client,
 }
 
 pub struct ApiBackend {
@@ -185,6 +187,12 @@ impl ApiBackend {
                 entry,
                 clients: Mutex::new(HashMap::new()),
                 limits: Mutex::new(None),
+                http: reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(10))
+                    .read_timeout(Duration::from_secs(300))
+                    .build()
+                    .unwrap_or_default(),
             }),
         })
     }
@@ -334,6 +342,44 @@ impl Backend for ApiBackend {
             detail,
             checked_at,
         }
+    }
+
+    async fn proxy_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<ProxiedReply, BackendError> {
+        let entry = &self.shared.entry;
+        if entry.protocol != ProviderProtocol::Openai {
+            return Err(BackendError {
+                class: FailureClass::BadRequest,
+                status: None,
+                message: format!("{path} works only for OpenAI-compatible accounts"),
+                emitted: false,
+                limits: None,
+            });
+        }
+        let url = format!("{}{path}", entry.base_url.trim_end_matches('/'));
+        let mut request = self.shared.http.post(url).json(&body);
+        if let Some(key) = &entry.api_key {
+            request = request.bearer_auth(key);
+        }
+        let account = &self.shared.account;
+        let failed = |error: reqwest::Error| {
+            // Адрес аккаунта в текст ошибки не попадает.
+            BackendError::from_app(
+                account,
+                &crate::error::AppError::Http(error.without_url()),
+                false,
+            )
+        };
+        let response = request.send().await.map_err(failed)?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await.map_err(failed)?;
+        Ok(ProxiedReply {
+            status,
+            body: body.to_vec(),
+        })
     }
 
     /// Без состояния на сервере: форк делит клиенты и лимиты аккаунта.

@@ -7,8 +7,8 @@
 
 use super::backend::Backend;
 use super::handle::{
-    CallSource, ConfigEdit, Decision, DecisionQuery, DisabledGateway, EditError, Gateway,
-    GatewayEvent, GatewayHandle, GatewaySnapshot, Ledger, ResolveError, Why,
+    BuildState, CallSource, ConfigEdit, Decision, DecisionQuery, DisabledGateway, EditError,
+    Gateway, GatewayEvent, GatewayHandle, GatewaySnapshot, Ledger, ResolveError, Why,
 };
 use super::state::RouteState;
 use super::types::{AccountId, GatewayConfig, Problem, Role, ToolMode};
@@ -83,6 +83,14 @@ impl PendingGateway {
         matches!(&*self.phase.borrow(), Phase::Building)
     }
 
+    fn build_state(&self) -> BuildState {
+        match &*self.phase.borrow() {
+            Phase::Ready(_) => BuildState::Ready,
+            Phase::Building => BuildState::Starting,
+            Phase::Failed(reason) => BuildState::Failed(reason.clone()),
+        }
+    }
+
     fn provider(self: &Arc<Self>, role: Role, source: CallSource) -> Option<PendingProvider> {
         let route = self.config.roles.route_for(role)?;
         let native = self
@@ -137,7 +145,10 @@ impl PendingGateway {
     ) -> Result<Arc<dyn LLMProvider>, ResolveError> {
         match self.ready() {
             Some(gateway) => gateway.provider_for_model_id(id, source),
-            None => Err(ResolveError::Starting),
+            None => Err(match self.build_state() {
+                BuildState::Failed(reason) => ResolveError::Failed(reason),
+                _ => ResolveError::Starting,
+            }),
         }
     }
 
@@ -149,7 +160,12 @@ impl PendingGateway {
             route: None,
             target: None,
             tool_mode: query.tool_mode,
-            why: Why::Starting,
+            why: match self.build_state() {
+                BuildState::Failed(reason) => Why::ConfigInvalid {
+                    message: format!("the gateway failed to start: {reason}"),
+                },
+                _ => Why::Starting,
+            },
             skipped: Vec::new(),
             snapshot_age: None,
             retry_at: None,
@@ -189,6 +205,13 @@ pub struct PendingHandle(pub Arc<PendingGateway>);
 impl Gateway for PendingHandle {
     fn is_enabled(&self) -> bool {
         self.0.is_enabled()
+    }
+
+    fn build_state(&self) -> BuildState {
+        match self.0.ready() {
+            Some(gateway) => gateway.build_state(),
+            None => self.0.build_state(),
+        }
     }
 
     fn snapshot(&self) -> GatewaySnapshot {
