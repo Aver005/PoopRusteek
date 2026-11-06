@@ -233,6 +233,29 @@ pub(crate) fn start_gateway(
     (handle, Some(pending))
 }
 
+/// Нужна ли пересборка шлюза после перечитывания конфига.
+fn gateway_is_stale(gateway: &crate::gateway::handle::GatewayHandle, config: &Config) -> bool {
+    use crate::gateway::handle::{AccountStatus, BuildState};
+    let wanted = crate::gateway::engine::gateway_config(config)
+        .gateway
+        .enabled;
+    if wanted != gateway.is_enabled() {
+        return true;
+    }
+    if !wanted {
+        return false;
+    }
+    match gateway.build_state() {
+        BuildState::Failed(_) => true,
+        BuildState::Starting => false,
+        BuildState::Ready => gateway
+            .snapshot()
+            .accounts
+            .iter()
+            .any(|a| matches!(a.status, AccountStatus::Unavailable { .. })),
+    }
+}
+
 /// Передать события шлюза в цикл приложения. Задача кончается вместе со шлюзом.
 fn spawn_gateway_events(
     gateway: &crate::gateway::handle::GatewayHandle,
@@ -1404,7 +1427,21 @@ impl App {
     /// (used after config edits and `/providers` switches) and start a
     /// fresh session id so the next turn can't thread onto state that
     /// belonged to the previous provider.
+    /// Шлюз собирается заново, когда конфиг перечитан, а прежняя сборка упала, включена или
+    /// выключена правкой, либо оставила аккаунты недоступными (секрет, бинарь): правку видно сразу.
+    fn rebuild_gateway_if_stale(&mut self) {
+        if !gateway_is_stale(&self.gateway, &self.config) {
+            return;
+        }
+        let (gateway, pending) = start_gateway(&self.config, &self.event_tx);
+        self.gateway = gateway;
+        self.pending_gateway = pending;
+        self.provider_models.set_gateway(self.gateway.clone());
+        self.sync_server_gateway();
+    }
+
     pub(crate) fn rebuild_provider(&mut self) {
+        self.rebuild_gateway_if_stale();
         switch_provider(
             &mut self.state,
             crate::gateway::handle::main_provider(&self.config, Some(&self.gateway)),
@@ -1799,6 +1836,72 @@ mod gateway_start_tests {
             engine.snapshot().accounts.len(),
             1,
             "the secret was resolved off the loop"
+        );
+    }
+
+    /// Упавшая сборка, правка включённости и недоступный аккаунт требуют пересборки; здоровый — нет.
+    #[tokio::test]
+    async fn a_reloaded_config_rebuilds_a_broken_gateway_and_leaves_a_healthy_one() {
+        let text = |enabled: bool, secret: &str| {
+            format!(
+                "[gateway]
+enabled = {enabled}
+[[accounts]]
+id = \"a\"
+provider = \"custom\"
+base_url = \"http://127.0.0.1:1/v1\"
+secret = \"{secret}\"
+model = \"m\"
+"
+            )
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let good = crate::config::parse(&text(true, "none")).unwrap();
+        let off = crate::config::parse(&text(false, "none")).unwrap();
+        let missing =
+            crate::config::parse(&text(true, "env:POOPRUSTEEK_STALE_TEST_MISSING")).unwrap();
+
+        let (disabled, _) = start_gateway(&off, &tx);
+        assert!(!gateway_is_stale(&disabled, &off), "off and wanted off");
+        assert!(
+            gateway_is_stale(&disabled, &good),
+            "the file now enables it"
+        );
+
+        let engine = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&good),
+            crate::gateway::engine::EngineDeps {
+                data_dir: None,
+                ..crate::gateway::engine::EngineDeps::for_config(&good)
+            },
+        );
+        assert!(
+            !gateway_is_stale(&engine, &good),
+            "a healthy gateway is left alone"
+        );
+        assert!(gateway_is_stale(&engine, &off), "the file now disables it");
+
+        let broken = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&missing),
+            crate::gateway::engine::EngineDeps {
+                data_dir: None,
+                ..crate::gateway::engine::EngineDeps::for_config(&missing)
+            },
+        );
+        assert!(
+            gateway_is_stale(&broken, &missing),
+            "an unavailable account is retried on reload"
+        );
+
+        let failed = crate::gateway::pending::PendingGateway::new(
+            crate::gateway::engine::gateway_config(&good),
+        );
+        failed.fail("task panicked".into());
+        let handle: crate::gateway::handle::GatewayHandle =
+            Arc::new(crate::gateway::pending::PendingHandle(failed));
+        assert!(
+            gateway_is_stale(&handle, &good),
+            "a failed build is retried"
         );
     }
 
