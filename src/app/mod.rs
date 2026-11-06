@@ -122,6 +122,12 @@ fn switch_provider(
     epoch_cell: &Arc<AtomicU64>,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    // История остаётся, поэтому новый провайдер узнаёт, откуда она: чужие вызовы в ней он развернёт.
+    if let (Some(old), Some(new)) = (&state.focused().provider, &provider)
+        && let Some(origin) = old.route_state()
+    {
+        new.seed_route_state(origin);
+    }
     state.focused_mut().provider = provider;
     state.focused_mut().session_id = crate::session::create_session_id();
     let epoch = invalidate_context_window(state, epoch_cell);
@@ -168,6 +174,53 @@ pub struct App {
     /// Bumped on every provider/model switch. A window poll answers with the
     /// epoch it started under, so a slow one can never overwrite a newer.
     provider_window_epoch: Arc<AtomicU64>,
+    /// Шлюз аккаунтов и маршрутов. Выключенный не вмешивается в сборку провайдера.
+    gateway: crate::gateway::handle::GatewayHandle,
+}
+
+/// Строка статуса при старте, если конфиг включённого шлюза содержит ошибки.
+fn gateway_startup_note(gateway: &crate::gateway::handle::GatewayHandle) -> Option<String> {
+    use crate::gateway::types::Severity;
+    if !gateway.is_enabled() {
+        return None;
+    }
+    let errors: Vec<_> = gateway
+        .snapshot()
+        .problems
+        .into_iter()
+        .filter(|problem| problem.severity == Severity::Error)
+        .collect();
+    let first = errors.first()?;
+    Some(format!(
+        "Gateway config has {} error(s), the accounts and routes they touch are off. First: {}: {}",
+        errors.len(),
+        first.path,
+        first.message
+    ))
+}
+
+/// Передать события шлюза в цикл приложения. Задача кончается вместе со шлюзом.
+fn spawn_gateway_events(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    if !gateway.is_enabled() {
+        return;
+    }
+    let mut events = gateway.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event_tx.send(AppEvent::Gateway(event)).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// Run one self-update pass off the event loop and report through
@@ -406,7 +459,13 @@ impl App {
             });
         });
 
-        let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
+        let gateway = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&config),
+            crate::gateway::engine::EngineDeps::for_config(&config),
+        );
+        spawn_gateway_events(&gateway, event_tx.clone());
+        let provider: Option<Arc<dyn LLMProvider>> =
+            crate::gateway::handle::main_provider(&config, Some(&gateway));
 
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let tools = Arc::new(ToolRegistry::new());
@@ -471,6 +530,11 @@ impl App {
             state.status_message = config.migration_notices.join(" · ");
         }
 
+        // Ошибки конфига шлюза: приложение запускается, а отключённые аккаунты названы.
+        if let Some(note) = gateway_startup_note(&gateway) {
+            state.status_message = note;
+        }
+
         // Semantic matcher: background init (first run downloads the
         // embedding model); turns get skill/MCP-tool hints once it's ready.
         // `tool_search` is registered unconditionally — before readiness it
@@ -512,6 +576,7 @@ impl App {
         // entries in the background (`cache_ms` decides what "stale" means;
         // a fresh cache makes this a no-op network-wise).
         let provider_models = crate::provider::model_cache::ProviderModelCache::load();
+        provider_models.set_gateway(gateway.clone());
         if !config.providers.is_empty() {
             providers::spawn_models_refresh(
                 Arc::clone(&provider_models),
@@ -556,6 +621,7 @@ impl App {
             last_models_refetch: std::time::Instant::now(),
             update_in_flight,
             provider_window_epoch,
+            gateway,
         })
     }
 
@@ -903,11 +969,24 @@ impl App {
             AppEvent::ProviderModelsRefreshed { summary, failed } => {
                 self.on_provider_models_refreshed(summary, failed);
             }
+            AppEvent::Gateway(event) => self.on_gateway_event(event),
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
         }
         Ok(false)
+    }
+
+    /// Событие шлюза. Экран аккаунтов читает снимок сам; здесь только строка статуса.
+    fn on_gateway_event(&mut self, event: crate::gateway::handle::GatewayEvent) {
+        use crate::gateway::handle::GatewayEvent;
+        if let GatewayEvent::FallbackTaken {
+            from, to, class, ..
+        } = event
+        {
+            self.state.status_message =
+                format!("{from} failed ({}), switched to {to}", class.code());
+        }
     }
 
     /// Такт анимации и периодическая дозагрузка моделей.
@@ -1198,6 +1277,12 @@ impl App {
             }
         }
         self.config = crate::config::Config::default();
+        // Живой шлюз держит аккаунты и разрешённые секреты из стёртого конфига: пересобираем.
+        self.gateway = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&self.config),
+            crate::gateway::engine::EngineDeps::for_config(&self.config),
+        );
+        self.provider_models.set_gateway(self.gateway.clone());
         self.state.approved_tools = crate::whitelist::Whitelist::default();
         self.state.input.history.clear();
         if errors.is_empty() {
@@ -1253,7 +1338,7 @@ impl App {
     pub(crate) fn rebuild_provider(&mut self) {
         switch_provider(
             &mut self.state,
-            crate::provider::build_provider(&self.config),
+            crate::gateway::handle::main_provider(&self.config, Some(&self.gateway)),
             &self.provider_window_epoch,
             &self.event_tx,
         );
@@ -1517,5 +1602,90 @@ mod window_tests {
                 .is_err(),
             "the provider we switched away from must not overwrite the new window"
         );
+    }
+
+    fn history_with_calls() -> Vec<ChatMessage> {
+        let mut assistant = ChatMessage::assistant("looking");
+        assistant.tool_calls = vec![crate::provider::ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+            provider_state: Some(serde_json::json!({"thoughtSignature": "sig"})),
+        }];
+        vec![
+            ChatMessage::user("read it"),
+            assistant,
+            ChatMessage::tool("call_1", "contents"),
+            ChatMessage::user("and now?"),
+        ]
+    }
+
+    /// Переключение провайдера оставляет историю, поэтому новый узнаёт, откуда она.
+    #[tokio::test]
+    async fn switching_provider_hands_the_route_origin_to_the_new_one() {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, ask, ask_with, rig};
+        let rig = rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut state = test_state();
+
+        // Беседа шла на a, потом a остыл: новый провайдер уйдёт на b и не должен получить подписи a.
+        let old = rig.main();
+        ask(&old, "hi").await.0.unwrap();
+        state.focused_mut().provider = Some(old);
+        rig.cool("a", 300);
+        let fresh = rig.main();
+        switch_provider(&mut state, Some(Arc::clone(&fresh)), &epoch, &tx);
+        ask_with(&fresh, history_with_calls()).await.0.unwrap();
+        let seen = rig.fakes["b"].last_messages();
+        assert!(seen[1].tool_calls.is_empty(), "b never sees a's ids");
+        assert!(seen[1].content.contains("<tool_use>"));
+
+        // Обратная сторона: цель не сменилась — вызовы остаются как были.
+        let rig = rig_pair();
+        let old = rig.main();
+        ask(&old, "hi").await.0.unwrap();
+        state.focused_mut().provider = Some(old);
+        let same = rig.main();
+        switch_provider(&mut state, Some(Arc::clone(&same)), &epoch, &tx);
+        ask_with(&same, history_with_calls()).await.0.unwrap();
+        assert_eq!(rig.fakes["a"].last_messages()[1].tool_calls.len(), 1);
+    }
+
+    fn rig_pair() -> crate::gateway::testkit::Rig {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, rig};
+        rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_gateway_with_config_errors_is_named_at_startup_and_a_healthy_one_is_silent() {
+        use crate::gateway::handle::GatewayHandle;
+        use crate::gateway::testkit::TWO_ACCOUNTS;
+        let bad = TWO_ACCOUNTS.replace(
+            "model = \"model-a\"",
+            "model = \"model-a\"\n[accounts.limits]\nmax_concurrency = 0",
+        );
+        let broken: GatewayHandle = Arc::new(crate::gateway::testkit::rig(&bad, Vec::new()).engine);
+        let note = gateway_startup_note(&broken).expect("the errors are named");
+        assert!(
+            note.contains("1 error") && note.contains("max_concurrency"),
+            "{note}"
+        );
+        let healthy: GatewayHandle = Arc::new(rig_pair().engine);
+        assert_eq!(gateway_startup_note(&healthy), None);
+        let off: GatewayHandle = Arc::new(crate::gateway::handle::DisabledGateway::new());
+        assert_eq!(gateway_startup_note(&off), None);
     }
 }

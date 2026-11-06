@@ -24,7 +24,7 @@ pub(crate) enum PersistJob {
         messages: Vec<ChatMessage>,
         config: Box<crate::config::Config>,
         workspace_path: String,
-        meta: crate::session::SessionMeta,
+        meta: Box<crate::session::SessionMeta>,
     },
     /// Replace `history.json` with this already-transformed list — the
     /// in-memory recall list is the source of truth (see

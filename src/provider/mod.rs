@@ -294,10 +294,6 @@ pub struct CompletionChunk {
     /// Настоящий расход, когда сервер его сообщил. Anthropic и Gemini кладут его
     /// в терминальный чанк, OpenAI — в отдельный чанк после него: кто читает
     /// только до `finish_reason`, его не увидит.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "читает шлюз, он ещё не подключён")
-    )]
     pub usage: Option<Usage>,
 }
 
@@ -406,13 +402,17 @@ pub trait LLMProvider: Send + Sync {
 
     /// Заголовки лимитов последнего ответа аккаунта (общие для всех форков).
     /// `None`: протокол их не отдаёт или ответа ещё не было.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "читает шлюз, он ещё не подключён")
-    )]
     fn rate_limits(&self) -> Option<failure::RateLimitHeaders> {
         None
     }
+
+    /// Где беседа остановилась в шлюзе (маршрут, аккаунт, модель). Без шлюза — `None`.
+    fn route_state(&self) -> Option<crate::gateway::state::RouteState> {
+        None
+    }
+
+    /// Подсказать шлюзу, где беседа была до перезапуска: чужую историю он развернёт в текст.
+    fn seed_route_state(&self, _state: crate::gateway::state::RouteState) {}
 
     /// Create a sibling instance that shares this provider's configuration
     /// (and connection) but starts a **fresh session** — no shared

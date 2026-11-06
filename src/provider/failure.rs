@@ -36,7 +36,7 @@ pub enum FailureClass {
     BadRequest,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "читает шлюз, он ещё не подключён")
+        expect(dead_code, reason = "создаёт отмена вызова при /serve (GW-SERVE)")
     )]
     Cancelled,
     /// Ответ не разобрался.
@@ -45,7 +45,6 @@ pub enum FailureClass {
 
 impl FailureClass {
     /// Короткий код для журнала и тела ошибок.
-    #[expect(dead_code, reason = "читает шлюз, он ещё не подключён")]
     pub fn code(&self) -> &'static str {
         match self {
             Self::RateLimit { .. } => "rate_limit",

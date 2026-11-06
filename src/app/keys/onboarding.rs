@@ -51,7 +51,9 @@ impl App {
                     }
 
                     // Hot-create the provider so the app works without restart.
-                    let Some(provider) = crate::provider::build_provider(&self.config) else {
+                    let Some(provider) =
+                        crate::gateway::handle::main_provider(&self.config, Some(&self.gateway))
+                    else {
                         // build_provider logged the cause via tracing.
                         self.state.onboarding.error =
                             Some("Failed to initialize provider — see log");

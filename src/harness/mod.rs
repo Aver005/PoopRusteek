@@ -265,6 +265,7 @@ pub struct MockArgs {
 /// runner has to hand them to the `exec` children it spawns, or they would
 /// load the user's real config and write into the user's real data.
 pub async fn run(command: Command, config: Config, globals: GlobalFlags) -> AppResult<i32> {
+    driver::note_explicit_config(globals.config.is_some());
     match command {
         Command::Exec(args) => exec(*args, config).await,
         Command::Scenario(args) => scenario::run_one(args, &config, globals).await,

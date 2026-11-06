@@ -802,12 +802,28 @@ impl GatewayConfig {
                 add(Severity::Error, at.clone(), "route has no steps".into());
             }
             for (index, step) in route.steps.iter().enumerate() {
-                if self.account(&step.account).is_none() {
-                    add(
+                match self.account(&step.account) {
+                    None => add(
                         Severity::Error,
                         format!("{at}.steps[{index}]"),
                         format!("unknown account '{}'", step.account),
-                    );
+                    ),
+                    // Сервер без названия модели получил бы пустое поле `model`.
+                    Some(account)
+                        if account.provider.protocol().is_some()
+                            && step.model.is_none()
+                            && account.model.is_none() =>
+                    {
+                        add(
+                            Severity::Error,
+                            format!("{at}.steps[{index}]"),
+                            format!(
+                                "account '{}' has no model: set model on the account or on the step",
+                                step.account
+                            ),
+                        );
+                    }
+                    Some(_) => {}
                 }
             }
             if route.switch_at_pct.is_some_and(|p| p > 100) {
@@ -903,7 +919,7 @@ impl GatewayConfig {
 }
 
 /// Адрес серверов Anthropic: другое имя провайдера запрет прямого токена не снимает.
-fn is_claude_host(base_url: &str) -> bool {
+pub(crate) fn is_claude_host(base_url: &str) -> bool {
     let Some(host) = reqwest::Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
@@ -961,6 +977,7 @@ mod tests {
         provider = "openai"
         base_url = "http://127.0.0.1:1234/v1"
         secret = "none"
+        model = "qwen2.5-coder"
 
         [[routes]]
         id = "coding"
@@ -1185,6 +1202,7 @@ mod tests {
             id = "api"
             provider = "openai"
             tools = "native"
+            model = "m"
             [[accounts]]
             id = "cli"
             provider = "cli:claude"
@@ -1207,6 +1225,44 @@ mod tests {
             ToolMode::Prompt,
             "a mixed route runs the prompt protocol for the whole turn"
         );
+    }
+
+    #[test]
+    fn an_api_step_without_any_model_is_an_error_but_a_step_model_or_a_cli_is_fine() {
+        let bare = parse(
+            r#"
+            [[accounts]]
+            id = "api"
+            provider = "openai"
+            [[routes]]
+            id = "r"
+            steps = [{ account = "api" }]
+            "#,
+        );
+        assert!(errors(&bare).iter().any(|e| e.contains("has no model")));
+        let step_model = parse(
+            r#"
+            [[accounts]]
+            id = "api"
+            provider = "openai"
+            [[routes]]
+            id = "r"
+            steps = [{ account = "api", model = "gpt" }]
+            "#,
+        );
+        assert!(errors(&step_model).is_empty());
+        let cli = parse(
+            r#"
+            [[accounts]]
+            id = "c"
+            provider = "cli:opencode"
+            home = "/h"
+            [[routes]]
+            id = "r"
+            steps = [{ account = "c" }]
+            "#,
+        );
+        assert!(errors(&cli).is_empty(), "a CLI picks its own default model");
     }
 
     #[test]
