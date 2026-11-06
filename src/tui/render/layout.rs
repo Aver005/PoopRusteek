@@ -22,6 +22,8 @@ pub(crate) const SIDEBAR_WIDTH: u16 = 34;
 pub(crate) const SIDEBAR_AUTO_COLS: u16 = 140;
 /// Пока чату остаётся меньше колонок, панель не рисуется.
 const MIN_TRANSCRIPT_COLS_WITH_SIDEBAR: u16 = 60;
+/// С такой ширины окна панель вообще помещается (вместе с разделителем).
+pub(crate) const SIDEBAR_MIN_COLS: u16 = SIDEBAR_WIDTH + 1 + MIN_TRANSCRIPT_COLS_WITH_SIDEBAR;
 /// Столько строк под переписку оставляем при любых аппетитах остальных.
 const MIN_TRANSCRIPT_ROWS: u16 = 3;
 
@@ -78,10 +80,8 @@ impl Regions {
         let transcript_full = Rect::new(area.x, area.y, area.width, transcript_h);
 
         let sidebar_w = SIDEBAR_WIDTH + 1;
-        let sidebar = (needs.sidebar
-            && area.width >= sidebar_w + MIN_TRANSCRIPT_COLS_WITH_SIDEBAR
-            && transcript_h > 0)
-            .then(|| {
+        let sidebar =
+            (needs.sidebar && area.width >= SIDEBAR_MIN_COLS && transcript_h > 0).then(|| {
                 Rect::new(
                     transcript_full.right() - SIDEBAR_WIDTH,
                     transcript_full.y,

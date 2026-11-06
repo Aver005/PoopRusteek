@@ -576,7 +576,8 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(theme.bg))
         .wrap(Wrap { trim: false })
-        .scroll((local_offset as u16, 0));
+        // Выше 65 535 строк одного сообщения смещение упирается в потолок, а не оборачивается.
+        .scroll((u16::try_from(local_offset).unwrap_or(u16::MAX), 0));
     frame.render_widget(paragraph, area);
 }
 

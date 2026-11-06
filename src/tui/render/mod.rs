@@ -28,7 +28,7 @@ mod util;
 mod welcome;
 
 pub(crate) use approval::{ApprovalShape, viewport as approval_viewport};
-pub(crate) use layout::{MAX_INPUT_ROWS, SIDEBAR_AUTO_COLS, SIDEBAR_WIDTH};
+pub(crate) use layout::{MAX_INPUT_ROWS, SIDEBAR_AUTO_COLS, SIDEBAR_MIN_COLS, SIDEBAR_WIDTH};
 #[cfg(test)]
 pub(crate) use util::fix_clock;
 
@@ -486,5 +486,23 @@ mod tests {
         state.focused_mut().generation.active = true;
         let working = transcript_rows(&state).expect("size known");
         assert_eq!(idle - working, 1);
+    }
+
+    #[test]
+    fn ctrl_p_explains_why_the_panel_is_not_shown() {
+        let welcome = state_for(true, 200, 40);
+        assert!(
+            welcome
+                .stats_panel_blocker()
+                .is_some_and(|r| r.contains("messages"))
+        );
+        let narrow = state_for(false, 80, 40);
+        assert!(
+            narrow
+                .stats_panel_blocker()
+                .is_some_and(|r| r.contains("95"))
+        );
+        let wide = state_for(false, 160, 40);
+        assert_eq!(wide.stats_panel_blocker(), None);
     }
 }

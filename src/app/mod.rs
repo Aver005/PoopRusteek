@@ -323,6 +323,17 @@ impl AppState {
             .unwrap_or(cols >= crate::tui::render::SIDEBAR_AUTO_COLS)
     }
 
+    /// Почему боковая панель сейчас не видна, хотя её включили: на приветствии
+    /// её нет, а узкому окну не хватает места. `None` — ничто не мешает.
+    pub fn stats_panel_blocker(&self) -> Option<String> {
+        if self.focused().messages.is_empty() && !self.focused().generation.active {
+            return Some("The side panel appears once the chat has messages".to_string());
+        }
+        let need = crate::tui::render::SIDEBAR_MIN_COLS;
+        (self.terminal_cols < need)
+            .then(|| format!("The side panel needs a window at least {need} columns wide"))
+    }
+
     /// Рабочая папка путём: от неё считаются `@file`, `/attach` и автодополнение.
     pub fn workspace(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.workspace_path)

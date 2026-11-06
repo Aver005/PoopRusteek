@@ -69,6 +69,10 @@ impl App {
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let visible = self.state.stats_panel_visible(self.state.terminal_cols);
                 self.state.show_stats_panel = Some(!visible);
+                // Включили, а показать нечем — скажем почему, а не промолчим.
+                if !visible && let Some(reason) = self.state.stats_panel_blocker() {
+                    self.state.status_message = reason;
+                }
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Не стирает историю: перерисовка и прыжок вниз. Стирает `/clear`.
