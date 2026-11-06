@@ -31,6 +31,18 @@ pub struct Glyphs {
     pub radio_on: &'static str,
     pub radio_off: &'static str,
     pub spinner: &'static [&'static str],
+    /// Полоса выбранной строки списка.
+    pub sel_bar: &'static str,
+    /// Аккаунт остывает.
+    pub cooling: &'static str,
+    /// Избранная модель.
+    pub star: &'static str,
+    /// Шкала лимита: свежее показание, оценка, пустое.
+    pub gauge_full: &'static str,
+    pub gauge_est: &'static str,
+    pub gauge_empty: &'static str,
+    /// Курсор набираемого ответа.
+    pub caret: &'static str,
 }
 
 pub static UNICODE: Glyphs = Glyphs {
@@ -56,6 +68,13 @@ pub static UNICODE: Glyphs = Glyphs {
         "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}",
         "\u{2827}", "\u{2807}", "\u{280F}",
     ],
+    sel_bar: "\u{258C}",
+    cooling: "\u{25D4}",
+    star: "\u{2605}",
+    gauge_full: "\u{2588}",
+    gauge_est: "\u{2592}",
+    gauge_empty: "\u{2591}",
+    caret: "\u{258D}",
 };
 
 /// Только ASCII и знаки, которые есть в CP437 (рамки `─ │ ├ └`, `·`, стрелки):
@@ -80,6 +99,13 @@ pub static ASCII: Glyphs = Glyphs {
     radio_on: "(*)",
     radio_off: "( )",
     spinner: &["|", "/", "-", "\\"],
+    sel_bar: ">",
+    cooling: "~",
+    star: "*",
+    gauge_full: "#",
+    gauge_est: "+",
+    gauge_empty: "-",
+    caret: "_",
 };
 
 thread_local! {
@@ -250,6 +276,13 @@ mod tests {
             set.unchecked,
             set.radio_on,
             set.radio_off,
+            set.sel_bar,
+            set.cooling,
+            set.star,
+            set.gauge_full,
+            set.gauge_est,
+            set.gauge_empty,
+            set.caret,
         ];
         all.extend(set.spinner);
         all

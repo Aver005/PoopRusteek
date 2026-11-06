@@ -529,8 +529,13 @@ impl Grant {
                 None => format!("Always: {tool}"),
             },
             Grant::Tool => format!(
-                "{} Always: {tool} · ANYTHING",
-                crate::tui::glyphs::get().warn
+                "{} Always: {tool} · any {}",
+                crate::tui::glyphs::get().warn,
+                if matches!(tool, "bash" | "powershell") {
+                    "command"
+                } else {
+                    "call"
+                }
             ),
         }
     }
@@ -1324,7 +1329,7 @@ mod grant_tests {
         let narrow = Grant::Scope.label("bash", Some(&scope));
         assert!(narrow.contains("cargo test"), "{narrow}");
         let widest = Grant::Tool.label("bash", Some(&scope));
-        assert!(widest.contains("ANYTHING"), "{widest}");
+        assert!(widest.contains("any command"), "{widest}");
         assert!(!widest.contains("cargo test"), "{widest}");
     }
 }

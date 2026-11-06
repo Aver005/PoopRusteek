@@ -23,6 +23,9 @@ impl App {
     ) -> AppResult<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        if self.landing_key(key).await {
+            return Ok(false);
+        }
         match key.code {
             KeyCode::Char(c)
                 if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'C') =>
@@ -158,6 +161,44 @@ impl App {
         }
         self.refresh_autocomplete();
         Ok(false)
+    }
+
+    /// Выбор сессии курсором на главной. Ввод текста приоритетнее: пока в поле
+    /// что-то есть, стрелки и Enter работают как обычно. `true` — клавиша съедена.
+    async fn landing_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+        let on_welcome = self.state.focused().messages.is_empty()
+            && !self.state.focused().generation.active
+            && self.state.input.buffer.is_empty()
+            && !self.state.autocomplete.visible
+            && self.state.view == crate::app::events::View::Chat
+            && self.state.modal.is_none();
+        if !on_welcome || !key.modifiers.is_empty() {
+            self.state.landing.clear_cursor();
+            return false;
+        }
+        match key.code {
+            KeyCode::Down => self.state.landing.step_down(),
+            KeyCode::Up if self.state.landing.cursor().is_some() => self.state.landing.step_up(),
+            KeyCode::Esc if self.state.landing.cursor().is_some() => {
+                self.state.landing.clear_cursor();
+            }
+            KeyCode::Enter if self.state.landing.cursor().is_some() => {
+                if let Some(id) = self.state.landing.selected_id() {
+                    self.state.landing.clear_cursor();
+                    if let Err(error) = self.handle_load_session(&id).await {
+                        self.state.status_message = format!("Cannot open the session: {error}");
+                    }
+                }
+            }
+            // Любая печать возвращает ввод в поле: курсор уходит, клавиша идёт дальше.
+            KeyCode::Char(_) => {
+                self.state.landing.clear_cursor();
+                return false;
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Handle plain Enter: backslash line-continuation, empty-goal nudges,

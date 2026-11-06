@@ -17,6 +17,8 @@ pub struct LandingSessions {
     sessions: Vec<SessionSummary>,
     fetched_at: Option<Instant>,
     loading: bool,
+    /// Выбранная курсором сессия; `None` — курсор не на списке, ввод свободен.
+    cursor: Option<usize>,
 }
 
 impl LandingSessions {
@@ -25,9 +27,44 @@ impl LandingSessions {
         &self.sessions[..self.sessions.len().min(SHOWN_SESSIONS)]
     }
 
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    /// Вниз: из пустоты на первую строку, дальше до последней.
+    pub fn step_down(&mut self) {
+        let last = self.recent().len().checked_sub(1);
+        self.cursor = match (self.cursor, last) {
+            (_, None) => None,
+            (None, Some(_)) => Some(0),
+            (Some(at), Some(last)) => Some((at + 1).min(last)),
+        };
+    }
+
+    /// Вверх: с первой строки курсор уходит со списка.
+    pub fn step_up(&mut self) {
+        self.cursor = match self.cursor {
+            Some(at) if at > 0 => Some(at - 1),
+            _ => None,
+        };
+    }
+
+    pub fn clear_cursor(&mut self) {
+        self.cursor = None;
+    }
+
+    /// Id выбранной сессии.
+    pub fn selected_id(&self) -> Option<String> {
+        self.recent().get(self.cursor?).map(|s| s.id.clone())
+    }
+
     /// Положить прочитанный список. Зовёт цикл событий, когда пришёл ответ.
     pub fn apply(&mut self, sessions: Vec<SessionSummary>) {
         self.sessions = sessions;
+        // Список сократился — курсор не должен висеть за его концом.
+        if self.cursor.is_some_and(|at| at >= self.recent().len()) {
+            self.cursor = None;
+        }
         self.fetched_at = Some(Instant::now());
         self.loading = false;
     }
@@ -94,5 +131,39 @@ mod tests {
         landing.apply((0..9).map(|n| summary(&n.to_string())).collect());
         assert_eq!(landing.recent().len(), SHOWN_SESSIONS);
         assert_eq!(landing.recent()[0].id, "0");
+    }
+
+    #[test]
+    fn the_cursor_walks_the_list_and_leaves_it_from_the_top() {
+        let mut landing = LandingSessions::default();
+        landing.apply(vec![summary("a"), summary("b")]);
+        assert_eq!(landing.cursor(), None);
+        landing.step_down();
+        assert_eq!(landing.selected_id().as_deref(), Some("a"));
+        landing.step_down();
+        landing.step_down();
+        assert_eq!(
+            landing.selected_id().as_deref(),
+            Some("b"),
+            "stops at the last row"
+        );
+        landing.step_up();
+        landing.step_up();
+        assert_eq!(
+            landing.cursor(),
+            None,
+            "up from the first row frees the input"
+        );
+    }
+
+    #[test]
+    fn a_shorter_list_never_leaves_the_cursor_past_its_end() {
+        let mut landing = LandingSessions::default();
+        landing.apply(vec![summary("a"), summary("b"), summary("c")]);
+        landing.step_down();
+        landing.step_down();
+        landing.step_down();
+        landing.apply(vec![summary("a")]);
+        assert_eq!(landing.cursor(), None);
     }
 }

@@ -11,7 +11,6 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
 
 /// Самое широкое окно: дальше строки трудно читать.
 const MAX_POPUP_W: u16 = 100;
@@ -153,47 +152,30 @@ fn is_danger_token(token: &str) -> bool {
     DANGER_COMMANDS.contains(&name) || DANGER_FLAGS.contains(&name)
 }
 
-/// Короткий итог вызова для заголовка: команда, путь или запрос. Секреты
-/// замаскированы (полный текст виден ниже, в аргументах).
-fn call_summary(arguments: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(arguments) {
+/// Опасные слова вызова: команда или флаг, после которых стоит перечитать аргументы.
+fn danger_words(arguments: &str) -> Vec<String> {
+    let text = match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(value) if value.is_object() => crate::agent::tool_call_summary(&value),
-        _ => crate::util::one_line_label(
-            arguments
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or(""),
-            120,
-        ),
+        _ => arguments.to_string(),
+    };
+    let mut found: Vec<String> = Vec::new();
+    for token in text.split_whitespace().filter(|t| is_danger_token(t)) {
+        let word = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+        if !found.iter().any(|f| f == word) {
+            found.push(word.to_string());
+        }
     }
+    found
 }
 
-/// Заголовок окна: `⚠ Tool call · bash · <итог>`; опасные слова итога красные и жирные.
-fn title_line(tool_name: &str, arguments: &str, popup_w: usize, theme: &Theme) -> Line<'static> {
+/// Заголовок окна: вопрос, а не дубль аргументов; кто спрашивает — в теле.
+fn title_line(tool_name: &str, popup_w: usize, theme: &Theme) -> Line<'static> {
     let warn = Style::default()
         .fg(theme.warning)
         .add_modifier(Modifier::BOLD);
-    let danger = Style::default()
-        .fg(theme.error)
-        .add_modifier(Modifier::BOLD);
-    let head = format!(
-        " {} Tool call \u{00B7} {tool_name} ",
-        crate::tui::glyphs::get().warn
-    );
-    let room = popup_w
-        .saturating_sub(UnicodeWidthStr::width(head.as_str()) + 4)
-        .max(8);
-    let summary = super::util::truncate(&call_summary(arguments), room);
-    let mut spans = vec![Span::styled(head, warn)];
-    if !summary.is_empty() {
-        spans.push(Span::styled("\u{00B7} ", warn));
-        for token in summary.split_inclusive(' ') {
-            let style = if is_danger_token(token) { danger } else { warn };
-            spans.push(Span::styled(token.to_string(), style));
-        }
-        spans.push(Span::styled(" ", warn));
-    }
-    Line::from(spans)
+    let head = format!(" {} Allow {tool_name}? ", crate::tui::glyphs::get().warn);
+    let room = popup_w.saturating_sub(4).max(8);
+    Line::from(Span::styled(super::util::truncate(&head, room), warn))
 }
 
 /// Состояние окна одним аргументом.
@@ -233,7 +215,7 @@ pub(super) fn render_tool_approval(
         vp.popup_h.min(area.height),
     );
     let block = modal_block(
-        title_line(tool_name, arguments, vp.popup_w as usize, theme),
+        title_line(tool_name, vp.popup_w as usize, theme),
         theme.warning,
         theme,
     );
@@ -255,6 +237,20 @@ pub(super) fn render_tool_approval(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    let danger = danger_words(arguments);
+    if !danger.is_empty() {
+        let tool_row = lines.last_mut().expect("the tool row was just pushed");
+        tool_row.spans.push(Span::styled(
+            format!(
+                "   {} risky: {}",
+                crate::tui::glyphs::get().warn,
+                danger.join(" ")
+            ),
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     // Кто спрашивает — своей строкой, вне аргументов: подпись из текста модели
     // не должна рисовать в окне поддельные аргументы.
     if let Some(origin) = origin {
@@ -333,12 +329,12 @@ fn key_hints(theme: &Theme) -> Line<'static> {
     let hint = |text: &'static str| Span::styled(text, Style::default().fg(theme.text_dim));
     Line::from(vec![
         Span::raw("  "),
-        key("Y", theme.success),
+        key("Enter", theme.success),
         hint(" allow  "),
-        key("N", theme.error),
+        key("Esc", theme.error),
         hint(" deny  "),
         key("A", theme.accent),
-        hint(" change  "),
+        hint(" change scope  "),
         Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
         hint(" scroll"),
     ])
@@ -407,46 +403,29 @@ mod tests {
     }
 
     #[test]
-    fn the_title_names_the_tool_and_marks_the_dangerous_words() {
+    fn the_title_is_a_question_not_a_copy_of_the_arguments() {
         let theme = Theme::default_dark();
-        let arguments = "{\n  \"command\": \"rm -rf node_modules && echo done\"\n}";
-        let title = title_line("bash", arguments, 100, &theme);
+        let title = title_line("bash", 60, &theme);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains("bash") && text.contains("rm -rf node_modules"),
-            "{text}"
-        );
-        let danger_style = |word: &str| {
-            title
-                .spans
-                .iter()
-                .find(|s| s.content.trim() == word)
-                .map(|s| s.style.fg)
-        };
-        assert_eq!(danger_style("rm"), Some(Some(theme.error)));
-        assert_eq!(danger_style("-rf"), Some(Some(theme.error)));
-        assert_eq!(danger_style("echo"), Some(Some(theme.warning)));
+        assert!(text.contains("Allow bash?"), "{text}");
+        assert!(!text.contains("Tool call"), "{text}");
     }
 
     #[test]
-    fn a_long_summary_is_cut_to_the_window_and_a_secret_stays_masked() {
+    fn a_narrow_window_never_cuts_the_question_in_half() {
         let theme = Theme::default_dark();
-        let long = format!(
-            "{{\"command\": \"deploy --token s3cr3t {}\"}}",
-            "x".repeat(300)
-        );
-        let title = title_line("bash", &long, 60, &theme);
+        let title = title_line("some_long_mcp_tool_name", 44, &theme);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(UnicodeWidthStr::width(text.as_str()) <= 60, "{text}");
-        assert!(!text.contains("s3cr3t"), "{text}");
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 40, "{text}");
+        assert!(text.contains('?'), "the question mark survives: {text}");
     }
 
     #[test]
-    fn non_json_arguments_still_give_a_title() {
-        let theme = Theme::default_dark();
-        let title = title_line("write", "path: /tmp/x.txt\n\n+ hello", 80, &theme);
-        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("path: /tmp/x.txt"), "{text}");
+    fn dangerous_words_are_named_once_and_secrets_are_not_echoed() {
+        let arguments = "{\"command\": \"rm -rf node_modules && rm -rf dist --token s3cr3t\"}";
+        let words = danger_words(arguments);
+        assert_eq!(words, vec!["rm".to_string(), "-rf".to_string()]);
+        assert!(danger_words("{\"command\": \"cargo test\"}").is_empty());
     }
 
     #[test]

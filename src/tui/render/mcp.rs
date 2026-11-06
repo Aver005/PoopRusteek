@@ -72,7 +72,7 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
     let list_height = area.height.saturating_sub(1) as usize;
 
     // Колонки заголовка и строк считаются из одних и тех же ширин.
-    const STATUS_W: usize = 11;
+    const STATUS_W: usize = 9;
     const NAME_W: usize = 21;
     const TYPE_W: usize = 6;
     let header_style = Style::default()
@@ -123,13 +123,16 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
 
         let line = Line::from(vec![
             Span::styled(
-                format!(" {status_short} "),
+                if selected { glyph.sel_bar } else { " " },
+                Style::default().fg(theme.accent).bg(bg),
+            ),
+            Span::styled(
+                format!("{}{status_short} ", fit_col(status_icon, 3)),
                 Style::default()
                     .fg(status_color)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" {} ", fit_col(status_icon, 3)), dim_style),
             Span::styled(
                 fit_col(&server.name, NAME_W - 1) + " ",
                 Style::default()
@@ -143,7 +146,7 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
             ),
             Span::styled(fit_col(&server.transport, TYPE_W), dim_style),
             Span::styled(
-                format!("{}t", server.tool_count),
+                server.tool_count.to_string(),
                 Style::default().fg(theme.fg).bg(bg),
             ),
         ]);

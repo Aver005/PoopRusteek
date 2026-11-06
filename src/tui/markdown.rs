@@ -153,6 +153,8 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     // inside italic) revert to the right accumulated style rather than
     // clearing everything.
     let mut style_stack: Vec<Modifier> = Vec::new();
+    // Стиль заголовка действует на его текст; решётки в тексте не рисуются.
+    let mut heading_style: Option<Style> = None;
 
     for event in parser {
         let quote = (quote_depth > 0).then_some(&quote_prefix);
@@ -175,15 +177,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                             .add_modifier(Modifier::BOLD),
                         _ => Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                     };
-                    let prefix = match level {
-                        HeadingLevel::H1 => "# ",
-                        HeadingLevel::H2 => "## ",
-                        HeadingLevel::H3 => "### ",
-                        HeadingLevel::H4 => "#### ",
-                        HeadingLevel::H5 => "##### ",
-                        HeadingLevel::H6 => "###### ",
-                    };
-                    current_line.push(Span::styled(prefix.to_string(), style));
+                    heading_style = Some(style);
                 }
                 Tag::CodeBlock(lang) => {
                     in_code_block = true;
@@ -242,6 +236,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                     }
                 }
                 TagEnd::Heading(_) => {
+                    heading_style = None;
                     flush_line(&mut lines, &mut current_line, quote);
                 }
                 TagEnd::CodeBlock => {
@@ -280,7 +275,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 } else if in_table {
                     table_cell.push_str(&text);
                 } else {
-                    let mut style = Style::default().fg(theme.fg);
+                    let mut style = heading_style.unwrap_or_else(|| Style::default().fg(theme.fg));
                     for modifier in &style_stack {
                         style = style.add_modifier(*modifier);
                     }

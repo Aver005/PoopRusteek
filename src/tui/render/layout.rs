@@ -11,7 +11,7 @@
 //! footer                (1 строка)
 //! ```
 
-use super::dock::MAX_DOCK_ROWS;
+use super::dock::max_rows as max_dock_rows;
 use ratatui::layout::Rect;
 
 /// Сколько строк занимает поле ввода, пока не начнёт прокручиваться.
@@ -67,7 +67,7 @@ impl Regions {
         let free = free - extra_input;
         let attach_h = u16::from(needs.attachments).min(free);
         let free = free - attach_h;
-        let dock_h = needs.dock_rows.min(MAX_DOCK_ROWS).min(free);
+        let dock_h = needs.dock_rows.min(max_dock_rows(area.height)).min(free);
 
         let input_h = input_min + extra_input;
         let bottom = area.bottom();
