@@ -88,145 +88,146 @@ fn sync_window_title(terminal: &mut TuiTerminal, state: &AppState) {
     });
 }
 
+/// Тема кадра: из конфига, а на экране `/themes` — подсвеченная в мастере.
+fn frame_theme(state: &AppState, config: &Config) -> Theme {
+    // The active theme comes from config; while the `/themes` screen is
+    // open the *whole frame* is drawn with the highlighted / in-progress
+    // theme instead — that's the live preview, and leaving without applying
+    // restores the saved theme on the next frame for free.
+    if state.view == View::Themes {
+        state.themes.preview_theme(config)
+    } else {
+        Theme::resolve(&config.ui)
+    }
+}
+
+/// Один кадр целиком; вернёт, куда поставить курсор. Отдельно от [`render`],
+/// чтобы тот же код рисовал в `TestBackend` (`tui::capture`).
+pub(crate) fn draw_frame(
+    frame: &mut ratatui::Frame,
+    state: &AppState,
+    config: &Config,
+) -> Option<(u16, u16)> {
+    let theme = frame_theme(state, config);
+    let cursor_cell = Cell::new(None);
+    let area = frame.area();
+    frame.render_widget(
+        Paragraph::new(String::new()).style(Style::default().bg(theme.bg)),
+        area,
+    );
+
+    if state.view == View::Onboarding {
+        onboarding::render_onboarding(
+            frame,
+            area,
+            &state.onboarding,
+            state.focused().generation.animation_tick,
+            &theme,
+            &cursor_cell,
+        );
+        // Bottom status line — /logout and /wipe land here with their result.
+        if area.height > 1 {
+            let status_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+            status::render_mini_status(frame, status_area, state, config, &theme, false);
+        }
+    } else if state.view == View::Mcp {
+        mcp::render_mcp_view(frame, area, &state.mcp_status.view, &theme);
+    } else if state.view == View::Providers {
+        providers::render_providers_view(frame, area, &state.providers_view, config, &theme);
+    } else if state.view == View::Search {
+        search::render_search_view(frame, area, &state.search, &theme);
+    } else if state.view == View::Themes {
+        themes::render_themes_view(frame, area, &state.themes, config, &theme);
+    } else if state.focused().messages.is_empty() && !state.focused().generation.active {
+        landing::render_landing(frame, area, state, config, &theme, &cursor_cell);
+    } else {
+        let has_attachments = !state.attached_files.is_empty();
+        let mut constraints = vec![Constraint::Min(1), Constraint::Length(1)];
+        if has_attachments {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(4));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+
+        status::render_separator(frame, chunks[1], &theme);
+
+        // Split main content into chat + stats panel. The reserved panel
+        // width MUST equal what the panel actually draws (`panel_width`),
+        // otherwise the chat area overlaps it and chat text bleeds onto
+        // the panel — the panel only recolors backgrounds, it doesn't
+        // clear glyphs. A 1-column gap holds the panel's own separator.
+        let pad_w = 2u16;
+        let panel_w = if state.show_stats_panel {
+            widgets::panel::panel_width(chunks[0].width)
+        } else {
+            0
+        };
+        // Keep the panel only while it still leaves the chat a usable
+        // width; on very narrow terminals it collapses to the plain layout.
+        let show_panel = panel_w > 0 && chunks[0].width >= pad_w + 1 + panel_w + 24;
+        if show_panel {
+            let content_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(pad_w),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(panel_w),
+                ])
+                .split(chunks[0]);
+            widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
+            widgets::panel::render_stats_panel(frame, chunks[0], state, config, &theme);
+        } else {
+            let content_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(pad_w),
+                    Constraint::Min(1),
+                    Constraint::Length(pad_w),
+                ])
+                .split(chunks[0]);
+            widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
+        }
+
+        let attach_idx = 2usize;
+        let input_idx = if has_attachments { 3usize } else { 2usize };
+        let border_idx = if has_attachments { 4usize } else { 3usize };
+        let status_idx = if has_attachments { 5usize } else { 4usize };
+
+        if has_attachments {
+            status::render_attach_bar(frame, chunks[attach_idx], state, &theme);
+        }
+        widgets::input::render_input(frame, chunks[input_idx], state, &theme, false, &cursor_cell);
+        status::render_input_border(frame, chunks[border_idx], &theme);
+        status::render_mini_status(frame, chunks[status_idx], state, config, &theme, show_panel);
+
+        if state.autocomplete.visible {
+            modals::render_autocomplete(frame, chunks[2], state, &theme);
+        }
+    }
+
+    if let Some(modal) = &state.modal {
+        modals::render_modal(frame, area, modal, &theme);
+    }
+    cursor_cell.get()
+}
+
 pub fn render(
     terminal: &mut TuiTerminal,
     state: &AppState,
     config: &Config,
 ) -> crate::error::AppResult<()> {
-    // The active theme comes from config; while the `/themes` screen is
-    // open the *whole frame* is drawn with the highlighted / in-progress
-    // theme instead — that's the live preview, and leaving without applying
-    // restores the saved theme on the next frame for free.
-    let theme = if state.view == View::Themes {
-        state.themes.preview_theme(config)
-    } else {
-        Theme::resolve(&config.ui)
-    };
-    let cursor_cell = Cell::new(None);
     sync_window_title(terminal, state);
-    terminal.draw(|frame| {
-        let area = frame.area();
-        frame.render_widget(
-            Paragraph::new(String::new()).style(Style::default().bg(theme.bg)),
-            area,
-        );
-
-        if state.view == View::Onboarding {
-            onboarding::render_onboarding(
-                frame,
-                area,
-                &state.onboarding,
-                state.focused().generation.animation_tick,
-                &theme,
-                &cursor_cell,
-            );
-            // Bottom status line — /logout and /wipe land here with their result.
-            if area.height > 1 {
-                let status_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-                status::render_mini_status(frame, status_area, state, config, &theme, false);
-            }
-        } else if state.view == View::Mcp {
-            mcp::render_mcp_view(frame, area, &state.mcp_status.view, &theme);
-        } else if state.view == View::Providers {
-            providers::render_providers_view(frame, area, &state.providers_view, config, &theme);
-        } else if state.view == View::Search {
-            search::render_search_view(frame, area, &state.search, &theme);
-        } else if state.view == View::Themes {
-            themes::render_themes_view(frame, area, &state.themes, config, &theme);
-        } else if state.focused().messages.is_empty() && !state.focused().generation.active {
-            landing::render_landing(frame, area, state, config, &theme, &cursor_cell);
-        } else {
-            let has_attachments = !state.attached_files.is_empty();
-            let mut constraints = vec![Constraint::Min(1), Constraint::Length(1)];
-            if has_attachments {
-                constraints.push(Constraint::Length(1));
-            }
-            constraints.push(Constraint::Length(4));
-            constraints.push(Constraint::Length(1));
-            constraints.push(Constraint::Length(1));
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(constraints)
-                .split(area);
-
-            status::render_separator(frame, chunks[1], &theme);
-
-            // Split main content into chat + stats panel. The reserved panel
-            // width MUST equal what the panel actually draws (`panel_width`),
-            // otherwise the chat area overlaps it and chat text bleeds onto
-            // the panel — the panel only recolors backgrounds, it doesn't
-            // clear glyphs. A 1-column gap holds the panel's own separator.
-            let pad_w = 2u16;
-            let panel_w = if state.show_stats_panel {
-                widgets::panel::panel_width(chunks[0].width)
-            } else {
-                0
-            };
-            // Keep the panel only while it still leaves the chat a usable
-            // width; on very narrow terminals it collapses to the plain layout.
-            let show_panel = panel_w > 0 && chunks[0].width >= pad_w + 1 + panel_w + 24;
-            if show_panel {
-                let content_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(pad_w),
-                        Constraint::Min(1),
-                        Constraint::Length(1),
-                        Constraint::Length(panel_w),
-                    ])
-                    .split(chunks[0]);
-                widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
-                widgets::panel::render_stats_panel(frame, chunks[0], state, config, &theme);
-            } else {
-                let content_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(pad_w),
-                        Constraint::Min(1),
-                        Constraint::Length(pad_w),
-                    ])
-                    .split(chunks[0]);
-                widgets::chat::render_chat(frame, content_chunks[1], state, &theme);
-            }
-
-            let attach_idx = 2usize;
-            let input_idx = if has_attachments { 3usize } else { 2usize };
-            let border_idx = if has_attachments { 4usize } else { 3usize };
-            let status_idx = if has_attachments { 5usize } else { 4usize };
-
-            if has_attachments {
-                status::render_attach_bar(frame, chunks[attach_idx], state, &theme);
-            }
-            widgets::input::render_input(
-                frame,
-                chunks[input_idx],
-                state,
-                &theme,
-                false,
-                &cursor_cell,
-            );
-            status::render_input_border(frame, chunks[border_idx], &theme);
-            status::render_mini_status(
-                frame,
-                chunks[status_idx],
-                state,
-                config,
-                &theme,
-                show_panel,
-            );
-
-            if state.autocomplete.visible {
-                modals::render_autocomplete(frame, chunks[2], state, &theme);
-            }
-        }
-
-        if let Some(modal) = &state.modal {
-            modals::render_modal(frame, area, modal, &theme);
-        }
-    })?;
+    let mut cursor = None;
+    terminal.draw(|frame| cursor = draw_frame(frame, state, config))?;
     // Re-set cursor position after frame flush to prevent flicker onto (0,0)
-    if let Some((cx, cy)) = cursor_cell.get() {
+    if let Some((cx, cy)) = cursor {
         use crossterm::cursor::MoveTo;
         crossterm::execute!(terminal.backend_mut(), MoveTo(cx, cy))?;
     }

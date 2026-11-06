@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod capture;
 pub mod markdown;
 pub mod render;
 pub mod theme;
