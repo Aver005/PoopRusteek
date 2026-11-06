@@ -997,4 +997,27 @@ mod tests {
         assert!(trust.bindings.contains_key("keyring:global/mine"));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Пример из репозитория обязан читаться и проходить проверку шлюза: иначе он врёт.
+    #[test]
+    fn the_example_config_loads_and_has_no_gateway_errors() {
+        let text = include_str!("../../config.example.toml");
+        let config = super::super::parse(text).expect("the example must parse");
+        let errors: Vec<String> = config
+            .gateway_config()
+            .validate()
+            .into_iter()
+            .filter(|p| p.severity == crate::gateway::types::Severity::Error)
+            .map(|p| format!("{}: {}", p.path, p.message))
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.accounts.len(), 5);
+        assert!(
+            !super::fields::contains_inline_secrets(text),
+            "the example holds no keys"
+        );
+        // Как проектный слой он не годится (там [secrets], [provider].token): проверка это видит.
+        let table: toml::Table = toml::from_str(text).unwrap();
+        assert!(!layers::check_project_layer(&table, &toml::Table::new()).is_empty());
+    }
 }

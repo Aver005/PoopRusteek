@@ -58,7 +58,14 @@ impl FileLock {
                     let _ = writeln!(file, "{}", std::process::id());
                     return Ok(Self { path });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // На Windows файл блокировки, который прямо сейчас удаляют, отвечает «отказано
+                // в доступе», а не «уже есть»: ждём так же.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
                     let age = std::fs::metadata(&path)
                         .and_then(|m| m.modified())
                         .ok()
