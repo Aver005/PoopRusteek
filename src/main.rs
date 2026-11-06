@@ -274,20 +274,29 @@ async fn run_async(args: Args, config: Config) -> Result<Option<i32>> {
     Ok(None)
 }
 
+/// Готовый шлюз отдаётся ждущему запросу. Чужое событие ждущего не трогает.
+fn settle_pending(
+    event: app::events::AppEvent,
+    pending: &mut Option<std::sync::Arc<gateway::pending::PendingGateway>>,
+) {
+    let app::events::AppEvent::GatewayBuilt(built) = event else {
+        return;
+    };
+    if let Some(waiting) = pending.take() {
+        match built.0 {
+            Ok(ready) => waiting.fulfil(ready),
+            Err(reason) => waiting.fail(reason),
+        }
+    }
+}
+
 fn run_acp_server(config: &Config) -> Result<()> {
     // Как в приложении: шлюз собирается вне цикла, запрос в это время ждёт готовности.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let (gateway, mut pending) = app::start_gateway(config, &event_tx);
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            if let (app::events::AppEvent::GatewayBuilt(built), Some(waiting)) =
-                (event, pending.take())
-            {
-                match built.0 {
-                    Ok(ready) => waiting.fulfil(ready),
-                    Err(reason) => waiting.fail(reason),
-                }
-            }
+            settle_pending(event, &mut pending);
         }
     });
     let Some(provider) = gateway::handle::main_provider(config, Some(&gateway)) else {
@@ -297,4 +306,40 @@ fn run_acp_server(config: &Config) -> Result<()> {
     let mut server = acp::server::AcpServer::new(provider);
     server.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waiting() -> std::sync::Arc<gateway::pending::PendingGateway> {
+        gateway::pending::PendingGateway::new(gateway::types::GatewayConfig::default())
+    }
+
+    /// Чужое событие не съедает ждущий шлюз: иначе запрос `--acp` повис бы навсегда.
+    #[test]
+    fn a_foreign_event_leaves_the_waiting_gateway_in_place() {
+        let pending = waiting();
+        let mut slot = Some(std::sync::Arc::clone(&pending));
+        settle_pending(
+            app::events::AppEvent::UpdateStatus {
+                message: "unrelated".to_string(),
+                notable: false,
+            },
+            &mut slot,
+        );
+        assert!(slot.is_some(), "still waiting for its own event");
+        assert!(pending.is_building());
+
+        let built: gateway::handle::GatewayHandle =
+            std::sync::Arc::new(gateway::handle::DisabledGateway::new());
+        settle_pending(
+            app::events::AppEvent::GatewayBuilt(app::events::BuiltGateway(Ok(built))),
+            &mut slot,
+        );
+        assert!(
+            slot.is_none() && !pending.is_building(),
+            "settled by GatewayBuilt"
+        );
+    }
 }

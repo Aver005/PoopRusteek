@@ -410,22 +410,35 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
     dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments).await
 }
 
-/// Окно подтверждения. `always` — белый список не действует, а в окне
-/// сказано, почему спрашиваем.
-async fn ask_person(call: &ParsedToolCall, ctx: &ToolExecContext<'_>, always: bool) -> bool {
+/// Запрос подтверждения. `always` — белый список не действует; команда про доверие и секреты
+/// получает это сама, и причина стоит первой строкой окна.
+fn build_approval(
+    call: &ParsedToolCall,
+    conversation: ConversationId,
+    always: bool,
+) -> ToolApprovalRequest {
     // Не сырой JSON: он экранирует переводы строк, и содержимое файла в
     // модалке становится одной нечитаемой строкой.
     let mut preview = crate::tools::approval_preview(&call.name, &call.arguments);
+    let risky = crate::tools::sensitive_shell_reason(&call.name, &call.arguments);
+    if let Some(reason) = risky {
+        preview = format!("{reason}\n{preview}");
+    }
     if let Some(warning) = call.origin.warning() {
         preview = format!("{warning}\n{preview}");
     }
-    let approval = ToolApprovalRequest::new(
-        ctx.conversation,
+    ToolApprovalRequest::new(
+        conversation,
         call.name.clone(),
         preview,
         crate::tools::approval_scope(&call.name, &call.arguments),
     )
-    .asking_always(always);
+    .asking_always(always || risky.is_some())
+}
+
+/// Окно подтверждения.
+async fn ask_person(call: &ParsedToolCall, ctx: &ToolExecContext<'_>, always: bool) -> bool {
+    let approval = build_approval(call, ctx.conversation, always);
     let _ = ctx
         .event_tx
         .send(AppEvent::RequestToolApproval(approval.clone()));
@@ -545,6 +558,45 @@ fn summarize_tool_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bash_call(command: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            id: None,
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": command }),
+            origin: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_trust_command_ignores_the_whitelist_and_says_why() {
+        let everything =
+            crate::whitelist::Whitelist::from_rules(vec![crate::whitelist::Rule::tool("bash")]);
+        let request = build_approval(
+            &bash_call("pooprusteek trust --yes"),
+            ConversationId::next(),
+            false,
+        );
+        assert!(request.always_ask);
+        assert!(
+            request.arguments.starts_with("risky:"),
+            "{}",
+            request.arguments
+        );
+        // Решение белого списка в приложении и харнессе — `!always_ask && allows`.
+        assert!(everything.allows("bash", request.scope.as_ref()));
+        assert!(
+            request.always_ask,
+            "so the whitelist verdict is not consulted"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_command_still_follows_the_whitelist() {
+        let request = build_approval(&bash_call("cargo test"), ConversationId::next(), false);
+        assert!(!request.always_ask);
+        assert!(!request.arguments.starts_with("risky:"));
+    }
 
     /// Родной протокол хранит битые аргументы строкой — такое не исполняется,
     /// и модель узнаёт настоящую причину.

@@ -3,6 +3,7 @@
 //! Один раз за процесс: перенос старой папки данных, копия старого конфига,
 //! перенос секретов в хранилище. Все шаги безопасно повторяются.
 
+use super::lock::FileLock;
 use super::{migrate, paths};
 use crate::secrets::{SecretStore, process_store};
 use std::path::{Path, PathBuf};
@@ -30,13 +31,77 @@ pub fn prepare_data_dir() -> Vec<String> {
 
 /// Какую папку данных взять: новую после переноса или старую, если перенос не удался.
 fn choose_data_dir(old: Option<PathBuf>, new: PathBuf) -> (PathBuf, Vec<String>) {
+    choose_data_dir_within(old, new, MIGRATION_WAIT, MIGRATION_STALE)
+}
+
+/// Замок переноса: тот, кто взял его, пульсирует после каждого файла, поэтому «брошенным»
+/// он считается только если держатель молчит целую минуту (упал).
+const MIGRATION_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+const MIGRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// Нужен ли перенос: метки нет вовсе, либо есть, но старый бинарь дописывал файлы после неё.
+fn needs_move(old: &Path, new: &Path) -> bool {
+    match migrate::marker_started(new) {
+        None => true,
+        Some(since) => migrate::old_has_news(old, since),
+    }
+}
+
+fn choose_data_dir_within(
+    old: Option<PathBuf>,
+    new: PathBuf,
+    wait: std::time::Duration,
+    stale: std::time::Duration,
+) -> (PathBuf, Vec<String>) {
     let Some(old) = old else {
         return (new, Vec::new());
     };
-    if old == new || !old.is_dir() || new.join(paths::DATA_MARKER).exists() {
+    if old == new || !old.is_dir() || !needs_move(&old, &new) {
         return (new, Vec::new());
     }
-    let report = migrate::migrate_data_dir(&old, &new);
+    // Перенос идёт под замком: второй запуск ждёт, потом видит метку первого и берёт ту же папку.
+    let lock = std::fs::create_dir_all(&new)
+        .and_then(|()| FileLock::acquire_within(&new.join(".migrate"), wait, stale));
+    let guard = match lock {
+        Ok(guard) => guard,
+        Err(error) => {
+            // Не дождались: тот, кто держит замок, ведёт перенос в эту же папку. Остаёмся с ней,
+            // чтобы обе копии видели одно; недостающее подберёт следующий запуск.
+            return (
+                new.clone(),
+                vec![format!(
+                    "Another copy is still moving the data to {} ({error}); using the new folder. What it has not copied yet appears at the next start.",
+                    new.display()
+                )],
+            );
+        }
+    };
+    // Пока ждали, другой запуск мог закончить.
+    if !needs_move(&old, &new) {
+        return (new, Vec::new());
+    }
+    let already_moved_once = migrate::marker_started(&new).is_some();
+    let report = migrate::migrate_data_dir_ticking(&old, &new, &|| guard.touch());
+    drop(guard);
+    if already_moved_once && !report.failed.is_empty() {
+        // Дополнение не удалось, но новая папка уже дом: остаёмся в ней, метка прежняя —
+        // следующий запуск повторит.
+        let notice = format!(
+            "Some files from the old folder {} could not be merged into {} ({}); they will be tried again at the next start.",
+            old.display(),
+            new.display(),
+            report.failed.join("; ")
+        );
+        return (new, vec![notice]);
+    }
+    if already_moved_once
+        && report.failed.is_empty()
+        && report.copied == 0
+        && report.kept_both.is_empty()
+    {
+        // Подобрать было нечего (файлы только тронуты): не шумим при каждом запуске.
+        return (new, Vec::new());
+    }
     if report.failed.is_empty() {
         let mut notices = vec![format!(
             "Data moved to {} ({} file(s) copied). The old folder {} was left in place; delete it when you are sure.",
@@ -310,6 +375,173 @@ mod tests {
         assert!(
             !new.join("later.json").exists(),
             "the marker makes the move a one-off"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── перенос данных: гонка запусков, падение, старый бинарь ────────────
+
+    use std::time::{Duration, SystemTime};
+
+    fn put(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Первый запуск ещё переносит; второй ждёт, потом видит метку и берёт ту же папку, ничего не копируя.
+    #[test]
+    fn the_second_first_start_waits_and_then_uses_the_same_folder() {
+        let root = dir("race");
+        let (old, new) = (root.join("old"), root.join("new"));
+        put(&old.join("sessions/s.json"), "{}");
+        std::fs::create_dir_all(&new).unwrap();
+        let first = FileLock::acquire(&new.join(".migrate")).unwrap();
+
+        let (o, n) = (old.clone(), new.clone());
+        let second = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let chosen =
+                choose_data_dir_within(Some(o), n, Duration::from_secs(30), MIGRATION_STALE);
+            (chosen, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        let report = migrate::migrate_data_dir(&old, &new);
+        assert!(report.failed.is_empty(), "{report:?}");
+        drop(first);
+
+        let ((chosen, notices), waited) = second.join().unwrap();
+        assert_eq!(chosen, new, "nobody stays on the old folder");
+        assert!(
+            notices.is_empty(),
+            "the second start copied nothing itself: {notices:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(300),
+            "it waited: {waited:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Не дождались замка живого держателя: берём новую папку (не старую) и ничего не копируем сами.
+    #[test]
+    fn a_start_that_cannot_get_the_lock_still_uses_the_new_folder() {
+        let root = dir("timeout");
+        let (old, new) = (root.join("old"), root.join("new"));
+        put(&old.join("sessions/s.json"), "{}");
+        std::fs::create_dir_all(&new).unwrap();
+        let _holder = FileLock::acquire(&new.join(".migrate")).unwrap();
+        let (chosen, notices) = choose_data_dir_within(
+            Some(old),
+            new.clone(),
+            Duration::from_millis(200),
+            MIGRATION_STALE,
+        );
+        assert_eq!(chosen, new);
+        assert!(notices[0].contains("Another copy"), "{notices:?}");
+        assert!(
+            !new.join("sessions/s.json").exists(),
+            "it moved nothing itself"
+        );
+        assert!(!new.join(paths::DATA_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Падение посреди переноса: часть файлов лежит, метки нет, замок брошен. Повтор доделывает.
+    #[test]
+    fn a_crash_in_the_middle_is_repeated_safely() {
+        let root = dir("crash");
+        let (old, new) = (root.join("old"), root.join("new"));
+        put(&old.join("sessions/a.json"), "a");
+        put(&old.join("sessions/b.json"), "b");
+        put(&new.join("sessions/a.json"), "a");
+        let lock = crate::config::lock::lock_path(&new.join(".migrate"));
+        put(&lock, "999999");
+        let old_time = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        let (chosen, notices) = choose_data_dir(Some(old), new.clone());
+        assert_eq!(chosen, new);
+        assert!(notices[0].contains("moved"), "{notices:?}");
+        assert_eq!(
+            std::fs::read_to_string(new.join("sessions/b.json")).unwrap(),
+            "b"
+        );
+        assert!(new.join(paths::DATA_MARKER).exists());
+        assert!(!lock.exists(), "the lock is released");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Старый бинарь дописал сессию и поправил файл после переноса: следующий запуск ничего не теряет.
+    #[test]
+    fn what_a_still_running_old_binary_wrote_is_merged_at_the_next_start() {
+        let root = dir("oldbin");
+        let (old, new) = (root.join("old"), root.join("new"));
+        put(&old.join("sessions/s1.json"), "first");
+        put(&old.join("whitelist.json"), "[\"before\"]");
+        let (chosen, _) = choose_data_dir(Some(old.clone()), new.clone());
+        assert_eq!(chosen, new);
+
+        // Старый бинарь живёт и пишет в свою папку.
+        std::thread::sleep(Duration::from_millis(80));
+        put(&old.join("sessions/s2.json"), "from the old binary");
+        put(&old.join("whitelist.json"), "[\"after\"]");
+
+        let (chosen, notices) = choose_data_dir(Some(old.clone()), new.clone());
+        assert_eq!(chosen, new);
+        assert!(notices[0].contains("moved"), "{notices:?}");
+        assert_eq!(
+            std::fs::read_to_string(new.join("sessions/s2.json")).unwrap(),
+            "from the old binary",
+            "the new session is not lost"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("whitelist.json")).unwrap(),
+            "[\"after\"]",
+            "the freshest wins"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("whitelist.json.legacy")).unwrap(),
+            "[\"before\"]",
+            "the other one lies beside it"
+        );
+        // Дальше тихо: метка обновлена, повтор ничего не делает.
+        let (_, notices) = choose_data_dir(Some(old), new);
+        assert!(notices.is_empty(), "{notices:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Дополнение не удалось: новая папка остаётся домом, метка прежняя — повторим в следующий раз.
+    #[test]
+    fn a_failed_top_up_stays_on_the_new_folder_and_is_tried_again() {
+        let root = dir("topup");
+        let (old, new) = (root.join("old"), root.join("new"));
+        put(&old.join("sessions/s1.json"), "first");
+        choose_data_dir(Some(old.clone()), new.clone());
+        let before = migrate::marker_started(&new);
+
+        std::thread::sleep(Duration::from_millis(80));
+        put(&old.join("sessions/s2.json"), "later");
+        std::fs::create_dir_all(new.join("sessions/s2.json")).unwrap(); // записи мешает папка
+        let (chosen, notices) = choose_data_dir(Some(old.clone()), new.clone());
+        assert_eq!(chosen, new, "never back to the old folder");
+        assert!(notices[0].contains("tried again"), "{notices:?}");
+        assert_eq!(
+            migrate::marker_started(&new),
+            before,
+            "the marker is not refreshed"
+        );
+
+        std::fs::remove_dir_all(new.join("sessions/s2.json")).unwrap();
+        let (_, notices) = choose_data_dir(Some(old), new.clone());
+        assert!(notices[0].contains("moved"), "{notices:?}");
+        assert_eq!(
+            std::fs::read_to_string(new.join("sessions/s2.json")).unwrap(),
+            "later"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

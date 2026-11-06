@@ -608,6 +608,17 @@ async fn cors_never_exposes_the_routing_headers_to_a_foreign_site() {
     let up = upstream(vec![("/a/", vec![text_stream(&["x"])])]).await;
     let gateway = engine(&config(up.port, false), Vec::new());
     let keyed = start(gateway.clone(), Some("server-key")).await;
+    // Клиент без `Origin` (SDK) работает как раньше.
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", keyed.base))
+        .bearer_auth("server-key")
+        .json(&serde_json::json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(header(&response, "x-pooprusteek-account").is_some());
+    assert_eq!(header(&response, "access-control-expose-headers"), None);
+    // Чужая страница отклоняется целиком, даже с верным ключом: ни запроса, ни заголовков маршрута.
     let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", keyed.base))
         .bearer_auth("server-key")
@@ -616,7 +627,9 @@ async fn cors_never_exposes_the_routing_headers_to_a_foreign_site() {
         .send()
         .await
         .unwrap();
-    assert!(header(&response, "x-pooprusteek-account").is_some());
+    assert_eq!(response.status(), 403);
+    assert_eq!(header(&response, "x-pooprusteek-account"), None);
+    assert_eq!(header(&response, "access-control-allow-origin"), None);
     assert_eq!(header(&response, "access-control-expose-headers"), None);
 
     let open = start(gateway, None).await;
@@ -628,9 +641,14 @@ async fn cors_never_exposes_the_routing_headers_to_a_foreign_site() {
         .await
         .unwrap();
     assert_eq!(
+        response.status(),
+        403,
+        "a foreign page cannot spend the subscriptions"
+    );
+    assert_eq!(
         header(&response, "access-control-allow-origin"),
         None,
-        "no key, no CORS"
+        "and is not allowed to read anything"
     );
     assert_eq!(header(&response, "access-control-expose-headers"), None);
 }

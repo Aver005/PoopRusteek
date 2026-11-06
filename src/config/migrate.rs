@@ -382,7 +382,10 @@ fn plan_data_files(old: &Path) -> (Vec<PathBuf>, Vec<String>) {
             walk_files(old, &path, &mut files);
         } else if path.is_file() && MIGRATED_FILES.contains(&name.as_str()) {
             files.push(PathBuf::from(&name));
-        } else if !REBUILDABLE.contains(&name.as_str()) && !skip_name(&name) {
+        } else if !REBUILDABLE.contains(&name.as_str())
+            && !skip_name(&name)
+            && !is_config_file(&name)
+        {
             left_behind.push(name);
         }
     }
@@ -421,13 +424,51 @@ fn modified(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Конфиг и его копия едут отдельным шагом (`copy_legacy_config`): в «оставленном» им не место,
+/// иначе заметка пугает ключами, которых в старом файле к этому моменту уже нет.
+fn is_config_file(name: &str) -> bool {
+    let base = name.strip_suffix(".pre-gateway").unwrap_or(name);
+    base == "config.toml"
+}
+
+/// Когда последний раз начинался перенос: по метке. Метка старого формата без времени —
+/// по времени её файла. `None` — метки нет.
+pub fn marker_started(new: &Path) -> Option<std::time::SystemTime> {
+    let marker = new.join(super::paths::DATA_MARKER);
+    let started = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("started_ms").and_then(serde_json::Value::as_u64))
+        .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+    started.or_else(|| modified(&marker))
+}
+
+/// Есть ли в старой папке переносимые файлы, изменённые после начала прошлого переноса:
+/// их писал запущенный старый бинарь, и они не должны пропасть.
+pub fn old_has_news(old: &Path, since: std::time::SystemTime) -> bool {
+    let (files, _) = plan_data_files(old);
+    files
+        .iter()
+        .any(|relative| modified(&old.join(relative)).is_some_and(|time| time > since))
+}
+
 /// Копирует данные из старой папки в новую. Старая остаётся нетронутой.
 /// Метка в новой папке ставится только после полного успеха: иначе перенос повторится.
+#[cfg(test)]
 pub fn migrate_data_dir(old: &Path, new: &Path) -> DataReport {
+    migrate_data_dir_ticking(old, new, &|| {})
+}
+
+/// То же, с пульсом после каждого файла: держатель замка сообщает, что жив.
+pub fn migrate_data_dir_ticking(old: &Path, new: &Path, tick: &dyn Fn()) -> DataReport {
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let mut report = DataReport::default();
     let (files, left_behind) = plan_data_files(old);
     report.left_behind = left_behind;
     for relative in files {
+        tick();
         let source = old.join(&relative);
         let target = new.join(&relative);
         let shown = relative.display().to_string();
@@ -493,6 +534,7 @@ pub fn migrate_data_dir(old: &Path, new: &Path) -> DataReport {
             "already_there": report.already_there,
             "kept_both": report.kept_both,
             "left_behind": report.left_behind,
+            "started_ms": started_ms,
         });
         let text = serde_json::to_string_pretty(&marker).unwrap_or_default();
         if let Err(e) =
@@ -907,8 +949,13 @@ base_url = "http://localhost:1/v1"
         ] {
             assert!(!new.join(left).exists(), "{left} must not be copied");
             assert!(old.join(left).exists(), "{left} stays in the old folder");
-            assert!(report.left_behind.contains(&left.to_string()), "{report:?}");
         }
+        // Конфиг едет отдельным шагом: заметка «оставлено, может хранить ключи» его не называет.
+        assert_eq!(
+            report.left_behind,
+            ["mcp.json.bak-craws", "notes.txt", "secrets"],
+            "{report:?}"
+        );
         // Ничто в новой папке не держит ключ.
         fn any_key(dir: &Path) -> bool {
             std::fs::read_dir(dir).unwrap().flatten().any(|e| {

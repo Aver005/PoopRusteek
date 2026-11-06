@@ -1906,6 +1906,47 @@ mod window_tests {
         )
     }
 
+    /// Отзыв доверия или `/cd` пересобирает шлюз в «выключен»; запущенный `/serve` не должен
+    /// продолжать отдавать аккаунты прежнего движка.
+    #[tokio::test]
+    async fn restarting_into_a_disabled_gateway_takes_the_running_server_with_it() {
+        let mut config = Config::default();
+        config.semantic.enabled = false;
+        config.update.auto = false;
+        config.server.port = 0;
+        let mut app = App::new(config).await.expect("the app starts");
+        app.gateway = Arc::new(rig_pair().engine);
+        app.start_server("test");
+        let addr = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), app.event_rx.recv())
+                .await
+                .expect("the server starts")
+                .expect("channel open")
+            {
+                AppEvent::ServerStarted { addr, .. } => break addr,
+                _ => continue,
+            }
+        };
+        let models = || async {
+            reqwest::get(format!("http://{addr}/v1/models"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["data"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(usize::MAX)
+        };
+        assert!(models().await > 0, "the live engine's accounts are served");
+
+        // Конфиг приложения — выключенный шлюз (слой пропал): пересборка.
+        app.restart_gateway();
+        assert!(!app.gateway.is_enabled());
+        assert_eq!(models().await, 0, "the server follows the rebuilt gateway");
+        app.server.as_ref().unwrap().request_shutdown();
+    }
+
     #[test]
     fn a_gateway_with_config_errors_is_named_at_startup_and_a_healthy_one_is_silent() {
         use crate::gateway::handle::GatewayHandle;

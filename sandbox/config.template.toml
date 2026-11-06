@@ -1,5 +1,5 @@
 # Config template for the sandbox container. The entrypoint copies this to
-# $XDG_CONFIG_HOME/pooprusteek/config.toml and substitutes the token from the
+# ~/.pooprusteek/config.toml and substitutes the token from the
 # POOPRUSTEEK_TOKEN environment variable, so no secret is ever baked into an
 # image layer.
 #

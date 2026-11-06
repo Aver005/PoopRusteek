@@ -9,6 +9,7 @@
 pub mod backend;
 pub mod chunked;
 pub mod error;
+pub mod human;
 pub mod keyring_slots;
 pub mod ops;
 pub mod redact;

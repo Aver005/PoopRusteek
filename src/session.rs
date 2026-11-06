@@ -141,12 +141,17 @@ pub fn save_session(
     // «Не знаю» не имеет права затирать то, что уже сохранено: иначе прогон,
     // который не завёл серверной сессии (упал на токене, например), стирает
     // связь здоровой сессии, и следующий `--resume` подхватывать уже нечего.
+    // Файл читается не больше раза и только если что-то из трёх полей неизвестно.
+    let stored = std::cell::LazyCell::new(|| read_stored(&path));
     let (provider_session_id, provider_parent_message_id) = match &meta.remote {
         RemoteLink::Established {
             session_id,
             parent_message_id,
         } => (Some(session_id.clone()), *parent_message_id),
-        RemoteLink::Unknown => stored_link(&path),
+        RemoteLink::Unknown => (
+            stored.provider_session_id.clone(),
+            stored.provider_parent_message_id,
+        ),
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -162,8 +167,8 @@ pub fn save_session(
         provider_session_id,
         provider_parent_message_id,
         broken: meta.broken,
-        route_state: meta.route.clone().or_else(|| stored_route(&path)),
-        title: meta.title.clone().or_else(|| stored_title(&path)),
+        route_state: meta.route.clone().or_else(|| stored.route_state.clone()),
+        title: meta.title.clone().or_else(|| stored.title.clone()),
     };
 
     let json = serde_json::to_string_pretty(&session)?;
@@ -171,54 +176,30 @@ pub fn save_session(
     Ok(())
 }
 
-/// Цель шлюза, уже лежащая в файле: «не знаю» не затирает известное (как `stored_link`).
-fn stored_route(path: &std::path::Path) -> Option<crate::gateway::state::RouteState> {
-    #[derive(Deserialize)]
-    struct StoredRoute {
-        #[serde(default)]
-        route_state: Option<crate::gateway::state::RouteState>,
-    }
-    let json = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<StoredRoute>(&json).ok()?.route_state
+/// Что уже лежит в файле сессии и не должно теряться от сохранения, которое этого не знает:
+/// связь с серверной сессией, цель шлюза, заголовок. Весь транскрипт разбирать незачем.
+#[derive(Deserialize, Default)]
+struct Stored {
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    provider_parent_message_id: Option<i64>,
+    #[serde(default)]
+    route_state: Option<crate::gateway::state::RouteState>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
-/// Заголовок, уже лежащий в файле: «не знаю» не затирает придуманный моделью.
-fn stored_title(path: &std::path::Path) -> Option<String> {
-    #[derive(Deserialize)]
-    struct StoredTitle {
-        #[serde(default)]
-        title: Option<String>,
-    }
-    let json = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<StoredTitle>(&json).ok()?.title
-}
-
-/// Связь с серверной сессией, уже лежащая в файле. Отсутствие файла или
-/// нечитаемый файл — не ошибка: сохранять надо в любом случае, просто
-/// переносить нечего.
-fn stored_link(path: &std::path::Path) -> (Option<String>, Option<i64>) {
-    /// Только два поля: разбирать весь транскрипт ради них незачем.
-    #[derive(Deserialize)]
-    struct StoredLink {
-        #[serde(default)]
-        provider_session_id: Option<String>,
-        #[serde(default)]
-        provider_parent_message_id: Option<i64>,
-    }
-
+/// Отсутствие файла или нечитаемый файл — не ошибка: сохранять надо в любом случае,
+/// просто переносить нечего.
+fn read_stored(path: &std::path::Path) -> Stored {
     let Ok(json) = std::fs::read_to_string(path) else {
-        return (None, None);
+        return Stored::default();
     };
-    match serde_json::from_str::<StoredLink>(&json) {
-        Ok(stored) => (
-            stored.provider_session_id,
-            stored.provider_parent_message_id,
-        ),
-        Err(error) => {
-            tracing::warn!("could not read the stored session link from {path:?}: {error}");
-            (None, None)
-        }
-    }
+    serde_json::from_str(&json).unwrap_or_else(|error| {
+        tracing::warn!("could not read the stored session fields from {path:?}: {error}");
+        Stored::default()
+    })
 }
 
 pub fn load_local(id: &str, _config: &Config) -> AppResult<Session> {

@@ -182,6 +182,46 @@ pub fn host_allowed(header: Option<&str>, port: u16, extra: &[String]) -> bool {
             .any(|allowed| allowed.eq_ignore_ascii_case(&name))
 }
 
+/// Подходит ли `Origin` браузерной страницы. Своя страница сервера (loopback-имя на его порту)
+/// и имена из `allowed_hosts` (на любом порту) проходят; всё остальное, в том числе `null`, нет.
+pub fn origin_allowed(origin: &str, port: u16, own_host: &str, extra: &[String]) -> bool {
+    let origin = origin.trim();
+    let (scheme, rest) = match origin.split_once("://") {
+        Some(("http", rest)) => (80u16, rest),
+        Some(("https", rest)) => (443u16, rest),
+        _ => return false,
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (name, given_port) = if let Some(inner) = authority.strip_prefix('[') {
+        match inner.split_once(']') {
+            Some((name, tail)) => (name, tail.strip_prefix(':')),
+            None => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let origin_port = match given_port {
+        Some(text) => match text.parse::<u16>() {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
+        None => scheme,
+    };
+    let name = name.to_ascii_lowercase();
+    if extra
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&name))
+    {
+        return true;
+    }
+    let own_page = matches!(name.as_str(), "127.0.0.1" | "localhost" | "::1")
+        || (!own_host.is_empty() && own_host.eq_ignore_ascii_case(&name));
+    own_page && origin_port == port
+}
+
 /// Что показывает статус-эндпоинт тому, кто прошёл проверку ключа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusAccess {
@@ -248,9 +288,10 @@ fn unix(time: SystemTime) -> u64 {
     crate::gateway::clock::to_unix(time)
 }
 
-/// Всё, что уходит клиенту или в открытый статус, не должно нести адрес апстрима:
-/// URL и пары `хост:порт` заменяются.
+/// Всё, что уходит клиенту или в открытый статус, не должно нести адрес апстрима и ключ:
+/// URL и пары `хост:порт` заменяются, секреты вычёркиваются (`Incorrect API key: sk-…`).
 pub(super) fn scrub(text: &str) -> String {
+    let text = crate::secrets::redact::redact(text);
     text.split(' ')
         .map(|word| {
             let bare = word.trim_matches(|c: char| "()<>\"',;".contains(c));
@@ -449,6 +490,43 @@ mod tests {
             scrub("rate limit exceeded, retry in 30s"),
             "rate limit exceeded, retry in 30s"
         );
+    }
+
+    #[test]
+    fn scrub_also_removes_keys_an_upstream_echoed_back() {
+        let text = scrub(
+            "Incorrect API key provided: sk-test-canary-0123456789abcdef at https://x.example/v1",
+        );
+        assert!(!text.contains("canary"), "{text}");
+        assert!(!text.contains("x.example"), "{text}");
+        assert!(text.contains("Incorrect API key provided"), "{text}");
+    }
+
+    #[test]
+    fn an_origin_is_a_page_of_this_server_or_a_named_host() {
+        let named = vec!["webui.example".to_string()];
+        for good in [
+            "http://127.0.0.1:7667",
+            "http://localhost:7667",
+            "http://[::1]:7667",
+            "https://webui.example",
+            "https://WEBUI.example:8443",
+        ] {
+            assert!(origin_allowed(good, 7667, "127.0.0.1", &named), "{good}");
+        }
+        for bad in [
+            "null",
+            "https://evil.example",
+            "http://127.0.0.1:1",
+            "http://localhost",
+            "http://127.0.0.1:7667.evil.example",
+            "ftp://127.0.0.1:7667",
+            "file://",
+            "",
+            "http://webui.example.evil.example",
+        ] {
+            assert!(!origin_allowed(bad, 7667, "127.0.0.1", &named), "{bad}");
+        }
     }
 
     #[test]
