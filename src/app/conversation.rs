@@ -58,10 +58,13 @@ pub struct ToolRun {
 /// Сообщение, набранное, пока шёл ход: уходит моделью после его конца.
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
-    /// Текст с развёрнутыми вставками.
+    /// Текст с развёрнутыми вставками; файловые чипы остаются в нём плейсхолдерами.
     pub text: String,
-    /// Файлы-чипы из поля ввода: после очистки поля иначе потерялись бы.
-    pub files: Vec<crate::provider::AttachedFile>,
+    /// Файловые чипы из поля ввода: после очистки поля иначе потерялись бы.
+    pub chips: Vec<crate::app::input::FileChip>,
+    /// Файлы `/attach`, снятые в момент Enter: сообщение уходит с теми, что
+    /// были при нём, а не с тем, что окажется в общей полосе позже.
+    pub named: Vec<crate::provider::AttachedFile>,
 }
 
 /// A parked (non-focused) conversation: it owns its own messages, forked
@@ -109,6 +112,9 @@ pub struct Conversation {
     pub current_tool: Option<ToolRun>,
     /// Сообщения, набранные во время хода: уходят по одному, когда ход кончится.
     pub queued: std::collections::VecDeque<QueuedMessage>,
+    /// Очередь стоит: последний ход упал, и решает человек (Enter на пустом
+    /// поле шлёт следующее, Esc возвращает в поле).
+    pub queue_paused: bool,
 }
 
 impl Conversation {
@@ -135,6 +141,7 @@ impl Conversation {
             fenced: false,
             current_tool: None,
             queued: std::collections::VecDeque::new(),
+            queue_paused: false,
         }
     }
 

@@ -4,10 +4,9 @@
 //! slash-command dispatch via `dispatch::apply_command_result`, or a plain
 //! message turn).
 
-use crate::app::conversation::{ConversationId, QueuedMessage};
+use crate::app::conversation::QueuedMessage;
 use crate::app::{App, AutocompleteState};
 use crate::error::AppResult;
-use crate::provider::AttachedFile;
 
 /// How `submit_input` left the turn: keep processing the key normally
 /// (refresh autocomplete), swallow the key, or quit the app.
@@ -184,12 +183,7 @@ impl App {
             return Ok(SubmitOutcome::Continue);
         }
 
-        // Sending a message acknowledges any errors flagged since the last
-        // one — clear the red marker (the text stays in errors.log).
-        self.state.error_count = 0;
-        self.state.last_error = None;
-
-        let chip_files = self.state.input.chip_files();
+        let chips = self.state.input.present_chips();
         // Команде и цели файл из чипа нужен путём: `/attach x [📎 a.pdf]` так и работает.
         let with_paths = self.state.input.with_chip_paths(&input);
         self.state.input.clear_buffer();
@@ -208,9 +202,13 @@ impl App {
         }
 
         if turn_running {
+            // Файлы `/attach` уходят с этим сообщением, а не с тем, что
+            // окажется в полосе вложений к концу хода.
+            let named = std::mem::take(&mut self.state.attached_files);
             self.state.focused_mut().queued.push_back(QueuedMessage {
                 text: input,
-                files: chip_files,
+                chips,
+                named,
             });
             self.state.status_message = format!(
                 "Queued ({}) — sent when the turn ends",
@@ -218,6 +216,12 @@ impl App {
             );
             return Ok(SubmitOutcome::Continue);
         }
+
+        // Sending a message acknowledges any errors flagged since the last
+        // one — clear the red marker (the text stays in errors.log). Постановка
+        // в очередь ничего не отправляет и метку не гасит.
+        self.state.error_count = 0;
+        self.state.last_error = None;
 
         // GOAL mode intercepts non-command input — the whole state machine
         // lives in goal.rs; `false` means goal mode just ended and the
@@ -240,86 +244,8 @@ impl App {
         }
 
         let focused = self.state.conversations.focused_id();
-        self.send_user_text(focused, input, chip_files).await?;
+        let named = std::mem::take(&mut self.state.attached_files);
+        self.send_user_text(focused, input, chips, named).await?;
         Ok(SubmitOutcome::Continue)
-    }
-
-    /// Отправить текст человека ходом в беседе `conversation`: развернуть
-    /// `@файл`, собрать вложения и запустить ход. Общая точка для Enter и для
-    /// очереди сообщений.
-    pub(crate) async fn send_user_text(
-        &mut self,
-        conversation: ConversationId,
-        input: String,
-        chip_files: Vec<AttachedFile>,
-    ) -> AppResult<()> {
-        let killed = self.state.background.cleanup_turn_of(conversation).await;
-        if killed > 0 {
-            self.state.push_system(&format!(
-                "Cleaned {killed} ephemeral job(s) before the new turn."
-            ));
-        }
-        let expanded = self.expand_file_mentions(&input);
-        let provider = self
-            .state
-            .conversations
-            .get(conversation)
-            .and_then(|conv| conv.provider.clone());
-        let accepts = |path: &std::path::Path| {
-            provider
-                .as_ref()
-                .is_some_and(|provider| provider.accepts_attachment(path))
-        };
-        // Прикреплённые через `/attach` и `@` в тексте не видны — их назовёт
-        // сводка; чипы и `@файл` видны и так.
-        let mut named = std::mem::take(&mut self.state.attached_files);
-        named.retain(|f| !chip_files.iter().any(|c| c.path == f.path));
-        let mut files = named.clone();
-        let mentioned = crate::app::attachments::binary_mentions(&input, &self.state.workspace());
-        for file in chip_files.into_iter().chain(mentioned) {
-            crate::app::attachments::push_unique(&mut files, file);
-        }
-        // Содержимое файлов уходит модели, а не в чат: рисовать 2 МБ лога
-        // в ленте (и пересчитывать их каждый кадр) никому не нужно.
-        let message =
-            crate::app::attachments::user_message(&expanded, &input, &files, &named, &accepts);
-        // Человек написал сам — цепочка автоматических побудок оборвана.
-        self.reset_timer_wakes(conversation);
-        self.send_turn(conversation, Some(message)).await
-    }
-
-    /// Ход кончился: отправить следующее сообщение из очереди беседы, если оно есть.
-    pub(crate) async fn send_next_queued(&mut self, conversation: ConversationId) {
-        let Some(target) = self.state.conversations.get_mut(conversation) else {
-            return;
-        };
-        if target.is_busy() || target.is_background_kind() {
-            return;
-        }
-        let Some(next) = target.queued.pop_front() else {
-            return;
-        };
-        if let Err(error) = self
-            .send_user_text(conversation, next.text, next.files)
-            .await
-        {
-            self.state
-                .push_ui_system(&format!("Queued message failed: {error}"));
-        }
-    }
-
-    /// Esc во время хода: очередь не пропадает, а возвращается в поле ввода.
-    pub(crate) fn restore_queued_to_input(&mut self) {
-        let queued: Vec<String> = self
-            .state
-            .focused_mut()
-            .queued
-            .drain(..)
-            .map(|message| message.text)
-            .collect();
-        if queued.is_empty() {
-            return;
-        }
-        self.state.input.append_restored(&queued.join("\n"));
     }
 }

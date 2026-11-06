@@ -17,6 +17,7 @@ pub mod paste_burst;
 mod persist;
 mod pickers;
 pub mod providers;
+mod queue;
 pub mod reduce;
 pub(crate) mod runtime;
 pub mod search;
@@ -704,6 +705,10 @@ impl App {
             }
         }
 
+        // Единственный выход очереди: что бы ни освободило чат — ход,
+        // `/compact`, отмена, — следующее сообщение уходит отсюда.
+        dirty |= self.drain_idle_queue().await;
+
         if self.state.view == View::Mcp {
             dirty |= self.state.mcp_status.refresh_view(&self.mcp).await;
         }
@@ -953,7 +958,6 @@ impl App {
             self.state.status_message = message;
         }
 
-        let turn_ended = end.is_some();
         let goal_end = end
             .clone()
             .filter(|_| self.state.goal.conversation == Some(target));
@@ -976,10 +980,6 @@ impl App {
                 ));
             }
             _ => {}
-        }
-        // Ход кончился, а человек успел набрать следующее — отправляем его.
-        if turn_ended {
-            self.send_next_queued(target).await;
         }
     }
 
@@ -1022,8 +1022,7 @@ impl App {
         let killed = self.state.background.cleanup_turn_of(conversation).await;
         self.state.focused_mut().generation.active = false;
         self.state.focused_mut().current_tool = None;
-        let queued = self.state.focused().queued.len();
-        self.restore_queued_to_input();
+        let queued = self.state.restore_queued_to_input();
         // The aborted task may have been a `/compact`: drop its claim here, or
         // the command stays refused for this chat forever.
         self.state.focused_mut().compacting = None;

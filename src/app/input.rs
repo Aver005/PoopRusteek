@@ -293,21 +293,62 @@ impl InputState {
         self.file_chips.clear();
     }
 
-    /// Insert a newline at the cursor, replacing any selection first.
+    /// Файловые чипы, которые ещё стоят в тексте: с ними сообщение уходит в очередь.
+    pub fn present_chips(&self) -> Vec<FileChip> {
+        self.file_chips
+            .iter()
+            .filter(|chip| self.buffer.contains(&chip.placeholder))
+            .cloned()
+            .collect()
+    }
+
     /// Вернуть в поле текст, который из него уже ушёл (очередь отменённого
-    /// хода): ниже того, что человек успел набрать, курсор в конце.
-    pub fn append_restored(&mut self, text: &str) {
+    /// хода): ниже того, что человек успел набрать, курсор в конце. Чипы
+    /// встают настоящими вложениями; одноимённый чип, что уже есть в поле,
+    /// переименовывается, чтобы два файла не слились в один.
+    pub fn append_restored(&mut self, text: &str, chips: Vec<FileChip>) {
+        let mut text = text.to_string();
+        let mut kept = Vec::new();
+        for mut chip in chips {
+            if !text.contains(&chip.placeholder) {
+                continue;
+            }
+            if self.placeholder_taken(&chip.placeholder) {
+                let inner = chip
+                    .placeholder
+                    .trim_start_matches("[📎 ")
+                    .trim_end_matches(']')
+                    .to_string();
+                let renamed = (2..)
+                    .map(|n| format!("[📎 {inner} #{n}]"))
+                    .find(|candidate| {
+                        !self.placeholder_taken(candidate) && !text.contains(candidate)
+                    })
+                    .unwrap_or_else(|| chip.placeholder.clone());
+                text = text.replace(&chip.placeholder, &renamed);
+                chip.placeholder = renamed;
+            }
+            kept.push(chip);
+        }
         if text.is_empty() {
             return;
         }
         if !self.buffer.is_empty() {
             self.buffer.push('\n');
         }
-        self.buffer.push_str(text);
+        self.buffer.push_str(&text);
+        self.file_chips.extend(kept);
         self.cursor = self.buffer.chars().count();
         self.selection_anchor = None;
     }
 
+    /// Занят ли такой чип: он уже стоит в тексте или записан в черновике.
+    fn placeholder_taken(&self, candidate: &str) -> bool {
+        self.buffer.contains(candidate)
+            || self.file_chips.iter().any(|c| c.placeholder == candidate)
+    }
+
+    /// Insert a newline at the cursor, replacing any selection first.
     pub fn insert_newline(&mut self) {
         self.delete_selection();
         self.leave_chip();
@@ -967,7 +1008,7 @@ two"
         let mut input = InputState::default();
         input.buffer = "typed".to_string();
         input.cursor = 5;
-        input.append_restored("first\nsecond");
+        input.append_restored("first\nsecond", Vec::new());
         assert_eq!(input.buffer, "typed\nfirst\nsecond");
         assert_eq!(input.cursor, input.buffer.chars().count());
     }
@@ -975,9 +1016,9 @@ two"
     #[test]
     fn restoring_into_an_empty_input_adds_no_leading_newline() {
         let mut input = InputState::default();
-        input.append_restored("only");
+        input.append_restored("only", Vec::new());
         assert_eq!(input.buffer, "only");
-        input.append_restored("");
+        input.append_restored("", Vec::new());
         assert_eq!(input.buffer, "only");
     }
 }

@@ -508,7 +508,8 @@ mod tests {
             .queued
             .push_back(crate::app::conversation::QueuedMessage {
                 text: "add a test for the empty string".to_string(),
-                files: Vec::new(),
+                chips: Vec::new(),
+                named: Vec::new(),
             });
         let model = model(&state);
         assert_eq!(model.queue.as_ref().map(|(count, _)| *count), Some(1));

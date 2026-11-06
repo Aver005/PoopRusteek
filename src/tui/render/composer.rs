@@ -130,7 +130,8 @@ mod tests {
             .queued
             .push_back(crate::app::conversation::QueuedMessage {
                 text: "next".to_string(),
-                files: Vec::new(),
+                chips: Vec::new(),
+                named: Vec::new(),
             });
         assert!(label(&state).contains("1 queued"));
     }

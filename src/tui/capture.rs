@@ -403,7 +403,8 @@ fn chat_working(config: &mut Config) -> AppState {
     }
     state.focused_mut().queued.push_back(QueuedMessage {
         text: "и ещё добавь тест на пустую строку".to_string(),
-        files: Vec::new(),
+        chips: Vec::new(),
+        named: Vec::new(),
     });
     state.background.total = 2;
     state.background.interactive = 1;
