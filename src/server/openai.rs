@@ -237,6 +237,9 @@ const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 
 /// Ошибка апстрима и её HTTP-код: клиент должен отличать «подожди» (429),
 /// «не дождались» (504) и «апстрим сломан» (502) — всё было 500.
+const UPSTREAM_AUTH_MESSAGE: &str =
+    "the upstream provider rejected this server's credentials; see the server log";
+
 struct UpstreamError {
     status: StatusCode,
     message: String,
@@ -306,12 +309,15 @@ impl UpstreamError {
                 Some("overloaded"),
             ),
             FailureClass::Timeout => (StatusCode::GATEWAY_TIMEOUT, "server_error", None),
-            // Ключ апстрима — забота сервера, а не клиента: 401 ввёл бы его в заблуждение.
-            FailureClass::Auth | FailureClass::AccountBlocked => (
-                StatusCode::BAD_GATEWAY,
-                "server_error",
-                Some("upstream_auth"),
-            ),
+            // Ключ апстрима — забота сервера. Текст отказа может раскрыть ключ или аккаунт.
+            FailureClass::Auth | FailureClass::AccountBlocked => {
+                mapped.message = UPSTREAM_AUTH_MESSAGE.to_string();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    Some("upstream_auth"),
+                )
+            }
             FailureClass::ContextTooLong => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -1605,6 +1611,9 @@ mod tests {
         let auth = UpstreamError::from_app(&typed(FailureClass::Auth));
         assert_eq!(auth.status, StatusCode::BAD_GATEWAY);
         assert_eq!(auth.body().error.code.as_deref(), Some("upstream_auth"));
+        assert_eq!(auth.body().error.message, super::UPSTREAM_AUTH_MESSAGE);
+        let blocked = UpstreamError::from_app(&typed(FailureClass::AccountBlocked));
+        assert_eq!(blocked.body().error.message, super::UPSTREAM_AUTH_MESSAGE);
         let context = UpstreamError::from_app(&typed(FailureClass::ContextTooLong));
         assert_eq!(context.status, StatusCode::BAD_REQUEST);
         assert_eq!(

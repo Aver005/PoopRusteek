@@ -789,10 +789,24 @@ impl GatewayConfig {
         at: &str,
         add: &mut impl FnMut(Severity, String, String),
     ) {
+        // Подписка Claude живёт только в официальном CLI: ни ключа, ни токена в нём.
+        if account.provider == AccountProvider::CliClaude
+            && matches!(
+                account.credential(),
+                Ok(Credential::ApiKey(_) | Credential::SecretRef(_))
+            )
+        {
+            add(
+                Severity::Error,
+                at.to_string(),
+                "cli:claude signs in through the official CLI: set only home".into(),
+            );
+        }
         match account.credential() {
             Err(message) => add(Severity::Error, at.to_string(), message),
             Ok(Credential::DirectToken(_)) => {
-                if account.provider.is_claude_family() {
+                let claude_host = account.base_url.as_deref().is_some_and(is_claude_host);
+                if account.provider.is_claude_family() || claude_host {
                     add(
                         Severity::Error,
                         at.to_string(),
@@ -830,6 +844,19 @@ impl GatewayConfig {
             );
         }
     }
+}
+
+/// Адрес серверов Anthropic: другое имя провайдера запрет прямого токена не снимает.
+fn is_claude_host(base_url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    ["anthropic.com", "claude.ai", "claude.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
 }
 
 #[cfg(test)]
@@ -977,6 +1004,49 @@ mod tests {
                 "{provider}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_direct_token_to_claude_servers_is_refused_under_any_provider_name() {
+        for host in [
+            "https://api.anthropic.com/v1",
+            "https://API.Anthropic.com",
+            "https://claude.ai/x",
+        ] {
+            let config = parse(&format!(
+                "[[accounts]]\nid = \"c\"\nprovider = \"custom\"\nbase_url = \"{host}\"\ndirect_token = \"keyring:c\"\ndirect_token_ack = true\n"
+            ));
+            let found = errors(&config);
+            assert!(
+                found.iter().any(|e| e.contains("not allowed for Claude")),
+                "{host}: {found:?}"
+            );
+        }
+        // Похожее имя чужого домена запрет не включает.
+        let config = parse(
+            "[[accounts]]\nid = \"x\"\nprovider = \"custom\"\nbase_url = \"https://notanthropic.com/v1\"\ndirect_token = \"keyring:x\"\ndirect_token_ack = true\n",
+        );
+        assert!(
+            !errors(&config)
+                .iter()
+                .any(|e| e.contains("not allowed for Claude"))
+        );
+    }
+
+    #[test]
+    fn cli_claude_refuses_keys_and_secrets_but_accepts_a_home() {
+        for credential in ["secret = \"keyring:c\"", "api_key = \"k\""] {
+            let config = parse(&format!(
+                "[[accounts]]\nid = \"c\"\nprovider = \"cli:claude\"\n{credential}\n"
+            ));
+            assert!(
+                errors(&config).iter().any(|e| e.contains("official CLI")),
+                "{credential}"
+            );
+        }
+        let config =
+            parse("[[accounts]]\nid = \"c\"\nprovider = \"cli:claude\"\nhome = \"D:/c\"\n");
+        assert!(!errors(&config).iter().any(|e| e.contains("official CLI")));
     }
 
     #[test]

@@ -288,19 +288,45 @@ async fn a_server_that_rejects_stream_options_gets_one_retry_and_is_remembered()
     assert!(!bodies[2].contains("stream_options"));
 }
 
+/// Шлюз отвергает параметр пустым телом: по тексту это не распознать.
 #[tokio::test]
-async fn an_unrelated_400_is_not_retried_and_stays_a_bad_request() {
-    let (base, seen) = serve(vec![Reply::json(
-        "400 Bad Request",
-        vec![],
-        r#"{"error":{"message":"messages: field required"}}"#,
-    )])
+async fn a_gateway_rejecting_with_an_empty_400_still_streams_after_a_retry() {
+    let (base, seen) = serve(vec![
+        Reply::json("400 Bad Request", vec![], ""),
+        Reply::sse(PLAIN_STREAM),
+        Reply::sse(PLAIN_STREAM),
+    ])
     .await;
+    let provider = provider(&base);
+    assert!(
+        collect(&provider)
+            .await
+            .iter()
+            .any(|chunk| chunk.content == "ok")
+    );
+    collect(&provider).await;
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3);
+    assert!(!bodies[2].contains("stream_options"));
+}
+
+/// Настоящая ошибка запроса не должна отключать расход для этого сервера.
+#[tokio::test]
+async fn a_real_400_stays_a_bad_request_and_usage_is_still_asked_next_time() {
+    let bad = || {
+        Reply::json(
+            "400 Bad Request",
+            vec![],
+            r#"{"error":{"message":"messages: field required"}}"#,
+        )
+    };
+    let (base, seen) = serve(vec![bad(), bad(), Reply::sse(PLAIN_STREAM)]).await;
+    let provider = provider(&base);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let error = provider(&base)
-        .complete_stream(request(), tx)
-        .await
-        .unwrap_err();
+    let error = provider.complete_stream(request(), tx).await.unwrap_err();
     assert_eq!(error.failure_class(), Some(FailureClass::BadRequest));
-    assert_eq!(seen.lock().unwrap().len(), 1);
+    collect(&provider).await;
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies[2].contains("stream_options"));
 }

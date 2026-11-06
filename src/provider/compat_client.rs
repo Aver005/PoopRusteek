@@ -99,8 +99,8 @@ pub(crate) trait CompatProtocol: Send + Sync + 'static {
     /// Попросить сервер прислать расход в потоке (OpenAI: `stream_options`).
     fn request_stream_usage(_body: &mut serde_json::Value) {}
 
-    /// Отверг ли сервер этот параметр: тогда запрос повторяется без него.
-    fn rejects_stream_usage(_status: u16, _message: &str) -> bool {
+    /// Мог ли отказ вызвать этот параметр: тогда запрос повторяется без него.
+    fn may_reject_stream_usage(_class: &crate::provider::failure::FailureClass) -> bool {
         false
     }
 }
@@ -235,6 +235,7 @@ impl<P: CompatProtocol> CompatClient<P> {
     ) -> AppResult<reqwest::Response> {
         let url = P::completions_url(&self.base_url, &self.model, stream);
         let mut ask_usage = stream && self.stream_usage.load(Ordering::Relaxed);
+        let mut retried_without_usage = false;
         loop {
             let mut body = P::request_body(request, &self.model, stream);
             if ask_usage {
@@ -256,6 +257,10 @@ impl<P: CompatProtocol> CompatClient<P> {
                 .filter(|limits| !limits.is_empty());
             self.remember_limits(limits.clone());
             if status.is_success() {
+                // Помогло только снятие параметра: больше его этому серверу не шлём.
+                if retried_without_usage {
+                    self.stream_usage.store(false, Ordering::Relaxed);
+                }
                 return Ok(response);
             }
             let text = response.text().await.unwrap_or_default();
@@ -265,15 +270,14 @@ impl<P: CompatProtocol> CompatClient<P> {
                 &format!("{}.error", P::LOG_TAG),
                 format!("status={status} message={message}"),
             );
-            // Сервер не знает параметра расхода: повторяем без него и больше не просим.
-            if ask_usage && P::rejects_stream_usage(status.as_u16(), &message) {
-                self.stream_usage.store(false, Ordering::Relaxed);
+            let failure = ProviderFailure::from_response(status, &headers, &text, message, limits);
+            // Текст отказа у шлюзов любой, поэтому решает повтор, а не поиск слов.
+            if ask_usage && P::may_reject_stream_usage(&failure.class) {
                 ask_usage = false;
+                retried_without_usage = true;
                 continue;
             }
-            return Err(AppError::Upstream(Box::new(
-                ProviderFailure::from_response(status, &headers, &text, message, limits),
-            )));
+            return Err(AppError::Upstream(Box::new(failure)));
         }
     }
 }

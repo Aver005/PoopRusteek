@@ -223,11 +223,9 @@ impl CompatProtocol for OpenAiProtocol {
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
 
-    /// Сервер без `stream_options` отвечает 400/422 с названием параметра.
-    fn rejects_stream_usage(status: u16, message: &str) -> bool {
-        let text = message.to_ascii_lowercase();
-        matches!(status, 400 | 422)
-            && (text.contains("stream_options") || text.contains("include_usage"))
+    /// Совместимые серверы отвергают `stream_options` по-разному, иногда с пустым телом.
+    fn may_reject_stream_usage(class: &crate::provider::failure::FailureClass) -> bool {
+        matches!(class, crate::provider::failure::FailureClass::BadRequest)
     }
 }
 
