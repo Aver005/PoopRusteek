@@ -767,11 +767,16 @@ impl App {
         // saves run on the persist worker now, and quitting right after a
         // turn completes must not lose that turn's save. Bounded like the
         // remote discards above: exiting must not hang on a wedged disk.
-        // Сохранения конфига, поставленные в очередь, тоже должны дойти до диска.
-        let _ = tokio::task::spawn_blocking(|| {
-            crate::config::flush_saves(std::time::Duration::from_secs(5))
+        // Сохранения конфига дойдут до диска: на занятом диске запись занимает секунды.
+        // Пустая очередь не ждёт, а срыв срока видно в журнале, а не потеря молчком.
+        let flushed = tokio::task::spawn_blocking(|| {
+            crate::config::flush_saves(std::time::Duration::from_secs(30))
         })
-        .await;
+        .await
+        .unwrap_or(false);
+        if !flushed {
+            tracing::error!("config saves did not reach the disk before exit");
+        }
         self.persister
             .flush(std::time::Duration::from_secs(3))
             .await;

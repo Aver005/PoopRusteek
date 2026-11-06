@@ -158,7 +158,7 @@ mod tests {
     fn two_quick_saves_keep_their_order() {
         let root = dir("order");
         let path = root.join("config.toml");
-        // Тест падал один раз за пять полных прогонов: ошибки записи должны быть видны.
+        // Десять записей с fsync на занятом диске не укладывались в 20 с: срок как у замка.
         let (tx, rx) = mpsc::channel::<String>();
         let tx = Mutex::new(tx);
         let queue = SaveQueue::start(Arc::new(move |message| {
@@ -171,7 +171,7 @@ mod tests {
             queue.submit(load::prepare_job(&first).unwrap());
             queue.submit(load::prepare_job(&second).unwrap());
         }
-        let flushed = queue.flush(Duration::from_secs(20));
+        let flushed = queue.flush(Duration::from_secs(120));
         let errors: Vec<String> = rx.try_iter().collect();
         assert!(flushed, "flush timed out, save errors: {errors:?}");
         let text = std::fs::read_to_string(&path).unwrap();
