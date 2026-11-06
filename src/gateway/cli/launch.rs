@@ -105,9 +105,10 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn create(base: &Path) -> std::io::Result<Self> {
+        private_dir(base)?;
         let root = base.join(uuid::Uuid::new_v4().simple().to_string());
-        std::fs::create_dir_all(root.join("work"))?;
-        std::fs::create_dir_all(root.join("config"))?;
+        private_dir(&root.join("work"))?;
+        private_dir(&root.join("config"))?;
         Ok(Self { root, keep: false })
     }
 
@@ -129,8 +130,46 @@ impl Scratch {
     /// Системный промпт: файл рядом с рабочей папкой, не в ней.
     pub fn write_system(&self, text: &str) -> std::io::Result<PathBuf> {
         let path = self.root.join("system.md");
-        std::fs::write(&path, text)?;
+        write_private(&path, text)?;
         Ok(path)
+    }
+}
+
+/// Папка только для владельца (0700 на unix): чужие локальные пользователи в неё не зайдут.
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        // Папка могла существовать с чужими правами: приводим явно.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Файл только для владельца (0600 на unix); папка вызова своя, гонки за имя нет.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(text.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, text)
     }
 }
 
@@ -200,6 +239,42 @@ mod tests {
         let shown = format!("{launch:?}");
         assert!(shown.contains("SECRET_TOKEN"));
         assert!(!shown.contains("hunter2") && !shown.contains("private prompt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_folders_are_0700_and_the_prompt_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("pooprusteek-scratch-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Папка уже была, и с открытыми правами: приводится к 0700.
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scratch = Scratch::create(&base).unwrap();
+        let system = scratch.write_system("hi").unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&base), 0o700);
+        assert_eq!(mode(system.parent().unwrap()), 0o700);
+        assert_eq!(mode(&scratch.work_dir()), 0o700);
+        assert_eq!(mode(&scratch.config_dir()), 0o700);
+        assert_eq!(mode(&system), 0o600);
+        drop(scratch);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_prompt_file_is_rewritten_in_place_and_goes_away_with_the_folder() {
+        let base =
+            std::env::temp_dir().join(format!("pooprusteek-scratch-new-{}", std::process::id()));
+        let scratch = Scratch::create(&base).unwrap();
+        let first = scratch.write_system("one, longer").unwrap();
+        let second = scratch.write_system("two").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "two");
+        drop(scratch);
+        assert!(!first.exists(), "the folder goes away after the call");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

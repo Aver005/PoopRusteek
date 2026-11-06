@@ -5,7 +5,7 @@ use super::adapter::{CliBackend, CliSetup};
 use super::claude::{ClaudeDialect, MIN_VERSION};
 use super::codex::CodexBackend;
 use super::dialect::check_model;
-use super::discover::{Lookup, find, read_version};
+use super::discover::{Lookup, VersionState, find, version_state, warm_version};
 use super::opencode::OpencodeDialect;
 use crate::gateway::backend::Backend;
 use crate::gateway::engine::{BackendFactory, SecretResolver};
@@ -47,6 +47,13 @@ impl CliFactory {
         }
     }
 
+    /// Сборка после прогрева версии: так аккаунт собирается при старте шлюза (только тесты).
+    #[cfg(test)]
+    pub fn build_ready(&self, account: &Account) -> Result<Arc<dyn Backend>, String> {
+        BackendFactory::prepare(self, std::slice::from_ref(account));
+        self.build_for(account)
+    }
+
     /// Оставлять папки вызовов на диске (проверка приманки).
     #[cfg(test)]
     pub fn keeping_scratch(mut self) -> Self {
@@ -78,7 +85,17 @@ impl CliFactory {
             .clone()
             .unwrap_or_else(|| Lookup::from_env(tool));
         let program = find(tool, &lookup)?;
-        let version = read_version(&program)?;
+        // Версию читают вне цикла событий: на промахе кэша аккаунт недоступен, пока проверка идёт.
+        let version = match version_state(&program) {
+            VersionState::Ready(version) => version,
+            VersionState::Failed(reason) => return Err(reason),
+            VersionState::Checking => {
+                return Err(format!(
+                    "checking the version of {} (not ready yet); it becomes available after the next change of the accounts",
+                    program.path.display()
+                ));
+            }
+        };
         let dialect: Arc<dyn super::dialect::Dialect> = match tool {
             CliTool::Claude => {
                 if version < MIN_VERSION {
@@ -104,6 +121,29 @@ impl CliFactory {
 }
 
 impl BackendFactory for CliFactory {
+    /// Старт шлюза (не цикл событий): версии нужных бинарей читаются сразу и ложатся в кэш,
+    /// чтобы позднейшие правки аккаунтов не ждали процесс.
+    fn prepare(&self, accounts: &[Account]) {
+        let mut done: Vec<CliTool> = Vec::new();
+        for account in accounts.iter().filter(|a| a.enabled) {
+            let Some(tool) = account.provider.cli_tool() else {
+                continue;
+            };
+            if tool == CliTool::Codex || done.contains(&tool) {
+                continue;
+            }
+            done.push(tool);
+            let lookup = self
+                .lookup
+                .clone()
+                .unwrap_or_else(|| Lookup::from_env(tool));
+            if let Ok(program) = find(tool, &lookup) {
+                // Ошибка ляжет в кэш и всплывёт причиной недоступности при сборке адаптера.
+                let _ = warm_version(&program);
+            }
+        }
+    }
+
     fn build(
         &self,
         account: &Account,

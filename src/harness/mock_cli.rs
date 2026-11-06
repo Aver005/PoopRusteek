@@ -22,7 +22,7 @@ pub struct MockCliArgs {
     pub flavor: String,
 
     /// success | rate-limit | throttled | not-logged-in | cut-off | cut-off-silent | silence | grandchild |
-    /// grandchild-fail | unknown-error | garbage | slow-exit | tool-step | old-version.
+    /// grandchild-fail | unknown-error | garbage | slow-exit | tool-step | old-version | slow-version (the version check takes 1.5 s).
     #[arg(long, default_value = "success")]
     pub scenario: String,
 
@@ -134,7 +134,7 @@ fn claude_success() -> Vec<String> {
 
 fn claude_script(scenario: &str) -> Option<Script> {
     Some(match scenario {
-        "success" | "garbage" => {
+        "success" | "garbage" | "slow-version" => {
             let mut lines = claude_success();
             if scenario == "garbage" {
                 lines.insert(1, "this is not json".to_string());
@@ -224,7 +224,7 @@ fn opencode_success() -> Vec<String> {
 
 fn opencode_script(scenario: &str) -> Option<Script> {
     Some(match scenario {
-        "success" | "garbage" => {
+        "success" | "garbage" | "slow-version" => {
             let mut lines = opencode_success();
             if scenario == "garbage" {
                 lines.insert(1, "this is not json".to_string());
@@ -409,6 +409,9 @@ fn answer_side_call(args: &MockCliArgs, out: &mut impl Write) -> Option<i32> {
     let argv = &args.argv;
     let first = argv.first().map(String::as_str);
     if argv.iter().any(|a| a == "--version") {
+        if args.scenario == "slow-version" {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
         emit(out, version_of(&args.flavor, &args.scenario));
         return Some(0);
     }

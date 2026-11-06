@@ -96,6 +96,11 @@ impl Rig {
     }
 
     fn record(&self) -> Value {
+        // Под нагрузкой мок успевает записать след чуть позже, чем адаптер его убил.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.record.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         serde_json::from_str(&std::fs::read_to_string(&self.record).expect("mock wrote a record"))
             .unwrap()
     }
@@ -986,7 +991,7 @@ fn a_missing_binary_makes_the_account_unavailable_with_a_reason_not_a_crash() {
     let rig = Rig::new("factory-missing");
     let factory = factory(Lookup::default(), &rig);
     let reason = factory
-        .build_for(&cli_account(AccountProvider::CliClaude))
+        .build_ready(&cli_account(AccountProvider::CliClaude))
         .err()
         .expect("nothing to run");
     assert!(reason.contains("claude was not found") && reason.contains("POOPRUSTEEK_CLI_CLAUDE"));
@@ -996,7 +1001,7 @@ fn a_missing_binary_makes_the_account_unavailable_with_a_reason_not_a_crash() {
 fn a_claude_older_than_the_minimum_is_unavailable_and_a_new_one_is_built() {
     let rig = Rig::new("factory-version");
     let old = factory(lookup_json("claude", "old-version"), &rig)
-        .build_for(&cli_account(AccountProvider::CliClaude))
+        .build_ready(&cli_account(AccountProvider::CliClaude))
         .err()
         .expect("too old to run safely");
     assert!(
@@ -1004,7 +1009,7 @@ fn a_claude_older_than_the_minimum_is_unavailable_and_a_new_one_is_built() {
         "{old}"
     );
     let built = factory(lookup_json("claude", "success"), &rig)
-        .build_for(&cli_account(AccountProvider::CliClaude))
+        .build_ready(&cli_account(AccountProvider::CliClaude))
         .expect("a current version is accepted");
     assert!(built.capabilities().pure_model);
 }
@@ -1015,12 +1020,12 @@ fn a_cli_account_refuses_secrets_and_codex_is_built_but_never_a_plain_model() {
     let mut keyed = cli_account(AccountProvider::CliClaude);
     keyed.api_key = Some("x".into());
     let refusal = factory(lookup_json("claude", "success"), &rig)
-        .build_for(&keyed)
+        .build_ready(&keyed)
         .err()
         .expect("keys do not belong to a CLI");
     assert!(refusal.contains("home"));
     let codex = factory(Lookup::default(), &rig)
-        .build_for(&cli_account(AccountProvider::CliCodex))
+        .build_ready(&cli_account(AccountProvider::CliCodex))
         .expect("codex is described even without a binary");
     assert!(!codex.capabilities().pure_model);
 }
@@ -1161,14 +1166,14 @@ fn an_account_whose_default_model_is_a_flag_is_unavailable() {
     let mut account = cli_account(AccountProvider::CliOpencode);
     account.model = Some("--standalone".into());
     let refusal = factory(lookup_json("opencode", "success"), &rig)
-        .build_for(&account)
+        .build_ready(&account)
         .err()
         .expect("a flag is not a model");
     assert!(refusal.contains("account model") && refusal.contains("refusing to start"));
     account.model = Some("mock/model".into());
     assert!(
         factory(lookup_json("opencode", "success"), &rig)
-            .build_for(&account)
+            .build_ready(&account)
             .is_ok()
     );
 }
@@ -1536,6 +1541,93 @@ fn opencode_on_the_shared_login_passes_the_users_own_dirs_through_and_nothing_el
     let _ = std::fs::remove_dir_all(base);
 }
 
+// ── F9: версия читается вне цикла событий ───────────────────────────────────────────────
+
+#[test]
+fn a_cache_miss_does_not_wait_for_the_version_process_and_the_account_comes_up_after_it() {
+    let rig = Rig::new("version-async");
+    let factory = factory(lookup_json("claude", "slow-version"), &rig);
+    let account = cli_account(AccountProvider::CliClaude);
+    // Версия приходит через 1,5 с: ответ-отказ значит, что сборка не стала её ждать.
+    let first = factory
+        .build_for(&account)
+        .err()
+        .expect("the check has not finished yet");
+    assert!(first.contains("checking the version"), "{first}");
+    // Пока проверка идёт, ответ тот же и тоже мгновенный.
+    assert!(factory.build_for(&account).is_err());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while factory.build_for(&account).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the background check never finished"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        factory.build_for(&account).is_ok(),
+        "a cached version is ready at once"
+    );
+}
+
+#[test]
+fn preparing_the_factory_at_startup_warms_the_cache_so_later_builds_never_wait() {
+    use crate::gateway::engine::BackendFactory;
+    let rig = Rig::new("version-prepare");
+    let factory = factory(lookup_json("opencode", "slow-version"), &rig);
+    let mut account = cli_account(AccountProvider::CliOpencode);
+    account.model = Some("mock/model".into());
+    // Это место, где ждать можно: старт шлюза. Дальше сборка мгновенна.
+    factory.prepare(std::slice::from_ref(&account));
+    // Промах кэша дал бы «checking…»: сборка без ожидания удалась, значит версия уже в кэше.
+    assert!(factory.build_for(&account).is_ok());
+}
+
+#[test]
+fn a_failed_version_check_is_reported_as_the_reason_and_not_cached_forever() {
+    use super::discover::{VersionState, version_state};
+    let rig = Rig::new("version-missing");
+    let program = Program {
+        path: rig.dir.join("no-such-binary"),
+        prefix: Vec::new(),
+        source: Source::Override,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match version_state(&program) {
+            VersionState::Failed(reason) => {
+                assert!(reason.contains("cannot start"), "{reason}");
+                break;
+            }
+            VersionState::Checking => {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            VersionState::Ready(_) => panic!("no such binary"),
+        }
+    }
+}
+
+// ── Подмена бинаря только для тестов и харнесса ─────────────────────────────────────────
+
+#[test]
+fn the_binary_override_is_ignored_in_a_normal_run_and_honoured_where_it_is_allowed() {
+    use super::discover::gate_override;
+    let value = Some("[\"/bin/evil\"]".to_string());
+    assert_eq!(
+        gate_override(false, value.clone()),
+        None,
+        "a normal run must ignore it"
+    );
+    assert_eq!(gate_override(true, value.clone()), value);
+    assert_eq!(
+        gate_override(true, Some("  ".into())),
+        None,
+        "blank is absent"
+    );
+    assert_eq!(gate_override(true, None), None);
+}
+
 // ── Настоящие CLI: приманка (`--ignored`, расходует крошечный запрос на аккаунт) ─────────
 
 /// Просьба создать файл. Без запрета инструментов файл появился бы (контроль — в спайке, c2/o2).
@@ -1563,7 +1655,7 @@ async fn decoy_with(provider: AccountProvider, model: &str, root: &Path) -> Stri
     let factory =
         CliFactory::with_lookup(Lookup::from_env(tool), root.to_path_buf()).keeping_scratch();
     let backend = factory
-        .build_for(&cli_account(provider))
+        .build_ready(&cli_account(provider))
         .expect("the real CLI is installed and recent enough");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let ctx = context(model);
@@ -1624,5 +1716,88 @@ async fn real_clis_do_not_create_the_file_a_decoy_prompt_asks_for() {
             "{provider:?}: pwned.txt appeared: {pwned:?}"
         );
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Настройки пользователя с хуками на три события; каждый хук оставляет файл-след.
+fn hook_settings(home: &Path) -> String {
+    let marker = |name: &str| {
+        let path = super::launch::forward_slashes(&home.join(name));
+        serde_json::json!([{"hooks": [{"type": "command", "command": format!("echo ran > {path}")}]}])
+    };
+    serde_json::json!({"hooks": {
+        "SessionStart": marker("ran-session.txt"),
+        "UserPromptSubmit": marker("ran-prompt.txt"),
+        "Stop": marker("ran-stop.txt"),
+    }})
+    .to_string()
+}
+
+fn hook_traces(home: &Path) -> Vec<String> {
+    ["ran-session.txt", "ran-prompt.txt", "ran-stop.txt"]
+        .iter()
+        .filter(|name| home.join(name).exists())
+        .map(|name| name.to_string())
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "runs the installed claude twice with a tiny prompt; needs no login"]
+async fn a_hook_in_the_users_claude_settings_does_not_run_under_the_adapter() {
+    let root = std::env::temp_dir().join(format!("gw-cli-hook-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), hook_settings(&home)).unwrap();
+    let lookup = Lookup::from_env(crate::gateway::types::CliTool::Claude);
+    let program = super::discover::find(crate::gateway::types::CliTool::Claude, &lookup).unwrap();
+
+    // Контроль: тот же запуск без `--restricted` обязан хук сработать, иначе проверка ничего не стоит.
+    let (scratch, base) = scratch("hook-control");
+    let mut control = launch_with(
+        &ClaudeDialect,
+        &scratch,
+        Some(&home),
+        "haiku",
+        std::env::vars_os().collect(),
+    );
+    control.program = program.path.clone();
+    control.args.retain(|arg| arg != "--restricted");
+    control.stdin = b"hi".to_vec();
+    let ran = super::process::run_captured(&control, Duration::from_secs(90)).await;
+    eprintln!(
+        "control (no --restricted): exit {:?}, traces {:?}",
+        ran.exit,
+        hook_traces(&home)
+    );
+    let fired = hook_traces(&home);
+    assert!(
+        !fired.is_empty(),
+        "the control run did not fire any hook: this test would prove nothing ({:?})",
+        ran.failure
+    );
+    for name in fired {
+        std::fs::remove_file(home.join(name)).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(base);
+
+    // Сам адаптер: тот же дом с тем же `settings.json`.
+    let factory = CliFactory::with_lookup(lookup, root.join("scratch"));
+    let mut account = cli_account(AccountProvider::CliClaude);
+    account.home = Some(home.clone());
+    let backend = factory.build_ready(&account).expect("claude is installed");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = backend
+        .call(request("hi"), &context("haiku"), EmitTracker::new(tx))
+        .await;
+    match &result {
+        Ok(_) => eprintln!("adapter: answered"),
+        Err(error) => eprintln!("adapter: {} ({})", error.message, error.class.code()),
+    }
+    assert_eq!(
+        hook_traces(&home),
+        Vec::<String>::new(),
+        "a user hook ran under --restricted"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

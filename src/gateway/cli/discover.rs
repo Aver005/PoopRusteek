@@ -60,12 +60,31 @@ pub struct Lookup {
     pub home: Option<PathBuf>,
 }
 
+/// Подмена бинаря разрешена только в тестах и в харнессе с `--config`: иначе модель через `bash`
+/// могла бы подменить бинарь на следующий запуск. Пользователям — только `PATH` и известные места.
+static OVERRIDES_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Харнесс с `--config` включает подмену, обычный запуск оставляет выключенной.
+pub fn allow_overrides(allowed: bool) {
+    OVERRIDES_ALLOWED.store(allowed, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn overrides_allowed() -> bool {
+    cfg!(test) || OVERRIDES_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Значение переменной подмены, если подмена вообще разрешена; пустое — как отсутствующее.
+pub(super) fn gate_override(allowed: bool, value: Option<String>) -> Option<String> {
+    value.filter(|v| allowed && !v.trim().is_empty())
+}
+
 impl Lookup {
     pub fn from_env(tool: CliTool) -> Self {
         Self {
-            override_value: std::env::var(override_var(tool))
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
+            override_value: gate_override(
+                overrides_allowed(),
+                std::env::var(override_var(tool)).ok(),
+            ),
             path_dirs: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
@@ -197,30 +216,94 @@ fn plain(path: PathBuf, source: Source) -> Program {
     }
 }
 
-/// Версия по `--version`. Блокирует не дольше [`VERSION_TIMEOUT`]; успех кэшируется на процесс.
-pub fn read_version(program: &Program) -> Result<Version, String> {
-    use std::sync::{Mutex, OnceLock};
-    type Known = Vec<(PathBuf, Vec<OsString>, Version)>;
-    static CACHE: OnceLock<Mutex<Known>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(known) = cache.lock()
-        && let Some((_, _, version)) = known
-            .iter()
-            .find(|(path, prefix, _)| *path == program.path && *prefix == program.prefix)
-    {
-        return Ok(*version);
-    }
+/// Состояние проверки версии бинаря.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionState {
+    Ready(Version),
+    Failed(String),
+    /// Проверка идёт в фоне, результата ещё нет.
+    Checking,
+}
+
+enum Slot {
+    Checking,
+    Done(Result<Version, String>, std::time::Instant),
+}
+
+type Key = (PathBuf, Vec<OsString>);
+
+/// Ошибку проверки помним недолго: бинарь могли поставить или починить.
+const FAILURE_TTL: Duration = Duration::from_secs(30);
+
+fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<Key, Slot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Key, Slot>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn key_of(program: &Program) -> Key {
+    (program.path.clone(), program.prefix.clone())
+}
+
+fn probe_version(program: &Program) -> Result<Version, String> {
     let text = run_version(program)?;
-    let version = Version::parse(&text).ok_or_else(|| {
+    Version::parse(&text).ok_or_else(|| {
         format!(
             "cannot read a version from the output of {}",
             program.path.display()
         )
-    })?;
-    if let Ok(mut known) = cache.lock() {
-        known.push((program.path.clone(), program.prefix.clone(), version));
+    })
+}
+
+fn store(key: Key, result: Result<Version, String>) {
+    if let Ok(mut slots) = cache().lock() {
+        slots.insert(key, Slot::Done(result, std::time::Instant::now()));
     }
-    Ok(version)
+}
+
+/// Версия без ожидания: кэш или `Checking` (проверка стартует в фоновом потоке).
+/// Годится для пути правки конфига, который идёт рядом с циклом событий.
+pub fn version_state(program: &Program) -> VersionState {
+    let key = key_of(program);
+    {
+        let Ok(mut slots) = cache().lock() else {
+            return VersionState::Failed("version cache is unavailable".to_string());
+        };
+        match slots.get(&key) {
+            Some(Slot::Done(Ok(version), _)) => return VersionState::Ready(*version),
+            Some(Slot::Done(Err(error), at)) if at.elapsed() < FAILURE_TTL => {
+                return VersionState::Failed(error.clone());
+            }
+            Some(Slot::Checking) => return VersionState::Checking,
+            _ => {}
+        }
+        slots.insert(key.clone(), Slot::Checking);
+    }
+    let program = program.clone();
+    let slot_key = key.clone();
+    let spawned = std::thread::Builder::new()
+        .name("cli-version".into())
+        .spawn(move || store(slot_key, probe_version(&program)));
+    if let Err(error) = spawned {
+        let message = format!("cannot start the version check: {error}");
+        store(key, Err(message.clone()));
+        return VersionState::Failed(message);
+    }
+    VersionState::Checking
+}
+
+/// Версия с ожиданием (до [`VERSION_TIMEOUT`]) и записью в кэш. Только вне цикла событий:
+/// при старте шлюза (`BackendFactory::prepare`) и в тестах.
+pub fn warm_version(program: &Program) -> Result<Version, String> {
+    let key = key_of(program);
+    if let Ok(slots) = cache().lock()
+        && let Some(Slot::Done(Ok(version), _)) = slots.get(&key)
+    {
+        return Ok(*version);
+    }
+    let result = probe_version(program);
+    store(key, result.clone());
+    result
 }
 
 fn run_version(program: &Program) -> Result<String, String> {

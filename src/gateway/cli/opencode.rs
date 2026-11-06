@@ -253,20 +253,46 @@ impl OpencodeParser {
         if let Some(tokens) = part.get("tokens") {
             self.add_tokens(tokens);
         }
-        let reason = part.get("reason").and_then(Value::as_str).unwrap_or("stop");
-        if reason == "tool-calls" {
+        let reason = part.get("reason").and_then(Value::as_str);
+        if reason == Some("tool-calls") {
             // Нативный вызов несуществующего инструмента (спайк §2.2): ничего не исполнено,
             // текст этого шага не наш ответ, итог придёт со следующим шагом.
             self.step_text.clear();
             return Feed::default();
         }
+        let mut note = None;
+        let finish_reason = match reason {
+            Some("stop") => "stop",
+            Some("length") => "length",
+            // Неизвестная или отсутствующая причина — не успех: без текста это отказ протокола,
+            // с текстом ответ оставляем и помечаем в журнале.
+            other => {
+                let shown = other.unwrap_or("<none>");
+                if self.step_text.trim().is_empty() {
+                    self.terminal = Some(Err(Failure {
+                        class: FailureClass::Protocol,
+                        status: None,
+                        message: format!(
+                            "opencode ended a step with the reason '{shown}' and no text"
+                        ),
+                        limits: None,
+                        unrecognized: true,
+                    }));
+                    return Feed::done(String::new());
+                }
+                note = Some(format!(
+                    "opencode ended the step with the unknown reason '{shown}'; the text was kept"
+                ));
+                "stop"
+            }
+        };
         self.terminal = Some(Ok(Success {
             usage: std::mem::take(&mut self.usage),
-            finish_reason: if reason == "length" { "length" } else { "stop" }.to_string(),
+            finish_reason: finish_reason.to_string(),
             context_window: None,
             upstream_id: self.session.clone(),
             limits: None,
-            note: None,
+            note,
         }));
         Feed::done(std::mem::take(&mut self.step_text))
     }
@@ -420,6 +446,62 @@ mod tests {
         assert_eq!(text, "I have no tools.");
         assert!(done);
         assert_eq!(parser.terminal().unwrap().unwrap().usage.prompt_tokens, 30);
+    }
+
+    fn step(reason: Option<&str>, text: &str) -> Vec<String> {
+        let finish = match reason {
+            Some(r) => format!(
+                r#"{{"type":"step_finish","part":{{"reason":"{r}","tokens":{{"input":5,"output":1}}}}}}"#
+            ),
+            None => {
+                r#"{"type":"step_finish","part":{"tokens":{"input":5,"output":1}}}"#.to_string()
+            }
+        };
+        let mut lines = vec![r#"{"type":"step_start"}"#.to_string()];
+        if !text.is_empty() {
+            lines.push(format!(r#"{{"type":"text","part":{{"text":"{text}"}}}}"#));
+        }
+        lines.push(finish);
+        lines
+    }
+
+    fn run_owned(lines: &[String]) -> (OpencodeParser, String, bool) {
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        run(&refs)
+    }
+
+    #[test]
+    fn an_unknown_or_missing_step_reason_without_text_is_a_protocol_failure() {
+        for reason in [Some("error"), Some("aborted"), Some("other"), None] {
+            let (mut parser, text, done) = run_owned(&step(reason, ""));
+            assert!(done && text.is_empty(), "{reason:?}");
+            let failure = parser.terminal().unwrap().unwrap_err();
+            assert_eq!(failure.class, FailureClass::Protocol, "{reason:?}");
+            assert!(failure.message.contains("no text"), "{}", failure.message);
+        }
+    }
+
+    #[test]
+    fn an_unknown_step_reason_with_text_keeps_the_text_and_leaves_a_note() {
+        let (mut parser, text, _) = run_owned(&step(Some("error"), "partial but real"));
+        assert_eq!(text, "partial but real");
+        let success = parser.terminal().unwrap().unwrap();
+        assert_eq!(success.finish_reason, "stop");
+        assert!(success.note.unwrap().contains("'error'"));
+    }
+
+    #[test]
+    fn the_known_reasons_stay_plain_successes_without_a_note() {
+        for (reason, expected) in [("stop", "stop"), ("length", "length")] {
+            let (mut parser, text, _) = run_owned(&step(Some(reason), "ok"));
+            assert_eq!(text, "ok");
+            let success = parser.terminal().unwrap().unwrap();
+            assert_eq!(success.finish_reason, expected);
+            assert!(success.note.is_none());
+        }
+        // Пустой ответ с честной причиной `stop` по-прежнему решает рантайм, не парсер.
+        let (mut parser, ..) = run_owned(&step(Some("stop"), ""));
+        assert!(parser.terminal().unwrap().is_ok());
     }
 
     #[test]

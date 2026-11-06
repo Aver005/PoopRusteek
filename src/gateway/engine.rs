@@ -118,6 +118,10 @@ impl SecretResolver for EnvOnlyResolver {
 /// Фабрика адаптеров. Движок спрашивает фабрики по порядку; первая, взявшая аккаунт, побеждает.
 /// GW-CLI добавляет свою для `cli:*`.
 pub trait BackendFactory: Send + Sync {
+    /// Вызывается один раз при создании движка, до сборки аккаунтов: можно прогреть кэши, которых
+    /// не должно ждать позднейшее `apply_edit` (процессы, диск). Умолчание — ничего.
+    fn prepare(&self, _accounts: &[Account]) {}
+
     /// `None` — аккаунт не этой фабрики.
     fn build(
         &self,
@@ -1063,6 +1067,9 @@ impl Engine {
         let issues = Issues::of(&config);
         for message in issues.errors() {
             tracing::warn!("gateway config error: {message}");
+        }
+        for factory in &deps.factories {
+            factory.prepare(&config.accounts);
         }
         let core = Arc::new(Core {
             clock: deps.clock,

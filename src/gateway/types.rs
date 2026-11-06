@@ -11,7 +11,7 @@ use crate::config::{ProviderEntry, ProviderProtocol, ToolProtocol};
 use crate::provider::failure::FailureClass;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── Идентификаторы ──────────────────────────────────────────────────────
 
@@ -238,6 +238,42 @@ pub enum Credential {
     CliHome(PathBuf),
     /// Токен подписки, выданный вне CLI. Только вручную и только не для Claude.
     DirectToken(SecretRef),
+}
+
+/// Путь папки входа для сравнения: `~` раскрыт, `.`/`..` свёрнуты, слэши прямые, на Windows без учёта регистра.
+fn normalize_home(path: &Path) -> String {
+    let expanded = match path.strip_prefix("~") {
+        Ok(rest) => dirs::home_dir().map_or_else(|| path.to_path_buf(), |home| home.join(rest)),
+        Err(_) => path.to_path_buf(),
+    };
+    let text = expanded.to_string_lossy().replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = format!(
+        "{}{}",
+        if text.starts_with('/') { "/" } else { "" },
+        parts.join("/")
+    );
+    if cfg!(windows) {
+        joined.to_lowercase()
+    } else {
+        joined
+    }
+}
+
+/// Папка входа, которую CLI и так использует сам (там живёт общий вход).
+fn is_default_login(tool: CliTool, home: &Path) -> bool {
+    tool == CliTool::Claude
+        && dirs::home_dir()
+            .is_some_and(|dir| normalize_home(home) == normalize_home(&dir.join(".claude")))
 }
 
 // ── Аккаунт ─────────────────────────────────────────────────────────────
@@ -656,6 +692,8 @@ impl GatewayConfig {
         };
 
         let mut seen: BTreeSet<&AccountId> = BTreeSet::new();
+        // Папка входа → кто её занял первым: по CLI и по нормализованному пути.
+        let mut homes: BTreeMap<(String, String), &AccountId> = BTreeMap::new();
         let mut deepseek = 0;
         for account in &self.accounts {
             let at = format!("accounts[{}]", account.id);
@@ -723,13 +761,35 @@ impl GatewayConfig {
                             .into(),
                     );
                 }
-                if account.home.is_none() {
-                    add(
+                match &account.home {
+                    None => add(
                         Severity::Warning,
                         at.clone(),
-                        "no home set: the CLI's own login is shared, a parallel session may log it out"
+                        "no home set: this account uses the login the CLI already has on this machine, so signing out there, or a parallel session, may log it out; set home to give it its own login"
                             .into(),
-                    );
+                    ),
+                    Some(home) => {
+                        if is_default_login(tool, home) {
+                            add(
+                                Severity::Warning,
+                                at.clone(),
+                                format!(
+                                    "home ({}) is the CLI's default login folder: that is the shared login, a parallel session may log it out",
+                                    home.display()
+                                ),
+                            );
+                        }
+                        if let Some(first) = homes.insert((format!("{tool:?}"), normalize_home(home)), &account.id) {
+                            add(
+                                Severity::Error,
+                                at.clone(),
+                                format!(
+                                    "home ({}) is already the login folder of account '{first}': two accounts on one login share one quota and one session",
+                                    home.display()
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1258,6 +1318,124 @@ mod tests {
                 .any(|m| m.contains("cannot run as a plain model"))
         );
         assert!(messages.iter().any(|m| m.contains("may log it out")));
+    }
+
+    fn cli_pair(first_home: &str, second_home: &str, second_tool: &str) -> Vec<Problem> {
+        let text = format!(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = {first_home:?}
+
+[[accounts]]
+id = \"b\"
+provider = \"{second_tool}\"
+home = {second_home:?}
+"
+        );
+        parse(&text).validate()
+    }
+
+    fn problem_errors(problems: &[Problem]) -> Vec<&Problem> {
+        problems
+            .iter()
+            .filter(|p| p.severity == Severity::Error)
+            .collect()
+    }
+
+    #[test]
+    fn two_accounts_on_one_login_folder_are_an_error_on_the_second_only() {
+        for (a, b) in [
+            ("/work/claude", "/work/claude"),
+            ("/work/claude", "/work/claude/"),
+            ("/work/./x/../claude", "/work/claude"),
+            ("C:\\work\\claude", "C:/work/claude"),
+        ] {
+            let problems = cli_pair(a, b, "cli:claude");
+            let errs = problem_errors(&problems);
+            assert_eq!(errs.len(), 1, "{a} vs {b}: {problems:?}");
+            assert_eq!(errs[0].path, "accounts[b]");
+            assert!(
+                errs[0]
+                    .message
+                    .contains("already the login folder of account 'a'")
+            );
+        }
+        // Windows не различает регистр путей; unix различает.
+        let cased =
+            problem_errors(&cli_pair("C:/Work/Claude", "c:/work/claude", "cli:claude")).len();
+        assert_eq!(cased, usize::from(cfg!(windows)));
+    }
+
+    #[test]
+    fn different_folders_or_different_clis_do_not_collide() {
+        assert!(problem_errors(&cli_pair("/work/a", "/work/b", "cli:claude")).is_empty());
+        // Одна папка у разных CLI — разные переменные и разные данные, это не одно хранилище входа.
+        assert!(
+            problem_errors(&cli_pair("/work/shared", "/work/shared", "cli:opencode")).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_default_claude_folder_and_a_missing_home_both_warn_about_the_shared_login() {
+        let Some(user_home) = dirs::home_dir() else {
+            return;
+        };
+        let default = user_home.join(".claude");
+        let text = format!(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = {:?}
+",
+            default.to_string_lossy()
+        );
+        let messages: Vec<String> = parse(&text)
+            .validate()
+            .into_iter()
+            .map(|p| p.message)
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("default login folder")),
+            "{messages:?}"
+        );
+        let tilde = parse(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = \"~/.claude\"
+",
+        );
+        assert!(
+            tilde
+                .validate()
+                .iter()
+                .any(|p| p.message.contains("default login folder"))
+        );
+        let own = parse(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = \"/work/own\"
+",
+        );
+        assert!(
+            own.validate()
+                .iter()
+                .all(|p| p.severity != Severity::Warning)
+        );
+        let none = parse(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+",
+        );
+        let shared = none.validate();
+        assert!(
+            shared
+                .iter()
+                .any(|p| p.message.contains("set home to give it its own login"))
+        );
     }
 
     #[test]

@@ -344,6 +344,9 @@ impl Backend for CliBackend {
         );
 
         let success = outcome?;
+        if let Some(note) = &success.note {
+            crate::debug_log::log("gateway.cli.note", note);
+        }
         let (usage, usage_estimated) = if success.usage.total_tokens == 0 {
             // CLI ничего не сообщил: честная оценка с пометкой, а не нули под видом данных.
             let prompt_tokens = estimate(prompt_chars);
