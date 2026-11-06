@@ -168,6 +168,32 @@ pub struct App {
     /// Bumped on every provider/model switch. A window poll answers with the
     /// epoch it started under, so a slow one can never overwrite a newer.
     provider_window_epoch: Arc<AtomicU64>,
+    /// Шлюз аккаунтов и маршрутов. Выключенный не вмешивается в сборку провайдера.
+    gateway: crate::gateway::handle::GatewayHandle,
+}
+
+/// Передать события шлюза в цикл приложения. Задача кончается вместе со шлюзом.
+fn spawn_gateway_events(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    if !gateway.is_enabled() {
+        return;
+    }
+    let mut events = gateway.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event_tx.send(AppEvent::Gateway(event)).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// Run one self-update pass off the event loop and report through
@@ -397,7 +423,13 @@ impl App {
         // exists (see logging::setup). Idempotent across App re-creation.
         crate::logging::set_error_sink(event_tx.clone());
 
-        let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
+        let gateway = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&config),
+            crate::gateway::engine::EngineDeps::for_config(&config),
+        );
+        spawn_gateway_events(&gateway, event_tx.clone());
+        let provider: Option<Arc<dyn LLMProvider>> =
+            crate::gateway::handle::main_provider(&config, Some(&gateway));
 
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let tools = Arc::new(ToolRegistry::new());
@@ -498,6 +530,7 @@ impl App {
         // entries in the background (`cache_ms` decides what "stale" means;
         // a fresh cache makes this a no-op network-wise).
         let provider_models = crate::provider::model_cache::ProviderModelCache::load();
+        provider_models.set_gateway(gateway.clone());
         if !config.providers.is_empty() {
             providers::spawn_models_refresh(
                 Arc::clone(&provider_models),
@@ -542,6 +575,7 @@ impl App {
             last_models_refetch: std::time::Instant::now(),
             update_in_flight,
             provider_window_epoch,
+            gateway,
         })
     }
 
@@ -884,11 +918,24 @@ impl App {
             AppEvent::ProviderModelsRefreshed { summary, failed } => {
                 self.on_provider_models_refreshed(summary, failed);
             }
+            AppEvent::Gateway(event) => self.on_gateway_event(event),
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
         }
         Ok(false)
+    }
+
+    /// Событие шлюза. Экран аккаунтов читает снимок сам; здесь только строка статуса.
+    fn on_gateway_event(&mut self, event: crate::gateway::handle::GatewayEvent) {
+        use crate::gateway::handle::GatewayEvent;
+        if let GatewayEvent::FallbackTaken {
+            from, to, class, ..
+        } = event
+        {
+            self.state.status_message =
+                format!("{from} failed ({}), switched to {to}", class.code());
+        }
     }
 
     /// Такт анимации и периодическая дозагрузка моделей.
@@ -1215,7 +1262,7 @@ impl App {
     pub(crate) fn rebuild_provider(&mut self) {
         switch_provider(
             &mut self.state,
-            crate::provider::build_provider(&self.config),
+            crate::gateway::handle::main_provider(&self.config, Some(&self.gateway)),
             &self.provider_window_epoch,
             &self.event_tx,
         );

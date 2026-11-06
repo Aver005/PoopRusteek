@@ -33,6 +33,10 @@ pub struct Session {
     /// session rather than re-checking a link already known dead.
     #[serde(default)]
     pub broken: bool,
+    /// Где беседа остановилась в шлюзе. Нужен, чтобы после перезапуска не отдать чужие
+    /// подписи вызовов другому аккаунту; старые файлы читаются без поля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state: Option<crate::gateway::state::RouteState>,
 }
 
 /// What a save knows about the provider's server-side session.
@@ -89,6 +93,8 @@ pub struct SessionMeta {
     pub tag: Option<String>,
     pub broken: bool,
     pub remote: RemoteLink,
+    /// Цель шлюза на момент сохранения; `None` — не знаем, прежнее значение остаётся.
+    pub route: Option<crate::gateway::state::RouteState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,11 +156,23 @@ pub fn save_session(
         provider_session_id,
         provider_parent_message_id,
         broken: meta.broken,
+        route_state: meta.route.clone().or_else(|| stored_route(&path)),
     };
 
     let json = serde_json::to_string_pretty(&session)?;
     crate::util::atomic_write(&path, json.as_bytes())?;
     Ok(())
+}
+
+/// Цель шлюза, уже лежащая в файле: «не знаю» не затирает известное (как `stored_link`).
+fn stored_route(path: &std::path::Path) -> Option<crate::gateway::state::RouteState> {
+    #[derive(Deserialize)]
+    struct StoredRoute {
+        #[serde(default)]
+        route_state: Option<crate::gateway::state::RouteState>,
+    }
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<StoredRoute>(&json).ok()?.route_state
 }
 
 /// Связь с серверной сессией, уже лежащая в файле. Отсутствие файла или
@@ -427,6 +445,7 @@ mod tests {
                 session_id: "remote-123".to_string(),
                 parent_message_id: Some(9),
             },
+            route: None,
         };
 
         save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &meta)
@@ -441,6 +460,48 @@ mod tests {
         assert!(session.broken);
         assert_eq!(session.provider_session_id.as_deref(), Some("remote-123"));
         assert_eq!(session.provider_parent_message_id, Some(9));
+    }
+
+    /// Старый файл без `route_state` грузится; известная цель шлюза не затирается
+    /// сохранением, которое её не знает (как `stored_link`).
+    #[test]
+    fn route_state_loads_from_old_files_and_survives_an_unaware_save() {
+        use crate::gateway::state::RouteState;
+        let id = "pooprusteek_test_session_route_state";
+        let config = Config::default();
+        let route = RouteState {
+            route: None,
+            account: crate::gateway::types::AccountId::parse("claude-work").unwrap(),
+            model: "opus".to_string(),
+        };
+        let known = SessionMeta {
+            route: Some(route.clone()),
+            ..SessionMeta::default()
+        };
+        save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &known).unwrap();
+        // Сохранение, не знающее цели (провайдер без шлюза), её не стирает.
+        save_session(
+            id,
+            "2020-01-01T00:00:00Z",
+            &[],
+            &config,
+            "/tmp",
+            &SessionMeta::default(),
+        )
+        .unwrap();
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+        let loaded = load_local(id, &config);
+        cleanup(&path);
+        assert_eq!(loaded.unwrap().route_state, Some(route));
+
+        let old = r#"{"version":1,"id":"x","created_at":"a","updated_at":"b","workspace_root":"/","model_type":"m","messages":[]}"#;
+        let session: Session = serde_json::from_str(old).unwrap();
+        assert!(session.route_state.is_none());
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(
+            !json.contains("route_state"),
+            "an absent state is not written: {json}"
+        );
     }
 
     #[test]

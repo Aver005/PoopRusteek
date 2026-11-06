@@ -304,6 +304,9 @@ pub enum AppEvent {
         failed: usize,
     },
 
+    /// Событие шлюза аккаунтов (смена статуса, лимиты, переход на запасной).
+    Gateway(crate::gateway::handle::GatewayEvent),
+
     /// A self-update pass (manual `/update` or the startup auto-check)
     /// finished — see `crate::update`. With `notable: false` (startup check
     /// found nothing to do) only the status line changes; otherwise the

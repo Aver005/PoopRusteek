@@ -536,6 +536,7 @@ fn plant_sessions(config: &Config) {
             provider_session_id: None,
             provider_parent_message_id: None,
             broken: false,
+            route_state: None,
         };
         let _ = crate::session::save_local(&session, config);
     }

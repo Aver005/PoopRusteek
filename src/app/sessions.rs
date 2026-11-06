@@ -46,6 +46,9 @@ impl App {
 
                 let provider = self.state.focused().provider.clone();
                 let conversation = self.state.conversations.focused_id();
+                if let (Some(provider), Some(route)) = (&provider, &s.route_state) {
+                    provider.seed_route_state(route.clone());
+                }
 
                 match (provider, s.provider_session_id.clone()) {
                     (Some(provider), Some(remote_id)) => {
@@ -293,6 +296,7 @@ impl App {
                 provider_session_id: None,
                 provider_parent_message_id: None,
                 broken: false,
+                route_state: None,
             },
             &self.config,
         ) {
@@ -474,6 +478,7 @@ impl App {
             tag: conv.tag.clone(),
             broken,
             remote,
+            route: conv.provider.as_ref().and_then(|p| p.route_state()),
         };
 
         // Snapshot everything now and hand the write (plus the follow-up
@@ -488,7 +493,7 @@ impl App {
                 messages: conv.messages.clone(),
                 config: Box::new(self.config.clone()),
                 workspace_path: self.state.workspace_path.clone(),
-                meta,
+                meta: Box::new(meta),
             });
         self.state.focused_mut().broken = broken;
     }

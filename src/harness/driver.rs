@@ -578,6 +578,9 @@ fn load_resumed(
 /// The trace says which of the two happened, so a run is never silently
 /// judged on a conversation it did not actually continue.
 async fn adopt_remote_session(provider: &Arc<dyn LLMProvider>, session: &crate::session::Session) {
+    if let Some(route) = &session.route_state {
+        provider.seed_route_state(route.clone());
+    }
     let remote = match (session.broken, session.provider_session_id.as_deref()) {
         (false, Some(id)) => id,
         (true, _) => return replay_locally(session, "session_marked_broken", None, provider).await,
@@ -650,6 +653,24 @@ fn log_resume(
     );
 }
 
+/// Шлюз прогона. Пока `[gateway]` не встроен в `Config`, сценарии берут его настройки из
+/// файла, названного в `POOPRUSTEEK_GATEWAY_TOML`; без переменной шлюз выключен.
+fn harness_gateway(config: &Config) -> AppResult<crate::gateway::handle::GatewayHandle> {
+    let mut settings = crate::gateway::engine::gateway_config(config);
+    if let Some(path) = std::env::var_os("POOPRUSTEEK_GATEWAY_TOML") {
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            AppError::Custom(format!("{}: {e}", std::path::Path::new(&path).display()))
+        })?;
+        // Только `message()`: полный текст ошибки TOML печатает строку исходника.
+        settings = toml::from_str(&text)
+            .map_err(|e| AppError::Custom(format!("gateway config: {}", e.message())))?;
+    }
+    Ok(crate::gateway::engine::build_gateway(
+        settings,
+        crate::gateway::engine::EngineDeps::for_config(config),
+    ))
+}
+
 /// Build provider, tools, skills, semantic service and system prompt.
 async fn assemble(
     config: &Config,
@@ -660,11 +681,14 @@ async fn assemble(
     // Пропавший `--attach` — отказ до сборки провайдера и ожидания индекса.
     let attachments =
         attached_files(options, std::path::Path::new(workspace)).map_err(AppError::Custom)?;
-    let provider = crate::provider::build_provider(config).ok_or_else(|| {
-        AppError::Custom(
-            "no provider configured: set [provider].token or pick a /providers entry".to_string(),
-        )
-    })?;
+    let gateway = harness_gateway(config)?;
+    let provider =
+        crate::gateway::handle::main_provider(config, Some(&gateway)).ok_or_else(|| {
+            AppError::Custom(
+                "no provider configured: set [provider].token or pick a /providers entry"
+                    .to_string(),
+            )
+        })?;
 
     // Same shape as `App::new`: ask once, in the background, and let the
     // answer arrive as an event. A provider that cannot say never sends one,
@@ -1414,6 +1438,7 @@ fn persist(
         // локальной историей, — следующий `--resume` перескажет её заново.
         broken: conversation.broken && (interrupted || !remote.is_established()),
         remote,
+        route: provider.route_state(),
     };
     match crate::session::save_session(
         &conversation.session_id,
