@@ -35,7 +35,7 @@ secret = "keyring:global/openai-work"
 model = "gpt-5.5"
 # tools = "native"                   # prompt (по умолчанию) | native; смесь в одном маршруте
                                      # требует allow_mixed_tools = true у маршрута
-favorites = ["gpt-5.5", "gpt-5.5-mini"]
+favorites = ["gpt-5.5", "your-cheap-model"]
 
 [accounts.limits]
 soft_pct = 85                        # с этого процента окна аккаунт уходит вниз по списку
@@ -91,9 +91,16 @@ steps = [
   { account = "lmstudio" },
 ]
 
+# Служебные вызовы: заголовки чатов и сводки /compact. Им нужен быстрый аккаунт,
+# поэтому дешёвая модель, а не CLI: холодный старт в 3–4 с дороже самого ответа.
+[[routes]]
+id = "cheap"
+steps = [{ account = "openai-work", model = "your-cheap-model" }]
+
 [roles]
 main = "coding"
-title = "coding"
+title = "cheap"
+summary = "cheap"
 
 # ── Подтверждённые хосты секретов ───────────────────────────────────────
 # Аккаунт из проектного конфига получает ключ только для хоста, который вы подтвердили

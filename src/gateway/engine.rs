@@ -139,6 +139,10 @@ impl SecretResolver for EnvOnlyResolver {
 /// Фабрика адаптеров. Движок спрашивает фабрики по порядку; первая, взявшая аккаунт, побеждает.
 /// GW-CLI добавляет свою для `cli:*`.
 pub trait BackendFactory: Send + Sync {
+    /// Вызывается один раз при создании движка, до сборки аккаунтов: можно прогреть кэши, которых
+    /// не должно ждать позднейшее `apply_edit` (процессы, диск). Умолчание — ничего.
+    fn prepare(&self, _accounts: &[Account]) {}
+
     /// `None` — аккаунт не этой фабрики.
     fn build(
         &self,
@@ -274,9 +278,10 @@ impl EngineDeps {
             data_dir: Some(Config::data_dir().join("gateway")),
             clock: Arc::new(SystemClock),
             resolver: Arc::new(config.secret_resolver()),
-            factories: vec![Arc::new(BuiltinFactory::new(
-                DeepseekSettings::from_config(config),
-            ))],
+            factories: vec![
+                Arc::new(BuiltinFactory::new(DeepseekSettings::from_config(config))),
+                Arc::new(super::cli::CliFactory::new()),
+            ],
             persist: None,
         }
     }
@@ -300,6 +305,11 @@ pub fn build_gateway(gateway: GatewayConfig, deps: EngineDeps) -> GatewayHandle 
         return Arc::new(DisabledGateway::new());
     }
     Arc::new(Engine::new(gateway, deps))
+}
+
+/// Подписки CLI только для себя: в `/serve` в этом релизе их нет (ни Claude, ни OpenCode).
+fn closed_to_serve(source: CallSource, provider: AccountProvider) -> bool {
+    source == CallSource::Serve && provider.is_cli()
 }
 
 // ── Внутреннее устройство ───────────────────────────────────────────────
@@ -634,7 +644,7 @@ impl Core {
                 class: class.clone(),
             });
         }
-        if query.source == CallSource::Serve && account.provider.cli_tool().is_some() {
+        if closed_to_serve(query.source, account.provider) {
             return skip(SkipReason::NotForServe);
         }
         let Some(runtime) = self.runtime(&account.id) else {
@@ -1095,6 +1105,9 @@ impl Engine {
         for message in issues.errors() {
             tracing::warn!("gateway config error: {message}");
         }
+        for factory in &deps.factories {
+            factory.prepare(&config.accounts);
+        }
         let core = Arc::new(Core {
             clock: deps.clock,
             resolver: deps.resolver,
@@ -1308,13 +1321,12 @@ impl Gateway for Engine {
         let unknown = || ResolveError::Unknown(id.to_string());
         let binding = self.resolve(id).ok_or_else(unknown)?;
         // Подписки CLI наружу не раздаются: такой адрес для `/serve` не существует.
-        if source == CallSource::Serve
-            && let Binding::Fixed(target) = &binding
+        if let Binding::Fixed(target) = &binding
             && self
                 .core
                 .config()
                 .account(&target.account)
-                .is_some_and(|a| a.provider.cli_tool().is_some())
+                .is_some_and(|a| closed_to_serve(source, a.provider))
         {
             return Err(unknown());
         }

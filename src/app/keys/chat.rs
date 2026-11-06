@@ -4,6 +4,7 @@
 //! slash-command dispatch via `dispatch::apply_command_result`, or a plain
 //! message turn).
 
+use crate::app::conversation::QueuedMessage;
 use crate::app::{App, AutocompleteState};
 use crate::error::AppResult;
 
@@ -42,17 +43,21 @@ impl App {
                     || self.state.focused().agent_task.is_some()
                 {
                     self.cancel_focused_turn().await;
-                } else if self.state.focused_mut().messages.is_empty() {
-                    let _ = self.state.background.shutdown_all().await;
-                    return Ok(true);
+                } else if self.state.autocomplete.visible {
+                    self.state.autocomplete = AutocompleteState::default();
+                } else if self.state.goal.is_setup_pending() {
+                    // Настройка цели — не история: её можно отменить, текст поля цел.
+                    self.state.goal.deactivate();
+                    self.state.status_message = "GOAL setup cancelled".to_string();
+                } else if !self.state.focused().queued.is_empty() {
+                    // Очередь, что висит без хода (упавший ход), возвращается в поле.
+                    let count = self.state.restore_queued_to_input();
+                    self.state.status_message =
+                        format!("{count} queued message(s) returned to the input");
                 } else {
-                    // Esc with no active turn clears the chat; if a goal was mid
-                    // setup, clear that too so we don't orphan its state.
-                    if self.state.goal.mode {
-                        self.state.goal.deactivate();
-                    }
-                    self.state.focused_mut().messages.clear();
-                    self.state.scroll_offset = 0;
+                    // В простое Esc ничего не стирает и не выходит: чат чистит
+                    // только `/clear`, выход — Ctrl+C.
+                    self.state.input.selection_anchor = None;
                 }
             }
             KeyCode::Tab => {
@@ -62,11 +67,17 @@ impl App {
                 self.cycle_focus(-1);
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.show_stats_panel = !self.state.show_stats_panel;
+                let visible = self.state.stats_panel_visible(self.state.terminal_cols);
+                self.state.show_stats_panel = Some(!visible);
+                // Включили, а показать нечем — скажем почему, а не промолчим.
+                if !visible && let Some(reason) = self.state.stats_panel_blocker() {
+                    self.state.status_message = reason;
+                }
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.focused_mut().messages.clear();
+                // Не стирает историю: перерисовка и прыжок вниз. Стирает `/clear`.
                 self.state.scroll_offset = 0;
+                self.state.needs_full_redraw = true;
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.select_all();
@@ -74,13 +85,11 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.input.insert_newline();
             }
-            KeyCode::Enter if !self.state.focused_mut().generation.active => {
-                match self.submit_input().await? {
-                    SubmitOutcome::Continue => {}
-                    SubmitOutcome::Consumed => return Ok(false),
-                    SubmitOutcome::Quit => return Ok(true),
-                }
-            }
+            KeyCode::Enter => match self.submit_input().await? {
+                SubmitOutcome::Continue => {}
+                SubmitOutcome::Consumed => return Ok(false),
+                SubmitOutcome::Quit => return Ok(true),
+            },
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.insert_char(c);
             }
@@ -154,7 +163,8 @@ impl App {
     /// Handle plain Enter: backslash line-continuation, empty-goal nudges,
     /// then either goal-mode interception, a slash command, or a normal
     /// message turn (with `@file` expansion and attachments inlined for the
-    /// model but not the chat view).
+    /// model but not the chat view). Пока ход идёт, обычный текст встаёт в
+    /// очередь и уходит, когда ход кончится.
     async fn submit_input(&mut self) -> AppResult<SubmitOutcome> {
         let buf = &self.state.input.buffer;
         let ends_with_backslash = buf.chars().last().is_some_and(|c| c == '\\')
@@ -170,6 +180,17 @@ impl App {
         // Expand any `[Pasted #N, L lines]` chips back to their real content so
         // the model (and the saved message) get the full pasted text.
         let input = self.state.input.expanded().trim().to_string();
+        // Пустое поле при стоящей очереди — «отправь следующее».
+        if input.is_empty()
+            && self.state.attached_files.is_empty()
+            && !self.state.focused().generation.active
+            && !self.state.focused().queued.is_empty()
+        {
+            self.state.focused_mut().queue_paused = false;
+            let focused = self.state.conversations.focused_id();
+            self.send_next_queued(focused).await;
+            return Ok(SubmitOutcome::Continue);
+        }
         // Одни файлы без текста — тоже сообщение, но не пустая цель.
         if input.is_empty() && (self.state.attached_files.is_empty() || self.state.goal.mode) {
             // Empty while defining a goal gets a nudge instead of silence.
@@ -177,12 +198,16 @@ impl App {
             return Ok(SubmitOutcome::Continue);
         }
 
-        // Sending a message acknowledges any errors flagged since the last
-        // one — clear the red marker (the text stays in errors.log).
-        self.state.error_count = 0;
-        self.state.last_error = None;
+        // Команды и ввод цели во время хода не ставим в очередь: у них свой
+        // порядок, и они меняют то, что ход читает. Текст остаётся в поле.
+        let turn_running = self.state.focused().generation.active;
+        if turn_running && (input.starts_with('/') || self.state.goal.mode) {
+            self.state.status_message =
+                "Commands wait for the turn to end — Esc cancels it".to_string();
+            return Ok(SubmitOutcome::Continue);
+        }
 
-        let chip_files = self.state.input.chip_files();
+        let chips = self.state.input.present_chips();
         // Команде и цели файл из чипа нужен путём: `/attach x [📎 a.pdf]` так и работает.
         let with_paths = self.state.input.with_chip_paths(&input);
         self.state.input.clear_buffer();
@@ -199,6 +224,28 @@ impl App {
                     self.state.input.history.clone(),
                 ));
         }
+
+        if turn_running {
+            // Файлы `/attach` уходят с этим сообщением, а не с тем, что
+            // окажется в полосе вложений к концу хода.
+            let named = std::mem::take(&mut self.state.attached_files);
+            self.state.focused_mut().queued.push_back(QueuedMessage {
+                text: input,
+                chips,
+                named,
+            });
+            self.state.status_message = format!(
+                "Queued ({}) — sent when the turn ends",
+                self.state.focused().queued.len()
+            );
+            return Ok(SubmitOutcome::Continue);
+        }
+
+        // Sending a message acknowledges any errors flagged since the last
+        // one — clear the red marker (the text stays in errors.log). Постановка
+        // в очередь ничего не отправляет и метку не гасит.
+        self.state.error_count = 0;
+        self.state.last_error = None;
 
         // GOAL mode intercepts non-command input — the whole state machine
         // lives in goal.rs; `false` means goal mode just ended and the
@@ -221,35 +268,8 @@ impl App {
         }
 
         let focused = self.state.conversations.focused_id();
-        let killed = self.state.background.cleanup_turn_of(focused).await;
-        if killed > 0 {
-            self.state.push_system(&format!(
-                "Cleaned {killed} ephemeral job(s) before the new turn."
-            ));
-        }
-        let expanded = self.expand_file_mentions(&input);
-        let provider = self.state.focused().provider.clone();
-        let accepts = |path: &std::path::Path| {
-            provider
-                .as_ref()
-                .is_some_and(|provider| provider.accepts_attachment(path))
-        };
-        // Прикреплённые через `/attach` и `@` в тексте не видны — их назовёт
-        // сводка; чипы и `@файл` видны и так.
-        let mut named = std::mem::take(&mut self.state.attached_files);
-        named.retain(|f| !chip_files.iter().any(|c| c.path == f.path));
-        let mut files = named.clone();
-        let mentioned = crate::app::attachments::binary_mentions(&input, &self.state.workspace());
-        for file in chip_files.into_iter().chain(mentioned) {
-            crate::app::attachments::push_unique(&mut files, file);
-        }
-        // Содержимое файлов уходит модели, а не в чат: рисовать 2 МБ лога
-        // в ленте (и пересчитывать их каждый кадр) никому не нужно.
-        let message =
-            crate::app::attachments::user_message(&expanded, &input, &files, &named, &accepts);
-        // Человек написал сам — цепочка автоматических побудок оборвана.
-        self.reset_timer_wakes(self.state.conversations.focused_id());
-        self.send_focused_turn(Some(message)).await?;
+        let named = std::mem::take(&mut self.state.attached_files);
+        self.send_user_text(focused, input, chips, named).await?;
         Ok(SubmitOutcome::Continue)
     }
 }

@@ -18,11 +18,12 @@ impl Command for ResetCommand {
     }
 
     fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        state.clear_chat_view();
         state.attached_files.clear();
         state.input.buffer.clear();
         state.input.cursor = 0;
         state.input.selection_anchor = None;
+        // После очистки поля: очередь возвращается в него, а не теряется.
+        state.clear_chat_view();
         state.focused_mut().generation.active = false;
         state.status_message = "Ready".to_string();
 

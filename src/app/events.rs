@@ -112,6 +112,8 @@ pub enum AgentEvent {
     /// Пошёл вызов инструмента.
     ToolStarted {
         name: String,
+        /// Короткая строка аргументов для панели «идёт работа» (`cargo test`, путь файла).
+        summary: String,
     },
     ToolDone {
         /// Выжимка результата; суб-агент пересылает её родителю.
@@ -163,9 +165,10 @@ pub enum AppEvent {
     // text field currently has focus so multi-line pastes never fire an early
     // submit. See `keys::paste`.
     Paste(String),
-    /// Отрисовка сама спрашивает размер у терминала; высота нужна клавишам —
-    /// они приходят раньше кадра, а шаг страницы обязан совпасть с экраном.
+    /// Отрисовка сама спрашивает размер у терминала; размер нужен клавишам —
+    /// они приходят раньше кадра, а шаг страницы и перенос строк обязаны совпасть с экраном.
     Resize {
+        cols: u16,
         rows: u16,
     },
     Tick,
@@ -286,6 +289,16 @@ pub enum AppEvent {
         matches: Vec<crate::semantic::history::HistoryMatch>,
     },
 
+    /// Фоновое чтение списка сессий для главного экрана закончилось.
+    LandingSessionsLoaded(Vec<crate::session::SessionSummary>),
+
+    /// Фоновый скан папки для `@путь` закончился. `generation` — номер
+    /// запроса: ответ на устаревший запрос отбрасывается.
+    AutocompleteReady {
+        generation: u64,
+        items: Vec<crate::commands::CommandSuggestion>,
+    },
+
     // API server lifecycle (`/serve`, `--serve`). Each event carries the
     // launch generation so a replaced server's late events can't clobber
     // the handle of its successor.
@@ -322,6 +335,13 @@ pub enum AppEvent {
 
     /// Движок шлюза собран на `spawn_blocking`: секреты прочитаны вне цикла событий.
     GatewayBuilt(BuiltGateway),
+
+    /// Короткий заголовок чата из служебной модели (`[roles] title`). Приходит
+    /// из фоновой задачи; пустая строка не приходит никогда.
+    ChatTitle {
+        conversation: ConversationId,
+        title: String,
+    },
 
     /// A self-update pass (manual `/update` or the startup auto-check)
     /// finished — see `crate::update`. With `notable: false` (startup check

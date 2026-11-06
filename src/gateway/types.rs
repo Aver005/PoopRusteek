@@ -11,7 +11,7 @@ use crate::config::{ProviderEntry, ProviderProtocol, ToolProtocol};
 use crate::provider::failure::FailureClass;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── Идентификаторы ──────────────────────────────────────────────────────
 
@@ -157,6 +157,11 @@ impl AccountProvider {
         }
     }
 
+    /// Любой `cli:*`: подписка, которую шлюз не раздаёт наружу.
+    pub fn is_cli(self) -> bool {
+        self.cli_tool().is_some()
+    }
+
     /// Протокол провода для HTTP-аккаунтов; у CLI и DeepSeek его нет.
     pub fn protocol(self) -> Option<ProviderProtocol> {
         match self {
@@ -233,6 +238,42 @@ pub enum Credential {
     CliHome(PathBuf),
     /// Токен подписки, выданный вне CLI. Только вручную и только не для Claude.
     DirectToken(SecretRef),
+}
+
+/// Путь папки входа для сравнения: `~` раскрыт, `.`/`..` свёрнуты, слэши прямые, на Windows без учёта регистра.
+fn normalize_home(path: &Path) -> String {
+    let expanded = match path.strip_prefix("~") {
+        Ok(rest) => dirs::home_dir().map_or_else(|| path.to_path_buf(), |home| home.join(rest)),
+        Err(_) => path.to_path_buf(),
+    };
+    let text = expanded.to_string_lossy().replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = format!(
+        "{}{}",
+        if text.starts_with('/') { "/" } else { "" },
+        parts.join("/")
+    );
+    if cfg!(windows) {
+        joined.to_lowercase()
+    } else {
+        joined
+    }
+}
+
+/// Папка входа, которую CLI и так использует сам (там живёт общий вход).
+fn is_default_login(tool: CliTool, home: &Path) -> bool {
+    tool == CliTool::Claude
+        && dirs::home_dir()
+            .is_some_and(|dir| normalize_home(home) == normalize_home(&dir.join(".claude")))
 }
 
 impl std::fmt::Debug for Credential {
@@ -707,6 +748,8 @@ impl GatewayConfig {
         }
 
         let mut seen: BTreeSet<&AccountId> = BTreeSet::new();
+        // Папка входа → кто её занял первым: по CLI и по нормализованному пути.
+        let mut homes: BTreeMap<(String, String), &AccountId> = BTreeMap::new();
         let mut deepseek = 0;
         for account in &self.accounts {
             let at = format!("accounts[{}]", account.id);
@@ -774,13 +817,35 @@ impl GatewayConfig {
                             .into(),
                     );
                 }
-                if account.home.is_none() {
-                    add(
+                match &account.home {
+                    None => add(
                         Severity::Warning,
                         at.clone(),
-                        "no home set: the CLI's own login is shared, a parallel session may log it out"
+                        "no home set: this account uses the login the CLI already has on this machine, so signing out there, or a parallel session, may log it out; set home to give it its own login"
                             .into(),
-                    );
+                    ),
+                    Some(home) => {
+                        if is_default_login(tool, home) {
+                            add(
+                                Severity::Warning,
+                                at.clone(),
+                                format!(
+                                    "home ({}) is the CLI's default login folder: that is the shared login, a parallel session may log it out",
+                                    home.display()
+                                ),
+                            );
+                        }
+                        if let Some(first) = homes.insert((format!("{tool:?}"), normalize_home(home)), &account.id) {
+                            add(
+                                Severity::Error,
+                                at.clone(),
+                                format!(
+                                    "home ({}) is already the login folder of account '{first}': two accounts on one login share one quota and one session",
+                                    home.display()
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -850,6 +915,32 @@ impl GatewayConfig {
                     format!("roles.{role:?}"),
                     format!("unknown route '{route}'"),
                 );
+            }
+        }
+
+        // Служебную модель зовут на мелочь: холодный старт CLI (3–4 с) тут дороже
+        // самого ответа. Наследование от `main` — не повод ругаться, там CLI законен.
+        for role in [Role::Title, Role::Summary] {
+            if !self.roles.0.contains_key(&role) {
+                continue;
+            }
+            let Some(route) = self.roles.route_for(role).and_then(|id| self.route(id)) else {
+                continue;
+            };
+            for step in &route.steps {
+                let Some(account) = self.account(&step.account) else {
+                    continue;
+                };
+                if account.provider.cli_tool().is_some() {
+                    add(
+                        Severity::Error,
+                        format!("roles.{role:?}"),
+                        format!(
+                            "route '{}' uses account '{}' ({:?}), whose CLI starts cold (3-4 s): choose an API account for the {role:?} role",
+                            route.id, account.id, account.provider
+                        ),
+                    );
+                }
             }
         }
         problems
@@ -989,9 +1080,14 @@ mod tests {
           { account = "lmstudio" },
         ]
 
+        [[routes]]
+        id = "cheap"
+        steps = [{ account = "opencode-work" }]
+
         [roles]
         main = "coding"
-        title = "coding"
+        title = "cheap"
+        summary = "cheap"
     "#;
 
     #[test]
@@ -1311,6 +1407,124 @@ mod tests {
         assert!(messages.iter().any(|m| m.contains("may log it out")));
     }
 
+    fn cli_pair(first_home: &str, second_home: &str, second_tool: &str) -> Vec<Problem> {
+        let text = format!(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = {first_home:?}
+
+[[accounts]]
+id = \"b\"
+provider = \"{second_tool}\"
+home = {second_home:?}
+"
+        );
+        parse(&text).validate()
+    }
+
+    fn problem_errors(problems: &[Problem]) -> Vec<&Problem> {
+        problems
+            .iter()
+            .filter(|p| p.severity == Severity::Error)
+            .collect()
+    }
+
+    #[test]
+    fn two_accounts_on_one_login_folder_are_an_error_on_the_second_only() {
+        for (a, b) in [
+            ("/work/claude", "/work/claude"),
+            ("/work/claude", "/work/claude/"),
+            ("/work/./x/../claude", "/work/claude"),
+            ("C:\\work\\claude", "C:/work/claude"),
+        ] {
+            let problems = cli_pair(a, b, "cli:claude");
+            let errs = problem_errors(&problems);
+            assert_eq!(errs.len(), 1, "{a} vs {b}: {problems:?}");
+            assert_eq!(errs[0].path, "accounts[b]");
+            assert!(
+                errs[0]
+                    .message
+                    .contains("already the login folder of account 'a'")
+            );
+        }
+        // Windows не различает регистр путей; unix различает.
+        let cased =
+            problem_errors(&cli_pair("C:/Work/Claude", "c:/work/claude", "cli:claude")).len();
+        assert_eq!(cased, usize::from(cfg!(windows)));
+    }
+
+    #[test]
+    fn different_folders_or_different_clis_do_not_collide() {
+        assert!(problem_errors(&cli_pair("/work/a", "/work/b", "cli:claude")).is_empty());
+        // Одна папка у разных CLI — разные переменные и разные данные, это не одно хранилище входа.
+        assert!(
+            problem_errors(&cli_pair("/work/shared", "/work/shared", "cli:opencode")).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_default_claude_folder_and_a_missing_home_both_warn_about_the_shared_login() {
+        let Some(user_home) = dirs::home_dir() else {
+            return;
+        };
+        let default = user_home.join(".claude");
+        let text = format!(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = {:?}
+",
+            default.to_string_lossy()
+        );
+        let messages: Vec<String> = parse(&text)
+            .validate()
+            .into_iter()
+            .map(|p| p.message)
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("default login folder")),
+            "{messages:?}"
+        );
+        let tilde = parse(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = \"~/.claude\"
+",
+        );
+        assert!(
+            tilde
+                .validate()
+                .iter()
+                .any(|p| p.message.contains("default login folder"))
+        );
+        let own = parse(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+home = \"/work/own\"
+",
+        );
+        assert!(
+            own.validate()
+                .iter()
+                .all(|p| p.severity != Severity::Warning)
+        );
+        let none = parse(
+            "[[accounts]]
+id = \"a\"
+provider = \"cli:claude\"
+",
+        );
+        let shared = none.validate();
+        assert!(
+            shared
+                .iter()
+                .any(|p| p.message.contains("set home to give it its own login"))
+        );
+    }
+
     #[test]
     fn concurrency_defaults_keep_cli_and_deepseek_to_one_call() {
         let new = |p| Account::new(AccountId::parse("a").unwrap(), p);
@@ -1414,5 +1628,53 @@ mod tests {
         assert_eq!(CliTool::Opencode.home_env_var(), "XDG_DATA_HOME");
         assert!(CliTool::Claude.pure_model_verified() && CliTool::Opencode.pure_model_verified());
         assert!(!CliTool::Codex.pure_model_verified());
+    }
+
+    /// Служебные роли не ставятся на CLI: холодный старт дороже самого ответа.
+    #[test]
+    fn title_and_summary_refuse_cli_accounts_while_main_may_use_them() {
+        let base = r#"
+            [[accounts]]
+            id = "cli"
+            provider = "cli:claude"
+            home = "/h"
+            [[accounts]]
+            id = "api"
+            provider = "openai"
+            model = "m"
+            [[routes]]
+            id = "coding"
+            steps = [{ account = "cli" }]
+            [[routes]]
+            id = "cheap"
+            steps = [{ account = "api" }]
+        "#;
+        // Основной чат на CLI — обычное дело.
+        assert!(errors(&parse(base)).is_empty());
+        // Наследование от `main` тоже не наказывается.
+        assert!(
+            errors(&parse(&format!("{base}\n[roles]\nmain = \"coding\"\n"))).is_empty(),
+            "a role that inherits main is not a service role of its own"
+        );
+        // Явная роль на CLI — понятная ошибка.
+        for role in ["title", "summary"] {
+            let config = parse(&format!(
+                "{base}\n[roles]\nmain = \"coding\"\n{role} = \"coding\"\n"
+            ));
+            let found = errors(&config).join("\n");
+            let path = if role == "title" {
+                "roles.Title"
+            } else {
+                "roles.Summary"
+            };
+            assert!(found.contains(path), "{role}: {found}");
+            assert!(found.contains("starts cold"), "{role}: {found}");
+            assert!(found.contains("account 'cli'"), "{role}: {found}");
+        }
+        // Дешёвый API-маршрут проходит.
+        let cheap = parse(&format!(
+            "{base}\n[roles]\nmain = \"coding\"\ntitle = \"cheap\"\nsummary = \"cheap\"\n"
+        ));
+        assert!(errors(&cheap).is_empty());
     }
 }

@@ -1,7 +1,6 @@
 use crate::app::AppState;
 use crate::config::Config;
 use crate::provider::Role;
-use crate::session;
 use crate::tui::theme::Theme;
 use ratatui::{
     Frame,
@@ -10,57 +9,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const PANEL_W: usize = 34;
-
-/// The number of columns the stats panel will actually occupy for a given
-/// available width, or `0` if it won't render (too narrow — see the
-/// `panel_w < 20` guard in [`render_stats_panel`]).
-///
-/// The layout in `tui::render` MUST reserve exactly this width so the chat
-/// area never overlaps the panel: the panel paints its background by
-/// *recoloring* cells (`Block`/`Paragraph` styles), which does not clear the
-/// glyphs already drawn there, so any chat text left under the panel bleeds
-/// through its blank/indented cells. Reserving a mismatched width (the old
-/// `34.min(width/4)`) is what let long chat lines climb onto the panel on
-/// terminals narrower than ~136 columns.
-pub fn panel_width(available: u16) -> u16 {
-    let w = PANEL_W.min(available as usize);
-    if w < 20 { 0 } else { w as u16 }
-}
-
-/// How long a cached session tag stays valid before `session::load_local`
-/// is asked to re-read the file. The panel repaints every frame while the
-/// UI is active, but the on-disk tag only changes on an explicit user
-/// action, so a few seconds of staleness is unobservable in practice.
-const SESSION_TAG_TTL: Duration = Duration::from_secs(5);
-
-thread_local! {
-    /// Session id -> (fetched-at, tag). Avoids re-reading and re-parsing the
-    /// whole session JSON file every frame just to show its `tag`.
-    static SESSION_TAG_CACHE: RefCell<HashMap<String, (Instant, Option<String>)>> = RefCell::new(HashMap::new());
-}
-
-/// The focused session's `tag`, read from disk at most once per
-/// [`SESSION_TAG_TTL`] window per session id.
-fn cached_session_tag(session_id: &str, config: &Config) -> Option<String> {
-    SESSION_TAG_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some((fetched_at, tag)) = cache.get(session_id)
-            && fetched_at.elapsed() < SESSION_TAG_TTL
-        {
-            return tag.clone();
-        }
-        let tag = session::load_local(session_id, config)
-            .ok()
-            .and_then(|s| s.tag);
-        cache.insert(session_id.to_string(), (Instant::now(), tag.clone()));
-        tag
-    })
-}
+/// Ширину панели задаёт раскладка: она же резервирует под неё место.
+const PANEL_W: usize = crate::tui::render::SIDEBAR_WIDTH as usize;
 
 pub fn render_stats_panel(
     frame: &mut Frame,
@@ -69,9 +21,6 @@ pub fn render_stats_panel(
     config: &Config,
     theme: &Theme,
 ) {
-    if !state.show_stats_panel {
-        return;
-    }
     let panel_w = PANEL_W.min(area.width as usize);
     if panel_w < 20 {
         return;
@@ -135,8 +84,8 @@ pub fn render_stats_panel(
 
     // ── Session ──
     section_header(&mut lines, "Session", panel_w, theme);
-    if let Some(tag) = cached_session_tag(&state.focused().session_id, config) {
-        data_row(&mut lines, "Tag", &tag, theme);
+    if let Some(tag) = state.focused().tag.as_deref() {
+        data_row(&mut lines, "Tag", tag, theme);
     }
     let started = format_time_short(&state.focused().session_started_at);
     data_row(&mut lines, "Started", &started, theme);
@@ -167,7 +116,9 @@ pub fn render_stats_panel(
     let speed = if tps > 0.0 {
         format!("{:.1} t/s", tps)
     } else if state.focused().generation.active {
-        spinner(state.focused().generation.animation_tick)
+        crate::tui::glyphs::get()
+            .spin(state.focused().generation.animation_tick)
+            .to_string()
     } else {
         "\u{2014}".to_string()
     };
@@ -226,7 +177,7 @@ pub fn render_stats_panel(
         .filter(|s| s.enabled)
         .collect();
     if enabled_servers.is_empty() {
-        data_row(&mut lines, "\u{2713}", "none", theme);
+        data_row(&mut lines, crate::tui::glyphs::get().check, "none", theme);
     } else {
         for server in &enabled_servers {
             let ok = server.status == "connected";
@@ -247,7 +198,11 @@ pub fn render_stats_panel(
         blank(&mut lines);
         section_header(&mut lines, "Errors", panel_w, theme);
         lines.push(Line::from(Span::styled(
-            format!("  \u{26A0} {} logged", state.error_count),
+            format!(
+                "  {} {} logged",
+                crate::tui::glyphs::get().warn,
+                state.error_count
+            ),
             Style::default()
                 .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
@@ -289,36 +244,52 @@ fn mcp_row_layout(
     let right = format!(
         " {} {}",
         tool_count,
-        if ok { "\u{2713}" } else { "\u{26A0}" }
+        if ok {
+            crate::tui::glyphs::get().check
+        } else {
+            crate::tui::glyphs::get().warn
+        }
     );
-    let right_len = right.chars().count();
+    let right_len = UnicodeWidthStr::width(right.as_str());
     let left_budget = panel_w.saturating_sub(right_len + 4);
     let left_full = format!(" - {}", server_name);
-    let left: String = if left_full.chars().count() > left_budget {
-        left_full.chars().take(left_budget).collect()
-    } else {
-        left_full
-    };
+    let left = clip_cells(&left_full, left_budget);
     let gap = panel_w
-        .saturating_sub(left.chars().count() + right_len)
+        .saturating_sub(UnicodeWidthStr::width(left.as_str()) + right_len)
         .saturating_sub(4);
     (left, gap, right)
 }
 
 fn section_header(lines: &mut Vec<Line<'static>>, title: &str, width: usize, theme: &Theme) {
-    let prefix = " \u{2501}\u{2501} ".to_string();
-    let suffix_len = width.saturating_sub(prefix.len() + title.len() + 1);
-    let suffix = "\u{2501}".repeat(suffix_len);
+    let rule = crate::tui::glyphs::get().heavy_rule;
+    let lead = format!(" {rule}{rule} {title} ");
+    let used = UnicodeWidthStr::width(lead.as_str());
+    let fill = rule.repeat(width.saturating_sub(used + 1));
     lines.push(Line::from(vec![Span::styled(
-        format!("{}{} {}", prefix, title, suffix),
+        format!("{lead}{fill}"),
         Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
     )]));
 }
 
+/// Обрезать до `max` клеток (не символов): широкие знаки занимают две.
+fn clip_cells(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > max {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out
+}
+
 fn data_row(lines: &mut Vec<Line<'static>>, label: &str, value: &str, theme: &Theme) {
-    let label_w = label.chars().count().min(10);
+    let label_w = UnicodeWidthStr::width(label).min(10);
     let pad = if label_w < 10 {
         " ".repeat(10 - label_w)
     } else {
@@ -373,15 +344,6 @@ fn format_num(n: u64) -> String {
     }
 }
 
-fn spinner(tick: u64) -> String {
-    match tick % 4 {
-        0 => "\u{25D0}".to_string(),
-        1 => "\u{25D1}".to_string(),
-        2 => "\u{25D1}".to_string(),
-        _ => "\u{25D0}".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,7 +356,7 @@ mod tests {
         // produced for this (non-adversarial) input.
         let (left, gap, right) = mcp_row_layout("filesystem", 3, true, 34);
         assert_eq!(left, " - filesystem");
-        assert_eq!(right, " 3 \u{2713}");
+        assert_eq!(right, format!(" 3 {}", crate::tui::glyphs::UNICODE.check));
         assert_eq!(gap, 13);
         assert!(left.chars().count() + gap + right.chars().count() <= 34);
     }
@@ -435,55 +397,19 @@ mod tests {
     }
 
     #[test]
-    fn panel_width_matches_drawn_width_on_normal_terminals() {
-        // On any terminal at least as wide as PANEL_W, the reserved width the
-        // layout uses must equal the fixed width the panel actually draws —
-        // this is the invariant whose violation let chat text bleed onto the
-        // panel (the old layout reserved `34.min(width/4)` instead).
-        for available in [40u16, 80, 120, 136, 200] {
-            assert_eq!(
-                panel_width(available),
-                PANEL_W as u16,
-                "available={available}"
-            );
-        }
+    fn mcp_row_layout_counts_wide_characters_as_two_cells() {
+        // Три иероглифа — шесть клеток: строка не должна выйти за панель.
+        let (left, gap, right) = mcp_row_layout("世界世界世界世界世界", 12, true, 24);
+        let total =
+            UnicodeWidthStr::width(left.as_str()) + gap + UnicodeWidthStr::width(right.as_str());
+        assert!(total <= 24, "{left:?} {gap} {right:?}: {total} cells");
+        assert!(UnicodeWidthStr::width(left.as_str()) < 20);
     }
 
     #[test]
-    fn panel_width_never_exceeds_available() {
-        for available in 0u16..=40 {
-            assert!(panel_width(available) <= available, "available={available}");
-        }
-    }
-
-    #[test]
-    fn panel_width_is_zero_when_too_narrow_to_render() {
-        // Mirrors the `panel_w < 20` early-return in render_stats_panel: below
-        // 20 columns the panel does not draw, so nothing must be reserved.
-        for available in 0u16..20 {
-            assert_eq!(panel_width(available), 0, "available={available}");
-        }
-        assert_eq!(panel_width(20), 20);
-    }
-
-    #[test]
-    fn session_tag_cache_misses_gracefully_for_unknown_session() {
-        let config = Config::default();
-        // A session id that will never exist on disk — must return None,
-        // not panic or error out.
-        let tag = cached_session_tag("no-such-session-ever-00000000", &config);
-        assert_eq!(tag, None);
-    }
-
-    #[test]
-    fn session_tag_cache_reuses_entry_within_ttl() {
-        let config = Config::default();
-        let id = "panel-test-ttl-cache-session-id";
-        // First call populates the cache (miss on disk -> None, cached).
-        let first = cached_session_tag(id, &config);
-        // Second call within the TTL window must hit the cache rather than
-        // touching disk again; result should be identical.
-        let second = cached_session_tag(id, &config);
-        assert_eq!(first, second);
+    fn clip_cells_never_splits_a_wide_character() {
+        assert_eq!(clip_cells("世界", 3), "世");
+        assert_eq!(clip_cells("abc", 2), "ab");
+        assert_eq!(clip_cells("привет", 4), "прив");
     }
 }

@@ -6,6 +6,7 @@ use super::popup::{
     center_popup, draw_popup, fill_panel_space, modal_block, option_row, push_text_box_lines,
     separator_line,
 };
+use super::util::fit_col;
 use crate::app::list::{ListWindow, NAV_HINT};
 use crate::app::providers::{
     ProviderAddState, ProviderWizardStep, ProvidersViewState, provider_rows,
@@ -39,8 +40,19 @@ pub(super) fn render_providers_view(
     for (slot, i) in window.range().enumerate() {
         let row = &rows[i];
         let selected = i == view.selected;
-        let bg = if selected { theme.accent_dim } else { theme.bg };
-        let marker = if row.active { " ● " } else { " ○ " };
+        let bg = if selected { theme.selection } else { theme.bg };
+        let glyph = crate::tui::glyphs::get();
+        let marker = format!(
+            " {} ",
+            fit_col(
+                if row.active {
+                    glyph.radio_on
+                } else {
+                    glyph.radio_off
+                },
+                3
+            )
+        );
         let marker_color = if row.active {
             theme.success
         } else {
@@ -51,14 +63,14 @@ pub(super) fn render_providers_view(
             Span::styled(marker, Style::default().fg(marker_color).bg(bg)),
             Span::styled(
                 format!("{:<16} ", row.name),
-                if selected {
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.fg).bg(bg)
-                },
+                Style::default()
+                    .fg(theme.fg)
+                    .bg(bg)
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
             Span::styled(
                 format!("{:<18} ", format!("[{}]", row.tag)),
@@ -70,7 +82,7 @@ pub(super) fn render_providers_view(
             ),
         ]);
         frame.render_widget(
-            Paragraph::new(line),
+            Paragraph::new(line).style(Style::default().bg(bg)),
             Rect::new(body.x, body.y + slot as u16, body.width, 1),
         );
     }
@@ -215,7 +227,7 @@ pub(super) fn render_provider_add(
     if let Some(error) = &wizard.error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("  \u{26A0} {error}"),
+            format!("  {} {error}", crate::tui::glyphs::get().warn),
             Style::default().fg(theme.error),
         )));
     }

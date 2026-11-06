@@ -46,6 +46,27 @@ pub enum ConversationKind {
     SubAgent,
 }
 
+/// Инструмент, который сейчас выполняется в ходе: панель «идёт работа»
+/// показывает его имя, суть аргументов и сколько он уже идёт.
+#[derive(Debug, Clone)]
+pub struct ToolRun {
+    pub name: String,
+    pub summary: String,
+    pub started: std::time::Instant,
+}
+
+/// Сообщение, набранное, пока шёл ход: уходит моделью после его конца.
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    /// Текст с развёрнутыми вставками; файловые чипы остаются в нём плейсхолдерами.
+    pub text: String,
+    /// Файловые чипы из поля ввода: после очистки поля иначе потерялись бы.
+    pub chips: Vec<crate::app::input::FileChip>,
+    /// Файлы `/attach`, снятые в момент Enter: сообщение уходит с теми, что
+    /// были при нём, а не с тем, что окажется в общей полосе позже.
+    pub named: Vec<crate::provider::AttachedFile>,
+}
+
 /// A parked (non-focused) conversation: it owns its own messages, forked
 /// provider/session, generation status, and agent task, so it keeps streaming
 /// independently while the user looks at something else.
@@ -56,6 +77,9 @@ pub struct Conversation {
     /// notify / deliver the result). `None` for top-level chats.
     pub parent: Option<ConversationId>,
     pub title: String,
+    /// Заголовок уже просили у служебной модели. Один запрос на чат: отказ,
+    /// пустой ответ и таймаут второго не будет — остаётся `derive_title`.
+    pub title_requested: bool,
     pub session_id: String,
     pub session_started_at: String,
     pub messages: Vec<ChatMessage>,
@@ -87,6 +111,13 @@ pub struct Conversation {
     /// Ход оборван, а его события ещё в очереди: до `AppEvent::TurnFenced`
     /// они выбрасываются, иначе легли бы в новую историю (загруженную сессию).
     pub fenced: bool,
+    /// Инструмент в работе; сбрасывается его завершением и концом хода.
+    pub current_tool: Option<ToolRun>,
+    /// Сообщения, набранные во время хода: уходят по одному, когда ход кончится.
+    pub queued: std::collections::VecDeque<QueuedMessage>,
+    /// Очередь стоит: последний ход упал, и решает человек (Enter на пустом
+    /// поле шлёт следующее, Esc возвращает в поле).
+    pub queue_paused: bool,
 }
 
 impl Conversation {
@@ -98,6 +129,7 @@ impl Conversation {
             kind: ConversationKind::Main,
             parent: None,
             title: String::new(),
+            title_requested: false,
             session_id: crate::session::create_session_id(),
             session_started_at: chrono::Utc::now().to_rfc3339(),
             messages: Vec::new(),
@@ -111,6 +143,9 @@ impl Conversation {
             compacting: None,
             deferred: Vec::new(),
             fenced: false,
+            current_tool: None,
+            queued: std::collections::VecDeque::new(),
+            queue_paused: false,
         }
     }
 

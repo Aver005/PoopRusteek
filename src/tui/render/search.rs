@@ -46,7 +46,7 @@ fn render_query_box(frame: &mut Frame, area: Rect, view: &SearchViewState, theme
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut spans = vec![Span::styled(" 🔎 ", Style::default().fg(theme.accent))];
+    let mut spans = vec![Span::styled(" ? ", Style::default().fg(theme.accent))];
     if view.query.buffer.is_empty() && !focused {
         spans.push(Span::styled(
             "type to search…",
@@ -67,7 +67,10 @@ fn render_query_box(frame: &mut Frame, area: Rect, view: &SearchViewState, theme
                 let after: String = chars[cursor + 1..].iter().collect();
                 spans.push(Span::styled(after, Style::default().fg(theme.fg)));
             } else {
-                spans.push(Span::styled("▏", Style::default().fg(theme.accent)));
+                spans.push(Span::styled(
+                    crate::tui::glyphs::get().quote_bar,
+                    Style::default().fg(theme.accent),
+                ));
             }
         } else if cursor < chars.len() {
             let after: String = chars[cursor..].iter().collect();
@@ -152,7 +155,11 @@ fn render_results(frame: &mut Frame, area: Rect, view: &SearchViewState, theme: 
 
         let date = m.timestamp.split('T').next().unwrap_or("—");
         let date = if date.is_empty() { "—" } else { date };
-        let marker = if is_selected { "▶ " } else { "  " };
+        let marker = if is_selected {
+            format!("{} ", crate::tui::glyphs::get().pointer)
+        } else {
+            "  ".to_string()
+        };
         let role_color = if m.role == "user" {
             theme.accent_soft
         } else {

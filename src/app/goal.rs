@@ -7,8 +7,25 @@
 
 use super::App;
 use super::events::{AppEvent, GoalEvalOutcome, GoalStage, GoalVerdict};
+use crate::gateway::handle::CallSource;
+use crate::gateway::types::Role as ServiceRole;
 use crate::provider::ChatMessage;
 use std::sync::Arc;
+
+/// Оценщик — служебная роль, если она настроена; иначе форк провайдера чата, как
+/// раньше. Форк одноразовый: серверная сессия работника не подменяется.
+fn evaluator_for(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    chat: Option<Arc<dyn crate::provider::LLMProvider>>,
+) -> Option<Arc<dyn crate::provider::LLMProvider>> {
+    gateway
+        .provider_for_role(
+            ServiceRole::Evaluator,
+            CallSource::Role(ServiceRole::Evaluator),
+        )
+        .or(chat)
+        .map(|provider| provider.fork())
+}
 
 /// Stop the worker/evaluator loop after this many attempts so a goal that can
 /// never be satisfied (or a flaky evaluator) doesn't retry forever.
@@ -119,6 +136,12 @@ impl GoalState {
     /// and recover from that.
     pub(crate) fn is_running(&self) -> bool {
         matches!(self.stage, GoalStage::RunAgent1 | GoalStage::RunEvaluator)
+    }
+
+    /// Идёт настройка: режим включён, а цикл ещё не запущен (ждём задачу или
+    /// цель). Esc в это время отменяет настройку, а не «ничего».
+    pub(crate) fn is_setup_pending(&self) -> bool {
+        self.mode && !self.is_running()
     }
 
     /// Enter goal mode fresh: clear all per-run state and start two new agent
@@ -410,6 +433,20 @@ mod tests {
     }
 
     #[test]
+    fn setup_is_pending_until_the_cycle_starts() {
+        let mut g = GoalState::default();
+        assert!(!g.is_setup_pending(), "режим выключен");
+        g.activate();
+        assert!(g.is_setup_pending());
+        g.stage = GoalStage::WaitForGoal;
+        assert!(g.is_setup_pending());
+        g.stage = GoalStage::RunAgent1;
+        assert!(!g.is_setup_pending(), "цикл идёт — это уже не настройка");
+        g.deactivate();
+        assert!(!g.is_setup_pending());
+    }
+
+    #[test]
     fn deactivate_resets_everything() {
         let mut g = GoalState {
             mode: true,
@@ -423,6 +460,62 @@ mod tests {
         assert!(!g.is_running());
         assert_eq!(g.iteration, 0);
         assert!(g.prompt.is_empty());
+    }
+
+    /// Обе стороны: без роли оценивает провайдер чата, с ролью — служебный.
+    #[test]
+    fn the_evaluator_role_takes_the_goal_call_only_when_it_is_set() {
+        use crate::gateway::handle::{DisabledGateway, GatewayHandle};
+        use crate::gateway::testkit::{FakeBackend, rig};
+        use crate::provider::fake::FakeProvider;
+
+        const EVALUATOR_RIG: &str = r#"
+            [gateway]
+            enabled = true
+
+            [[accounts]]
+            id = "cheap"
+            provider = "custom"
+            base_url = "http://cheap.invalid/v1"
+            secret = "none"
+            model = "cheap-model"
+
+            [[routes]]
+            id = "main"
+            steps = [{ account = "cheap" }]
+
+            [[routes]]
+            id = "cheap"
+            steps = [{ account = "cheap" }]
+
+            [roles]
+            main = "main"
+            evaluator = "cheap"
+        "#;
+
+        let chat: Arc<dyn crate::provider::LLMProvider> =
+            Arc::new(FakeProvider::with_response("**Status:** SUCCESS"));
+        let off: GatewayHandle = Arc::new(DisabledGateway::new());
+        assert_eq!(
+            evaluator_for(&off, Some(chat.clone()))
+                .expect("the chat's provider evaluates")
+                .model(),
+            "fake"
+        );
+        assert!(
+            evaluator_for(&off, None).is_none(),
+            "no provider at all — the cycle is cancelled"
+        );
+
+        let rig = rig(EVALUATOR_RIG, vec![("cheap", FakeBackend::new(vec![]))]);
+        let on: GatewayHandle = Arc::new(rig.engine);
+        assert_eq!(
+            evaluator_for(&on, Some(chat))
+                .expect("the role provider evaluates")
+                .model(),
+            "auto/cheap",
+            "the configured role serves the verdict"
+        );
     }
 }
 
@@ -460,19 +553,16 @@ impl App {
     /// подменял серверную сессию работника, и тот терял всю историю.
     pub(crate) fn spawn_goal_evaluation(&mut self, agent_result: String, tool_report: String) {
         let target = self.goal_conversation();
-        let provider = match self
+        let chat = self
             .state
             .conversations
             .get(target)
-            .and_then(|conversation| conversation.provider.as_ref())
-        {
-            Some(p) => p.fork(),
-            None => {
-                self.cancel_goal_cycle(
-                    "No provider configured for evaluation — goal cancelled. Set your token, then /goal to retry.",
-                );
-                return;
-            }
+            .and_then(|conversation| conversation.provider.clone());
+        let Some(provider) = evaluator_for(&self.gateway, chat) else {
+            self.cancel_goal_cycle(
+                "No provider configured for evaluation — goal cancelled. Set your token, then /goal to retry.",
+            );
+            return;
         };
 
         let system_prompt = self.prompts.goal_evaluator_prompt.clone();

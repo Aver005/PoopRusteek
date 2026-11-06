@@ -7,7 +7,7 @@ use super::popup::{
     center_popup, draw_popup, fill_panel_space, modal_block, overflow_line, push_text_box_lines,
     separator_line,
 };
-use super::util::{highlight_json, truncate};
+use super::util::truncate;
 use crate::app::AppState;
 use crate::app::events::{ConfirmState, Modal, PickerMode, PickerState, QuestionState};
 use crate::app::list::{NAV_HINT, NAV_HINT_ARROWS};
@@ -16,7 +16,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     match modal {
@@ -27,10 +28,10 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
             scroll_offset,
             grant,
             scope,
-        } => render_tool_approval(
+        } => super::approval::render_tool_approval(
             frame,
             area,
-            ToolApprovalView {
+            super::approval::ToolApprovalView {
                 tool_name,
                 arguments,
                 origin: origin.as_deref(),
@@ -51,167 +52,6 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
     }
 }
 
-/// Состояние модалки одним аргументом: восемь позиционных упирались в
-/// блокирующий гейт clippy, а список только рос.
-struct ToolApprovalView<'a> {
-    tool_name: &'a str,
-    arguments: &'a str,
-    origin: Option<&'a str>,
-    scroll_offset: usize,
-    grant: crate::app::view_state::Grant,
-    scope: Option<&'a crate::whitelist::Scope>,
-}
-
-fn render_tool_approval(frame: &mut Frame, area: Rect, view: ToolApprovalView<'_>, theme: &Theme) {
-    let ToolApprovalView {
-        tool_name,
-        arguments,
-        origin,
-        scroll_offset,
-        grant,
-        scope,
-    } = view;
-    let popup_width = area.width.clamp(50, 72);
-    let max_height = area.height.saturating_sub(4);
-    let content_height = arguments
-        .lines()
-        .count()
-        .max(4)
-        .min(max_height.saturating_sub(6) as usize);
-    // Плюс строка на каждый вариант разрешения — их два или три, и обрезать
-    // их снизу нельзя: именно там человек видит, что именно он разрешает.
-    let grants = crate::app::view_state::Grant::all(scope.is_some()).len();
-    let popup_height = (content_height + 7 + grants + usize::from(origin.is_some()))
-        .min(max_height as usize) as u16;
-    let popup_area = center_popup(area, popup_width, popup_height);
-
-    let block = modal_block(" \u{26A0} Tool Call ", theme.warning, theme);
-    let inner = block.inner(popup_area);
-    let inner_w = inner.width as usize;
-    let inner_h = inner.height as usize;
-
-    let mut all_lines: Vec<Line> = Vec::new();
-
-    // Tool name line
-    all_lines.push(Line::from(vec![
-        Span::styled("  \u{2692} ", Style::default().fg(theme.warning)),
-        Span::styled("Tool:", Style::default().fg(theme.text_dim)),
-        Span::styled(" ", Style::default().fg(theme.fg)),
-        Span::styled(
-            tool_name.to_string(),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    // Кто спрашивает — своей строкой, вне аргументов: подпись из текста модели
-    // не должна рисовать в модалке поддельные аргументы.
-    if let Some(origin) = origin {
-        all_lines.push(Line::from(vec![
-            Span::styled("    From: ", Style::default().fg(theme.text_dim)),
-            Span::styled(origin.to_string(), Style::default().fg(theme.warning)),
-        ]));
-    }
-    all_lines.push(Line::from(""));
-
-    // Arguments header
-    all_lines.push(Line::from(vec![Span::styled(
-        "  \u{1F4CB} Arguments:",
-        Style::default().fg(theme.text_dim),
-    )]));
-
-    // Parse and format arguments with JSON highlighting
-    let arg_lines = highlight_json(arguments, theme);
-    let max_visible = inner_h.saturating_sub(6);
-    let total_args = arg_lines.len();
-    let scroll = scroll_offset;
-    let display_lines: Vec<&Line> = if total_args > max_visible {
-        let end = (scroll + max_visible).min(total_args);
-        arg_lines[scroll..end].iter().collect()
-    } else {
-        arg_lines.iter().collect()
-    };
-
-    for line in &display_lines {
-        let mut line_spans = vec![Span::styled("  ", Style::default().fg(theme.fg))];
-        for span in &line.spans {
-            line_spans.push(Span::styled(span.content.clone(), span.style));
-        }
-        all_lines.push(Line::from(line_spans));
-    }
-
-    // Scroll indicator
-    if total_args > max_visible {
-        let pct = if total_args > 0 {
-            (scroll as f64 / (total_args.saturating_sub(max_visible)) as f64 * 100.0) as u16
-        } else {
-            0
-        };
-        let indicator = format!("\u{2191}\u{2193} {:.0}%", pct.min(100));
-        all_lines.push(Line::from(vec![Span::styled(
-            format!("  {}", indicator),
-            Style::default().fg(theme.text_dim),
-        )]));
-    }
-
-    fill_panel_space(&mut all_lines, inner_h.saturating_sub(3));
-    all_lines.push(separator_line(inner_w, theme));
-
-    // Все варианты списком, а не только текущий: человек, видящий одну
-    // строку «just this once», не знает, что там есть что-то ещё.
-    use crate::app::view_state::Grant;
-    for option in Grant::all(scope.is_some()) {
-        let current = option == grant;
-        let style = match (current, option) {
-            (false, _) => Style::default().fg(theme.text_dim),
-            (true, Grant::Tool) => Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-            (true, _) => Style::default()
-                .fg(theme.success)
-                .add_modifier(Modifier::BOLD),
-        };
-        all_lines.push(Line::from(vec![Span::styled(
-            format!(
-                "  {} {}",
-                if current { "\u{25CF}" } else { "\u{25CB}" },
-                option.label(tool_name, scope)
-            ),
-            style,
-        )]));
-    }
-
-    // Key bindings
-    all_lines.push(Line::from(vec![
-        Span::styled("  ", Style::default().fg(theme.fg)),
-        Span::styled(
-            "Y",
-            Style::default()
-                .fg(theme.success)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" allow  ", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            "N",
-            Style::default()
-                .fg(theme.error)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" deny  ", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            "A",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" change  ", Style::default().fg(theme.text_dim)),
-        Span::styled("\u{2191}\u{2193}", Style::default().fg(theme.accent_soft)),
-        Span::styled(" scroll", Style::default().fg(theme.text_dim)),
-    ]));
-
-    draw_popup(frame, popup_area, inner, block, all_lines, theme);
-}
-
 fn render_delete_sessions(
     frame: &mut Frame,
     area: Rect,
@@ -226,7 +66,7 @@ fn render_delete_sessions(
         let popup_h = 8u16.min(area.height.saturating_sub(2));
         let popup_area = center_popup(area, popup_width, popup_h);
 
-        let block = modal_block(" \u{1F5D1} Confirm deletion ", theme.error, theme);
+        let block = modal_block(" Confirm deletion ", theme.error, theme);
         let inner = block.inner(popup_area);
 
         let n = st.confirm_ids.len();
@@ -270,7 +110,7 @@ fn render_delete_sessions(
     let popup_h = ((rows + 7) as u16).min(area.height.saturating_sub(2));
     let popup_area = center_popup(area, popup_width, popup_h);
 
-    let block = modal_block(" \u{1F5D1} Delete sessions ", theme.warning, theme);
+    let block = modal_block(" Delete sessions ", theme.warning, theme);
     let inner = block.inner(popup_area);
     let inner_w = inner.width as usize;
 
@@ -332,7 +172,12 @@ fn render_delete_sessions(
             theme.panel
         };
 
-        let checkbox = if is_checked { "\u{2611} " } else { "\u{2610} " };
+        let glyph = crate::tui::glyphs::get();
+        let checkbox = if is_checked {
+            format!("{} ", glyph.checked)
+        } else {
+            format!("{} ", glyph.unchecked)
+        };
         let badge = match (entry.local, entry.remote) {
             (true, true) => "[L+G]",
             (true, false) => "[L]  ",
@@ -435,6 +280,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, cs: &ConfirmState, theme: &Them
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Theme) {
+    let glyph = crate::tui::glyphs::get();
     let popup_width = area.width.clamp(48, 80);
     let visible = picker.items.len().clamp(3, 12);
     let popup_h = (visible + 8) as u16;
@@ -462,10 +308,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         picker.search.clone()
     };
     lines.push(Line::from(vec![
-        Span::styled(
-            " \u{1F50D} ",
-            Style::default().fg(theme.text_dim).bg(theme.panel),
-        ),
+        Span::styled(" ? ", Style::default().fg(theme.text_dim).bg(theme.panel)),
         Span::styled(
             search_display,
             Style::default()
@@ -493,9 +336,13 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         let is_checked = picker.checked.contains(&i);
 
         let indicator = if is_multi {
-            if is_checked { "\u{2611} " } else { "\u{2610} " }
+            if is_checked {
+                glyph.checked
+            } else {
+                glyph.unchecked
+            }
         } else {
-            if is_cursor { "\u{25B6} " } else { "  " }
+            if is_cursor { glyph.pointer } else { " " }
         };
 
         let item = &picker.items[i];
@@ -568,6 +415,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
 }
 
 fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Theme) {
+    let glyph = crate::tui::glyphs::get();
     let popup_width = area.width.clamp(48, 72);
     let is_custom_mode = qs.is_custom_mode;
     let is_yes_no = qs.options.is_empty();
@@ -590,13 +438,13 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
     let mut lines: Vec<Line> = Vec::new();
 
     // Question text
-    let wrapped = textwrap::wrap(&qs.question, inner_w.saturating_sub(4));
+    let wrapped = crate::tui::wrap::wrap_words(&qs.question, inner_w.saturating_sub(4));
     for (i, wline) in wrapped.iter().enumerate() {
         let prefix = if i == 0 { "  " } else { "    " };
         lines.push(Line::from(vec![
             Span::styled(prefix, Style::default().fg(theme.fg)),
             Span::styled(
-                wline.to_string(),
+                wline.clone(),
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -674,7 +522,7 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
             };
             let fg = if is_cursor { theme.fg } else { theme.text_soft };
 
-            let indicator = if is_cursor { "\u{25B6} " } else { "  " };
+            let indicator = if is_cursor { glyph.pointer } else { " " };
             let label = if is_custom_entry {
                 "Custom...".to_string()
             } else {
@@ -738,9 +586,11 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;
 
+/// Подсказки команд и файлов над правилом поля ввода. `anchor` — строка
+/// правила: окно встаёт прямо над ней и ничего из ввода не перекрывает.
 pub(super) fn render_autocomplete(
     frame: &mut Frame,
-    input_area: Rect,
+    anchor: Rect,
     state: &AppState,
     theme: &Theme,
 ) {
@@ -749,102 +599,79 @@ pub(super) fn render_autocomplete(
         return;
     }
     let total = items.len();
-
     let window = state
         .autocomplete
         .cursor
         .window(total, AUTOCOMPLETE_VISIBLE);
     let scroll_off = window.start;
     let vis_items = &items[window.range()];
+    let is_file = state.autocomplete.file_mode;
+    let prefix = if is_file { "@" } else { "/" };
 
     let max_name_width = items
         .iter()
-        .map(|s| s.name.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.name.as_str()) + 1)
         .max()
         .unwrap_or(0)
-        .max(6) as u16;
+        .max(6);
     let popup_h = (vis_items.len() + 2) as u16;
-    let popup_w = input_area
+    let popup_w = anchor
         .width
-        .min(64)
-        .max(max_name_width + 28)
-        .min(input_area.width);
+        .min(72)
+        .max((max_name_width + 28) as u16)
+        .min(anchor.width);
+    let popup_h = popup_h.min(anchor.y.saturating_sub(1).max(3));
+    let popup_area = Rect::new(anchor.x, anchor.y.saturating_sub(popup_h), popup_w, popup_h);
 
-    let max_y_above = input_area.y.saturating_sub(1);
-    let popup_h = popup_h.min(max_y_above.max(2));
-    let popup_y = input_area.y.saturating_sub(popup_h);
-    let popup_area = Rect::new(input_area.x, popup_y, popup_w, popup_h);
-
-    frame.render_widget(Clear, popup_area);
-
-    let is_file = state.autocomplete.file_mode;
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border_focus))
-        .title(if is_file { " Files " } else { " Commands " })
-        .title_style(
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(theme.panel));
+    let title = if is_file { " Files " } else { " Commands " };
+    let block = modal_block(title, theme.border_focus, theme);
     let inner = block.inner(popup_area);
+    frame.render_widget(Clear, popup_area);
     frame.render_widget(block, popup_area);
 
-    let sel_style = Style::default()
-        .fg(theme.bg)
-        .bg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let name_style = Style::default().fg(theme.accent_soft).bg(theme.panel);
-    let desc_style = Style::default().fg(theme.text_soft).bg(theme.panel);
-    let usage_style = Style::default().fg(theme.text_dim).bg(theme.panel);
-    let muted = Style::default().fg(theme.text_dim).bg(theme.panel);
-
-    let max_name_w = max_name_width as usize;
-
+    let pointer = crate::tui::glyphs::get().pointer;
     let lines: Vec<Line> = vis_items
         .iter()
         .enumerate()
         .map(|(rel, item)| {
-            let is_sel = (scroll_off + rel) == state.autocomplete.cursor.selected;
-            let indicator = if is_sel { "▸ " } else { "  " };
-            let prefix = if is_file { "@" } else { "/" };
-            let name_full = format!("{prefix}{}", item.name);
-            let padding = max_name_w.saturating_sub(item.name.chars().count()).max(1);
-            let pad_str = " ".repeat(padding);
-
-            let mut spans: Vec<Span> = Vec::new();
-            if is_sel {
-                spans.push(Span::styled(indicator, sel_style));
-                spans.push(Span::styled(name_full, sel_style));
-                spans.push(Span::styled(pad_str, sel_style));
-                let desc_text = if item.description.is_empty() {
-                    String::new()
-                } else {
-                    item.description.clone()
-                };
-                spans.push(Span::styled(desc_text, sel_style));
-                if !item.usage.is_empty() {
-                    spans.push(Span::styled("  ", sel_style));
-                    spans.push(Span::styled(item.usage.clone(), sel_style));
-                }
+            let selected = (scroll_off + rel) == state.autocomplete.cursor.selected;
+            let bg = if selected {
+                theme.selection
             } else {
-                spans.push(Span::styled(indicator, muted));
-                spans.push(Span::styled(name_full, name_style));
-                spans.push(Span::styled(pad_str, muted));
-                spans.push(Span::styled("  ", muted));
-                spans.push(Span::styled(item.description.clone(), desc_style));
-                if !item.usage.is_empty() {
-                    spans.push(Span::styled("  ", muted));
-                    spans.push(Span::styled(item.usage.clone(), usage_style));
-                }
+                theme.panel
+            };
+            let name = format!("{prefix}{}", item.name);
+            let pad = max_name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+            let mark = if selected { pointer } else { " " };
+            let name_style = Style::default().fg(theme.accent_soft).bg(bg);
+            let mut spans = vec![
+                Span::styled(format!("{mark} "), Style::default().fg(theme.accent).bg(bg)),
+                Span::styled(
+                    name,
+                    if selected {
+                        name_style.add_modifier(Modifier::BOLD)
+                    } else {
+                        name_style
+                    },
+                ),
+                Span::styled(" ".repeat(pad + 2), Style::default().bg(bg)),
+                Span::styled(
+                    item.description.clone(),
+                    Style::default()
+                        .fg(if selected { theme.fg } else { theme.text_soft })
+                        .bg(bg),
+                ),
+            ];
+            // Usage повторяет имя команды — показываем, только если добавляет сведений.
+            if !is_file && !item.usage.is_empty() && item.usage != format!("/{}", item.name) {
+                spans.push(Span::styled(
+                    format!("  {}", item.usage),
+                    Style::default().fg(theme.text_dim).bg(bg),
+                ));
             }
             Line::from(spans)
         })
         .collect();
-
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.panel)),
         inner,

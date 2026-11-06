@@ -1,0 +1,40 @@
+# Config for the CLI → API fallback scenario: pass it with `--config`, like any other config.
+# The CLI account runs `pooprusteek mock-cli` (POOPRUSTEEK_CLI_CLAUDE=mock:throttled; the override
+# works only in the harness with --config); the API account talks to the scripted provider.
+# Host `mock` is the compose service; for a local mock replace it with 127.0.0.1.
+#
+# Needs POOPRUSTEEK_MOCK_KEY_API set to anything (the scripted provider ignores the value).
+
+[agent]
+max_steps_per_turn = 8
+rate_limit_ms = 0
+max_retries = 0
+
+[semantic]
+enabled = false
+
+[update]
+auto = false
+
+[gateway]
+schema = 1
+enabled = true
+
+[[accounts]]
+id = "cli"
+provider = "cli:claude"
+model = "haiku"
+
+[[accounts]]
+id = "api"
+provider = "custom"
+base_url = "http://mock:811/api/v1"
+secret = "env:POOPRUSTEEK_MOCK_KEY_API"
+model = "mock"
+
+[[routes]]
+id = "main"
+steps = [{ account = "cli" }, { account = "api" }]
+
+[roles]
+main = "main"

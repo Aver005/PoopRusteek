@@ -23,6 +23,7 @@ pub mod driver;
 pub mod metrics;
 pub mod mine;
 pub mod mock;
+pub mod mock_cli;
 pub mod report;
 pub mod scenario;
 pub mod trace;
@@ -82,6 +83,8 @@ pub enum Command {
     Mine(MineArgs),
     /// Serve a scripted OpenAI-compatible endpoint for deterministic runs.
     MockProvider(MockArgs),
+    /// Stand in for the `claude`/`opencode` CLI so gateway adapters run without them.
+    MockCli(mock_cli::MockCliArgs),
 }
 
 #[derive(Args)]
@@ -265,12 +268,14 @@ pub struct MockArgs {
 /// runner has to hand them to the `exec` children it spawns, or they would
 /// load the user's real config and write into the user's real data.
 pub async fn run(command: Command, config: Config, globals: GlobalFlags) -> AppResult<i32> {
+    crate::gateway::cli::discover::allow_overrides(globals.config.is_some());
     match command {
         Command::Exec(args) => exec(*args, config).await,
         Command::Scenario(args) => scenario::run_one(args, &config, globals).await,
         Command::Suite(args) => scenario::run_suite(args, &config, globals).await,
         Command::Mine(args) => mine::run(args),
         Command::MockProvider(args) => mock::run(args).await,
+        Command::MockCli(args) => mock_cli::run(args),
     }
 }
 

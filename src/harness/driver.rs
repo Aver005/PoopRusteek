@@ -894,7 +894,7 @@ impl Verdict {
     /// подтверждения: иначе `todo`, `task` и ход суб-агента не попадали в список.
     fn on_tool_event(&mut self, conversation: ConversationId, event: &AgentEvent) {
         match event {
-            AgentEvent::ToolStarted { name } => {
+            AgentEvent::ToolStarted { name, .. } => {
                 self.tools.push(ToolInvocation {
                     name: name.clone(),
                     approved: true,
@@ -1458,6 +1458,7 @@ fn persist(
         broken: conversation.broken && (interrupted || !remote.is_established()),
         remote,
         route: provider.route_state(),
+        title: (!conversation.title.trim().is_empty()).then(|| conversation.title.clone()),
     };
     match crate::session::save_session(
         &conversation.session_id,
@@ -1606,6 +1607,7 @@ mod tests {
         let root = ConversationId::next();
         let started = |name: &str| AgentEvent::ToolStarted {
             name: name.to_string(),
+            summary: String::new(),
         };
         verdict.on_tool_event(root, &started("task"));
         verdict.on_tool_event(root, &started("look › bash"));
@@ -2030,6 +2032,7 @@ model = \"m\"
             model_type: "m".to_string(),
             messages: history_with_native_calls(),
             tag: None,
+            title: None,
             provider_session_id: None,
             provider_parent_message_id: None,
             broken: false,

@@ -528,7 +528,10 @@ impl Grant {
                 Some(scope) => format!("Always: {tool} · {}", scope.describe()),
                 None => format!("Always: {tool}"),
             },
-            Grant::Tool => format!("\u{26A0} Always: {tool} · ANYTHING"),
+            Grant::Tool => format!(
+                "{} Always: {tool} · ANYTHING",
+                crate::tui::glyphs::get().warn
+            ),
         }
     }
 

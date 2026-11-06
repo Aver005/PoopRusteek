@@ -133,9 +133,9 @@ It copies your own token into the clipboard — paste it into the token box and 
 | `Enter` | Send message (trailing `\` continues on a new line) |
 | `Shift+Enter` | Insert a newline |
 | `Tab` / `Shift+Tab` | Switch to next / previous chat |
-| `Esc` | Cancel generation · clear chat · quit (context-dependent) |
+| `Esc` | Cancel generation (does nothing when idle; `/clear` wipes the chat, `Ctrl+C` quits) |
 | `Ctrl+C` | Cancel generation / quit |
-| `Ctrl+L` | Clear current chat |
+| `Ctrl+L` | Redraw the screen and jump to the latest message |
 | `Ctrl+P` | Toggle the stats panel |
 | `Ctrl+A` | Select all input |
 | `↑` / `↓` | Input history / scroll |
