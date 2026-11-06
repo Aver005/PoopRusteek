@@ -254,7 +254,10 @@ impl App {
                 Ok(false)
             }
             Modal::McpAdd(state) => self.handle_mcp_add_key(key, state).await,
-            Modal::ProviderAdd(state) => self.handle_provider_add_key(key, state).await,
+            Modal::AccountWizard(state) => self.handle_account_wizard_key(key, state).await,
+            Modal::SecretPrompt(state) => self.handle_secret_prompt_key(key, state).await,
+            Modal::AccountLimits(state) => self.handle_limits_key(key, state).await,
+            Modal::Trust(state) => self.handle_trust_key(key, state).await,
         }
     }
 

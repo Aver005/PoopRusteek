@@ -151,6 +151,12 @@ pub fn get() -> &'static Glyphs {
     ACTIVE.with(Cell::get)
 }
 
+/// Маска скрытого ввода: точки по числу знаков, но не длиннее поля.
+pub fn mask_text(len: usize) -> String {
+    let dot = if get().ascii { "*" } else { "\u{2022}" };
+    dot.repeat(len.min(48))
+}
+
 impl Glyphs {
     /// Кадр спиннера для такта анимации.
     pub fn spin(&self, tick: u64) -> &'static str {

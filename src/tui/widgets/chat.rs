@@ -311,6 +311,19 @@ fn build_segment_lines(
             ));
             lines.push(Line::from(head));
         }
+        Role::System if msg.status.as_deref() == Some(crate::app::gateway_view::SEAM_STATUS) => {
+            // Шов: тонкая строка о смене аккаунта, чтобы человек видел, кто отвечал.
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " \u{2500}\u{2500} ",
+                    Style::default().fg(theme.border).bg(theme.bg),
+                ),
+                Span::styled(
+                    msg.visible_content().to_string(),
+                    Style::default().fg(theme.text_soft).bg(theme.bg),
+                ),
+            ]));
+        }
         Role::System => {
             let body = msg.visible_content();
             let body_lines: Vec<&str> = body.lines().collect();

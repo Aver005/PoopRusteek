@@ -691,11 +691,14 @@ pub enum Modal {
     /// `/mcp add` — paste-JSON / step-by-step wizard for adding a new MCP
     /// server. State lives in `app::mcp_add` (its own module — see there).
     McpAdd(crate::app::mcp_add::McpAddState),
-    /// `/providers add` — step-by-step wizard for adding an
-    /// OpenAI-compatible provider. State lives in `app::providers`. Boxed
-    /// for the same reason as `McpAdd`'s wizard: four `InputState` fields
-    /// would otherwise size every `Modal`.
-    ProviderAdd(Box<crate::app::providers::ProviderAddState>),
+    /// Мастер добавления аккаунта: тип → имя → адрес и модель → секрет.
+    AccountWizard(Box<crate::app::gateway_view::wizard::AccountWizard>),
+    /// Скрытый ввод секрета (`/secrets set <имя>`): значение только здесь, под маской.
+    SecretPrompt(Box<crate::app::gateway_view::forms::SecretPrompt>),
+    /// Ограничения и избранные модели аккаунта.
+    AccountLimits(Box<crate::app::gateway_view::forms::LimitsForm>),
+    /// Проектный конфиг просит изменить, куда уходят запросы; по умолчанию — отказ.
+    Trust(Box<crate::app::gateway_view::forms::TrustDialog>),
 }
 
 // ─── /delete — session deletion picker ────────────────────────────

@@ -3,7 +3,7 @@
 use super::describe::describe;
 use super::fields;
 use super::layers::{self, Layer, LayerInfo, LayerStatus, Origins};
-use super::{Config, is_isolated, migrate, paths, queue, startup, write};
+use super::{Config, ProviderEntry, is_isolated, migrate, paths, queue, startup, write};
 use crate::error::{AppError, AppResult};
 use crate::gateway::types::{AccountId, GatewaySettings, Roles};
 use crate::secrets::{
@@ -19,6 +19,12 @@ use super::GATEWAY_SCHEMA as SUPPORTED_SCHEMA;
 
 pub(super) fn gateway_is_default(settings: &GatewaySettings) -> bool {
     *settings == GatewaySettings::default()
+}
+
+/// Записи `[[providers]]` только читаются: экран аккаунтов пишет `[[accounts]]`.
+/// Раз при загрузке и при сохранении их нет в сериализации, запись файл не трогает.
+pub(super) fn providers_not_written(_: &[ProviderEntry]) -> bool {
+    true
 }
 
 pub(super) fn roles_empty(roles: &Roles) -> bool {
@@ -1244,13 +1250,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Экран аккаунтов пишет `[[accounts]]`; старые `[[providers]]` читаются, но не пишутся.
     #[test]
-    fn two_saves_in_a_row_do_not_duplicate_added_providers() {
+    fn providers_are_read_but_never_written_and_never_lost() {
         let root = dir("twice");
         let global = root.join("config.toml");
-        std::fs::write(&global, "[ui]\ntheme = \"x\"\n").unwrap();
+        let old = "[ui]
+theme = \"x\"
+
+[[providers]]
+name = \"old\"
+base_url = \"http://old/v1\"
+model = \"m\"
+";
+        std::fs::write(&global, old).unwrap();
         let (_, store) = fake_store();
         let mut config = load_layers(plan(&global, None, &store)).unwrap();
+        assert_eq!(config.providers.len(), 1, "the old file still reads");
         config.providers.push(crate::config::ProviderEntry {
             name: "lm".into(),
             base_url: "http://x/v1".into(),
@@ -1259,10 +1275,23 @@ mod tests {
             protocol: Default::default(),
             tools: Default::default(),
         });
+        config.ui.theme = "y".into();
         save_now(&config).unwrap();
         save_now(&config).unwrap();
         let saved = std::fs::read_to_string(&global).unwrap();
         assert_eq!(saved.matches("[[providers]]").count(), 1, "{saved}");
+        assert!(
+            saved.contains("name = \"old\""),
+            "the old entry stays: {saved}"
+        );
+        assert!(
+            !saved.contains("name = \"lm\""),
+            "a new entry is not written: {saved}"
+        );
+        assert!(
+            saved.contains("theme = \"y\""),
+            "other settings still save: {saved}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

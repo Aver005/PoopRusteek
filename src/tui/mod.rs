@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod capture;
+#[cfg(test)]
+mod capture_accounts;
 pub mod glyphs;
 pub mod markdown;
 pub mod render;

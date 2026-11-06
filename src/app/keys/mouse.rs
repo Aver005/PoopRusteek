@@ -83,10 +83,15 @@ impl App {
                 let selected = self.state.themes.selected;
                 self.state.themes.selected = nav.move_within(selected, len, page(rows::THEME));
             }
-            View::Providers => {
-                let len = crate::app::providers::provider_rows(&self.config).len();
-                let selected = self.state.providers_view.selected;
-                self.state.providers_view.selected =
+            View::Accounts => {
+                let len = self
+                    .state
+                    .gateway_view
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |s| s.accounts.len());
+                let selected = self.state.gateway_view.screen.selected;
+                self.state.gateway_view.screen.selected =
                     nav.move_within(selected, len, page(rows::PROVIDER));
             }
             _ => {

@@ -46,9 +46,14 @@ pub(super) fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: 
         Modal::DeleteSessions(st) => render_delete_sessions(frame, area, st, theme),
         Modal::Confirm(cs) => render_confirm(frame, area, cs, theme),
         Modal::McpAdd(state) => super::mcp::render_mcp_add(frame, area, state, theme),
-        Modal::ProviderAdd(state) => {
-            super::providers::render_provider_add(frame, area, state, theme)
+        Modal::AccountWizard(state) => {
+            super::accounts::render_account_wizard(frame, area, state, theme)
         }
+        Modal::SecretPrompt(state) => {
+            super::accounts::render_secret_prompt(frame, area, state, theme)
+        }
+        Modal::AccountLimits(state) => super::accounts::render_limits(frame, area, state, theme),
+        Modal::Trust(state) => super::accounts::render_trust(frame, area, state, theme),
     }
 }
 

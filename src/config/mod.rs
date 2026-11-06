@@ -20,7 +20,7 @@ pub const GATEWAY_SCHEMA: u32 = 1;
 
 pub use layers::{Layer, LayerInfo, LayerStatus, looks_like_key};
 pub use load::{
-    ConfigSource, SecretsConfig, TrustConfig, bind_secret_host, file_references,
+    ConfigSource, SecretsConfig, TrustConfig, TrustRequest, bind_secret_host, file_references,
     inline_secret_labels, link_secret_reference, project_key, trust_project, untrust_project,
     wipe_secrets_and_files,
 };
@@ -65,7 +65,7 @@ pub struct Config {
     /// OpenRouter, …) managed via `/providers`. The DeepSeek web client
     /// configured by `[provider]` above is the implicit built-in entry and
     /// never appears in this list.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "load::providers_not_written")]
     pub providers: Vec<ProviderEntry>,
     /// Name of the entry in `providers` that is currently active. `None`
     /// (or a name that no longer exists) means the built-in DeepSeek

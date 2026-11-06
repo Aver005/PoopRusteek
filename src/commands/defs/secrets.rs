@@ -6,7 +6,7 @@ use crate::secrets::{Secret, ops, process_store};
 /// `/secrets` — секреты в системном хранилище. Работа с хранилищем идёт вне цикла событий.
 pub struct SecretsCommand;
 
-const USAGE: &str = "/secrets [list | set <name> <value> | rm <name> | test | bind <ref> <host>]";
+const USAGE: &str = "/secrets [list | set <name> | rm <name> | test | bind <ref> <host>]";
 
 impl Command for SecretsCommand {
     fn name(&self) -> &str {
@@ -39,9 +39,13 @@ impl Command for SecretsCommand {
             })),
             "set" => {
                 let (name, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                if name.is_empty() || value.trim().is_empty() {
+                if !name.is_empty() && value.trim().is_empty() {
+                    // Без значения в строке: оно вводится в модалке под маской.
+                    return CommandResult::PromptSecret(name.to_string());
+                }
+                if name.is_empty() {
                     return CommandResult::Error(
-                        "Usage: /secrets set <name> <value>. Typing the value here shows it on screen; for a hidden prompt run `pooprusteek secrets set <name>` in a shell. This line is not saved to history."
+                        "Usage: /secrets set <name> — the value is asked in a hidden prompt. This line is not saved to history."
                             .to_string(),
                     );
                 }

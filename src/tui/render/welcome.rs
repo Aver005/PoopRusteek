@@ -30,10 +30,12 @@ const GAP: usize = 2;
 struct WelcomePlan {
     card: bool,
     session_rows: usize,
+    /// Строка аккаунтов с лимитами над полем ввода.
+    accounts: bool,
 }
 
 /// Разделить высоту между частями. Карточка важнее сессий.
-fn plan(height: u16, sessions: usize) -> WelcomePlan {
+fn plan(height: u16, sessions: usize, has_accounts: bool) -> WelcomePlan {
     let height = usize::from(height);
     let card_rows = if height >= usize::from(CARD_H) + 2 {
         usize::from(CARD_H)
@@ -41,14 +43,23 @@ fn plan(height: u16, sessions: usize) -> WelcomePlan {
         1
     };
     let card = card_rows == usize::from(CARD_H);
-    let left = height.saturating_sub(card_rows);
+    let mut left = height.saturating_sub(card_rows);
+    // Строка аккаунтов — последняя строка области, прямо над полем ввода.
+    let accounts = has_accounts && left >= 2;
+    if accounts {
+        left -= 1;
+    }
     // Пустая строка перед сессиями и их заголовок.
     let session_rows = if sessions > 0 && left >= 3 {
         (left - 2).min(sessions.min(SHOWN_SESSIONS))
     } else {
         0
     };
-    WelcomePlan { card, session_rows }
+    WelcomePlan {
+        card,
+        session_rows,
+        accounts,
+    }
 }
 
 fn card_lines(
@@ -150,7 +161,9 @@ pub(super) fn render_welcome(
     }
     let content_w = area.width.saturating_sub(2);
     let content = Rect::new(area.x + 1, area.y, content_w, area.height);
-    let plan = plan(area.height, state.landing.recent().len());
+    let chips =
+        super::accounts::account_chips(&state.gateway_view, usize::from(content.width), theme);
+    let plan = plan(area.height, state.landing.recent().len(), chips.is_some());
     let width = usize::from(content.width);
 
     let mut y = content.y;
@@ -191,6 +204,14 @@ pub(super) fn render_welcome(
             Rect::new(content.x, y, content.width, height),
         );
     }
+    if plan.accounts
+        && let Some(line) = chips
+    {
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme.bg)),
+            Rect::new(content.x, area.bottom() - 1, content.width, 1),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -199,21 +220,22 @@ mod tests {
 
     #[test]
     fn a_tall_area_fits_everything() {
-        let plan = plan(24, 4);
+        let plan = plan(24, 4, true);
         assert_eq!(
             plan,
             WelcomePlan {
                 card: true,
                 session_rows: 4,
+                accounts: true,
             }
         );
     }
 
     #[test]
     fn a_short_area_drops_sessions_before_the_card() {
-        let short = plan(6, 4);
+        let short = plan(6, 4, false);
         assert!(short.card && short.session_rows == 0);
-        let tiny = plan(3, 4);
+        let tiny = plan(3, 4, false);
         assert!(!tiny.card);
     }
 
@@ -221,14 +243,14 @@ mod tests {
     fn the_plan_never_asks_for_more_rows_than_it_has() {
         for height in 0..40u16 {
             for sessions in 0..8 {
-                let plan = plan(height, sessions);
+                let plan = plan(height, sessions, true);
                 let card = if plan.card { usize::from(CARD_H) } else { 1 };
                 let sessions_block = if plan.session_rows > 0 {
                     plan.session_rows + 2
                 } else {
                     0
                 };
-                let used = card + sessions_block;
+                let used = card + sessions_block + usize::from(plan.accounts);
                 assert!(
                     used <= usize::from(height).max(1),
                     "height {height}, sessions {sessions}, used {used}"
@@ -239,6 +261,6 @@ mod tests {
 
     #[test]
     fn at_most_the_shown_number_of_sessions_is_planned() {
-        assert!(plan(60, 20).session_rows <= SHOWN_SESSIONS);
+        assert!(plan(60, 20, true).session_rows <= SHOWN_SESSIONS);
     }
 }
