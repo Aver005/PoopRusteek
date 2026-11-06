@@ -335,6 +335,7 @@ pub(crate) fn settings(
         deepseek: None,
         entries: Vec::new(),
         request_log: false,
+        allowed_hosts: Vec::new(),
         gateway: GatewayCell::new(gateway),
     }
 }

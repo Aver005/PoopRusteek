@@ -150,6 +150,59 @@ pub fn check_address(
     known.then(|| raw.to_string()).ok_or_else(not_found)
 }
 
+// ── Доступ ──────────────────────────────────────────────────────────────
+
+/// Подходит ли заголовок `Host` серверу на loopback: `127.0.0.1`, `localhost`, `[::1]` и
+/// настроенные имена, с портом сервера или без. Заголовка нет вовсе (HTTP/1.0) — пускаем.
+pub fn host_allowed(header: Option<&str>, port: u16, extra: &[String]) -> bool {
+    let Some(raw) = header else {
+        return true;
+    };
+    let raw = raw.trim();
+    let (name, given_port) = if let Some(rest) = raw.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((name, tail)) => (name, tail.strip_prefix(':')),
+            None => return false,
+        }
+    } else {
+        match raw.rsplit_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (raw, None),
+        }
+    };
+    if let Some(given) = given_port
+        && given.parse::<u16>().ok() != Some(port)
+    {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    matches!(name.as_str(), "127.0.0.1" | "localhost" | "::1")
+        || extra
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&name))
+}
+
+/// Что показывает статус-эндпоинт тому, кто прошёл проверку ключа.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusAccess {
+    /// Ключ сервера задан и предъявлен: всё.
+    Detailed,
+    /// Ключа нет, сервер на loopback: имена и состояния отдаваемых аккаунтов.
+    Minimal,
+    /// Ключа нет, сервер открыт в сеть: ничего.
+    Forbidden,
+}
+
+pub fn status_access(has_api_key: bool, host: &str) -> StatusAccess {
+    if has_api_key {
+        StatusAccess::Detailed
+    } else if super::is_loopback_host(host) {
+        StatusAccess::Minimal
+    } else {
+        StatusAccess::Forbidden
+    }
+}
+
 // ── Заголовки ───────────────────────────────────────────────────────────
 
 /// Значение заголовка только из видимого ASCII: чужой текст в заголовок не попадёт.
@@ -200,10 +253,11 @@ fn unix(time: SystemTime) -> u64 {
 pub(super) fn scrub(text: &str) -> String {
     text.split(' ')
         .map(|word| {
-            let bare = word.trim_matches(|c: char| "()[]<>\"',;".contains(c));
+            let bare = word.trim_matches(|c: char| "()<>\"',;".contains(c));
             if bare.contains("://") {
                 "<url>"
-            } else if looks_like_address(bare) {
+            } else if looks_like_address(bare) || looks_like_address(bare.trim_matches(['[', ']']))
+            {
                 "<addr>"
             } else {
                 word
@@ -311,6 +365,8 @@ pub fn status_body(snapshot: &GatewaySnapshot, detailed: bool) -> serde_json::Va
     let accounts: Vec<serde_json::Value> = snapshot
         .accounts
         .iter()
+        // Без ключа сервера подписки CLI и их имена не показываем.
+        .filter(|account| detailed || is_served(account))
         .map(|account| {
             let mut value = serde_json::json!({
                 "id": account.id.as_str(),
@@ -337,11 +393,17 @@ pub fn status_body(snapshot: &GatewaySnapshot, detailed: bool) -> serde_json::Va
         "generated_at_unix": unix(now),
         "gateway": { "enabled": true },
         "accounts": accounts,
-        "routes": snapshot.routes.iter().map(|route| serde_json::json!({
-            "id": route.id.as_str(),
-            "served": route_is_served(route, snapshot),
-            "steps": route.steps.iter().map(|s| s.account.as_str()).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        "routes": snapshot.routes.iter()
+            .filter(|route| detailed || route_is_served(route, snapshot))
+            .map(|route| serde_json::json!({
+                "id": route.id.as_str(),
+                "served": route_is_served(route, snapshot),
+                "steps": route.steps.iter()
+                    .filter(|s| detailed || snapshot.accounts.iter().any(|a| a.id == s.account && is_served(a)))
+                    .map(|s| s.account.as_str())
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
     });
     if detailed {
         body["decisions"] = snapshot.recent.iter().map(decision_json).collect();
@@ -366,6 +428,68 @@ mod tests {
 
     fn is_loopback(host: &str) -> bool {
         super::super::is_loopback_host(host)
+    }
+
+    #[test]
+    fn scrub_hides_urls_and_host_port_pairs() {
+        for (input, hidden) in [
+            (
+                "error sending request for url (http://10.0.0.5:8080/a/v1)",
+                "10.0.0.5",
+            ),
+            ("connect to 192.168.1.9:443 refused", "192.168.1.9"),
+            ("dial [::1]:8080 failed", "::1"),
+            ("lookup api.internal.example:8443 failed", "api.internal"),
+            ("peer 10.1.2.3 unreachable", "10.1.2.3"),
+        ] {
+            let text = scrub(input);
+            assert!(!text.contains(hidden), "{input} -> {text}");
+        }
+        assert_eq!(
+            scrub("rate limit exceeded, retry in 30s"),
+            "rate limit exceeded, retry in 30s"
+        );
+    }
+
+    #[test]
+    fn the_host_header_must_be_a_loopback_name_with_the_servers_port() {
+        let none: &[String] = &[];
+        for good in [
+            "127.0.0.1:7667",
+            "127.0.0.1",
+            "localhost:7667",
+            "LOCALHOST:7667",
+            "[::1]:7667",
+            "[::1]",
+        ] {
+            assert!(host_allowed(Some(good), 7667, none), "{good}");
+        }
+        for bad in [
+            "evil.example:7667",
+            "evil.example",
+            "127.0.0.1:80",
+            "localhost.evil.example:7667",
+            "127.0.0.1.evil.example",
+            "[::1",
+            "",
+        ] {
+            assert!(!host_allowed(Some(bad), 7667, none), "{bad}");
+        }
+        assert!(host_allowed(None, 7667, none), "HTTP/1.0 sends no Host");
+        let extra = vec!["proxy.lan".to_string()];
+        assert!(host_allowed(Some("proxy.lan:7667"), 7667, &extra));
+        assert!(host_allowed(Some("PROXY.LAN"), 7667, &extra));
+        assert!(!host_allowed(Some("proxy.lan:9"), 7667, &extra));
+        assert!(!host_allowed(Some("other.lan"), 7667, &extra));
+    }
+
+    #[test]
+    fn status_access_follows_the_key_and_the_bind_address() {
+        assert_eq!(status_access(true, "0.0.0.0"), StatusAccess::Detailed);
+        assert_eq!(status_access(false, "127.0.0.1"), StatusAccess::Minimal);
+        assert_eq!(status_access(false, "::1"), StatusAccess::Minimal);
+        assert_eq!(status_access(false, "0.0.0.0"), StatusAccess::Forbidden);
+        assert_eq!(status_access(false, "192.168.1.5"), StatusAccess::Forbidden);
     }
 
     #[test]

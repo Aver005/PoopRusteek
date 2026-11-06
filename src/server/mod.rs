@@ -70,6 +70,8 @@ pub struct ServerSettings {
     /// Emit an `AppEvent::ServerRequestLog` per request. On for proxy mode
     /// (the log IS the UI there); off for the TUI, which shows counters.
     pub request_log: bool,
+    /// Имена сверх loopback, разрешённые в заголовке `Host`.
+    pub allowed_hosts: Vec<String>,
     /// Живой шлюз. Выключенный — прежний путь по `entries` и `deepseek`.
     pub gateway: GatewayCell,
 }
@@ -106,6 +108,7 @@ impl ServerSettings {
             }),
             entries: config.providers.clone(),
             request_log: false,
+            allowed_hosts: config.server.allowed_hosts.clone(),
             gateway: GatewayCell::default(),
         }
     }

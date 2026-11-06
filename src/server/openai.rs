@@ -1613,6 +1613,7 @@ mod tests {
                 tools: Default::default(),
             }],
             request_log: false,
+            allowed_hosts: Vec::new(),
             gateway: Default::default(),
         }
     }

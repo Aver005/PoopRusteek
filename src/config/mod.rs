@@ -212,6 +212,10 @@ pub struct ServerConfig {
     /// `None`/empty = no auth (fine on loopback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Имена, по которым к серверу на loopback обращаются кроме `127.0.0.1`, `localhost`, `[::1]`
+    /// (заголовок `Host`; защита от DNS rebinding). Пусто — только они.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -248,6 +252,7 @@ impl Default for ServerConfig {
             port: default_server_port(),
             api: ServerApi::default(),
             api_key: None,
+            allowed_hosts: Vec::new(),
         }
     }
 }

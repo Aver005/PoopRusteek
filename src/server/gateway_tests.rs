@@ -1,6 +1,7 @@
 //! `/serve` через шлюз: настоящий локальный сервер с одной стороны, настоящий «апстрим» на TCP с другой.
 //! Проверяется то, что видит клиент: коды, поток, заголовки, расход, каталог, статус.
 
+use super::ServerSettings;
 use super::testkit::{
     Script, Stand, Upstream, engine, eventually, settings, start, start_with, upstream,
 };
@@ -581,7 +582,7 @@ async fn without_a_server_key_the_status_is_trimmed_and_only_on_loopback() {
     set_keys();
     let up = upstream(vec![("/a/", vec![text_stream(&["x"])])]).await;
     let gateway = engine(&config(up.port, false), Vec::new());
-    let loopback = start(gateway.clone(), None).await;
+    let loopback = start(gateway, None).await;
     let _ = post(&loopback, "a/m", false).await;
     let body: serde_json::Value = reqwest::get(format!("{}/v1/pooprusteek/status", loopback.base))
         .await
@@ -599,13 +600,6 @@ async fn without_a_server_key_the_status_is_trimmed_and_only_on_loopback() {
         "{account}"
     );
     assert!(account["status"].get("reason").is_none(), "{account}");
-
-    // Открытый на сеть сервер без ключа статус не отдаёт вовсе.
-    let open = start_with(settings(gateway, None, "0.0.0.0")).await;
-    let refused = reqwest::get(format!("{}/v1/pooprusteek/status", open.base))
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), 403);
 }
 
 #[tokio::test]
@@ -1024,4 +1018,137 @@ async fn an_error_response_does_not_claim_that_an_account_answered() {
     let response = post(&stand, "auto/main", false).await;
     assert_eq!(response.status(), 429);
     assert_eq!(header(&response, "x-pooprusteek-account"), None);
+}
+
+// ── Host (DNS rebinding) и доступ к статусу ─────────────────────────────
+
+async fn get_with_host(stand: &Stand, path: &str, host: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{}{path}", stand.base))
+        .header("host", host)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_foreign_host_header_is_refused_on_a_loopback_server() {
+    let (stand, _up) = stand(vec![("/a/", vec![text_stream(&["x"])])]).await;
+    let port = stand.base.rsplit(':').next().unwrap().to_string();
+    for path in ["/health", "/v1/models", "/v1/pooprusteek/status"] {
+        for host in [
+            "evil.example".to_string(),
+            format!("evil.example:{port}"),
+            "127.0.0.1:1".to_string(),
+        ] {
+            let response = get_with_host(&stand, path, &host).await;
+            assert_eq!(response.status(), 403, "{path} with Host {host}");
+        }
+        for host in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("[::1]:{port}"),
+        ] {
+            let response = get_with_host(&stand, path, &host).await;
+            assert_eq!(response.status(), 200, "{path} with Host {host}");
+        }
+    }
+    // Запрос чата с чужим именем тоже не доходит до апстрима.
+    let chat = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", stand.base))
+        .header("host", "evil.example")
+        .json(&serde_json::json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), 403);
+}
+
+#[tokio::test]
+async fn configured_names_are_allowed_and_the_key_is_still_checked() {
+    set_keys();
+    let up = upstream(vec![("/a/", vec![text_stream(&["x"])])]).await;
+    let mut s = settings(
+        engine(&config(up.port, false), Vec::new()),
+        Some("server-key"),
+        "127.0.0.1",
+    );
+    s.allowed_hosts = vec!["proxy.lan".to_string()];
+    let stand = start_with(s).await;
+    let port = stand.base.rsplit(':').next().unwrap().to_string();
+    let named = reqwest::Client::new()
+        .get(format!("{}/v1/models", stand.base))
+        .header("host", format!("proxy.lan:{port}"))
+        .bearer_auth("server-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(named.status(), 200);
+    // Своё имя не отменяет ключ.
+    let keyless = get_with_host(&stand, "/v1/models", &format!("proxy.lan:{port}")).await;
+    assert_eq!(keyless.status(), 401);
+    let foreign = reqwest::Client::new()
+        .get(format!("{}/v1/models", stand.base))
+        .header("host", "other.lan")
+        .bearer_auth("server-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 403);
+}
+
+#[test]
+fn a_blank_api_key_is_no_key_at_all() {
+    for blank in ["", "   ", "\t"] {
+        let mut config = crate::config::Config::default();
+        config.server.api_key = Some(blank.to_string());
+        assert_eq!(
+            ServerSettings::from_config(&config).api_key,
+            None,
+            "{blank:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_trimmed_status_hides_subscription_accounts_and_routes() {
+    set_keys();
+    let up = upstream(vec![("/a/", vec![text_stream(&["x"])])]).await;
+    let cli = FakeBackend::new(vec![Act::Reply("never")]);
+    let gateway = engine(
+        &config(up.port, true),
+        vec![Arc::new(CliFactory(Arc::clone(&cli)))],
+    );
+    let open = start(gateway.clone(), None).await;
+    let text = reqwest::get(format!("{}/v1/pooprusteek/status", open.base))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for hidden in ["sub", "oc", "cx", "cli:", "subscription", "opus"] {
+        assert!(
+            !text.contains(&format!("\"{hidden}")) && !text.contains(&format!("{hidden}\"")),
+            "{hidden} in {text}"
+        );
+    }
+    assert!(!text.contains("cli:"), "{text}");
+
+    let keyed = start(gateway, Some("server-key")).await;
+    let full: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/v1/pooprusteek/status", keyed.base))
+        .bearer_auth("server-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = full["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"sub") && ids.contains(&"a"), "{ids:?}");
 }
