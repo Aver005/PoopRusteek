@@ -109,6 +109,8 @@ impl App {
                 compacting: None,
                 deferred: Vec::new(),
                 fenced: false,
+                current_tool: None,
+                queued: std::collections::VecDeque::new(),
             });
         Ok(())
     }
@@ -281,6 +283,8 @@ impl App {
             compacting: None,
             deferred: Vec::new(),
             fenced: false,
+            current_tool: None,
+            queued: std::collections::VecDeque::new(),
         });
         self.state.scroll_offset = 0;
         self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();

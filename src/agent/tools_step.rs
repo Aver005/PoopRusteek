@@ -158,11 +158,42 @@ impl ToolExecContext<'_> {
 
     /// «Инструмент пошёл»: три ветки исполнения шлют это одинаково, каждая
     /// перед своей работой.
-    fn emit_tool_started(&self, name: &str) {
+    fn emit_tool_started(&self, name: &str, arguments: &serde_json::Value) {
         self.emit(AgentEvent::ToolStarted {
             name: name.to_string(),
+            summary: tool_call_summary(arguments),
         });
     }
+}
+
+/// Ключи аргументов, по которым узнаётся суть вызова, по убыванию важности.
+const SUMMARY_KEYS: [&str; 8] = [
+    "command",
+    "cmd",
+    "path",
+    "file_path",
+    "pattern",
+    "query",
+    "url",
+    "prompt",
+];
+/// Длина строки сути вызова в символах.
+const SUMMARY_CHARS: usize = 100;
+
+/// Одна короткая строка про вызов для панели работы: команда, путь, запрос.
+/// Пусто, если в аргументах нет ни одной строки.
+fn tool_call_summary(arguments: &serde_json::Value) -> String {
+    let text = SUMMARY_KEYS
+        .iter()
+        .find_map(|key| arguments.get(key).and_then(|value| value.as_str()))
+        .or_else(|| {
+            arguments
+                .as_object()?
+                .values()
+                .find_map(|value| value.as_str())
+        })
+        .unwrap_or_default();
+    crate::util::one_line_label(text, SUMMARY_CHARS)
 }
 
 /// Человек посмотрел и отказал.
@@ -204,7 +235,7 @@ fn manage_timer(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome
         return ToolOutcome::failed("Timers are not available to background agents.");
     }
     // «Пошёл» — только для правда запущенного: отказ сводка не считает.
-    ctx.emit_tool_started(TIMER_TOOL_NAME);
+    ctx.emit_tool_started(TIMER_TOOL_NAME, &call.arguments);
     let timers = ctx.tools.timers();
     let owner = ctx.conversation.0;
     let now = chrono::Local::now();
@@ -306,7 +337,7 @@ async fn ask_the_user(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolO
     let _ = ctx
         .event_tx
         .send(AppEvent::RequestQuestion(request.clone(), qs));
-    ctx.emit_tool_started(&call.name);
+    ctx.emit_tool_started(&call.name, &call.arguments);
     let answer = request.wait().await;
     if answer.is_empty() {
         ToolOutcome::failed("User cancelled the question")
@@ -348,7 +379,7 @@ async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOut
             "Started background sub-agent: {label}. Its result will be added to this conversation when it finishes; you are not woken up for it."
         ));
     }
-    ctx.emit_tool_started(TASK_TOOL_NAME);
+    ctx.emit_tool_started(TASK_TOOL_NAME, &call.arguments);
     crate::agent::sub_agent::run_task(ctx, &label, prompt).await
 }
 
@@ -370,7 +401,7 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
     if needs_approval && !ask_person(&call, ctx, person).await {
         return ToolOutcome::failed(DENIED_BY_USER);
     }
-    ctx.emit_tool_started(&call.name);
+    ctx.emit_tool_started(&call.name, &call.arguments);
     dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments).await
 }
 

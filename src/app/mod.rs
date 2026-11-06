@@ -62,7 +62,7 @@ fn status_for(event: &AgentEvent) -> Option<String> {
         AgentEvent::Started => "Thinking...".to_string(),
         AgentEvent::Done(_) => "Ready".to_string(),
         AgentEvent::Failed(error) => error.clone(),
-        AgentEvent::ToolStarted { name } => format!("Running {name}..."),
+        AgentEvent::ToolStarted { name, .. } => format!("Running {name}..."),
         AgentEvent::ToolDone { .. } => "Tool finished".to_string(),
         AgentEvent::ToolError { error } => format!("Tool error: {error}"),
         AgentEvent::ToolOutputCleared {
@@ -953,6 +953,7 @@ impl App {
             reduce::TurnTail::Background(error) => self.finish_background(target, error),
             reduce::TurnTail::Focused(_) => {
                 self.record_gen_stats();
+        let turn_ended = end.is_some();
                 self.auto_save_session();
             }
         }
@@ -976,6 +977,10 @@ impl App {
         let Some(conv) = self.state.conversations.get_mut(conversation) else {
             return;
         };
+        // Ход кончился, а человек успел набрать следующее — отправляем его.
+        if turn_ended {
+            self.send_next_queued(target).await;
+        }
         let Some(handle) = conv.agent_task.take() else {
             return;
         };
@@ -1011,11 +1016,17 @@ impl App {
         // The aborted task may have been a `/compact`: drop its claim here, or
         // the command stays refused for this chat forever.
         self.state.focused_mut().compacting = None;
-        self.state.status_message = if killed > 0 {
-            format!("Cancelled; killed {killed} background process(es)")
-        } else {
-            "Cancelled".to_string()
+        self.state.status_message = match (killed, queued) {
+            (0, 0) => "Cancelled".to_string(),
+            (0, n) => format!("Cancelled; {n} queued message(s) returned to the input"),
+            (k, 0) => format!("Cancelled; killed {k} background process(es)"),
+            (k, n) => format!(
+                "Cancelled; killed {k} background process(es), {n} queued message(s) returned to the input"
+            ),
         };
+        self.state.focused_mut().current_tool = None;
+        let queued = self.state.focused().queued.len();
+        self.restore_queued_to_input();
         self.state.needs_terminal_restore = true;
         {
             let focused = self.state.focused_mut();

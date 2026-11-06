@@ -1,7 +1,7 @@
 //! Единственное место, где событие хода агента меняет историю беседы.
 //! Зовут его все трое — фокусный чат, фоновый и безголовый харнесс.
 
-use crate::app::conversation::Conversation;
+use crate::app::conversation::{Conversation, ToolRun};
 use crate::app::events::AgentEvent;
 
 /// Чем кончился ход. Что делать дальше — решает вызывающий: фокусный чат
@@ -101,6 +101,7 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
     match event {
         AgentEvent::Started => {
             conversation.generation.begin(std::time::Instant::now());
+            conversation.current_tool = None;
             None
         }
         AgentEvent::BeginAssistantMessage => {
@@ -128,11 +129,13 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
             None
         }
         AgentEvent::Done(_) => {
+            conversation.current_tool = None;
             conversation.finish_turn("FINISHED");
             conversation.flush_deferred();
             turn_end(event)
         }
         AgentEvent::Failed(reason) => {
+            conversation.current_tool = None;
             conversation.finish_turn("ABORTED");
             // Причина остаётся в истории: строка состояния её забывала, а модель
             // следующего хода не знала, что прошлый оборвался.
@@ -142,12 +145,22 @@ pub fn apply(conversation: &mut Conversation, event: &AgentEvent) -> Option<Turn
             conversation.flush_deferred();
             turn_end(event)
         }
-        // Ход инструмента и сброс серверной сессии историю не трогают:
-        // это строка состояния и телеметрия.
-        AgentEvent::ToolStarted { .. }
-        | AgentEvent::ToolDone { .. }
-        | AgentEvent::ToolError { .. }
-        | AgentEvent::SessionReset { .. } => None,
+        // Инструмент историю не трогает (его результат придёт сообщением):
+        // это только «что делается сейчас» для панели работы.
+        AgentEvent::ToolStarted { name, summary } => {
+            conversation.current_tool = Some(ToolRun {
+                name: name.clone(),
+                summary: summary.clone(),
+                started: std::time::Instant::now(),
+            });
+            None
+        }
+        AgentEvent::ToolDone { .. } | AgentEvent::ToolError { .. } => {
+            conversation.current_tool = None;
+            None
+        }
+        // Сброс серверной сессии историю не трогает: строка состояния и телеметрия.
+        AgentEvent::SessionReset { .. } => None,
     }
 }
 
@@ -331,6 +344,7 @@ mod tests {
         for event in [
             AgentEvent::ToolStarted {
                 name: "bash".to_string(),
+                summary: "cargo test".to_string(),
             },
             AgentEvent::ToolDone {
                 result: "ок".to_string(),
@@ -417,5 +431,55 @@ mod tests {
         let mut conv = conversation();
         apply(&mut conv, &AgentEvent::ContextUsage(1234));
         assert_eq!(conv.context_used, 1234);
+    }
+
+    #[test]
+    fn a_running_tool_is_tracked_until_it_ends() {
+        let mut conv = conversation();
+        apply(
+            &mut conv,
+            &AgentEvent::ToolStarted {
+                name: "bash".to_string(),
+                summary: "cargo test".to_string(),
+            },
+        );
+        let run = conv.current_tool.as_ref().expect("tool is running");
+        assert_eq!(
+            (run.name.as_str(), run.summary.as_str()),
+            ("bash", "cargo test")
+        );
+        apply(
+            &mut conv,
+            &AgentEvent::ToolDone {
+                result: "ok".to_string(),
+            },
+        );
+        assert!(conv.current_tool.is_none());
+    }
+
+    #[test]
+    fn a_failed_tool_and_a_finished_turn_both_clear_the_running_tool() {
+        for ending in [
+            AgentEvent::ToolError {
+                error: "нет".to_string(),
+            },
+            AgentEvent::Failed("сеть".to_string()),
+            AgentEvent::Done(AgentResult {
+                text: String::new(),
+                tool_calls: Vec::new(),
+                truncated: None,
+            }),
+        ] {
+            let mut conv = conversation();
+            apply(
+                &mut conv,
+                &AgentEvent::ToolStarted {
+                    name: "grep".to_string(),
+                    summary: String::new(),
+                },
+            );
+            apply(&mut conv, &ending);
+            assert!(conv.current_tool.is_none(), "{ending:?}");
+        }
     }
 }

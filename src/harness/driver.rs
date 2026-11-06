@@ -851,7 +851,7 @@ impl Verdict {
     /// подтверждения: иначе `todo`, `task` и ход суб-агента не попадали в список.
     fn on_tool_event(&mut self, conversation: ConversationId, event: &AgentEvent) {
         match event {
-            AgentEvent::ToolStarted { name } => {
+            AgentEvent::ToolStarted { name, .. } => {
                 self.tools.push(ToolInvocation {
                     name: name.clone(),
                     approved: true,
@@ -1562,6 +1562,7 @@ mod tests {
         let root = ConversationId::next();
         let started = |name: &str| AgentEvent::ToolStarted {
             name: name.to_string(),
+            summary: String::new(),
         };
         verdict.on_tool_event(root, &started("task"));
         verdict.on_tool_event(root, &started("look › bash"));

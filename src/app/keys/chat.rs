@@ -4,8 +4,10 @@
 //! slash-command dispatch via `dispatch::apply_command_result`, or a plain
 //! message turn).
 
+use crate::app::conversation::{ConversationId, QueuedMessage};
 use crate::app::{App, AutocompleteState};
 use crate::error::AppResult;
+use crate::provider::AttachedFile;
 
 /// How `submit_input` left the turn: keep processing the key normally
 /// (refresh autocomplete), swallow the key, or quit the app.
@@ -70,13 +72,11 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.input.insert_newline();
             }
-            KeyCode::Enter if !self.state.focused_mut().generation.active => {
-                match self.submit_input().await? {
-                    SubmitOutcome::Continue => {}
-                    SubmitOutcome::Consumed => return Ok(false),
-                    SubmitOutcome::Quit => return Ok(true),
-                }
-            }
+            KeyCode::Enter => match self.submit_input().await? {
+                SubmitOutcome::Continue => {}
+                SubmitOutcome::Consumed => return Ok(false),
+                SubmitOutcome::Quit => return Ok(true),
+            },
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.insert_char(c);
             }
@@ -150,7 +150,8 @@ impl App {
     /// Handle plain Enter: backslash line-continuation, empty-goal nudges,
     /// then either goal-mode interception, a slash command, or a normal
     /// message turn (with `@file` expansion and attachments inlined for the
-    /// model but not the chat view).
+    /// model but not the chat view). Пока ход идёт, обычный текст встаёт в
+    /// очередь и уходит, когда ход кончится.
     async fn submit_input(&mut self) -> AppResult<SubmitOutcome> {
         let buf = &self.state.input.buffer;
         let ends_with_backslash = buf.chars().last().is_some_and(|c| c == '\\')
@@ -170,6 +171,15 @@ impl App {
         if input.is_empty() && (self.state.attached_files.is_empty() || self.state.goal.mode) {
             // Empty while defining a goal gets a nudge instead of silence.
             self.maybe_nudge_empty_goal();
+            return Ok(SubmitOutcome::Continue);
+        }
+
+        // Команды и ввод цели во время хода не ставим в очередь: у них свой
+        // порядок, и они меняют то, что ход читает. Текст остаётся в поле.
+        let turn_running = self.state.focused().generation.active;
+        if turn_running && (input.starts_with('/') || self.state.goal.mode) {
+            self.state.status_message =
+                "Commands wait for the turn to end — Esc cancels it".to_string();
             return Ok(SubmitOutcome::Continue);
         }
 
@@ -196,6 +206,18 @@ impl App {
                 ));
         }
 
+        if turn_running {
+            self.state.focused_mut().queued.push_back(QueuedMessage {
+                text: input,
+                files: chip_files,
+            });
+            self.state.status_message = format!(
+                "Queued ({}) — sent when the turn ends",
+                self.state.focused().queued.len()
+            );
+            return Ok(SubmitOutcome::Continue);
+        }
+
         // GOAL mode intercepts non-command input — the whole state machine
         // lives in goal.rs; `false` means goal mode just ended and the
         // input proceeds as a normal turn.
@@ -217,14 +239,31 @@ impl App {
         }
 
         let focused = self.state.conversations.focused_id();
-        let killed = self.state.background.cleanup_turn_of(focused).await;
+        self.send_user_text(focused, input, chip_files).await?;
+        Ok(SubmitOutcome::Continue)
+    }
+
+    /// Отправить текст человека ходом в беседе `conversation`: развернуть
+    /// `@файл`, собрать вложения и запустить ход. Общая точка для Enter и для
+    /// очереди сообщений.
+    pub(crate) async fn send_user_text(
+        &mut self,
+        conversation: ConversationId,
+        input: String,
+        chip_files: Vec<AttachedFile>,
+    ) -> AppResult<()> {
+        let killed = self.state.background.cleanup_turn_of(conversation).await;
         if killed > 0 {
             self.state.push_system(&format!(
                 "Cleaned {killed} ephemeral job(s) before the new turn."
             ));
         }
         let expanded = self.expand_file_mentions(&input);
-        let provider = self.state.focused().provider.clone();
+        let provider = self
+            .state
+            .conversations
+            .get(conversation)
+            .and_then(|conv| conv.provider.clone());
         let accepts = |path: &std::path::Path| {
             provider
                 .as_ref()
@@ -244,8 +283,42 @@ impl App {
         let message =
             crate::app::attachments::user_message(&expanded, &input, &files, &named, &accepts);
         // Человек написал сам — цепочка автоматических побудок оборвана.
-        self.reset_timer_wakes(self.state.conversations.focused_id());
-        self.send_focused_turn(Some(message)).await?;
-        Ok(SubmitOutcome::Continue)
+        self.reset_timer_wakes(conversation);
+        self.send_turn(conversation, Some(message)).await
+    }
+
+    /// Ход кончился: отправить следующее сообщение из очереди беседы, если оно есть.
+    pub(crate) async fn send_next_queued(&mut self, conversation: ConversationId) {
+        let Some(target) = self.state.conversations.get_mut(conversation) else {
+            return;
+        };
+        if target.is_busy() || target.is_background_kind() {
+            return;
+        }
+        let Some(next) = target.queued.pop_front() else {
+            return;
+        };
+        if let Err(error) = self
+            .send_user_text(conversation, next.text, next.files)
+            .await
+        {
+            self.state
+                .push_ui_system(&format!("Queued message failed: {error}"));
+        }
+    }
+
+    /// Esc во время хода: очередь не пропадает, а возвращается в поле ввода.
+    pub(crate) fn restore_queued_to_input(&mut self) {
+        let queued: Vec<String> = self
+            .state
+            .focused_mut()
+            .queued
+            .drain(..)
+            .map(|message| message.text)
+            .collect();
+        if queued.is_empty() {
+            return;
+        }
+        self.state.input.append_restored(&queued.join("\n"));
     }
 }

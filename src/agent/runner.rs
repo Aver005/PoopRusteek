@@ -1610,7 +1610,7 @@ mod tests {
                     ..
                 } => ended_with.push(tool_calls),
                 AppEvent::Agent {
-                    event: AgentEvent::ToolStarted { name },
+                    event: AgentEvent::ToolStarted { name, .. },
                     ..
                 } => ran_tools.push(name),
                 _ => {}

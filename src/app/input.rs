@@ -294,6 +294,20 @@ impl InputState {
     }
 
     /// Insert a newline at the cursor, replacing any selection first.
+    /// Вернуть в поле текст, который из него уже ушёл (очередь отменённого
+    /// хода): ниже того, что человек успел набрать, курсор в конце.
+    pub fn append_restored(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.buffer.is_empty() {
+            self.buffer.push('\n');
+        }
+        self.buffer.push_str(text);
+        self.cursor = self.buffer.chars().count();
+        self.selection_anchor = None;
+    }
+
     pub fn insert_newline(&mut self) {
         self.delete_selection();
         self.leave_chip();
@@ -946,5 +960,24 @@ two"
         s.insert_newline();
         assert!(s.buffer.starts_with("[📎 a.pdf]\n"), "{:?}", s.buffer);
         assert_eq!(s.chip_files().len(), 1);
+    }
+
+    #[test]
+    fn restored_text_goes_below_what_was_typed_and_moves_the_cursor_to_the_end() {
+        let mut input = InputState::default();
+        input.buffer = "typed".to_string();
+        input.cursor = 5;
+        input.append_restored("first\nsecond");
+        assert_eq!(input.buffer, "typed\nfirst\nsecond");
+        assert_eq!(input.cursor, input.buffer.chars().count());
+    }
+
+    #[test]
+    fn restoring_into_an_empty_input_adds_no_leading_newline() {
+        let mut input = InputState::default();
+        input.append_restored("only");
+        assert_eq!(input.buffer, "only");
+        input.append_restored("");
+        assert_eq!(input.buffer, "only");
     }
 }
