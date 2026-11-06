@@ -205,6 +205,11 @@ async fn handle_request(
     let started = std::time::Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    // Чужая страница CORS-заголовков не получает вовсе: ответ ей читать нельзя.
+    let page_origin = request.headers().get(header::ORIGIN).cloned();
+    let foreign_page = page_origin
+        .as_ref()
+        .is_some_and(|origin| !origin_is_allowed(&context, origin));
     let mut response = route(request, &context).await;
     if response.status().is_client_error() || response.status().is_server_error() {
         context.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -223,14 +228,17 @@ async fn handle_request(
             ),
         });
     }
-    // CORS only when a bearer token is configured — otherwise the browser's
-    // same-origin policy is the only thing stopping a page from reading replies.
-    if context.api_key.is_some() {
+    // CORS: с ключом — для всех; без ключа — только странице, чей `Origin` уже прошёл проверку
+    // (своя или из `allowed_hosts`). Иначе единственный барьер чтения ответа — политика браузера.
+    if !foreign_page && (context.api_key.is_some() || page_origin.is_some()) {
         let headers = response.headers_mut();
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            "*".parse().expect("static header value"),
+            page_origin
+                .clone()
+                .unwrap_or_else(|| "*".parse().expect("static header value")),
         );
+        headers.append(header::VARY, "Origin".parse().expect("static header value"));
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_METHODS,
             "GET, POST, OPTIONS".parse().expect("static header value"),
@@ -262,6 +270,19 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
                 ),
             );
         }
+    }
+
+    // Страница из браузера, чужая серверу, не пускается даже с верным ключом: простой кросс-доменный
+    // POST исполнился бы, даже если ответ ей недоступен (CSRF). Клиенты SDK `Origin` не шлют.
+    if let Some(origin) = request.headers().get(header::ORIGIN)
+        && !origin_is_allowed(context, origin)
+    {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &ErrorResponse::invalid_request(
+                "requests from other web pages are refused; add the page's host to [server] allowed_hosts to allow it",
+            ),
+        );
     }
 
     if request.method() == Method::OPTIONS {
@@ -313,6 +334,16 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
         }
     }
 
+    // Тело POST — только JSON: `text/plain` и формы шлёт «простой» запрос без предзапроса.
+    if request.method() == Method::POST && !is_json_content_type(request.headers()) {
+        return json_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            &ErrorResponse::invalid_request(
+                "POST bodies must be sent as Content-Type: application/json",
+            ),
+        );
+    }
+
     if request.method() == Method::GET
         && matches!(
             path.as_str(),
@@ -341,6 +372,23 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
             &ErrorResponse::invalid_request(format!("no route for {path}")),
         )
     })
+}
+
+/// Страница с таким `Origin` своя серверу или названа в `allowed_hosts`.
+fn origin_is_allowed(context: &ServerContext, origin: &header::HeaderValue) -> bool {
+    let port = context.bound_port.load(Ordering::Relaxed);
+    origin.to_str().is_ok_and(|origin| {
+        super::routing::origin_allowed(origin, port, &context.host, &context.allowed_hosts)
+    })
+}
+
+/// `Content-Type: application/json` (параметры вроде `charset` допустимы, регистр не важен).
+fn is_json_content_type(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// Статус шлюза. Ключ сервера уже проверен выше; без ключа отдаётся урезанный вид и только
@@ -489,6 +537,7 @@ mod tests {
         let bad = client
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth("sekret")
+            .header("content-type", "application/json")
             .body("{not json")
             .send()
             .await
@@ -570,5 +619,161 @@ mod tests {
             cors_headers_present(Some("sekret")).await,
             "api_key configured → CORS headers present (bearer check is the real gate)"
         );
+    }
+
+    /// Поднять сервер на свободном порту и вернуть адрес вместе с ручкой остановки.
+    async fn start(
+        settings: ServerSettings,
+    ) -> (
+        String,
+        crate::server::ServerHandle,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
+        let handle = spawn(settings, models, 1, event_tx);
+        let addr = match event_rx.recv().await {
+            Some(AppEvent::ServerStarted { addr, .. }) => addr,
+            _ => panic!("expected ServerStarted"),
+        };
+        (addr.to_string(), handle, event_rx)
+    }
+
+    fn chat_body() -> serde_json::Value {
+        serde_json::json!({"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    /// Простой кросс-доменный POST (`text/plain`) исполнился бы без предзапроса: сервер отказывает.
+    #[tokio::test]
+    async fn a_post_that_is_not_json_is_refused() {
+        let (addr, handle, _events) = start(test_settings(None)).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/chat/completions");
+        for content_type in [
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            None,
+        ] {
+            let mut request = client.post(&url).body(chat_body().to_string());
+            if let Some(value) = content_type {
+                request = request.header("content-type", value);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                415,
+                "{content_type:?}"
+            );
+        }
+        // Обычный клиент SDK: JSON, в том числе с параметром и в другом регистре.
+        for value in ["application/json", "Application/JSON; charset=utf-8"] {
+            let reply = client
+                .post(&url)
+                .header("content-type", value)
+                .body(chat_body().to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                reply.status(),
+                404,
+                "unknown model reaches the handler: {value}"
+            );
+        }
+        // Чтение (GET) типа тела не требует.
+        let models = client
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 200);
+        handle.request_shutdown();
+    }
+
+    /// Страница с чужим `Origin` отклоняется, даже если у неё есть верный ключ.
+    #[tokio::test]
+    async fn a_foreign_origin_is_refused_even_with_the_key() {
+        for api_key in [None, Some("sekret")] {
+            let (addr, handle, _events) = start(test_settings(api_key)).await;
+            let client = reqwest::Client::new();
+            let url = format!("http://{addr}/v1/chat/completions");
+            for origin in [
+                "https://evil.example",
+                "null",
+                "http://127.0.0.1:1",
+                "http://localhost",
+            ] {
+                let mut request = client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("origin", origin)
+                    .body(chat_body().to_string());
+                if let Some(key) = api_key {
+                    request = request.bearer_auth(key);
+                }
+                let reply = request.send().await.unwrap();
+                assert_eq!(reply.status(), 403, "{origin} with key {api_key:?}");
+                assert!(
+                    !reply.headers().contains_key("access-control-allow-origin"),
+                    "a refused page must not be allowed to read the reply"
+                );
+            }
+            let preflight = client
+                .request(reqwest::Method::OPTIONS, &url)
+                .header("origin", "https://evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(preflight.status(), 403);
+            handle.request_shutdown();
+        }
+    }
+
+    /// Своя страница сервера и имена из `allowed_hosts` проходят; клиенты без `Origin` не задеты.
+    #[tokio::test]
+    async fn own_pages_allowed_hosts_and_sdk_clients_pass() {
+        let mut settings = test_settings(None);
+        settings.allowed_hosts = vec!["webui.example".to_string()];
+        let (addr, handle, _events) = start(settings).await;
+        let port = addr.rsplit(':').next().unwrap().to_string();
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/chat/completions");
+        for origin in [
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+            "https://webui.example".to_string(),
+            "https://WebUI.example:8443".to_string(),
+        ] {
+            let reply = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("origin", &origin)
+                .body(chat_body().to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 404, "{origin} reaches the handler");
+            assert_eq!(
+                reply
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .map(|v| v.to_str().unwrap()),
+                Some(origin.as_str()),
+                "an allowed page reads the reply"
+            );
+        }
+        // SDK: без Origin, JSON; `/v1/embeddings` доходит до обработчика (нет провайдера → 404, не 415/403).
+        let embeddings = client
+            .post(format!("http://{addr}/v1/embeddings"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"model": "text-embedding-3-small", "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            ![403u16, 415].contains(&embeddings.status().as_u16()),
+            "{}",
+            embeddings.status()
+        );
+        handle.request_shutdown();
     }
 }

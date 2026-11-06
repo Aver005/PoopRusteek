@@ -342,6 +342,8 @@ impl App {
         self.gateway = gateway;
         self.pending_gateway = pending;
         self.provider_models.set_gateway(self.gateway.clone());
+        // Работающий /serve переходит на новый движок (в том числе на выключенный).
+        self.sync_server_gateway();
     }
 
     pub(crate) fn open_accounts(&mut self, focus: Focus) {
