@@ -181,7 +181,8 @@ const SUMMARY_KEYS: [&str; 8] = [
 const SUMMARY_CHARS: usize = 100;
 
 /// Одна короткая строка про вызов для панели работы: команда, путь, запрос.
-/// Пусто, если в аргументах нет ни одной строки.
+/// Значения секретных полей не берутся, а в самой строке секреты маскируются.
+/// Пусто, если в аргументах нет ни одной подходящей строки.
 fn tool_call_summary(arguments: &serde_json::Value) -> String {
     let text = SUMMARY_KEYS
         .iter()
@@ -189,11 +190,13 @@ fn tool_call_summary(arguments: &serde_json::Value) -> String {
         .or_else(|| {
             arguments
                 .as_object()?
-                .values()
-                .find_map(|value| value.as_str())
+                .iter()
+                .filter(|(name, _)| !super::redact::is_secret_name(name))
+                .find_map(|(_, value)| value.as_str())
         })
         .unwrap_or_default();
-    crate::util::one_line_label(text, SUMMARY_CHARS)
+    // Сначала маска, потом усечение: обрезка не должна оставить кусок секрета.
+    crate::util::one_line_label(&super::redact::redact_secrets(text), SUMMARY_CHARS)
 }
 
 /// Человек посмотрел и отказал.
@@ -569,5 +572,31 @@ mod tests {
     #[test]
     fn an_empty_result_stays_empty() {
         assert_eq!(summarize_tool_result(""), "");
+    }
+
+    #[test]
+    fn the_summary_never_shows_a_secret_field() {
+        let args = serde_json::json!({"access_token": "tok-123", "server": "main"});
+        let summary = tool_call_summary(&args);
+        assert_eq!(summary, "main");
+        let only_secret = serde_json::json!({"password": "hunter2"});
+        assert_eq!(tool_call_summary(&only_secret), "");
+    }
+
+    #[test]
+    fn the_summary_masks_secrets_inside_a_command() {
+        let args = serde_json::json!({"command": "deploy --token s3cr3t && API_KEY=abc run"});
+        let summary = tool_call_summary(&args);
+        assert!(summary.contains("deploy"), "{summary}");
+        assert!(
+            !summary.contains("s3cr3t") && !summary.contains("abc"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn the_summary_of_a_plain_command_is_unchanged() {
+        let args = serde_json::json!({"command": "cargo test items::range"});
+        assert_eq!(tool_call_summary(&args), "cargo test items::range");
     }
 }
