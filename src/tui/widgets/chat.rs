@@ -819,4 +819,36 @@ mod tests {
             .unwrap();
         assert_eq!(text_color(&terminal), Some(light.fg));
     }
+
+    /// Панель работы выросла на две строки: прокрученный вверх текст не прыгает.
+    #[test]
+    fn the_top_line_stays_put_when_the_transcript_gets_shorter() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = AppState::new(crate::app::conversation::Conversation::fresh_main(None));
+        for index in 0..40 {
+            state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::user(&format!("message number {index}")));
+        }
+        let theme = Theme::default_dark();
+        let first_row = |state: &AppState, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
+            terminal
+                .draw(|f| render_chat(f, f.area(), state, &theme))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
+
+        state.scroll_offset = 25;
+        let before = first_row(&state, 20);
+        state.scroll_offset = crate::tui::render::scroll_after_height_change(25, 20, 17);
+        let after = first_row(&state, 17);
+        assert_eq!(before.trim(), after.trim());
+        assert!(before.contains("message number"), "{before}");
+    }
 }

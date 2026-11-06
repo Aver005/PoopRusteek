@@ -9,7 +9,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Ширину панели задаёт раскладка: она же резервирует под неё место.
 const PANEL_W: usize = crate::tui::render::SIDEBAR_WIDTH as usize;
@@ -250,16 +250,12 @@ fn mcp_row_layout(
             crate::tui::glyphs::get().warn
         }
     );
-    let right_len = right.chars().count();
+    let right_len = UnicodeWidthStr::width(right.as_str());
     let left_budget = panel_w.saturating_sub(right_len + 4);
     let left_full = format!(" - {}", server_name);
-    let left: String = if left_full.chars().count() > left_budget {
-        left_full.chars().take(left_budget).collect()
-    } else {
-        left_full
-    };
+    let left = clip_cells(&left_full, left_budget);
     let gap = panel_w
-        .saturating_sub(left.chars().count() + right_len)
+        .saturating_sub(UnicodeWidthStr::width(left.as_str()) + right_len)
         .saturating_sub(4);
     (left, gap, right)
 }
@@ -277,8 +273,23 @@ fn section_header(lines: &mut Vec<Line<'static>>, title: &str, width: usize, the
     )]));
 }
 
+/// Обрезать до `max` клеток (не символов): широкие знаки занимают две.
+fn clip_cells(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > max {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out
+}
+
 fn data_row(lines: &mut Vec<Line<'static>>, label: &str, value: &str, theme: &Theme) {
-    let label_w = label.chars().count().min(10);
+    let label_w = UnicodeWidthStr::width(label).min(10);
     let pad = if label_w < 10 {
         " ".repeat(10 - label_w)
     } else {
@@ -383,5 +394,22 @@ mod tests {
         assert_eq!(left, "");
         assert_eq!(gap, 0);
         assert!(!right.is_empty());
+    }
+
+    #[test]
+    fn mcp_row_layout_counts_wide_characters_as_two_cells() {
+        // Три иероглифа — шесть клеток: строка не должна выйти за панель.
+        let (left, gap, right) = mcp_row_layout("世界世界世界世界世界", 12, true, 24);
+        let total =
+            UnicodeWidthStr::width(left.as_str()) + gap + UnicodeWidthStr::width(right.as_str());
+        assert!(total <= 24, "{left:?} {gap} {right:?}: {total} cells");
+        assert!(UnicodeWidthStr::width(left.as_str()) < 20);
+    }
+
+    #[test]
+    fn clip_cells_never_splits_a_wide_character() {
+        assert_eq!(clip_cells("世界", 3), "世");
+        assert_eq!(clip_cells("abc", 2), "ab");
+        assert_eq!(clip_cells("привет", 4), "прив");
     }
 }

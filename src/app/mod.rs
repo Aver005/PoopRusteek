@@ -233,6 +233,9 @@ pub struct AppState {
     pub error_count: usize,
     pub last_error: Option<String>,
     pub scroll_offset: u32,
+    /// Высота области переписки в прошлом кадре: от неё считается, на сколько
+    /// сдвинуть прокрутку, когда панель работы или поле ввода меняют высоту.
+    pub last_transcript_rows: u16,
     /// Высота терминала, обновляется на `Resize`. Клавиши приходят раньше
     /// отрисовки, а шаг `PageUp`/`PageDown` должен совпадать с экраном.
     pub terminal_rows: u16,
@@ -273,6 +276,8 @@ pub struct AppState {
     pub goal: goal::GoalState,
 
     pub needs_terminal_restore: bool,
+    /// Перерисовать всё без выхода из альтернативного экрана (`Ctrl+L`).
+    pub needs_full_redraw: bool,
     pub background: background_stats::BackgroundCounters,
     /// Сколько таймеров взведено — для строки состояния. Обновляется тем же
     /// тиком, что их и будит (`app::timers`).
@@ -333,6 +338,7 @@ impl AppState {
             error_count: 0,
             last_error: None,
             scroll_offset: 0,
+            last_transcript_rows: 0,
             terminal_rows: 0,
             terminal_cols: 0,
             modal: None,
@@ -356,6 +362,7 @@ impl AppState {
             goal: goal::GoalState::default(),
             timers_pending: 0,
             needs_terminal_restore: false,
+            needs_full_redraw: false,
             background: background_stats::BackgroundCounters::default(),
             provider_context_window: 0,
         }
@@ -736,10 +743,33 @@ impl App {
             dirty = true;
         }
 
+        self.keep_scroll_when_layout_changes();
+
+        if std::mem::take(&mut self.state.needs_full_redraw) {
+            // Только сброс буфера: выхода из альтернативного экрана не нужно.
+            terminal.clear()?;
+            dirty = true;
+        }
+
         if dirty {
             self.render(terminal)?;
         }
         Ok(false)
+    }
+
+    /// Человек читает историю с прокруткой вверх, а панель работы выросла или
+    /// ввод стал выше: область переписки сузилась, и без поправки текст уехал
+    /// бы на эти строки. Верхний край остаётся на месте.
+    fn keep_scroll_when_layout_changes(&mut self) {
+        let Some(rows) = crate::tui::render::transcript_rows(&self.state) else {
+            return;
+        };
+        self.state.scroll_offset = crate::tui::render::scroll_after_height_change(
+            self.state.scroll_offset,
+            self.state.last_transcript_rows,
+            rows,
+        );
+        self.state.last_transcript_rows = rows;
     }
 
     /// Does a tick actually change pixels? The spinner and elapsed-time stats

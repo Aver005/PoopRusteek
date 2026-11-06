@@ -73,7 +73,7 @@ impl App {
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Не стирает историю: перерисовка и прыжок вниз. Стирает `/clear`.
                 self.state.scroll_offset = 0;
-                self.state.needs_terminal_restore = true;
+                self.state.needs_full_redraw = true;
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.select_all();

@@ -143,6 +143,30 @@ fn chat_regions(state: &AppState, area: Rect) -> Regions {
     Regions::compute(area, &needs_for(state, area))
 }
 
+/// Высота области переписки в текущем размере окна. `None`, пока размер не
+/// известен или окно слишком мало для интерфейса.
+pub(crate) fn transcript_rows(state: &AppState) -> Option<u16> {
+    let (cols, rows) = (state.terminal_cols, state.terminal_rows);
+    if cols < MIN_COLS || rows < MIN_ROWS || state.view != View::Chat {
+        return None;
+    }
+    Some(
+        chat_regions(state, Rect::new(0, 0, cols, rows))
+            .transcript
+            .height,
+    )
+}
+
+/// Новая прокрутка (строки от низа), когда переписка стала `new` строк вместо
+/// `old`: верхняя строка остаётся той же. У самого низа (0) ничего не меняется —
+/// он приклеен. Ноль в `old` значит «прошлого кадра не было».
+pub(crate) fn scroll_after_height_change(offset: u32, old: u16, new: u16) -> u32 {
+    if offset == 0 || old == 0 {
+        return offset;
+    }
+    (i64::from(offset) + i64::from(old) - i64::from(new)).max(0) as u32
+}
+
 /// Область текста внутри переписки: слева поле, ширина ограничена.
 fn transcript_text_area(transcript: Rect) -> Rect {
     let x = transcript.x + TRANSCRIPT_LEFT_MARGIN.min(transcript.width);
@@ -438,5 +462,26 @@ mod tests {
                 .sidebar
                 .is_some()
         );
+    }
+
+    #[test]
+    fn the_scroll_follows_the_top_edge_when_the_transcript_changes_height() {
+        // Док вырос на две строки: переписка стала ниже, прокрутка выросла на две.
+        assert_eq!(scroll_after_height_change(10, 30, 28), 12);
+        // Док исчез: переписка выше, прокрутка меньше, но не ниже нуля.
+        assert_eq!(scroll_after_height_change(10, 28, 30), 8);
+        assert_eq!(scroll_after_height_change(1, 28, 30), 0);
+        // У низа — без изменений; без прошлого кадра — тоже.
+        assert_eq!(scroll_after_height_change(0, 30, 28), 0);
+        assert_eq!(scroll_after_height_change(7, 0, 28), 7);
+    }
+
+    #[test]
+    fn the_transcript_rows_shrink_when_the_dock_opens() {
+        let mut state = state_for(false, 100, 30);
+        let idle = transcript_rows(&state).expect("size known");
+        state.focused_mut().generation.active = true;
+        let working = transcript_rows(&state).expect("size known");
+        assert_eq!(idle - working, 1);
     }
 }
