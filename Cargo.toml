@@ -87,7 +87,7 @@ wasmtime = { version = "27", default-features = false, features = [
 # MCP OAuth: encrypted token storage, browser launch, PKCE challenge
 keyring = "4.2"
 open = "5"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # PTY for interactive CLI tools (arrow-key menus, REPLs)
 portable-pty = "0.9"
