@@ -45,6 +45,10 @@ impl App {
                     self.cancel_focused_turn().await;
                 } else if self.state.autocomplete.visible {
                     self.state.autocomplete = AutocompleteState::default();
+                } else if self.state.goal.is_setup_pending() {
+                    // Настройка цели — не история: её можно отменить, текст поля цел.
+                    self.state.goal.deactivate();
+                    self.state.status_message = "GOAL setup cancelled".to_string();
                 } else if !self.state.focused().queued.is_empty() {
                     // Очередь, что висит без хода (упавший ход), возвращается в поле.
                     let count = self.state.restore_queued_to_input();

@@ -117,6 +117,14 @@ pub fn visible_rows(buffer: &str, width: u16) -> u16 {
 /// Подсказка в пустом поле: зависит от того, что сейчас происходит.
 pub fn placeholder(state: &AppState) -> &'static str {
     let focused = state.focused();
+    if state.goal.is_setup_pending() {
+        use crate::app::events::GoalStage;
+        return if state.goal.stage == GoalStage::WaitForGoal {
+            "Your next message becomes the goal \u{2014} Esc cancels GOAL setup"
+        } else {
+            "GOAL setup: describe the task, then the goal \u{2014} Esc cancels"
+        };
+    }
     if focused.generation.active {
         if focused.queued.is_empty() {
             "Type a follow-up \u{2014} Enter queues it until the turn ends\u{2026}"
@@ -362,5 +370,17 @@ mod tests {
         let running = placeholder(&state);
         assert!(landing != chat && chat != running && landing != running);
         assert!(running.contains("queue"));
+    }
+
+    #[test]
+    fn goal_setup_says_the_next_message_becomes_the_goal() {
+        use crate::app::events::GoalStage;
+        let mut state = AppState::new(crate::app::conversation::Conversation::fresh_main(None));
+        state.goal.activate();
+        let first = placeholder(&state);
+        state.goal.stage = GoalStage::WaitForGoal;
+        let second = placeholder(&state);
+        assert!(second.contains("becomes the goal"), "{second}");
+        assert!(first.contains("GOAL setup") && first != second);
     }
 }

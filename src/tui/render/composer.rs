@@ -20,6 +20,12 @@ fn hint_variants(state: &AppState) -> &'static [&'static str] {
             "Enter accept \u{00B7} Esc close",
             "Esc close",
         ]
+    } else if state.goal.is_setup_pending() {
+        &[
+            "Enter send \u{00B7} Esc cancel GOAL setup",
+            "Esc cancel GOAL setup",
+            "Esc cancel",
+        ]
     } else if state.focused().generation.active {
         &[
             "Esc cancel \u{00B7} Enter queue \u{00B7} Shift+Enter newline",
