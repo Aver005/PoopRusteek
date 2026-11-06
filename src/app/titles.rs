@@ -55,7 +55,9 @@ pub(crate) fn title_prompt(messages: &[ChatMessage]) -> Option<String> {
 
 /// Кусок реплики: модель видит начало, не весь ход.
 fn snippet(text: &str) -> String {
-    crate::util::truncate_with_ellipsis(text.trim(), TITLE_SOURCE_BYTES)
+    // Запрос может уйти на другой аккаунт: секрет из реплики туда не попадает.
+    let safe = crate::secrets::redact::redact(text.trim());
+    crate::util::truncate_with_ellipsis(&safe, TITLE_SOURCE_BYTES)
 }
 
 /// Текст модели недоверенный: одна строка без разметки, кавычек и управления.
@@ -243,6 +245,23 @@ impl super::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_known_secret_in_the_chat_does_not_reach_the_title_account() {
+        let secret = crate::secrets::Secret::new("title-test-secret-value-9f3a71c2");
+        crate::secrets::redact::register(&secret);
+        let messages = [ChatMessage::new(
+            Role::User,
+            "use the key title-test-secret-value-9f3a71c2 please",
+        )];
+        let prompt = title_prompt(&messages).expect("prompt");
+        assert!(
+            !prompt.contains("title-test-secret-value-9f3a71c2"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("use the key"), "{prompt}");
+    }
+
     use crate::gateway::handle::{DisabledGateway, Gateway};
     use crate::gateway::testkit::{Act, FakeBackend, rig};
     use crate::provider::fake::FakeProvider;
