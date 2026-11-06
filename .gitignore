@@ -29,6 +29,7 @@ Thumbs.db
 *.env
 config.local.*
 secrets.*
+!src/**/secrets.rs
 /secrets.json
 *.pem
 *.key

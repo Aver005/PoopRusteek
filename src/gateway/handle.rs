@@ -273,6 +273,8 @@ pub enum Why {
     RouteExhausted,
     /// Маршрут или роль не используются из-за ошибки конфига.
     ConfigInvalid { message: String },
+    /// Шлюз ещё собирается (секреты читаются вне цикла событий); запросы ждут готовности.
+    Starting,
 }
 
 /// Запрос на выбор.
@@ -349,6 +351,7 @@ impl Decision {
             }
             (Some(t), _) => format!("{} · {}: the only candidate left", t.account, t.model),
             (None, Why::ConfigInvalid { message }) => format!("route is off: {message}"),
+            (None, Why::Starting) => "the gateway is starting; requests wait for it".to_string(),
             (None, _) => "no account available".to_string(),
         };
         if self.skipped.is_empty() {
@@ -504,6 +507,8 @@ pub enum ResolveError {
     Unknown(String),
     /// Шлюз выключен.
     Disabled,
+    /// Шлюз ещё собирается: повторить через мгновение.
+    Starting,
 }
 
 impl std::fmt::Display for ResolveError {
@@ -511,6 +516,7 @@ impl std::fmt::Display for ResolveError {
         match self {
             Self::Unknown(id) => write!(f, "unknown model or account '{id}'"),
             Self::Disabled => f.write_str("the gateway is disabled"),
+            Self::Starting => f.write_str("the gateway is still starting"),
         }
     }
 }

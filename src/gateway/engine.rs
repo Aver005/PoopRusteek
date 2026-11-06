@@ -59,8 +59,20 @@ impl std::fmt::Debug for Secret {
 /// Ошибка называет аккаунт и вид ссылки, но не значение.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SecretError {
-    Unsupported { account: String, scheme: String },
-    Missing { account: String, name: String },
+    Unsupported {
+        account: String,
+        scheme: String,
+    },
+    Missing {
+        account: String,
+        name: String,
+    },
+    /// Резолвер отказал: ключ не найден, не прочитан или не привязан к хосту аккаунта.
+    /// Текст называет секрет и причину, значения в нём нет.
+    Refused {
+        account: String,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for SecretError {
@@ -70,6 +82,7 @@ impl std::fmt::Display for SecretError {
                 f,
                 "account '{account}': secret scheme '{scheme}' needs the secret store"
             ),
+            Self::Refused { account, message } => write!(f, "account '{account}': {message}"),
             Self::Missing { account, name } => {
                 write!(
                     f,
@@ -85,11 +98,19 @@ impl std::fmt::Display for SecretError {
 pub trait SecretResolver: Send + Sync {
     /// Зовётся при сборке адаптера, не при разборе конфига.
     fn resolve(&self, reference: &SecretRef, account: &AccountId) -> Result<Secret, SecretError>;
+
+    /// То же для адаптера, который знает аккаунт целиком: резолвер вправе сверить адрес
+    /// (`base_url`) с привязкой секрета к хосту. По умолчанию — только по id.
+    fn resolve_for(&self, reference: &SecretRef, account: &Account) -> Result<Secret, SecretError> {
+        self.resolve(reference, &account.id)
+    }
 }
 
-/// Заглушка: понимает только `env:NAME` и `none`.
+/// Заглушка для тестов: понимает только `env:NAME` и `none`. Рабочий путь — `StoreResolver`.
+#[cfg(test)]
 pub struct EnvOnlyResolver;
 
+#[cfg(test)]
 impl SecretResolver for EnvOnlyResolver {
     fn resolve(&self, reference: &SecretRef, account: &AccountId) -> Result<Secret, SecretError> {
         let raw = reference.as_str();
@@ -169,7 +190,7 @@ fn resolve_api_key(
 ) -> Result<Option<String>, String> {
     let from_secret = |reference: &SecretRef| {
         secrets
-            .resolve(reference, &account.id)
+            .resolve_for(reference, account)
             .map(|secret| Some(secret.expose().to_string()).filter(|key| !key.is_empty()))
             .map_err(|error| error.to_string())
     };
@@ -256,7 +277,7 @@ impl EngineDeps {
         Self {
             data_dir: Some(Config::data_dir().join("gateway")),
             clock: Arc::new(SystemClock),
-            resolver: Arc::new(EnvOnlyResolver),
+            resolver: Arc::new(config.secret_resolver()),
             factories: vec![
                 Arc::new(BuiltinFactory::new(DeepseekSettings::from_config(config))),
                 Arc::new(super::cli::CliFactory::new()),
@@ -266,10 +287,16 @@ impl EngineDeps {
     }
 }
 
-/// Откуда движок берёт `GatewayConfig`. Пока `[gateway]` не встроен в `Config` (дорожка
-/// SECRETS), шлюз выключен: тело этой функции SECRETS заменит на чтение конфига.
-pub fn gateway_config(_config: &Config) -> GatewayConfig {
-    GatewayConfig::default()
+/// Откуда движок берёт `GatewayConfig`: `[gateway]`, `[[accounts]]`, `[[routes]]`, `[roles]`
+/// слитого конфига. Заблокированное в `Config` уже не лежит: недоверенный проектный слой ждёт
+/// `pooprusteek trust`, и его аккаунты, маршруты и роли до подтверждения сюда не попадают.
+/// Конфиг, который не загружен как есть (схема новее), шлюз не включает.
+pub fn gateway_config(config: &Config) -> GatewayConfig {
+    let mut gateway = config.gateway_config();
+    if config.source.blocked.is_some() {
+        gateway.gateway.enabled = false;
+    }
+    gateway
 }
 
 /// Шлюз для приложения: выключенный — прежнее поведение без единого лишнего объекта.
@@ -628,7 +655,17 @@ impl Core {
                 message: message.clone(),
             });
         }
-        let (Some(caps), Ok(backend)) = (runtime.caps.as_ref(), runtime.backend.as_ref()) else {
+        // Адаптер не собрался (секрет не прочитан, привязан к другому хосту, нет бинаря):
+        // причина видна в решении, а не прячется за «недоступен».
+        let backend = match runtime.backend.as_ref() {
+            Ok(backend) => backend,
+            Err(reason) => {
+                return skip(SkipReason::InvalidConfig {
+                    message: reason.clone(),
+                });
+            }
+        };
+        let Some(caps) = runtime.caps.as_ref() else {
             return skip(SkipReason::Unavailable);
         };
         let (status, returns_at, hint_deadline, limits) = match runtime.state.lock() {

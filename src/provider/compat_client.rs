@@ -198,13 +198,45 @@ pub(crate) struct CompatClient<P: CompatProtocol> {
     _protocol: PhantomData<P>,
 }
 
+/// Ответ-редирект как отказ. Ключ лежит в заголовке запроса, поэтому на другой адрес мы за
+/// сервером не идём: показываем, куда он зовёт, и просим поправить `base_url`.
+fn redirect_failure(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ProviderFailure> {
+    if !status.is_redirection() {
+        return None;
+    }
+    let target = headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| reqwest::Url::parse(raw).ok())
+        .map(|url| match url.port() {
+            Some(port) => format!("{}:{port}", url.host_str().unwrap_or("?")),
+            None => url.host_str().unwrap_or("?").to_string(),
+        })
+        .unwrap_or_else(|| "another address".to_string());
+    Some(ProviderFailure {
+        class: crate::provider::failure::FailureClass::BadRequest,
+        status: Some(status),
+        message: format!(
+            "the server redirected the request to {target}; redirects are not followed because the request carries an API key. Set the provider's base_url to the final address"
+        ),
+        limits: None,
+    })
+}
+
 impl<P: CompatProtocol> CompatClient<P> {
     pub fn new(entry: &ProviderEntry) -> AppResult<Self> {
         // Same envelope as the DeepSeek client: fail fast on dead endpoints;
         // a stalled read is the provider's error, named before the idle guard.
+        // Редиректы не следуем вовсе: ключ едет заголовком запроса (`x-api-key`, `x-goog-api-key`),
+        // а `reqwest` при смене хоста снимает только Authorization. Ответ-редирект
+        // становится понятной ошибкой (`redirect_failure`), ключ не уходит.
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .read_timeout(crate::provider::PROVIDER_READ_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(AppError::Http)?;
         Ok(Self {
@@ -253,6 +285,9 @@ impl<P: CompatProtocol> CompatClient<P> {
 
             let status = response.status();
             let headers = response.headers().clone();
+            if let Some(failure) = redirect_failure(status, &headers) {
+                return Err(AppError::Upstream(Box::new(failure)));
+            }
             let limits = P::parse_limits(&headers, std::time::SystemTime::now())
                 .filter(|limits| !limits.is_empty());
             self.remember_limits(limits.clone());
@@ -337,6 +372,9 @@ impl<P: CompatProtocol> LLMProvider for CompatClient<P> {
         .map_err(AppError::Http)?;
         let status = response.status();
         let headers = response.headers().clone();
+        if let Some(failure) = redirect_failure(status, &headers) {
+            return Err(AppError::Upstream(Box::new(failure)));
+        }
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             let message =

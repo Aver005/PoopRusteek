@@ -1,6 +1,7 @@
-# Needs `sandbox mock cli-fallback` running, POOPRUSTEEK_GATEWAY_TOML=sandbox/gateway/cli-then-api.toml
-# and POOPRUSTEEK_CLI_CLAUDE=mock:throttled (the "CLI" is `pooprusteek mock-cli`, it answers a 429; a quota refusal would leave an
-# "exhausted" hint in the data dir and the next repeat would start on the API account).
+# Needs `sandbox mock cli-fallback` running, the scenario run with
+# `--config sandbox/gateway/cli-then-api.toml`, POOPRUSTEEK_MOCK_KEY_API set (any value) and
+# POOPRUSTEEK_CLI_CLAUDE=mock:throttled (the "CLI" is `pooprusteek mock-cli` answering a 429; a quota
+# refusal would leave an "exhausted" hint in the data dir and the next repeat would start on the API account).
 name = "cli-refusal-falls-back-to-api"
 description = "The CLI account refuses with a limit, the turn completes on the API account and the trace says why"
 prompt = "What is two plus two?"

@@ -98,6 +98,9 @@ pub enum ProviderModelsAction {
 
 pub enum CommandResult {
     Handled,
+    /// Работа вне цикла событий (хранилище ключей, чтение файлов): задание идёт на
+    /// `spawn_blocking`, текст результата приходит в чат событием.
+    Detached(Box<dyn FnOnce() -> String + Send>),
     LoadSession(String),
     ResetProvider,
     Quit,
@@ -303,6 +306,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::serve::ServerCommand));
         self.register(Box::new(defs::provider_models::RefetchProvidersCommand));
         self.register(Box::new(defs::provider_models::CacheProvidersCommand));
+        self.register(Box::new(defs::secrets::SecretsCommand));
+        self.register(Box::new(defs::doctor::DoctorCommand));
         self.register(Box::new(defs::update::UpdateCommand));
         self.register(Box::new(defs::update::AutoUpdateCommand));
 

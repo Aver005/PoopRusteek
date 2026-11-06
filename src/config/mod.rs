@@ -1,7 +1,44 @@
 use crate::error::{AppError, AppResult};
+use crate::gateway::types::{Account, GatewaySettings, Roles, Route};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+
+mod describe;
+pub mod fields;
+mod layers;
+mod load;
+mod lock;
+mod migrate;
+mod paths;
+pub mod protect;
+mod queue;
+mod startup;
+mod write;
+
+/// Новейшая схема `[gateway]`, которую понимает эта сборка.
+pub const GATEWAY_SCHEMA: u32 = 1;
+
+pub use layers::{Layer, LayerInfo, LayerStatus, looks_like_key};
+pub use load::{
+    ConfigSource, SecretsConfig, TrustConfig, bind_secret_host, file_references,
+    inline_secret_labels, link_secret_reference, project_key, trust_project, untrust_project,
+    wipe_secrets_and_files,
+};
+pub use paths::{
+    is_isolated, legacy_config_path as legacy_config_file, legacy_data_dir,
+    set_explicit_config as mark_explicit_config,
+};
+pub use queue::{enable_background_saves, flush_saves};
+
+/// Почему `/wipe` сейчас нельзя: прогон с `--config`/`--data-dir` не должен трогать настоящие папки,
+/// а `/wipe` сносит и старые места данных.
+pub fn wipe_blocked_reason(isolated: bool) -> Option<&'static str> {
+    isolated.then_some(
+        "/wipe is disabled in runs with --config or --data-dir: it would delete your real data folders",
+    )
+}
+pub use startup::{after_verified_load, prepare_data_dir as choose_data_dir};
+pub use write::restrict_to_owner;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -45,6 +82,25 @@ pub struct Config {
     /// Self-update from GitHub Releases (stable/dev channel) — see `crate::update`.
     #[serde(default)]
     pub update: UpdateConfig,
+    /// `[gateway]`, `[[accounts]]`, `[[routes]]`, `[roles]` — модель данных шлюза.
+    /// Шлюз выключен, пока `gateway.enabled = false`.
+    #[serde(default, skip_serializing_if = "load::gateway_is_default")]
+    pub gateway: GatewaySettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<Account>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<Route>,
+    #[serde(default, skip_serializing_if = "load::roles_empty")]
+    pub roles: Roles,
+    /// `[secrets]` — подтверждённые хосты секретов. Только в общем слое.
+    #[serde(default, skip_serializing_if = "SecretsConfig::is_empty")]
+    pub secrets: SecretsConfig,
+    /// `[trust.projects]` — проектные конфиги, которые человек подтвердил (путь → хэш содержимого).
+    #[serde(default, skip_serializing_if = "TrustConfig::is_empty")]
+    pub trust: TrustConfig,
+    /// Откуда загружен конфиг. Не ключ файла.
+    #[serde(skip)]
+    pub source: ConfigSource,
     /// What a migration changed while loading this file. Never a config key —
     /// `App::new` shows these once so a moved setting is not applied silently.
     #[serde(skip)]
@@ -140,7 +196,7 @@ impl ProviderModelsConfig {
 /// `[server]` — the local HTTP API gateway (`/serve on`, `--serve`).
 /// Exposes every configured provider (built-in DeepSeek + `/providers`
 /// entries) behind one endpoint speaking `api`'s wire dialect.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Bind address. Loopback by default — exposing a keyless gateway to
     /// paid/authed upstreams on a LAN must be an explicit decision.
@@ -156,6 +212,25 @@ pub struct ServerConfig {
     /// `None`/empty = no auth (fine on loopback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("api", &self.api)
+            .field("api_key", &mask(self.api_key.as_deref()))
+            .finish()
+    }
+}
+
+/// Для `Debug`: ключ не печатается, видно только «есть или нет».
+fn mask(secret: Option<&str>) -> &'static str {
+    match secret {
+        Some(text) if !text.is_empty() => "<secret>",
+        _ => "<none>",
+    }
 }
 
 fn default_server_host() -> String {
@@ -224,7 +299,7 @@ impl ServerApi {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(default = "default_provider_kind")]
     pub kind: ProviderKind,
@@ -242,6 +317,20 @@ pub struct ProviderConfig {
     /// порог (`40005`), а новой сборки ещё нет. Пусто — встроенная версия.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("kind", &self.kind)
+            .field("token", &mask(Some(&self.token)))
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("client_version", &self.client_version)
+            .finish()
+    }
 }
 
 fn default_provider_kind() -> ProviderKind {
@@ -317,7 +406,7 @@ impl ProviderProtocol {
 }
 
 /// One `/providers`-managed endpoint (OpenAI- or Anthropic-compatible).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderEntry {
     /// Unique display name; also the `active_provider` key. The name
     /// `"deepseek"` is reserved for the built-in provider.
@@ -343,6 +432,19 @@ pub struct ProviderEntry {
     /// см. `ToolProtocol`.
     #[serde(default)]
     pub tools: ToolProtocol,
+}
+
+impl std::fmt::Debug for ProviderEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderEntry")
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &mask(self.api_key.as_deref()))
+            .field("model", &self.model)
+            .field("protocol", &self.protocol)
+            .field("tools", &self.tools)
+            .finish()
+    }
 }
 
 /// Как этой записи объявлять инструменты.
@@ -885,11 +987,14 @@ impl Config {
         }
     }
 
+    /// Куда пишется конфиг: файл из `--config`, иначе общий `~/.pooprusteek/config.toml`.
     pub fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("pooprusteek")
-            .join("config.toml")
+        paths::write_target()
+    }
+
+    /// Общий конфиг пользователя, независимо от `--config`.
+    pub fn global_path() -> PathBuf {
+        paths::global_config_path()
     }
 
     /// Where every piece of user data lives: sessions, the rollback journal,
@@ -898,9 +1003,9 @@ impl Config {
     /// env override, so a harness run would otherwise write into the real
     /// user's data.
     pub fn data_dir() -> PathBuf {
-        match DATA_DIR_OVERRIDE.get() {
+        match paths::DATA_DIR_OVERRIDE.get() {
             Some(path) => path.clone(),
-            None => default_data_dir(),
+            None => paths::effective_data_dir(),
         }
     }
 
@@ -909,27 +1014,19 @@ impl Config {
     }
 }
 
-/// Папка данных, заданная флагом `--data-dir`. Ставится один раз в `main`,
-/// раньше всего, что читает [`Config::data_dir`].
-static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-
-fn default_data_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("pooprusteek")
-}
-
 /// Увести пользовательские данные процесса в другую папку. Зовётся из `main`
 /// до `logging::setup` и `checkpoints::Store::init` — оба читают
 /// [`Config::data_dir`] на старте, и переопределение обязано их опередить.
 pub fn set_data_dir(path: &Path) -> AppResult<()> {
     let resolved = prepare_data_dir(path)?;
-    DATA_DIR_OVERRIDE.set(resolved).map_err(|path: PathBuf| {
-        AppError::Config(format!(
-            "data directory is already set to {}",
-            path.display()
-        ))
-    })
+    paths::DATA_DIR_OVERRIDE
+        .set(resolved)
+        .map_err(|path: PathBuf| {
+            AppError::Config(format!(
+                "data directory is already set to {}",
+                path.display()
+            ))
+        })
 }
 
 /// Развернуть путь в абсолютный и создать папку. Абсолютный — потому что
@@ -988,59 +1085,7 @@ pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
     Ok(config)
 }
 
-/// `--config <file>` when given, the user's real config otherwise.
-pub fn load_from_optional(explicit: Option<&std::path::Path>) -> AppResult<Config> {
-    match explicit {
-        Some(path) => load_from(path),
-        None => load(),
-    }
-}
-
-/// Load from an explicit file instead of the user's real config. Used by
-/// `--config`, so a harness run can point at a throwaway token and data set
-/// without touching the config the TUI uses.
-pub fn load_from(path: &std::path::Path) -> AppResult<Config> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| AppError::Config(format!("{}: {e}", path.display())))?;
-    parse(&content).map_err(|e| AppError::Config(format!("{}: {e}", path.display())))
-}
-
-pub fn load() -> AppResult<Config> {
-    let path = Config::path();
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    let content = std::fs::read_to_string(&path).map_err(|e| AppError::Config(e.to_string()))?;
-    parse(&content).map_err(|e| AppError::Config(e.to_string()))
-}
-
-/// Сохранить настройки, а отказ вернуть готовым для показа текстом.
-/// Одна формулировка на все панели: копий было шестнадцать.
-pub fn save_or_message(config: &Config) -> Result<(), String> {
-    save(config).map_err(|error| format!("Failed to save config: {error}"))
-}
-
-pub fn save(config: &Config) -> AppResult<()> {
-    let path = Config::path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| AppError::Config(e.to_string()))?;
-    }
-    let content = toml::to_string_pretty(config).map_err(|e| AppError::Config(e.to_string()))?;
-    crate::util::atomic_write(&path, content.as_bytes())
-        .map_err(|e| AppError::Config(e.to_string()))?;
-
-    // The config file holds the DeepSeek token in plaintext — restrict it to
-    // the owner. No-op on Windows, which has no POSIX mode bits; ACLs are a
-    // separate concern out of scope for this fix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&path, perms).map_err(|e| AppError::Config(e.to_string()))?;
-    }
-
-    Ok(())
-}
+pub use load::{load, load_from_optional, save, save_or_message};
 
 #[cfg(test)]
 mod tests {
@@ -1051,6 +1096,12 @@ mod tests {
         agent.rate_limit_ms = rate_limit_ms;
         agent.rate_limit_per_minute = rate_limit_per_minute;
         agent
+    }
+
+    #[test]
+    fn wipe_is_blocked_in_an_isolated_run_and_allowed_otherwise() {
+        assert!(wipe_blocked_reason(true).is_some_and(|r| r.contains("--config")));
+        assert!(wipe_blocked_reason(false).is_none());
     }
 
     #[test]
@@ -1492,7 +1543,7 @@ mod tests {
         // places a legacy config reaches the app.
         let path = std::env::temp_dir().join("pooprusteek-legacy-auto-compact-test.toml");
         std::fs::write(&path, "[agent]\nauto_compact = false\n").unwrap();
-        let loaded = load_from(&path);
+        let loaded = load::load_from(&path);
         let _ = std::fs::remove_file(&path);
 
         let loaded = loaded.unwrap();

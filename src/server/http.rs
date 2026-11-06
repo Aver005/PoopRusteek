@@ -73,6 +73,8 @@ impl ServerContext {
         // Passthrough calls (embeddings/rerank) can be slow on big batches;
         // give them a generous read timeout, fail fast on dead endpoints.
         let http_client = reqwest::Client::builder()
+            // Ключ записи уходит заголовком: за редиректом на другой хост не идём.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             // Пакет эмбеддингов на CPU бывает долгим: срок щедрее, чем у чата.
             .read_timeout(std::time::Duration::from_secs(300))

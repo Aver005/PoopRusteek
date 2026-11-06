@@ -24,6 +24,7 @@ mod engine_tests;
 pub mod handle;
 pub mod history;
 pub mod ledger;
+pub mod pending;
 pub mod routed;
 #[cfg(test)]
 mod routed_tests;
@@ -31,3 +32,5 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod types;
+#[cfg(test)]
+mod wiring_tests;

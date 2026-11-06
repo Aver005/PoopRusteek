@@ -52,6 +52,8 @@ clap = { version = "4", features = ["derive"] }
 
 # Config
 toml = "1"
+# Точечная правка TOML: комментарии и порядок ключей переживают сохранение.
+toml_edit = "0.25"
 dirs = "7"
 
 # Logging / tracing

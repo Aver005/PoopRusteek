@@ -139,6 +139,19 @@ pub enum AgentEvent {
     ContextUsage(u32),
 }
 
+/// Итог сборки движка шлюза: сам движок или причина, по которой задача не дошла до конца.
+#[derive(Clone)]
+pub struct BuiltGateway(pub Result<crate::gateway::handle::GatewayHandle, String>);
+
+impl std::fmt::Debug for BuiltGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Ok(_) => f.write_str("BuiltGateway(ready)"),
+            Err(reason) => write!(f, "BuiltGateway(failed: {reason})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     // TUI events
@@ -306,6 +319,9 @@ pub enum AppEvent {
 
     /// Событие шлюза аккаунтов (смена статуса, лимиты, переход на запасной).
     Gateway(crate::gateway::handle::GatewayEvent),
+
+    /// Движок шлюза собран на `spawn_blocking`: секреты прочитаны вне цикла событий.
+    GatewayBuilt(BuiltGateway),
 
     /// A self-update pass (manual `/update` or the startup auto-check)
     /// finished — see `crate::update`. With `notable: false` (startup check
