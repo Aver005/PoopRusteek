@@ -64,7 +64,12 @@ async-trait = "0.1"
 
 # Markdown / syntax
 pulldown-cmark = "0.13"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "default-themes",
+    "regex-fancy",
+] }
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }
