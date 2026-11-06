@@ -276,6 +276,16 @@ pub enum AppEvent {
 
     // API server lifecycle (`/serve`, `--serve`). Each event carries the
     // launch generation so a replaced server's late events can't clobber
+    /// Фоновое чтение списка сессий для главного экрана закончилось.
+    LandingSessionsLoaded(Vec<crate::session::SessionSummary>),
+
+    /// Фоновый скан папки для `@путь` закончился. `generation` — номер
+    /// запроса: ответ на устаревший запрос отбрасывается.
+    AutocompleteReady {
+        generation: u64,
+        items: Vec<crate::commands::CommandSuggestion>,
+    },
+
     // the handle of its successor.
     /// The server task bound its listener and is accepting requests.
     ServerStarted {

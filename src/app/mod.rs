@@ -402,6 +402,13 @@ impl App {
         crate::logging::set_error_sink(event_tx.clone());
 
         let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
+    /// Номер скана папки, чей ответ ждём (0 — никакой). Ответ с другим
+    /// номером устарел; см. `AppEvent::AutocompleteReady`.
+    pub wanted: u64,
+    /// Скан папки идёт: новые нажатия лишь помечают `rescan`, а не плодят задачи.
+    pub scanning: bool,
+    /// Пока шёл скан, ввод изменился.
+    pub rescan: bool,
 
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let tools = Arc::new(ToolRegistry::new());
@@ -907,6 +914,10 @@ impl App {
         }
         self.maybe_refetch_provider_models();
     }
+            AppEvent::LandingSessionsLoaded(sessions) => self.state.landing.apply(sessions),
+            AppEvent::AutocompleteReady { generation, items } => {
+                self.on_autocomplete_ready(generation, items);
+            }
 
     /// Единственный вход агентских событий: историю меняет `reduce`, здесь
     /// остаётся хвост — фон и фокус расходятся ровно в нём.
