@@ -7,7 +7,8 @@
 # layer, and `docker history` never sees it.
 set -euo pipefail
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pooprusteek"
+# Общий конфиг лежит в ~/.pooprusteek (старое место ~/.config/pooprusteek только копируется при переносе).
+CONFIG_DIR="$HOME/.pooprusteek"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 TEMPLATE="${POOPRUSTEEK_CONFIG_TEMPLATE:-/opt/sandbox/config.template.toml}"
 
