@@ -42,17 +42,12 @@ impl App {
                     || self.state.focused().agent_task.is_some()
                 {
                     self.cancel_focused_turn().await;
-                } else if self.state.focused_mut().messages.is_empty() {
-                    let _ = self.state.background.shutdown_all().await;
-                    return Ok(true);
+                } else if self.state.autocomplete.visible {
+                    self.state.autocomplete = AutocompleteState::default();
                 } else {
-                    // Esc with no active turn clears the chat; if a goal was mid
-                    // setup, clear that too so we don't orphan its state.
-                    if self.state.goal.mode {
-                        self.state.goal.deactivate();
-                    }
-                    self.state.focused_mut().messages.clear();
-                    self.state.scroll_offset = 0;
+                    // В простое Esc ничего не стирает и не выходит: чат чистит
+                    // только `/clear`, выход — Ctrl+C.
+                    self.state.input.selection_anchor = None;
                 }
             }
             KeyCode::Tab => {
@@ -65,8 +60,9 @@ impl App {
                 self.state.show_stats_panel = !self.state.show_stats_panel;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.focused_mut().messages.clear();
+                // Не стирает историю: перерисовка и прыжок вниз. Стирает `/clear`.
                 self.state.scroll_offset = 0;
+                self.state.needs_terminal_restore = true;
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.select_all();

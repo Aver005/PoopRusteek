@@ -45,8 +45,9 @@ impl HelpCommand {
 
         out.push_str(
             "\nKeyboard shortcuts:\n\
+             \x20 Esc            — Cancel generation (does nothing when idle)\n\
              \x20 Ctrl+C         — Cancel generation (if active), otherwise quit\n\
-             \x20 Ctrl+L         — Clear chat\n\
+             \x20 Ctrl+L         — Redraw the screen and jump to the latest message\n\
              \x20 Enter          — Send message\n\
              \x20 Shift+Enter    — New line in prompt\n\
              \x20 `\\` + Enter   — New line in prompt (line continuation)\n\
