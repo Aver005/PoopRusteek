@@ -9,6 +9,11 @@ mod config;
 mod context;
 mod debug_log;
 mod error;
+#[expect(
+    dead_code,
+    reason = "контракты шлюза: потребители появятся в следующих дорожках"
+)]
+mod gateway;
 mod harness;
 mod instructions;
 mod logging;

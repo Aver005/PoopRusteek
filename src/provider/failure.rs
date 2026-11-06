@@ -34,7 +34,10 @@ pub enum FailureClass {
     ContentFilter,
     /// Запрос неверен сам по себе: на другом аккаунте будет то же.
     BadRequest,
-    #[expect(dead_code, reason = "читает шлюз, он ещё не подключён")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "читает шлюз, он ещё не подключён")
+    )]
     Cancelled,
     /// Ответ не разобрался.
     Protocol,
