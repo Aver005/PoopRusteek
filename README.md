@@ -73,7 +73,7 @@ Two subscriptions of one kind, step by step:
 > **Subscriptions and their terms.** Claude is supported **only through the real Claude Code CLI**; its token is never read, its usage endpoint is never called, and `cli:claude` is never served to other clients through `/serve`. Direct subscription tokens for other providers are opt-in behind an explicit warning — using them may break the provider's terms and get the account blocked. All CLI subscriptions (`cli:*`) are excluded from `/serve`: the gateway is for your own terminal, not a way to share a subscription.
 
 > [!NOTE]
-> **What was not verified in this release.** CLI adapters were exercised against a scripted stand-in (`pooprusteek mock-cli`) and their process environment was checked, but **two real logins of one CLI were never run side by side**. The Linux and macOS builds were not run here either (`cfg(unix)` code is compiled by CI, not locally), and **Codex does not work as a plain model** — it is direct-token only. Treat the first real subscription as a check, not a given.
+> **What was not verified in this release.** CLI adapters were exercised against a scripted stand-in (`pooprusteek mock-cli`) and their process environment was checked, but **two real logins of one CLI were never run side by side**. Linux and macOS pass the test suite in CI, but the real CLIs were only run on Windows, and **Codex does not work as a plain model** — it is direct-token only. Treat the first real subscription as a check, not a given.
 
 ### 🤖 Sub-agents
 Spin off isolated agents for sub-tasks — inspired by Claude Code.

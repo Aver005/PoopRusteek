@@ -39,10 +39,9 @@
   Нужны записанные потоки при исчерпанном 5-часовом/недельном окне и при
   лимите OpenCode Go, по строке в `CLAUDE_SAMPLES`/`OPENCODE_SAMPLES` и тест
   рядом. `→ src/gateway/cli/classify.rs`
-- `[?]` LOW — **код `cfg(unix)` не собран и не запущен на этой машине.**
-  `ProcessTree` (группа процессов), `Scratch` (права 0700/0600) повторяют
-  `tools/shell.rs`; типы проверены `rustc --target ...` (метаданные), тесты
-  `#[cfg(unix)]` прогонит CI. `→ src/gateway/cli/process.rs`,
+- `[?]` LOW — **код `cfg(unix)` проверен только тестами CI.** Linux и macOS зелёные на
+  `013aa93`, но `ProcessTree` и `Scratch` не гонялись с настоящими CLI вне Windows, а
+  релизная сборка всех целей в PR не идёт. `→ src/gateway/cli/process.rs`,
   `src/gateway/cli/launch.rs`, `src/secrets/*`
 - `[DEBT]` LOW — **`config::migrate_data_dir` не держит межпроцессный замок.**
   Итоговое ревью (`final-review-regressions` major-3) показало: два
