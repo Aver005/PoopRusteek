@@ -295,12 +295,15 @@ mod preview_tests {
     #[cfg(unix)]
     #[test]
     fn a_named_pipe_is_not_read_as_a_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("pipe");
+        let dir = std::env::temp_dir().join(format!("pooprusteek-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let _ = std::fs::remove_file(&fifo);
         let path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
         // SAFETY: путь — валидная C-строка, права обычные.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let refused = ensure_regular_file(&fifo, "pipe").unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(refused.contains("not a regular file"), "{refused}");
     }
 

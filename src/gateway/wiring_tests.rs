@@ -3,7 +3,7 @@
 //! у каждого свой ключ — и привязка секрета к хосту в адаптере.
 
 use super::engine::{EngineDeps, build_gateway, gateway_config};
-use super::handle::{CallSource, DecisionQuery, Gateway, GatewayHandle, SkipReason};
+use super::handle::{CallSource, DecisionQuery, GatewayHandle, SkipReason};
 use super::types::{Role, Severity, ToolMode};
 use crate::config::Config;
 use crate::provider::{ChatMessage, CompletionRequest};
