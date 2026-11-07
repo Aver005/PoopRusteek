@@ -127,8 +127,9 @@ pub(crate) fn active_sources(isolated: bool, data_dir_overridden: bool) -> Vec<S
 }
 
 pub fn load_mcp_config() -> HashMap<String, MCPServerConfig> {
+    // Юнит-тесты настоящие серверы разработчика не запускают никогда.
     let sources = active_sources(
-        crate::config::is_isolated(),
+        cfg!(test) || crate::config::is_isolated(),
         crate::config::data_dir_is_overridden(),
     );
     load_sources(&sources, &Roots::system(), &super::project::trusted_texts())

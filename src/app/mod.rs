@@ -654,7 +654,8 @@ impl App {
         // manager (sending a turn, the /mcp view) stay responsive while
         // servers connect. Counts and the semantic MCP corpus catch up via
         // the 2s stats poll and `McpInitialized`.
-        {
+        // Тесты не поднимают настоящие серверы пользователя и не ловят чужое событие в канале.
+        if !cfg!(test) {
             let mcp = Arc::clone(&mcp);
             let semantic = Arc::clone(&semantic);
             let event_tx = event_tx.clone();
