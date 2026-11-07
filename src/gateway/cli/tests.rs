@@ -327,9 +327,13 @@ async fn claude_runs_with_exactly_the_contract_argv_and_environment() {
         .collect();
     assert!(leaked.is_empty(), "parent variables leaked: {leaked:?}");
     assert_eq!(record["cwd_entries"], 0, "the working folder must be empty");
+    // На macOS временная папка — ссылка (`/var` → `/private/var`), а ребёнок видит настоящий путь.
+    let root = rig.scratch_root();
+    let real_root = root.canonicalize().expect("the folder exists");
+    let cwd = Path::new(record["cwd"].as_str().unwrap());
     assert!(
-        Path::new(record["cwd"].as_str().unwrap()).starts_with(rig.scratch_root()),
-        "the working folder is outside the project"
+        cwd.starts_with(&root) || cwd.starts_with(&real_root),
+        "the working folder is outside the project: {cwd:?}"
     );
     assert_eq!(record["system"], "SYS PROMPT");
     let stdin = record["stdin"].as_str().unwrap();

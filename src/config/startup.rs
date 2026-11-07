@@ -578,6 +578,8 @@ mod tests {
         let root = dir("cheap");
         let (old, new) = (root.join("old"), root.join("new"));
         put(&old.join("sessions/s1.json"), "first");
+        // Метка округляет время вниз до миллисекунды: в одну миллисекунду каталог кажется новее.
+        std::thread::sleep(Duration::from_millis(20));
         choose_data_dir(Some(old.clone()), new.clone());
         let since = migrate::marker_started(&new).unwrap();
         assert!(!migrate::sessions_dir_changed(&old, since));
