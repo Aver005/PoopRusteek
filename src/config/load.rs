@@ -647,6 +647,11 @@ pub fn save(config: &Config) -> AppResult<()> {
     }
 }
 
+/// Запись на месте, мимо очереди, с результатом: когда от успеха зависит следующий шаг. Блокирует.
+pub fn save_sync(config: &Config) -> AppResult<()> {
+    execute_job(prepare_job(config)?)
+}
+
 /// Запись на месте, мимо очереди: CLI и тесты.
 #[cfg(test)]
 pub(super) fn save_now(config: &Config) -> AppResult<()> {

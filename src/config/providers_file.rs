@@ -39,6 +39,39 @@ pub fn add_provider_at(
     })
 }
 
+/// Ключи записей так, как они лежат в файле: ссылкой или значением. В памяти ссылки уже развёрнуты.
+pub fn raw_api_keys_at(path: &Path) -> AppResult<std::collections::HashMap<String, String>> {
+    let text = match crate::util::read_text(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => {
+            return Err(AppError::Config(format!(
+                "{}: {}",
+                path.display(),
+                error.kind()
+            )));
+        }
+    };
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|error| AppError::Config(error.to_string()))?;
+    let mut keys = std::collections::HashMap::new();
+    for entry in table
+        .get("providers")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+    {
+        if let (Some(name), Some(key)) = (
+            entry.get("name").and_then(toml::Value::as_str),
+            entry.get("api_key").and_then(toml::Value::as_str),
+        ) {
+            keys.insert(name.to_string(), key.to_string());
+        }
+    }
+    Ok(keys)
+}
+
 /// Убрать запись (откат неудачного добавления).
 pub fn remove_provider_at(path: &Path, name: &str) -> AppResult<()> {
     edit(path, |_| {

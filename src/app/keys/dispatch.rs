@@ -185,6 +185,17 @@ impl App {
                 self.open_accounts(crate::app::gateway_view::Focus::Accounts);
                 self.enable_gateway();
             }
+            CommandResult::DisableGateway => {
+                self.open_accounts(crate::app::gateway_view::Focus::Accounts);
+                if self.gateway.is_enabled() {
+                    self.state.gateway_view.screen.confirm_disable = true;
+                } else {
+                    self.state
+                        .gateway_view
+                        .screen
+                        .say("The gateway is already off.");
+                }
+            }
             CommandResult::SetProviderTools { name, tools } => {
                 self.set_account_tools(&name, tools);
             }
@@ -634,5 +645,17 @@ mod tests {
         // Обратная сторона: обычный текст не страдает.
         app.state.push_ui_system("Pinned this chat to claude-max.");
         assert!(everything_said(&app).contains("claude-max"));
+    }
+
+    #[tokio::test]
+    async fn the_accounts_disable_command_asks_before_it_does_anything() {
+        let mut app = app().await;
+        let rig = crate::gateway::testkit::rig(crate::gateway::testkit::TWO_ACCOUNTS, Vec::new());
+        app.gateway = Arc::new(rig.engine);
+        app.apply_command_result(CommandResult::DisableGateway)
+            .await
+            .unwrap();
+        assert!(app.state.gateway_view.screen.confirm_disable);
+        assert!(app.gateway.is_enabled(), "nothing happened yet");
     }
 }

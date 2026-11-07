@@ -188,6 +188,10 @@ async fn the_off_screen_switches_the_active_provider_and_turns_the_gateway_on_on
     app.handle_accounts_key(press(KeyCode::Char('y')))
         .await
         .unwrap();
+    let next = enabled_event(&mut app)
+        .await
+        .expect("the enabling went through");
+    app.on_gateway_enabled(Ok(next));
     assert!(app.config.gateway.enabled, "confirmed");
     assert!(
         app.config.accounts.iter().any(|a| a.id.as_str() == "lm"),
@@ -521,6 +525,7 @@ async fn a_project_file_that_appears_or_vanishes_is_noticed_but_the_first_look_i
 #[tokio::test]
 async fn a_trust_question_postponed_by_another_modal_comes_back_on_the_tick() {
     let (mut app, _) = app_with_file("trust-later").await;
+    app.state.view = View::Chat;
     app.config.source.pending_trust = Some(crate::config::TrustRequest {
         config_path: "p/.pooprusteek/config.toml".into(),
         key: "k".into(),
@@ -571,7 +576,7 @@ async fn a_long_trust_list_cannot_be_trusted_by_tab_and_enter_alone() {
             .notice
             .as_deref()
             .unwrap_or("")
-            .contains("Read the whole list")
+            .contains("Show every line")
     );
     // Enter на отказе ничего не доверяет и закрывает диалог отказом.
     app.handle_trust_key(press(KeyCode::Enter), dialog)
@@ -579,7 +584,7 @@ async fn a_long_trust_list_cannot_be_trusted_by_tab_and_enter_alone() {
         .unwrap();
     assert!(app.state.modal.is_none());
     assert!(app.config.trust.projects.is_empty(), "nothing was trusted");
-    assert_eq!(app.state.gateway_view.project.denied.as_deref(), Some("h"));
+    assert!(app.state.gateway_view.project.denied.contains("h"));
 }
 
 // ── Вид ────────────────────────────────────────────────────────────────
@@ -606,4 +611,342 @@ async fn the_footer_names_the_model_that_answers_when_the_gateway_is_on() {
         app.gateway.snapshot().accounts[1].status,
         AccountStatus::Ready
     ));
+}
+
+// ── Включение и выключение шлюза ────────────────────────────────────────
+
+fn provider_with_key(name: &str, resolved: &str) -> ProviderEntry {
+    ProviderEntry {
+        api_key: Some(resolved.into()),
+        name: name.into(),
+        ..lm_entry()
+    }
+}
+
+async fn enabled_event(app: &mut App) -> Result<GatewayConfig, String> {
+    match next_event(app).await {
+        AppEvent::GatewayEnabled(result) => *result,
+        other => panic!("expected GatewayEnabled, got {other:?}"),
+    }
+}
+
+/// Ссылка из файла идёт в аккаунт как есть: ключ не теряется и значением в аккаунт не попадает.
+#[tokio::test]
+async fn enabling_carries_the_reference_of_a_key_as_it_is() {
+    let (mut app, path) = app_with_file("enable-refs").await;
+    std::fs::write(
+        &path,
+        "[[providers]]\nname = \"envp\"\nbase_url = \"http://a/v1\"\nmodel = \"m\"\napi_key = \"env:POOP_ENABLE_TEST_A\"\n\n\
+         [[providers]]\nname = \"keyp\"\nbase_url = \"http://b/v1\"\nmodel = \"m\"\napi_key = \"keyring:global/team-key\"\n\n\
+         [[providers]]\nname = \"cmdp\"\nbase_url = \"http://c/v1\"\nmodel = \"m\"\napi_key = \"cmd:[\\\"echo\\\", \\\"x\\\"]\"\n",
+    )
+    .unwrap();
+    for name in ["envp", "keyp", "cmdp"] {
+        let mut entry = provider_with_key(name, "resolved-value-0123456789");
+        entry.base_url = format!("http://{name}.invalid/v1");
+        app.config.providers.push(entry);
+    }
+    app.enable_gateway();
+    let next = enabled_event(&mut app).await.expect("enabled");
+    let secret = |id: &str| {
+        next.accounts
+            .iter()
+            .find(|a| a.id.as_str() == id)
+            .and_then(|a| a.secret.as_ref().map(|s| s.as_str().to_string()))
+    };
+    assert_eq!(secret("envp").as_deref(), Some("env:POOP_ENABLE_TEST_A"));
+    assert_eq!(secret("keyp").as_deref(), Some("keyring:global/team-key"));
+    assert!(secret("cmdp").unwrap().starts_with("cmd:"));
+    assert!(
+        next.accounts.iter().all(|a| a.api_key.is_none()),
+        "no key value in an account"
+    );
+    app.on_gateway_enabled(Ok(next));
+    assert!(app.config.gateway.enabled);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("env:POOP_ENABLE_TEST_A"), "{text}");
+    assert!(
+        !text.contains("resolved-value"),
+        "the resolved value never reaches the file: {text}"
+    );
+    assert_eq!(
+        text.matches("[[providers]]").count(),
+        3,
+        "the old entries stay: {text}"
+    );
+}
+
+/// Ключ, лежащий в файле значением, а хранилище не принимает: включение отменено целиком.
+#[tokio::test]
+async fn a_key_that_cannot_be_stored_cancels_the_enabling_and_changes_nothing() {
+    let (mut app, path) = app_with_file("enable-fail").await;
+    std::fs::write(
+        &path,
+        "[[providers]]\nname = \"plain\"\nbase_url = \"http://a/v1\"\nmodel = \"m\"\napi_key = \"inline-value-0123456789\"\n",
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    app.config
+        .providers
+        .push(provider_with_key("plain", "inline-value-0123456789"));
+    app.enable_gateway();
+    let result = enabled_event(&mut app).await;
+    assert!(result.is_err(), "the test store refuses writes");
+    app.on_gateway_enabled(result);
+    assert!(
+        !app.config.gateway.enabled && app.config.accounts.is_empty(),
+        "memory unchanged"
+    );
+    assert!(!app.gateway.is_enabled());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        before,
+        "the file is untouched"
+    );
+    let notice = app.state.gateway_view.screen.notice.clone().unwrap();
+    assert!(
+        notice.error
+            && notice.text.contains("was not turned on")
+            && notice.text.contains("still work"),
+        "{}",
+        notice.text
+    );
+    assert!(app.config.providers.iter().any(|p| p.name == "plain"));
+}
+
+#[tokio::test]
+async fn an_unreadable_config_file_cancels_the_enabling_too() {
+    let (mut app, path) = app_with_file("enable-unreadable").await;
+    // На месте файла каталог: прочитать записи нельзя.
+    std::fs::create_dir_all(&path).unwrap();
+    app.config
+        .providers
+        .push(provider_with_key("p", "value-0123456789"));
+    app.enable_gateway();
+    let result = enabled_event(&mut app).await;
+    assert!(result.is_err());
+    app.on_gateway_enabled(result);
+    assert!(!app.config.gateway.enabled);
+}
+
+#[tokio::test]
+async fn the_gateway_can_be_turned_off_from_the_screen_with_a_question() {
+    let mut app = two_accounts_app().await;
+    // Старый провайдер, на который чат вернётся.
+    app.config.providers.push(lm_entry());
+    app.config.active_provider = Some("lm".into());
+    app.pin_outcome("a").unwrap();
+    app.open_accounts(Focus::Accounts);
+
+    // Вопрос на `X`; всё, кроме `y`, оставляет шлюз включённым.
+    app.handle_accounts_key(press(KeyCode::Char('X')))
+        .await
+        .unwrap();
+    assert!(app.state.gateway_view.screen.confirm_disable);
+    app.handle_accounts_key(press(KeyCode::Char('n')))
+        .await
+        .unwrap();
+    assert!(app.gateway.is_enabled() && app.config.gateway.enabled);
+
+    app.handle_accounts_key(press(KeyCode::Char('X')))
+        .await
+        .unwrap();
+    app.handle_accounts_key(press(KeyCode::Char('y')))
+        .await
+        .unwrap();
+    let AppEvent::GatewayDisabled(result) = next_event(&mut app).await else {
+        panic!("expected GatewayDisabled");
+    };
+    app.on_gateway_disabled(*result);
+
+    assert!(!app.gateway.is_enabled() && !app.config.gateway.enabled);
+    assert_eq!(app.config.accounts.len(), 2, "accounts are kept, not lost");
+    assert!(
+        app.state.gateway_view.pins.is_empty(),
+        "the pin goes with the accounts"
+    );
+    assert!(
+        app.state.focused().provider.is_some(),
+        "the open chat is back on a provider"
+    );
+    let notice = app.state.gateway_view.screen.notice.clone().unwrap();
+    assert!(notice.text.contains("Gateway is off"), "{}", notice.text);
+}
+
+// ── Экран из инструмента агента ─────────────────────────────────────────
+
+fn trust_request(name: &str) -> crate::config::TrustRequest {
+    crate::config::TrustRequest {
+        config_path: format!("p/{name}.json").into(),
+        key: format!("key-{name}"),
+        hash: match name {
+            "only" => "h".to_string(),
+            other => format!("hash-{other}"),
+        },
+        held_back: vec![format!("MCP server {name} runs a program")],
+        summary: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn a_screen_started_from_an_agent_tool_turns_nothing_on_and_stores_no_secret() {
+    let (mut app, path) = app_with_file("restricted").await;
+    app.state.gateway_view.restricted = true;
+    app.config
+        .providers
+        .push(provider_with_key("p", "value-0123456789"));
+
+    app.enable_gateway();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), app.event_rx.recv())
+            .await
+            .is_err(),
+        "no work was started"
+    );
+    let notice = app.state.gateway_view.screen.notice.clone().unwrap();
+    assert!(
+        notice.error && notice.text.contains("agent tool"),
+        "{}",
+        notice.text
+    );
+
+    app.open_accounts(Focus::Accounts);
+    app.handle_accounts_key(press(KeyCode::Char('g')))
+        .await
+        .unwrap();
+    assert!(
+        !app.state.gateway_view.screen.confirm_enable,
+        "`g` does not even ask"
+    );
+
+    // Мастер: ключ не принимается, пока экран ограничен.
+    run_api_wizard(&mut app, "Keyed", "sk-test-canary-0123456789").await;
+    let Some(Modal::AccountWizard(wizard)) = &app.state.modal else {
+        panic!("the wizard stays open");
+    };
+    assert!(wizard.error.as_deref().unwrap_or("").contains("agent tool"));
+    assert!(provider_names(&path).is_empty());
+}
+
+#[tokio::test]
+async fn a_restricted_trust_dialog_never_trusts_whatever_the_keys() {
+    let (mut app, _) = app_with_file("restricted-trust").await;
+    app.state.view = View::Chat;
+    app.state.gateway_view.restricted = true;
+    app.config.source.pending_trust = Some(trust_request("only"));
+    app.open_trust_dialog_if_needed();
+    let Some(Modal::Trust(dialog)) = app.state.modal.take() else {
+        panic!("the dialog is shown, with its reason");
+    };
+    assert!(dialog.restricted);
+    app.state.terminal_cols = 80;
+    app.state.terminal_rows = 24;
+    app.handle_trust_key(press(KeyCode::Tab), dialog)
+        .await
+        .unwrap();
+    let Some(Modal::Trust(mut dialog)) = app.state.modal.take() else {
+        panic!("still open");
+    };
+    assert!(!dialog.confirmed());
+    assert!(
+        dialog
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("agent tool")
+    );
+    // Даже подделанный выбор не проходит: решение по-прежнему отказ.
+    dialog.choice = forms::TrustChoice::Trust;
+    app.resolve_trust(*dialog);
+    assert!(app.config.trust.projects.is_empty());
+    assert!(app.state.gateway_view.project.denied.contains("h"));
+}
+
+// ── Диалог доверия: несколько файлов, онбординг, MCP ────────────────────
+
+#[tokio::test]
+async fn a_refusal_of_the_first_file_leaves_the_others_to_be_asked() {
+    let (mut app, _) = app_with_file("trust-many").await;
+    app.state.view = View::Chat;
+    app.config.source.pending_trust = Some(trust_request("config"));
+    app.config.source.project_mcp = vec![crate::mcp::project::ProjectMcpFile {
+        request: trust_request("mcp"),
+        text: "{}".into(),
+        trusted: false,
+    }];
+    app.open_trust_dialog_if_needed();
+    let Some(Modal::Trust(first)) = app.state.modal.take() else {
+        panic!("the first question");
+    };
+    assert_eq!(first.request.key, "key-config");
+    app.handle_trust_key(press(KeyCode::Esc), first)
+        .await
+        .unwrap();
+    let Some(Modal::Trust(second)) = app.state.modal.take() else {
+        panic!("the MCP file is asked right after");
+    };
+    assert_eq!(
+        second.request.key, "key-mcp",
+        "a refusal does not hide the next file"
+    );
+    app.handle_trust_key(press(KeyCode::Esc), second)
+        .await
+        .unwrap();
+    assert!(app.state.modal.is_none(), "both were answered");
+    assert_eq!(app.state.gateway_view.project.denied.len(), 2);
+}
+
+#[tokio::test]
+async fn the_trust_question_waits_for_the_onboarding_to_end() {
+    let (mut app, _) = app_with_file("trust-onboarding").await;
+    app.config.source.pending_trust = Some(trust_request("config"));
+    app.state.view = View::Onboarding;
+    app.open_trust_dialog_if_needed();
+    app.tick_gateway_view();
+    assert!(
+        app.state.modal.is_none(),
+        "its keys would go to the token field"
+    );
+    app.state.view = View::Chat;
+    app.tick_gateway_view();
+    assert!(
+        matches!(app.state.modal, Some(Modal::Trust(_))),
+        "asked once the onboarding is over"
+    );
+}
+
+async fn mcp_reloaded_within(app: &mut App, wait: Duration) -> bool {
+    tokio::time::timeout(wait, async {
+        loop {
+            if let Some(AppEvent::McpOperationDone { .. }) = app.event_rx.recv().await {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn trusting_an_mcp_file_connects_its_servers_without_a_restart() {
+    let (mut app, _) = app_with_file("trust-mcp").await;
+    let mut fresh = app.config.clone();
+    fresh.source.project_mcp = vec![crate::mcp::project::ProjectMcpFile {
+        request: trust_request("mcp"),
+        text: "{}".into(),
+        trusted: true,
+    }];
+    // Без решения человека серверы не трогаются.
+    app.on_config_reloaded(Ok(fresh.clone()));
+    assert!(
+        !mcp_reloaded_within(&mut app, Duration::from_millis(500)).await,
+        "no reload without a decision"
+    );
+    // Согласие на файл MCP: перезагрузка идёт сама.
+    app.state.gateway_view.project.reload_mcp = true;
+    app.on_config_reloaded(Ok(fresh));
+    assert!(
+        mcp_reloaded_within(&mut app, Duration::from_secs(10)).await,
+        "the servers are reconnected"
+    );
 }

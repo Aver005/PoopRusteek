@@ -6,7 +6,7 @@ use crate::config::Config;
 /// `/accounts` — главный экран: аккаунты, лимиты, маршруты, последнее решение.
 pub struct AccountsCommand;
 
-const USAGE: &str = "/accounts | /accounts add | /accounts enable";
+const USAGE: &str = "/accounts | /accounts add | /accounts enable | /accounts disable";
 
 impl Command for AccountsCommand {
     fn name(&self) -> &str {
@@ -26,6 +26,7 @@ impl Command for AccountsCommand {
             "" => CommandResult::OpenAccounts(Focus::Accounts),
             "add" => CommandResult::OpenAccountAdd(None),
             "enable" => CommandResult::EnableGateway,
+            "disable" => CommandResult::DisableGateway,
             _ => CommandResult::Error(format!("Usage: {USAGE}")),
         }
     }

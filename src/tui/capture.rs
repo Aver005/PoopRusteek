@@ -163,6 +163,13 @@ fn scenes() -> Vec<Scene> {
             first_run: false,
         },
         Scene {
+            name: "accounts-disable-confirm",
+            build: |c| with_base(c, accounts::accounts_disable_confirm),
+            sizes: SIZES_ACCOUNTS,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
             name: "accounts-starting",
             build: |c| with_base(c, accounts::accounts_starting),
             sizes: SIZES_ACCOUNTS,

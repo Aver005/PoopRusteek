@@ -152,6 +152,8 @@ pub enum CommandResult {
     OpenAccountAdd(Option<String>),
     /// `/accounts enable` — включить шлюз: старые записи становятся аккаунтами.
     EnableGateway,
+    /// `/accounts disable` — выключить шлюз (с вопросом): `[[providers]]` снова ведут.
+    DisableGateway,
     /// `/pin <аккаунт>` и `/pin off`.
     Pin(String),
     /// `/usage` — расход за сутки.

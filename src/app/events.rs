@@ -348,6 +348,10 @@ pub enum AppEvent {
     AccountStored(Box<crate::app::gateway_view::AccountPlan>),
     /// То же при выключенном шлюзе: запись `[[providers]]` записана, ключ — в хранилище.
     LegacyProviderStored(Box<crate::app::gateway_view::LegacyPlan>),
+    /// Включение шлюза закончено вне цикла событий: новый конфиг шлюза или причина отказа.
+    GatewayEnabled(Box<Result<crate::gateway::types::GatewayConfig, String>>),
+    /// То же для выключения.
+    GatewayDisabled(Box<Result<(), String>>),
     /// Конфиг перечитан вне цикла событий (после команды, `/cd`, подтверждения проекта).
     ConfigReloaded(Box<Result<crate::config::Config, String>>),
     /// Время изменения файла проектного слоя (`None` — файла нет).

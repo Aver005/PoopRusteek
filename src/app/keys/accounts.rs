@@ -8,7 +8,7 @@ use crate::app::gateway_view::forms::{LimitsForm, SecretPrompt, TrustDialog};
 use crate::app::gateway_view::wizard::{
     AccountWizard, Existing, HiddenInput, Step, login_home_root,
 };
-use crate::app::gateway_view::{Focus, edits, rows};
+use crate::app::gateway_view::{Focus, HUMAN_ONLY, edits, rows};
 use crate::app::list::{ListNav, page_rows, rows as list_rows};
 use crate::error::AppResult;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -42,6 +42,14 @@ impl App {
             }
             return Ok(false);
         }
+        if std::mem::take(&mut self.state.gateway_view.screen.confirm_disable) {
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.disable_gateway();
+            } else {
+                self.state.gateway_view.screen.say("The gateway stays on.");
+            }
+            return Ok(false);
+        }
         if std::mem::take(&mut self.state.gateway_view.screen.confirm_enable) {
             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 self.enable_gateway();
@@ -72,6 +80,7 @@ impl App {
                 let screen = &mut self.state.gateway_view.screen;
                 screen.history = !screen.history;
             }
+            KeyCode::Char('X') => self.state.gateway_view.screen.confirm_disable = true,
             _ => match self.state.gateway_view.screen.focus {
                 Focus::Accounts => self.accounts_focus_key(key),
                 Focus::Routes => self.routes_focus_key(key),
@@ -96,6 +105,9 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_legacy_provider(),
             KeyCode::Char('a') => {
                 self.state.modal = Some(Modal::AccountWizard(Box::default()));
+            }
+            KeyCode::Char('g') if self.state.gateway_view.human_only() => {
+                self.state.gateway_view.screen.complain(HUMAN_ONLY);
             }
             KeyCode::Char('g') => self.state.gateway_view.screen.confirm_enable = true,
             _ => {}

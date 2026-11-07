@@ -611,6 +611,7 @@ fn hint_line(view: &GatewayView, width: usize, enabled: bool, theme: &Theme) -> 
             "Enter details",
             "K/J rank",
             "Space on/off",
+            "X gateway off",
             "a add",
             "e limits",
             "r route",
@@ -774,6 +775,11 @@ pub(super) fn render_accounts_view(
     let question = if view.screen.confirm_enable && !enabled {
         Some(
             "Turn the gateway on? Your providers become accounts in one route; nothing is deleted. y/n"
+                .to_string(),
+        )
+    } else if view.screen.confirm_disable && enabled {
+        Some(
+            "Turn the gateway off? Accounts and routes stay in the file; your old providers work again. y/n"
                 .to_string(),
         )
     } else {
@@ -1273,7 +1279,7 @@ pub(super) fn render_trust(frame: &mut Frame, area: Rect, dialog: &TrustDialog, 
         None => Line::from(""),
     });
     lines.push(separator_line(inner_w, theme));
-    let readable = dialog.fully_read(&view);
+    let readable = dialog.fully_read(&view) && !dialog.restricted;
     let button = |label: &str, active: bool, color: Color| {
         let style = if active {
             Style::default()
@@ -1294,7 +1300,9 @@ pub(super) fn render_trust(frame: &mut Frame, area: Rect, dialog: &TrustDialog, 
         ),
         Span::raw("   "),
         button(
-            if readable {
+            if dialog.restricted {
+                "Trust (not from an agent tool)"
+            } else if readable {
                 "Trust this file"
             } else {
                 "Trust this file (read it all first)"

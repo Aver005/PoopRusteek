@@ -330,6 +330,13 @@ pub(super) fn accounts_off_confirm(base: AppState, config: &mut Config) -> AppSt
     state
 }
 
+/// Выключение шлюза спрашивает: данные остаются.
+pub(super) fn accounts_disable_confirm(base: AppState, config: &mut Config) -> AppState {
+    let mut state = accounts(base, config);
+    state.gateway_view.screen.confirm_disable = true;
+    state
+}
+
 /// Шлюз ещё собирается: список пуст не потому, что аккаунтов нет.
 pub(super) fn accounts_starting(base: AppState, config: &mut Config) -> AppState {
     let mut state = base;

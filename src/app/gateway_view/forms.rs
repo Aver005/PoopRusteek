@@ -81,9 +81,9 @@ pub fn trust_view(cols: u16, rows: u16) -> TrustView {
     TrustView {
         popup_w,
         text_w: usize::from(popup_w).saturating_sub(8).max(20),
-        max_room: usize::from(rows.saturating_sub(2))
-            .saturating_sub(TRUST_CHROME)
-            .max(3),
+        // Ровно столько строк окно показывает на деле; на очень низком терминале их нет,
+        // и тогда прочитать список нельзя.
+        max_room: usize::from(rows.saturating_sub(2)).saturating_sub(TRUST_CHROME),
     }
 }
 
@@ -93,9 +93,11 @@ pub struct TrustDialog {
     pub choice: TrustChoice,
     /// Первая видимая строка документа.
     pub offset: usize,
-    /// До какой строки документ показан подряд с самого начала. Прыжок мимо непрочитанного
-    /// эту границу не двигает.
-    covered: usize,
+    /// Какие строки документа хоть раз были на экране. Порядок обхода не важен: `End`, потом
+    /// `Home` и постраничное чтение дают то же, что чтение сверху вниз.
+    seen: Vec<bool>,
+    /// Экран запущен из инструмента агента: согласие недоступно.
+    pub restricted: bool,
     /// Почему «Trust» ещё недоступен.
     pub notice: Option<String>,
 }
@@ -110,7 +112,8 @@ impl TrustDialog {
             request,
             choice: TrustChoice::Deny,
             offset: 0,
-            covered: 0,
+            seen: Vec::new(),
+            restricted: false,
             notice: None,
         }
     }
@@ -187,8 +190,12 @@ impl TrustDialog {
     pub fn reveal(&mut self, view: &TrustView) {
         let (total, room) = self.room(view);
         self.offset = self.offset.min(total.saturating_sub(room));
-        if self.offset <= self.covered {
-            self.covered = self.covered.max(self.offset + room);
+        // Другая ширина — другой перенос строк: прежние отметки к новому документу не относятся.
+        if self.seen.len() != total {
+            self.seen = vec![false; total];
+        }
+        for line in self.seen.iter_mut().skip(self.offset).take(room) {
+            *line = true;
         }
     }
 
@@ -205,16 +212,16 @@ impl TrustDialog {
         self.reveal(view);
     }
 
-    /// Документ показан подряд от первой строки до последней; окно на экране сейчас в счёт.
+    /// Каждая строка документа была на экране; окно, что видно сейчас, в счёт.
     pub fn fully_read(&self, view: &TrustView) -> bool {
         let (total, room) = self.room(view);
+        if room == 0 {
+            return false;
+        }
         let offset = self.offset.min(total.saturating_sub(room));
-        let shown = if offset <= self.covered {
-            self.covered.max(offset + room)
-        } else {
-            self.covered
-        };
-        shown >= total
+        (0..total).all(|line| {
+            (offset..offset + room).contains(&line) || (self.seen.len() == total && self.seen[line])
+        })
     }
 
     /// «Trust» выбирается только после того, как весь список был на экране.
@@ -224,12 +231,18 @@ impl TrustDialog {
                 self.choice = TrustChoice::Deny;
                 self.notice = None;
             }
+            TrustChoice::Deny if self.restricted => {
+                self.notice = Some(crate::app::gateway_view::HUMAN_ONLY.into());
+            }
             TrustChoice::Deny if self.fully_read(view) => {
                 self.choice = TrustChoice::Trust;
                 self.notice = None;
             }
             TrustChoice::Deny => {
-                self.notice = Some("Read the whole list first: PageDown / Down to the end.".into());
+                self.notice = Some(
+                    "Show every line first: scroll with Up/Down and PageUp/PageDown, in any order."
+                        .into(),
+                );
             }
         }
     }
@@ -548,5 +561,57 @@ mod tests {
         prompt.value.push_str("sk-very-secret");
         assert!(!format!("{prompt:?}").contains("sk-very"));
         assert!(prompt.title().contains("openai"));
+    }
+}
+
+#[cfg(test)]
+mod trust_view_tests {
+    use super::*;
+
+    fn request(items: usize) -> TrustRequest {
+        TrustRequest {
+            config_path: "x".into(),
+            key: "k".into(),
+            hash: "h".into(),
+            held_back: (0..items).map(|n| format!("item number {n}")).collect(),
+            summary: Default::default(),
+        }
+    }
+
+    /// `End` не ловушка: после прыжка список дочитывается в любом порядке.
+    #[test]
+    fn after_a_jump_to_the_end_the_rest_can_still_be_read_in_any_order() {
+        let view = trust_view(80, 24);
+        let mut dialog = TrustDialog::new(request(60));
+        dialog.reveal(&view);
+        dialog.scroll_to(true, &view);
+        assert!(!dialog.fully_read(&view), "the middle was skipped");
+        dialog.toggle(&view);
+        assert!(!dialog.confirmed());
+        // Назад страницами к началу: всё, что мелькнуло по пути, засчитывается.
+        for _ in 0..12 {
+            dialog.scroll(-(view.max_room as isize - 1), &view);
+        }
+        assert!(
+            dialog.fully_read(&view),
+            "every line has been on screen by now"
+        );
+        dialog.toggle(&view);
+        assert!(dialog.confirmed(), "the consent button is reachable");
+        // Отказ работает всегда.
+        dialog.toggle(&view);
+        assert!(!dialog.confirmed());
+    }
+
+    /// Окно, в котором строк нет, ничего «прочитанным» не делает.
+    #[test]
+    fn a_window_too_low_to_show_the_list_cannot_be_read() {
+        let tiny = trust_view(80, 8);
+        assert_eq!(tiny.max_room, 0);
+        let mut dialog = TrustDialog::new(request(1));
+        dialog.reveal(&tiny);
+        assert!(!dialog.fully_read(&tiny));
+        dialog.toggle(&tiny);
+        assert!(!dialog.confirmed());
     }
 }

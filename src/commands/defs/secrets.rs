@@ -8,6 +8,17 @@ pub struct SecretsCommand;
 
 const USAGE: &str = "/secrets [list | set <name> | rm <name> | test | bind <ref> <host>]";
 
+/// Запись и удаление секретов, привязка хоста — только у человека: из инструмента агента отказ.
+fn human_only_refusal(action: &str, agent_child: bool) -> Option<CommandResult> {
+    let changes = matches!(action, "set" | "rm" | "remove" | "delete" | "bind");
+    (changes && agent_child).then(|| {
+        CommandResult::Error(
+            "/secrets set, rm and bind change keys and trust: this screen was started from an agent tool, so they are off. Run pooprusteek in your own terminal."
+                .to_string(),
+        )
+    })
+}
+
 impl Command for SecretsCommand {
     fn name(&self) -> &str {
         "secrets"
@@ -25,6 +36,9 @@ impl Command for SecretsCommand {
         let args = args.trim();
         let (action, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
         let rest = rest.trim();
+        if let Some(refusal) = human_only_refusal(action, crate::secrets::human::is_agent_child()) {
+            return refusal;
+        }
         match action {
             "" | "list" => CommandResult::Detached(Box::new(|| {
                 let rows = ops::list(&process_store());
@@ -82,6 +96,34 @@ impl Command for SecretsCommand {
                 }
             }
             _ => CommandResult::Error(format!("Usage: {USAGE}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_child_cannot_change_keys_or_trust_but_can_look() {
+        for action in ["set", "rm", "remove", "delete", "bind"] {
+            assert!(
+                matches!(
+                    human_only_refusal(action, true),
+                    Some(CommandResult::Error(_))
+                ),
+                "{action}"
+            );
+            assert!(
+                human_only_refusal(action, false).is_none(),
+                "a person may {action}"
+            );
+        }
+        for action in ["", "list", "test"] {
+            assert!(
+                human_only_refusal(action, true).is_none(),
+                "{action} only reads"
+            );
         }
     }
 }

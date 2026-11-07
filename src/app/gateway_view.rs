@@ -62,6 +62,8 @@ pub struct AccountsScreen {
     pub confirm_remove: Option<RemoveConfirm>,
     /// Экран «шлюз выключен»: ждёт `y/n` на включение.
     pub confirm_enable: bool,
+    /// Включённый шлюз: ждёт `y/n` на выключение.
+    pub confirm_disable: bool,
 }
 
 /// Вопрос об удалении аккаунта: текст называет всё, что заденет удаление.
@@ -119,8 +121,10 @@ impl AccountsScreen {
 /// За изменением файла проектного слоя следит тик: чтение метаданных идёт вне цикла событий.
 #[derive(Debug, Default)]
 pub struct ProjectWatch {
-    /// Хэш файла, от которого человек уже отказался: пока файл тот же, не спрашиваем снова.
-    pub denied: Option<String>,
+    /// Хэши файлов, от которых человек отказался: пока файл тот же, не спрашиваем снова.
+    pub denied: std::collections::BTreeSet<String>,
+    /// Подтверждён файл MCP: после перезагрузки конфига серверы поднимаются сами.
+    reload_mcp: bool,
     /// Последний штамп файла: внешний `None` — ещё не смотрели, внутренний — файла нет.
     pub known: Option<Option<SystemTime>>,
     path: Option<std::path::PathBuf>,
@@ -138,9 +142,19 @@ pub struct GatewayView {
     /// Закреплённые чаты.
     pub pins: HashMap<ConversationId, Pin>,
     pub project: ProjectWatch,
+    /// Экран запущен из инструмента агента: доверие и секреты ему недоступны.
+    pub restricted: bool,
 }
 
+/// Что сказать, когда экран ограничен: решение за человеком в его терминале.
+pub const HUMAN_ONLY: &str = "This screen was started from an agent tool, so it can't change trust, secrets or the gateway. Run pooprusteek in your own terminal.";
+
 impl GatewayView {
+    /// Ограничен ли экран: метка агента на процессе (общая проверка `secrets::human`) или тестовый флаг.
+    pub fn human_only(&self) -> bool {
+        self.restricted || crate::secrets::human::is_agent_child()
+    }
+
     /// «Сейчас» для всех подсчётов кадра: время снимка, а не часы кадра, чтобы кадр был повторяем.
     pub fn now(&self) -> SystemTime {
         self.snapshot
@@ -204,6 +218,113 @@ pub fn seam_text(from: &str, to: &str, class_code: &str, back_in: Option<&str>) 
         text.push_str(&format!(", back in {left}"));
     }
     text
+}
+
+/// Новый `[gateway]`, аккаунты, маршруты и роли из конфига с подмешанными старыми записями.
+/// `secrets` — готовые ссылки для записей с ключом; без ссылки такая запись не переносится молча.
+fn assemble_enabled(
+    config: &Config,
+    secrets: &HashMap<String, crate::gateway::types::SecretRef>,
+) -> Result<GatewayConfig, String> {
+    let mut next = config.gateway_config();
+    for mut account in GatewayConfig::from_legacy(config).0.accounts {
+        if next.accounts.iter().any(|a| a.id == account.id) {
+            continue;
+        }
+        if account.api_key.take().is_some() {
+            let reference = secrets
+                .get(account.id.as_str())
+                .ok_or_else(|| format!("the key of '{}' has no place to go", account.id))?;
+            account.secret = Some(reference.clone());
+        }
+        next.accounts.push(account);
+    }
+    if next.routes.is_empty()
+        && let Some(route) = edits::starter_route(&next.accounts)
+    {
+        next.roles.0.insert(Role::Main, route.id.clone());
+        next.routes.push(route);
+    }
+    next.gateway.enabled = true;
+    if let Some(problem) = next
+        .validate()
+        .into_iter()
+        .find(|p| p.severity == Severity::Error)
+    {
+        return Err(format!("{}: {}", problem.path, problem.message));
+    }
+    Ok(next)
+}
+
+/// Куда деть ключ записи: ссылка из файла (`env:`, `file:`, `cmd:`, любой `keyring:`) идёт в аккаунт
+/// как есть; значение, лежащее прямо в файле, — в хранилище под именем записи. Блокирует.
+fn carry_keys(
+    path: &std::path::Path,
+    keys: &[(String, String)],
+    created: &mut Vec<String>,
+) -> Result<HashMap<String, crate::gateway::types::SecretRef>, String> {
+    use crate::gateway::types::SecretRef;
+    let raw = crate::config::raw_api_keys_at(path).map_err(|error| error.to_string())?;
+    let store = crate::secrets::process_store();
+    let mut out = HashMap::new();
+    for (name, value) in keys {
+        if let Some(reference) = raw
+            .get(name)
+            .filter(|r| crate::secrets::looks_like_reference(r) && r.trim() != "none")
+        {
+            out.insert(name.clone(), SecretRef::parse(reference)?);
+            continue;
+        }
+        let entry = crate::secrets::account_secret_id(name);
+        match store.get(&entry) {
+            // Стартовый перенос уже положил ключ под это имя.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                store
+                    .set_verified(&entry, &crate::secrets::Secret::new(value.as_str()))
+                    .map_err(|error| format!("the key of '{name}' was not stored: {error}"))?;
+                created.push(entry.clone());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "the key store did not answer for '{name}': {error}"
+                ));
+            }
+        }
+        out.insert(
+            name.clone(),
+            SecretRef::parse(&crate::secrets::keyring_ref(&entry))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Включение целиком вне цикла событий: ключи, сборка, проверка, запись. Любой сбой откатывает всё.
+fn enable_blocking(
+    mut config: Config,
+    path: &std::path::Path,
+    keys: Vec<(String, String)>,
+) -> Result<GatewayConfig, String> {
+    let mut created = Vec::new();
+    let outcome = carry_keys(path, &keys, &mut created)
+        .and_then(|secrets| assemble_enabled(&config, &secrets))
+        .and_then(|next| {
+            config.gateway = next.gateway.clone();
+            config.accounts = next.accounts.clone();
+            config.routes = next.routes.clone();
+            config.roles = next.roles.clone();
+            crate::config::save_sync(&config)
+                .map(|()| next)
+                .map_err(|error| format!("could not save the config: {error}"))
+        });
+    if outcome.is_err() {
+        // Ключи, положенные ради этого включения, не остаются сиротами.
+        let store = crate::secrets::process_store();
+        for entry in created {
+            let _ = store.delete(&entry);
+        }
+    }
+    outcome
 }
 
 /// Токен-ключ быстрой формы `<имя> [openai|anthropic|gemini] <адрес> [модель] [ключ]`: по позиции.
@@ -338,6 +459,7 @@ impl App {
         };
         let gateway_changed = fresh.gateway_config() != self.config.gateway_config();
         self.config = fresh;
+        self.reload_mcp_after_trust();
         if gateway_changed {
             self.restart_gateway();
         }
@@ -346,28 +468,80 @@ impl App {
         self.open_trust_dialog_if_needed();
     }
 
-    /// Проектный слой ждёт подтверждения — показать диалог (если ничего другого на экране нет).
-    pub(crate) fn open_trust_dialog_if_needed(&mut self) {
-        if self.state.modal.is_some() {
+    /// Файл MCP подтверждён: серверы проекта поднимаются без перезапуска (как `/mcp reload`).
+    fn reload_mcp_after_trust(&mut self) {
+        let watch = &mut self.state.gateway_view.project;
+        if !std::mem::take(&mut watch.reload_mcp)
+            || !self
+                .config
+                .source
+                .project_mcp
+                .iter()
+                .any(|file| file.trusted)
+        {
             return;
         }
-        if let Some(request) = self.config.source.pending_trust.clone()
-            && self.state.gateway_view.project.denied.as_deref() != Some(request.hash.as_str())
-        {
-            self.state.modal = Some(Modal::Trust(Box::new(forms::TrustDialog::new(request))));
+        self.state
+            .push_ui_system("Project MCP servers are trusted: connecting them now.");
+        let mcp = std::sync::Arc::clone(&self.mcp);
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            crate::mcp::manager::reload(&mcp).await;
+            let _ = event_tx.send(AppEvent::McpOperationDone {
+                message: "MCP servers reloaded".to_string(),
+            });
+        });
+    }
+
+    /// Проектный слой ждёт подтверждения — показать диалог (если ничего другого на экране нет).
+    pub(crate) fn open_trust_dialog_if_needed(&mut self) {
+        // Онбординг забирает клавиши раньше модалок: диалог ждёт его конца.
+        if self.state.modal.is_some() || self.state.view == View::Onboarding {
+            return;
+        }
+        // Первый запрос, от которого ещё не отказались: отказ по одному файлу не прячет остальные.
+        let next = self
+            .config
+            .pending_trust_requests()
+            .into_iter()
+            .find(|request| {
+                !self
+                    .state
+                    .gateway_view
+                    .project
+                    .denied
+                    .contains(&request.hash)
+            });
+        if let Some(request) = next {
+            let mut dialog = forms::TrustDialog::new(request);
+            dialog.restricted = self.state.gateway_view.human_only();
+            self.state.modal = Some(Modal::Trust(Box::new(dialog)));
         }
     }
 
     /// Решение по проектному слою. Отказ ничего не пишет: слой остаётся заблокированным.
     pub(crate) fn resolve_trust(&mut self, dialog: forms::TrustDialog) {
-        if !dialog.confirmed() {
-            self.state.gateway_view.project.denied = Some(dialog.request.hash);
+        if !dialog.confirmed() || self.state.gateway_view.human_only() {
+            self.state
+                .gateway_view
+                .project
+                .denied
+                .insert(dialog.request.hash);
             self.state.push_ui_system(
-                "Project config stays blocked: its accounts, routes and roles are not used.",
+                "Project config stays blocked: its accounts, routes, roles and MCP servers are not used.",
             );
+            // Следующий файл (например, MCP после конфига) спрашивается сразу.
+            self.open_trust_dialog_if_needed();
             return;
         }
         let request = dialog.request;
+        let is_mcp = self
+            .config
+            .source
+            .project_mcp
+            .iter()
+            .any(|file| file.request.key == request.key);
+        self.state.gateway_view.project.reload_mcp = is_mcp;
         let tx = self.event_tx.clone();
         tokio::task::spawn_blocking(move || {
             let message = match crate::config::trust_project(&request) {
@@ -410,46 +584,47 @@ impl App {
     }
 
     /// Включить шлюз: старые записи становятся аккаунтами, появляется маршрут `main`.
+    /// Работа с хранилищем и файлом идёт вне цикла событий; память меняется только после успеха.
     pub(crate) fn enable_gateway(&mut self) {
         self.state.gateway_view.screen.confirm_enable = false;
-        let mut next = self.config.gateway_config();
-        // Записи `[[providers]]`, которых ещё нет аккаунтами (добавлены при выключенном шлюзе).
-        for mut account in GatewayConfig::from_legacy(&self.config).0.accounts {
-            if next.accounts.iter().any(|a| a.id == account.id) {
-                continue;
-            }
-            if account.api_key.take().is_some() {
-                // Ключ лежит в хранилище под именем записи; значением в аккаунт он не идёт.
-                let entry = crate::secrets::account_secret_id(account.id.as_str());
-                account.secret =
-                    crate::gateway::types::SecretRef::parse(&crate::secrets::keyring_ref(&entry))
-                        .ok();
-            }
-            next.accounts.push(account);
+        if self.state.gateway_view.human_only() {
+            self.state.gateway_view.screen.complain(HUMAN_ONLY);
+            return;
         }
-        if next.routes.is_empty()
-            && let Some(route) = edits::starter_route(&next.accounts)
-        {
-            next.roles.0.insert(Role::Main, route.id.clone());
-            next.routes.push(route);
-        }
-        next.gateway.enabled = true;
-        if let Some(problem) = next
-            .validate()
+        let known: Vec<AccountId> = self.config.accounts.iter().map(|a| a.id.clone()).collect();
+        // Ключи записей, которых ещё нет аккаунтами: в памяти это уже значения, а не ссылки.
+        let keys: Vec<(String, String)> = GatewayConfig::from_legacy(&self.config)
+            .0
+            .accounts
             .into_iter()
-            .find(|p| p.severity == Severity::Error)
-        {
-            self.state.gateway_view.screen.complain(format!(
-                "Cannot turn the gateway on: {}: {}",
-                problem.path, problem.message
-            ));
-            return;
-        }
+            .filter(|a| !known.contains(&a.id))
+            .filter_map(|a| a.api_key.map(|key| (a.id.to_string(), key)))
+            .collect();
+        let config = self.config.clone();
+        let path = self.config_target();
+        let tx = self.event_tx.clone();
+        self.state
+            .gateway_view
+            .screen
+            .say("Turning the gateway on\u{2026}");
+        tokio::task::spawn_blocking(move || {
+            let result = enable_blocking(config, &path, keys);
+            let _ = tx.send(AppEvent::GatewayEnabled(Box::new(result)));
+        });
+    }
+
+    /// Шлюз включён и записан (или нет): применить в память и пересобрать.
+    pub(crate) fn on_gateway_enabled(&mut self, result: Result<GatewayConfig, String>) {
+        let next = match result {
+            Ok(next) => next,
+            Err(error) => {
+                self.state.gateway_view.screen.complain(format!(
+                    "The gateway was not turned on: {error}. Nothing was changed; your providers still work."
+                ));
+                return;
+            }
+        };
         self.apply_gateway_config(next);
-        if let Err(error) = crate::config::save_or_message(&self.config) {
-            self.state.gateway_view.screen.complain(error);
-            return;
-        }
         self.restart_gateway();
         self.rebuild_provider();
         // Экран сразу видит новое состояние (идёт сборка), а не прежний «OFF».
@@ -458,6 +633,58 @@ impl App {
             .gateway_view
             .screen
             .say("Gateway is on. Add accounts with a, order them with K/J.");
+    }
+
+    /// Выключить шлюз: аккаунты и маршруты остаются в файле, `[[providers]]` снова ведут.
+    pub(crate) fn disable_gateway(&mut self) {
+        self.state.gateway_view.screen.confirm_disable = false;
+        if !self.gateway.is_enabled() {
+            self.state
+                .gateway_view
+                .screen
+                .say("The gateway is already off.");
+            return;
+        }
+        let mut config = self.config.clone();
+        config.gateway.enabled = false;
+        let tx = self.event_tx.clone();
+        self.state
+            .gateway_view
+            .screen
+            .say("Turning the gateway off\u{2026}");
+        tokio::task::spawn_blocking(move || {
+            let result = crate::config::save_sync(&config).map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::GatewayDisabled(Box::new(result)));
+        });
+    }
+
+    pub(crate) fn on_gateway_disabled(&mut self, result: Result<(), String>) {
+        if let Err(error) = result {
+            self.state.gateway_view.screen.complain(format!(
+                "The gateway was not turned off: could not save the config: {error}. It stays on."
+            ));
+            return;
+        }
+        self.config.gateway.enabled = false;
+        self.restart_gateway();
+        // Закрепления гаснут (аккаунтов больше нет), чаты возвращаются на провайдер из `[[providers]]`.
+        self.refresh_pins();
+        let provider = crate::gateway::handle::main_provider(&self.config, Some(&self.gateway));
+        let chats: Vec<ConversationId> = self
+            .state
+            .conversations
+            .iter()
+            .filter(|chat| chat.provider.is_some())
+            .map(|chat| chat.id)
+            .collect();
+        for chat in chats {
+            self.set_chat_provider(chat, provider.clone());
+        }
+        self.refresh_gateway_view();
+        self.state.gateway_view.screen.selected = 0;
+        self.state.gateway_view.screen.say(
+            "Gateway is off. Your providers work as before; accounts and routes are kept for later.",
+        );
     }
 
     fn apply_gateway_config(&mut self, next: GatewayConfig) {
@@ -622,6 +849,10 @@ impl App {
                         .reopen_wizard(wizard, format!("the gateway failed to start: {reason}"));
                 }
             }
+        }
+        // Ключ в хранилище кладёт только человек из своего терминала.
+        if !wizard.secret.is_empty() && self.state.gateway_view.human_only() {
+            return self.reopen_wizard(wizard, HUMAN_ONLY);
         }
         let (ids, labels, legacy) = self.wizard_context();
         let root = wizard::login_home_root();
@@ -1755,6 +1986,7 @@ mod tests {
     #[tokio::test]
     async fn the_trust_dialog_opens_on_deny_and_enter_keeps_the_layer_blocked() {
         let mut app = test_app().await;
+        app.state.view = View::Chat;
         app.config.source.pending_trust = Some(crate::config::TrustRequest {
             config_path: "x/.pooprusteek/config.toml".into(),
             key: "k".into(),
@@ -1786,6 +2018,7 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_is_not_asked_again_until_the_file_changes() {
         let mut app = test_app().await;
+        app.state.view = View::Chat;
         let request = |hash: &str| crate::config::TrustRequest {
             config_path: "p".into(),
             key: "k".into(),

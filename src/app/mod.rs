@@ -1124,6 +1124,8 @@ impl App {
             AppEvent::GatewayPersist(next) => self.on_gateway_persist(*next),
             AppEvent::AccountStored(plan) => self.on_account_stored(*plan),
             AppEvent::LegacyProviderStored(plan) => self.on_legacy_provider_stored(*plan),
+            AppEvent::GatewayEnabled(result) => self.on_gateway_enabled(*result),
+            AppEvent::GatewayDisabled(result) => self.on_gateway_disabled(*result),
             AppEvent::ConfigReloaded(loaded) => self.on_config_reloaded(*loaded),
             AppEvent::ProjectConfigStamp(stamp) => self.on_project_stamp(stamp),
             AppEvent::HistorySearchDone { query, matches } => {
