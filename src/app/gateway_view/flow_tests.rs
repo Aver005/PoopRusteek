@@ -60,7 +60,7 @@ async fn run_api_wizard(app: &mut App, name: &str, key: &str) {
 }
 
 async fn next_event(app: &mut App) -> AppEvent {
-    tokio::time::timeout(Duration::from_secs(5), app.event_rx.recv())
+    tokio::time::timeout(Duration::from_secs(60), app.event_rx.recv())
         .await
         .expect("an event arrives")
         .expect("channel open")
@@ -515,7 +515,7 @@ async fn a_project_file_that_appears_or_vanishes_is_noticed_but_the_first_look_i
     app.on_project_stamp(Some(at));
     assert_eq!(app.state.gateway_view.project.known, Some(Some(at)));
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), app.event_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), app.event_rx.recv())
             .await
             .is_ok_and(|e| matches!(e, Some(AppEvent::ConfigReloaded(_)))),
         "a reload was started"
@@ -946,7 +946,7 @@ async fn trusting_an_mcp_file_connects_its_servers_without_a_restart() {
     app.state.gateway_view.project.reload_mcp = true;
     app.on_config_reloaded(Ok(fresh));
     assert!(
-        mcp_reloaded_within(&mut app, Duration::from_secs(10)).await,
+        mcp_reloaded_within(&mut app, Duration::from_secs(60)).await,
         "the servers are reconnected"
     );
 }

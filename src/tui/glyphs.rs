@@ -272,7 +272,10 @@ mod tests {
             if name == "glyphs.rs" || name == "capture.rs" {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).expect("source file");
+            // Git на Windows отдаёт CRLF, а разделитель ниже записан через LF.
+            let text = std::fs::read_to_string(&file)
+                .expect("source file")
+                .replace("\r\n", "\n");
             // Тесты самих файлов не рисуются: их данные могут быть любыми.
             let code_only = text.split("#[cfg(test)]\nmod ").next().unwrap_or(&text);
             for (number, line) in code_only.lines().enumerate() {

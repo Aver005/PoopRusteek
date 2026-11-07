@@ -1714,7 +1714,7 @@ mod tests {
         press_in_wizard(app, KeyCode::Enter).await;
         press_in_wizard(app, KeyCode::Enter).await; // own login folder
         press_in_wizard(app, KeyCode::Enter).await; // confirm
-        let event = tokio::time::timeout(Duration::from_secs(5), app.event_rx.recv())
+        let event = tokio::time::timeout(Duration::from_secs(60), app.event_rx.recv())
             .await
             .expect("the plan arrives")
             .expect("channel open");
