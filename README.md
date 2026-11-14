@@ -162,6 +162,7 @@ It copies your own token into the clipboard — paste it into the token box and 
 | `Ctrl+L` | Redraw the screen and jump to the latest message (it does not clear the chat) |
 | `Ctrl+B` | Show / hide the side panel (also `/panel on\|off\|auto`; the choice is saved in `[ui] panel`) |
 | `Ctrl+A` | Select all input |
+| `Ctrl+T` | Retype the input (or the selection) in the other keyboard layout: `ghbdtn` <-> `привет`; press again to undo |
 | `↑` / `↓` | Input history / scroll |
 | `PageUp` / `PageDown` | Scroll history |
 

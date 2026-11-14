@@ -60,7 +60,8 @@ impl HelpCommand {
              \x20 Ctrl+Left/Right — Move by word\n\
              \x20 Ctrl+Shift+Left/Right — Select by word\n\
              \x20 Shift+Left/Right — Select by char\n\
-             \x20 Ctrl+A         — Select all",
+             \x20 Ctrl+A         — Select all\n\
+             \x20 Ctrl+T         — Retype the input (or selection) in the other layout: ghbdtn <-> привет",
         );
 
         out

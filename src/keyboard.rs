@@ -64,6 +64,76 @@ pub fn latin_at(ch: char) -> Option<char> {
     Some(if lower == ch { *latin } else { shifted(*latin) })
 }
 
+/// Украинские буквы стоят на клавишах русских: обратно в кириллицу переводим в русские.
+const UKRAINIAN: [char; 3] = ['ї', 'і', 'є'];
+
+/// Знак без Shift и был ли Shift: `{` → (`[`, да), `A` → (`a`, да).
+fn unshifted(ch: char) -> (char, bool) {
+    match ch {
+        '{' => ('[', true),
+        '}' => (']', true),
+        ':' => (';', true),
+        '"' => ('\'', true),
+        '<' => (',', true),
+        '>' => ('.', true),
+        '~' => ('`', true),
+        c if c.is_ascii_uppercase() => (c.to_ascii_lowercase(), true),
+        c => (c, false),
+    }
+}
+
+/// Русская буква на той же клавише, что латинский знак `ch`.
+fn cyrillic_at(ch: char) -> Option<char> {
+    // Точка и запятая русской раскладки стоят на `/`.
+    match ch {
+        '/' => return Some('.'),
+        '?' => return Some(','),
+        _ => {}
+    }
+    let (base, shift) = unshifted(ch);
+    let (cyr, _) = BY_POSITION
+        .iter()
+        .find(|(cyr, latin)| *latin == base && !UKRAINIAN.contains(cyr))?;
+    Some(if shift {
+        cyr.to_uppercase().next().unwrap_or(*cyr)
+    } else {
+        *cyr
+    })
+}
+
+/// В какую сторону переводить текст, набранный не в той раскладке.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutShift {
+    ToCyrillic,
+    ToLatin,
+}
+
+impl LayoutShift {
+    /// Сторону выбирает большинство букв: латиницы больше — значит, хотели кириллицу.
+    pub fn for_text(text: &str) -> Option<Self> {
+        let latin = text.chars().filter(char::is_ascii_alphabetic).count();
+        let cyrillic = text
+            .chars()
+            .filter(|c| c.is_alphabetic() && latin_at(*c).is_some())
+            .count();
+        match (latin, cyrillic) {
+            (0, 0) => None,
+            (l, c) if l > c => Some(Self::ToCyrillic),
+            _ => Some(Self::ToLatin),
+        }
+    }
+
+    /// Знак после перевода; чужие знаки (цифры, пробелы, другая письменность) остаются.
+    pub fn convert(self, ch: char) -> char {
+        match self {
+            Self::ToCyrillic => cyrillic_at(ch),
+            Self::ToLatin if ch.is_alphabetic() => latin_at(ch),
+            Self::ToLatin => None,
+        }
+        .unwrap_or(ch)
+    }
+}
+
 /// Клавиша, какой её ждут обработчики. Сочетание с Ctrl или Alt (но не AltGr,
 /// это Ctrl+Alt и печать) переводится всегда; простая буква — только если
 /// `letters_are_commands`: в поле ввода кириллица остаётся текстом.
@@ -90,6 +160,22 @@ mod tests {
 
     fn key(ch: char, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), modifiers)
+    }
+
+    fn switch(text: &str) -> String {
+        let shift = LayoutShift::for_text(text).expect("letters");
+        text.chars().map(|c| shift.convert(c)).collect()
+    }
+
+    #[test]
+    fn text_typed_in_the_wrong_layout_switches_both_ways() {
+        assert_eq!(switch("ghbdtn vbh"), "привет мир");
+        assert_eq!(switch("Ghbdtn? rfr ltkf/"), "Привет, как дела.");
+        assert_eq!(switch("руддщ цщкдв"), "hello world");
+        // Обратно переводятся буквы, знаки препинания уже правильные.
+        assert_eq!(switch(&switch("Ghbdtn? rfr ltkf/")), "Ghbdtn, rfr ltkf.");
+        assert_eq!(switch("123 ghbdtn"), "123 привет");
+        assert_eq!(LayoutShift::for_text("123 !"), None);
     }
 
     #[test]

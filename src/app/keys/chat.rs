@@ -86,6 +86,11 @@ impl App {
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.select_all();
             }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.state.input.switch_layout() {
+                    self.state.status_message = "Nothing to switch: no letters typed".to_string();
+                }
+            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.input.insert_newline();
             }

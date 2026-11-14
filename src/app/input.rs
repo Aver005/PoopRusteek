@@ -90,6 +90,35 @@ impl InputState {
         true
     }
 
+    /// Ctrl+T: перевести набранное не в той раскладке (ghbdtn ↔ привет). Только
+    /// выделение, если оно есть, иначе всё поле; чипы не трогаются. `false` — нечего.
+    pub fn switch_layout(&mut self) -> bool {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let (start, end) = match self.selection_anchor {
+            Some(anchor) if anchor != self.cursor => {
+                (anchor.min(self.cursor), anchor.max(self.cursor))
+            }
+            _ => (0, chars.len()),
+        };
+        let chips = self.chip_spans();
+        let in_scope =
+            |i: usize| i >= start && i < end && !chips.iter().any(|&(s, e)| i >= s && i < e);
+        let source: String = (0..chars.len())
+            .filter(|&i| in_scope(i))
+            .map(|i| chars[i])
+            .collect();
+        let Some(shift) = crate::keyboard::LayoutShift::for_text(&source) else {
+            return false;
+        };
+        // Знак переводится в знак: длина та же, курсор и выделение остаются на месте.
+        self.buffer = chars
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| if in_scope(i) { shift.convert(c) } else { c })
+            .collect();
+        true
+    }
+
     /// Места чипов в буфере — индексы знаков, конец не включён.
     fn chip_spans(&self) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
@@ -655,6 +684,24 @@ mod tests {
         // Cursor sits after the chip; the newlines never entered the buffer.
         assert!(!s.buffer.contains('\n'));
         assert_eq!(s.expanded(), "hi line one\nline two\nline three");
+    }
+
+    /// Ctrl+T переводит всё поле или только выделение и не ломает чипы.
+    #[test]
+    fn switching_the_layout_keeps_chips_and_respects_the_selection() {
+        let mut s = at("ghbdtn ", 7);
+        s.insert_paste("a\nb".to_string());
+        assert!(s.switch_layout());
+        assert_eq!(s.buffer, "привет [Pasted #1, 2 lines]");
+        assert_eq!(s.expanded(), "привет a\nb");
+
+        let mut s = at("hello ghbdtn", 12);
+        s.selection_anchor = Some(6);
+        assert!(s.switch_layout());
+        assert_eq!(s.buffer, "hello привет");
+        assert_eq!((s.selection_anchor, s.cursor), (Some(6), 12));
+
+        assert!(!at("123", 3).switch_layout());
     }
 
     #[test]
