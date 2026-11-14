@@ -21,6 +21,7 @@ mod pickers;
 pub mod providers;
 mod queue;
 pub mod reduce;
+pub mod resume;
 pub(crate) mod runtime;
 pub mod search;
 mod serve;
@@ -375,6 +376,7 @@ pub struct AppState {
     pub mcp_status: mcp_status::McpStatus,
     pub gateway_view: gateway_view::GatewayView,
     pub search: search::SearchViewState,
+    pub resume: resume::ResumeState,
     pub themes: themes::ThemesViewState,
     pub workspace_path: String,
     /// Секция системного промпта из `AGENTS.md` рабочей папки и глобальных
@@ -479,6 +481,7 @@ impl AppState {
             mcp_status: mcp_status::McpStatus::default(),
             gateway_view: gateway_view::GatewayView::default(),
             search: search::SearchViewState::default(),
+            resume: resume::ResumeState::default(),
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
             instructions_section: String::new(),
@@ -1135,6 +1138,7 @@ impl App {
                 self.state.search.apply_results(&query, matches);
             }
             AppEvent::LandingSessionsLoaded(sessions) => self.state.landing.apply(sessions),
+            AppEvent::ResumeSessionsLoaded(sessions) => self.on_resume_loaded(sessions),
             AppEvent::AutocompleteReady { generation, items } => {
                 self.on_autocomplete_ready(generation, items);
             }

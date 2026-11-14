@@ -296,6 +296,13 @@ fn scenes() -> Vec<Scene> {
             first_run: true,
         },
         Scene {
+            name: "resume",
+            build: resume,
+            sizes: SIZES_MAIN,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
             name: "search",
             build: search,
             sizes: &[(80, 24)],
@@ -726,6 +733,63 @@ fn onboarding(config: &mut Config) -> AppState {
     let theme = config.ui.theme.clone();
     let mut state = base(config, &theme);
     state.view = View::Onboarding;
+    state
+}
+
+/// `/resume` со списком длиннее экрана: видно прокрутку и полосу справа.
+fn resume(config: &mut Config) -> AppState {
+    let theme = config.ui.theme.clone();
+    let mut state = base(config, &theme);
+    state.view = View::Resume;
+    state.resume.open();
+    let titles = [
+        "Починить падающий тест items::range",
+        "Перенести конфиг CI на reusable workflow",
+        "Разобрать утечку памяти в воркере очереди",
+        "Написать README и пример запуска",
+        "Добавить кэш в клиент PoW",
+        "Ревью ветки gateway",
+        "Почему мигает главная",
+        "Схема ролей для шлюза",
+        "Скрипт выпуска релиза",
+        "MCP OAuth для outline",
+        "Лимиты подписок в /usage",
+        "Тема paper: контраст",
+        "Перенос данных в Local",
+        "Эмбеддинги e5: батчи",
+        "Тесты на macOS",
+        "Очередь сообщений на диск",
+        "Docker-песочница сценариев",
+        "Ускорить сборку ort",
+        "Глифы в conhost",
+    ];
+    let sessions = titles
+        .iter()
+        .enumerate()
+        .map(|(n, title)| crate::session::SessionSummary {
+            id: format!("s{n}"),
+            created_at: String::new(),
+            updated_at: format!("2026-10-{:02}T12:00:00+00:00", 30 - n),
+            workspace_root: state.workspace_path.clone(),
+            message_count: 4,
+            title: (*title).to_string(),
+            model_type: if n % 3 == 1 {
+                "claude-code"
+            } else {
+                "deepseek-chat"
+            }
+            .to_string(),
+            tag: None,
+            broken: false,
+        })
+        .collect();
+    state.resume.apply(sessions);
+    let page = crate::app::list::page_rows(40, crate::app::list::rows::SESSION);
+    for _ in 0..8 {
+        state
+            .resume
+            .navigate(crate::app::list::ListNav::Down, titles.len(), page);
+    }
     state
 }
 

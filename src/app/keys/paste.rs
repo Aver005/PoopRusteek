@@ -137,6 +137,10 @@ impl App {
 
         // View-specific text inputs (no modal in front).
         match self.state.view {
+            View::Resume => {
+                self.state.resume.filter.insert_str(&sanitize(&text, false));
+                self.refilter_resume();
+            }
             View::Search => {
                 if self.state.search.focus == SearchFocus::Query {
                     self.state.search.query.insert_str(&sanitize(&text, false));

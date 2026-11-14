@@ -106,6 +106,8 @@ pub enum CommandResult {
     SetPanel(Option<crate::config::PanelMode>),
     /// `/landing` — вид главной; `None` — переключить.
     SetLanding(Option<crate::config::LandingStyle>),
+    /// `/resume`, `/sessions` — экран выбора сессии.
+    OpenResume,
     ResetProvider,
     Quit,
     Error(String),
@@ -284,7 +286,12 @@ impl CommandRegistry {
         self.register(Box::new(defs::last::LastCommand));
         self.register(Box::new(defs::load::LoadCommand));
         self.register(Box::new(defs::session_info::SessionInfoCommand));
-        self.register(Box::new(defs::session_list::SessionListCommand));
+        self.register(Box::new(defs::session_list::SessionListCommand {
+            name: "resume",
+        }));
+        self.register(Box::new(defs::session_list::SessionListCommand {
+            name: "sessions",
+        }));
         self.register(Box::new(defs::reset::ResetCommand));
         self.register(Box::new(defs::rate::RateCommand));
         self.register(Box::new(defs::retry::RetryCommand));

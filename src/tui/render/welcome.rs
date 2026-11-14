@@ -6,11 +6,11 @@
 use super::composer::render_input_box;
 use super::header::render_header;
 use super::layout::{BOX_BORDERS, SIDE_MARGIN};
-use super::util::{SHORT_DATE_COLS, fit_col, short_date, split_line, truncate};
+use super::session_row::{RowLayout, session_line};
+use super::util::{split_line, truncate};
 use super::{attach, footer, modals};
 use crate::app::AppState;
 use crate::config::{Config, LandingStyle};
-use crate::tui::glyphs;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::input;
 use ratatui::Frame;
@@ -29,8 +29,6 @@ const BOX_MAX_COLS: u16 = 76;
 const LOGO_ROWS: u16 = 3;
 /// Перед сессиями две пустые строки и подпись.
 const SESSIONS_LEAD_ROWS: u16 = 3;
-/// ` ▸ 1 ` перед названием сессии.
-const ROW_LEAD_COLS: usize = 5;
 /// Подпись над сессиями и подсказка листа: как выбрать сессию с клавиатуры.
 const PICK_HINT: &str = "\u{2193} pick \u{00B7} 1-5 or Enter open";
 /// Отступ листа слева и справа; в узком окне — поле колонки.
@@ -206,10 +204,14 @@ fn draw_center(
     let cursor = input::render_input(frame, inner, state, theme);
     y = input_box.bottom();
 
-    let model = footer::model_label(state, config).unwrap_or_default();
+    // Модель неизвестна, пока шлюз не выбрал аккаунт: тогда только `/help`.
+    let right = match footer::model_label(state, config) {
+        Some(model) => format!("{model} \u{00B7} /help"),
+        None => "/help".to_string(),
+    };
     let subline = split_line(
         vec![Span::styled(state.workspace_path.clone(), dim)],
-        vec![Span::styled(format!("{model} \u{00B7} /help"), dim)],
+        vec![Span::styled(right, dim)],
         usize::from(box_w.saturating_sub(4)),
     );
     frame.render_widget(
@@ -242,8 +244,12 @@ fn draw_center(
 
 /// Строки недавних сессий: `▸ 1  название ……… дата`, выбранная — с подсветкой.
 fn session_rows(state: &AppState, rows: usize, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    // Пробел перед датой и пробел после неё.
-    let title_w = width.saturating_sub(ROW_LEAD_COLS + 1 + SHORT_DATE_COLS + 1);
+    let layout = RowLayout {
+        number_cols: 1,
+        model: false,
+        messages: false,
+        trail: 1,
+    };
     let today = chrono::Local::now().date_naive();
     state
         .landing
@@ -253,31 +259,7 @@ fn session_rows(state: &AppState, rows: usize, width: usize, theme: &Theme) -> V
         .enumerate()
         .map(|(index, session)| {
             let picked = state.landing.cursor() == Some(index);
-            let bg = if picked { theme.selection } else { theme.bg };
-            let marker = if picked { glyphs::get().pointer } else { " " };
-            let title_color = if picked { theme.fg } else { theme.text_soft };
-            Line::from(vec![
-                Span::styled(
-                    format!(" {marker} {} ", index + 1),
-                    Style::default().fg(theme.accent).bg(bg),
-                ),
-                Span::styled(
-                    fit_col(&session.title, title_w),
-                    Style::default().fg(title_color).bg(bg),
-                ),
-                Span::styled(" ", Style::default().bg(bg)),
-                Span::styled(
-                    fit_col(
-                        &format!(
-                            "{:>SHORT_DATE_COLS$}",
-                            short_date(&session.updated_at, today)
-                        ),
-                        SHORT_DATE_COLS,
-                    ),
-                    Style::default().fg(theme.text_dim).bg(bg),
-                ),
-                Span::styled(" ", Style::default().bg(bg)),
-            ])
+            session_line(index + 1, session, picked, width, layout, today, theme)
         })
         .collect()
 }
@@ -421,6 +403,7 @@ mod tests {
     use super::*;
     use crate::app::conversation::Conversation;
     use crate::session::SessionSummary;
+    use crate::tui::glyphs;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

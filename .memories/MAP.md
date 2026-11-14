@@ -223,6 +223,9 @@ composer,footer,segments,chrome}.rs` (new skeleton and activity dock),
 | `src/tools/tool_search.rs` | `tool_search` builtin — capability search over MCP tools, returns full definitions; lexical fallback pre-init. The escape hatch for deferred MCP schemas |
 | `src/tools/history_search.rs` | `history_search` builtin — agent-facing search over past sessions (session id + title + date + excerpt per hit) |
 | `src/app/search.rs` | `View::Search` state: query `InputState`, matches in ranker order, pure `visible_indices` (role filter → per-session dedup → sort), `spawn_history_search` |
+| `src/app/resume.rs`, `src/app/keys/resume.rs`, `src/tui/render/resume.rs` | `/resume` (= `/sessions`) full-screen session picker: folder scope + Tab, title filter, scrollbar (2026-11-14). Row shared with the home screen: `src/tui/render/session_row.rs` |
+| `src/tui/render/welcome.rs` | Home screen, drawn on its own: `center` (logo, boxed input, recent sessions) and `sheet` (question, chips); `visible_sessions` feeds the landing keys (2026-11-14) |
+| `src/app/ui_prefs.rs`, `src/commands/defs/view.rs` | `/panel`, `/landing` and Ctrl+B: change `[ui] panel` / `[ui] landing` and save |
 | `src/app/keys/search.rs` | Search-screen keys — two focus zones (query text vs results hotkeys: s/r/u/Enter-open/q) |
 | `src/tui/render/search.rs` | Search-screen render: query box w/ drawn cursor, filter chips bar, 3-row result items, selection-derived scroll |
 | `src/util.rs` | `atomic_write` (now actually used everywhere), `expand_tilde` (single shared impl), `truncate_at_char_boundary` |

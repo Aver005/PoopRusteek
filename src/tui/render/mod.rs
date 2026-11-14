@@ -23,8 +23,10 @@ mod modals;
 mod onboarding;
 mod panel;
 mod popup;
+mod resume;
 mod search;
 mod segments;
+mod session_row;
 mod themes;
 mod util;
 mod welcome;
@@ -234,6 +236,8 @@ pub(crate) fn draw_frame(
             config,
             &theme,
         );
+    } else if state.view == View::Resume {
+        cursor = resume::render_resume_view(frame, area, state, &theme);
     } else if state.view == View::Search {
         search::render_search_view(frame, area, &state.search, &theme);
     } else if state.view == View::Themes {

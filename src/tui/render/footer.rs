@@ -304,14 +304,17 @@ pub(super) fn render_sheet_footer(
     if area.height == 0 {
         return;
     }
-    let model = model_label(state, config).unwrap_or_default();
+    // Модель неизвестна, пока шлюз не выбрал аккаунт: пропускаем её вместе с точкой.
+    let model = model_label(state, config)
+        .map(|model| format!("{model} \u{00B7} "))
+        .unwrap_or_default();
     let mut left = vec![
         Segment::new(
             3,
             Tone::Dim,
-            format!(" {} \u{00B7} {model} \u{00B7} ", state.workspace_path),
+            format!(" {} \u{00B7} {model}", state.workspace_path),
         )
-        .or_short(format!(" {model} \u{00B7} ")),
+        .or_short(format!(" {model}")),
         Segment::new(1, Tone::Plain, provider_text(state, config)),
     ];
     left.extend(left_segments(state, config, false, true));

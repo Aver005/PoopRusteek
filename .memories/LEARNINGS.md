@@ -182,3 +182,12 @@
   `rustup update stable` before trusting a local `clippy -D warnings` run;
   the `.githooks/pre-commit` hook uses the local toolchain too, so it
   inherits the same blind spot until updated.
+
+- **Хук pre-commit на Windows и линкер.** Хук идёт через `sh` Git, а он ставит
+  `Git\usr\bin` первым в PATH — cargo берёт GNU `link` и падает на сборке
+  тестов (fmt и clippy проходят). Не обходить `--no-verify`, а задать путь:
+  `cmd /c "vcvars64.bat && set CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=<MSVC 14.50>\link.exe && git commit …"`
+  (2026-11-14).
+- **`Select-Object -First` на выводе cargo оставляет висеть тестовый процесс:**
+  конвейер закрывается раньше, следующий прогон падает на LNK1104. Фильтровать
+  весь вывод (`Select-String` без `-First`) или убить процесс (2026-11-14).

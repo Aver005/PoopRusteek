@@ -78,6 +78,14 @@ impl App {
                     view.selected = nav.move_within(view.selected, len, page(rows::SERVER));
                 }
             }
+            View::Resume => {
+                let len = self.state.resume.visible(&self.state.workspace_path).len();
+                let page = crate::app::list::page_rows(
+                    self.state.terminal_rows,
+                    crate::app::list::rows::SESSION,
+                );
+                self.state.resume.navigate(nav, len, page);
+            }
             View::Search => {
                 let len = self.state.search.visible().len();
                 let search = &mut self.state.search;

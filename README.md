@@ -180,7 +180,7 @@ The home screen comes in two styles, chosen with `/landing` or `[ui] landing`: *
 | `/clear` · `/home` | Clear history · return to the landing screen |
 | `/compact` | Summarize history to shrink context |
 | `/reset` · `/last` | Reset session · open the most recent session |
-| `/load <id>` · `/sessions` · `/session` | Load a session · list sessions · current session info |
+| `/load <id>` · `/resume` (`/sessions`) · `/session` | Load a session · pick a session to continue (current folder, Tab for every project) · current session info |
 | `/delete [id]` · `/delete-local [id]` | Delete sessions — account + local, or local-only; multi-select picker with an All/Local/Remote filter and a confirm step |
 | `/export [path]` · `/import <path.md>` | Export / import chat as Markdown |
 | `/cwd` (`/cd`, `/move`) `<path>` | Change working directory |

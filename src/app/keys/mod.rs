@@ -25,6 +25,7 @@ mod modal;
 mod mouse;
 mod onboarding;
 mod paste;
+mod resume;
 mod search;
 mod themes;
 
@@ -112,6 +113,10 @@ impl App {
 
         if self.state.view == View::Accounts {
             return self.handle_accounts_key(key).await;
+        }
+
+        if self.state.view == View::Resume {
+            return self.handle_resume_key(key).await;
         }
 
         if self.state.view == View::Search {

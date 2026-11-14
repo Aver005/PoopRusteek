@@ -328,14 +328,6 @@ impl App {
                     self.apply_model_switch(&model);
                 }
             }
-            _ => {
-                if let Some(idx) = indices.first()
-                    && let Some(item) = picker.items.get(*idx)
-                {
-                    let id = item.value.clone();
-                    self.handle_load_session(&id).await?;
-                }
-            }
         }
         Ok(())
     }

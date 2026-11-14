@@ -459,6 +459,8 @@ impl App {
         };
         let gateway_changed = fresh.gateway_config() != self.config.gateway_config();
         self.config = fresh;
+        // Правку `[ui] panel` в файле видно сразу, как и `[ui] landing`.
+        self.state.show_stats_panel = self.config.ui.panel.forced();
         self.reload_mcp_after_trust();
         if gateway_changed {
             self.restart_gateway();

@@ -293,6 +293,8 @@ pub enum AppEvent {
 
     /// Фоновое чтение списка сессий для главного экрана закончилось.
     LandingSessionsLoaded(Vec<crate::session::SessionSummary>),
+    /// Список для экрана `/resume`, прочитанный в фоне.
+    ResumeSessionsLoaded(Vec<crate::session::SessionSummary>),
 
     /// Фоновый скан папки для `@путь` закончился. `generation` — номер
     /// запроса: ответ на устаревший запрос отбрасывается.
@@ -462,6 +464,8 @@ pub enum View {
     Accounts,
     /// `/search` — the history-search screen.
     Search,
+    /// `/resume` и `/sessions` — выбор сессии на весь экран.
+    Resume,
     /// `/themes` — the theme gallery + create wizard.
     Themes,
 }

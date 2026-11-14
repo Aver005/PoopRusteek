@@ -39,6 +39,7 @@ impl App {
             }
             CommandResult::SetPanel(mode) => self.set_panel(mode),
             CommandResult::SetLanding(style) => self.set_landing(style),
+            CommandResult::OpenResume => self.open_resume(),
             CommandResult::Quit => {
                 let _ = self.state.background.shutdown_all().await;
                 return Ok(true);

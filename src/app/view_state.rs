@@ -303,9 +303,6 @@ mod onboarding_tests {
 pub struct PickerItem {
     pub text: String,
     pub value: String,
-    /// Render this row flagged (e.g. yellow) — used by `/sessions` to mark
-    /// sessions whose remote link was found dead.
-    pub warn: bool,
 }
 
 impl PickerItem {
@@ -313,13 +310,7 @@ impl PickerItem {
         Self {
             text: text.into(),
             value: value.into(),
-            warn: false,
         }
-    }
-
-    pub fn warn(mut self, on: bool) -> Self {
-        self.warn = on;
-        self
     }
 }
 
@@ -331,7 +322,6 @@ pub enum PickerMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PickerKind {
-    Sessions,
     Whitelist,
     Skills,
     Chats,
@@ -354,21 +344,6 @@ pub struct PickerState {
 }
 
 impl PickerState {
-    pub fn new(title: impl Into<String>, items: Vec<PickerItem>, mode: PickerMode) -> Self {
-        let all_items = items.clone();
-        Self {
-            title: title.into(),
-            all_items,
-            items,
-            checked: Vec::new(),
-            persistent_checked: Vec::new(),
-            cursor: ListCursor::default(),
-            mode,
-            kind: PickerKind::Sessions,
-            search: String::new(),
-        }
-    }
-
     pub fn new_with_kind(
         title: impl Into<String>,
         items: Vec<PickerItem>,
@@ -1231,7 +1206,7 @@ mod picker_tests {
     use crossterm::event::KeyCode;
 
     fn multi_picker() -> PickerState {
-        PickerState::new(
+        PickerState::new_with_kind(
             "pick",
             vec![
                 PickerItem::new("alpha", "a"),
@@ -1239,6 +1214,7 @@ mod picker_tests {
                 PickerItem::new("gamma", "c"),
             ],
             PickerMode::Multi,
+            PickerKind::Chats,
         )
     }
 
@@ -1261,7 +1237,7 @@ mod picker_tests {
     fn every_letter_is_searchable_including_j_and_k() {
         // Раньше 'j' и 'k' были вырезаны из фильтра ради навигации, поэтому
         // ни "json", ни "kubernetes" в пикере было не найти.
-        let mut picker = PickerState::new(
+        let mut picker = PickerState::new_with_kind(
             "pick",
             vec![
                 PickerItem::new("json parser", "a"),
@@ -1269,6 +1245,7 @@ mod picker_tests {
                 PickerItem::new("alpha", "c"),
             ],
             PickerMode::Single,
+            PickerKind::Chats,
         );
         picker.update_search("j".to_string());
         assert_eq!(picker.items.len(), 1);

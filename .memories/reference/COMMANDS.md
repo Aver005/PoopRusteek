@@ -1,6 +1,6 @@
 # REFERENCE: Slash Commands
 > Complete catalog of in-TUI slash commands. Source of truth: `src/commands/`.
-> Last updated: 2026-11-07 (accounts, routes, roles, pin, usage, secrets, doctor;
+> Last updated: 2026-11-14 (/panel, /landing, /resume; earlier 2026-11-07: accounts, routes, roles, pin, usage, secrets, doctor;
 > `/providers` is now an alias for `/accounts`). Before: 2026-09-13 (`/update`
 > gained a `channel [stable|dev]` subcommand and now checks a manifest-driven
 > stable/dev release, not the old `latest` tag). Before: 2026-07-07 (added the 4
@@ -31,11 +31,11 @@
 `Pin` · `ShowUsage` · `PromptSecret` · `ReloadConfig` · `SetProviderTools` ·
 `OpenModels` · `SwitchModel` · `Rag` · `ConfirmUndo` · `Instructions` ·
 `SearchHistory` · `OpenThemes` · `OpenThemeWizard` · `SetTheme` · `Serve` ·
-`Update` · `ProviderModels` · `SetPanel` · `SetLanding` · `ResetProvider`…
+`Update` · `ProviderModels` · `SetPanel` · `SetLanding` · `OpenResume` · `ResetProvider`…
 `Detached` is how blocking work (keyring, files) leaves the event loop: the
 closure runs on `spawn_blocking` and its text comes back as an event.
 
-## FULL COMMAND LIST (59 distinct commands + 2 `/cwd` aliases = 61 registered names)
+## FULL COMMAND LIST (59 distinct commands + 2 `/cwd` aliases + `/sessions` = 62 registered names)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -59,7 +59,7 @@ closure runs on `spawn_blocking` and its text comes back as an event.
 | `/attach` | — | `<path1> [path2]…` | Attach files to the NEXT message (quoted paths; relative to the workspace). Text inline, PDF/images uploaded by DeepSeek (`app/attachments.rs`); drag-and-drop and `@file` feed the same path | `defs/attach.rs` |
 | `/export` | — | `[path]` | Export chat to Markdown (default `{data}/exports/{session_id}.md`) | `defs/export.rs` |
 | `/import` | — | `<path.md>` | Import chat from Markdown; session tagged `Imported` | `defs/import.rs` |
-| `/sessions` | — | — | List local sessions (hides `__goal_system__`-tagged); sessions with a confirmed-dead remote link show a ⚠ prefix and render yellow (`PickerItem::warn`) | `defs/session_list.rs` |
+| `/resume` | `/sessions` | — | Full-screen `View::Resume`: sessions of the current folder (Tab = every project), filter by title as you type, ↑↓/PgUp/PgDn/Home/End with a scrollbar, Enter loads, Esc back. List read off-loop (`AppEvent::ResumeSessionsLoaded`); `__goal_system__` sessions hidden, broken ones get a ⚠ prefix. Intent `OpenResume` | `defs/session_list.rs`, `app/resume.rs`, `keys/resume.rs`, `tui/render/resume.rs` |
 | `/session` | — | — | Show current session info (stats, tokens, model) | `defs/session_info.rs` |
 | `/load` | — | `<session_id>` | Load session by ID (local, or DeepSeek remote) | `defs/load.rs` |
 | `/last` | — | — | Open most recent session, or start fresh | `defs/last.rs` |

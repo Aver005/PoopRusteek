@@ -359,13 +359,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &PickerState, theme: &Th
         } else {
             theme.panel
         };
-        let fg = if is_cursor {
-            theme.fg
-        } else if item.warn {
-            theme.warning
-        } else {
-            theme.text_soft
-        };
+        let fg = if is_cursor { theme.fg } else { theme.text_soft };
 
         let text = truncate(&item.text, inner_w.saturating_sub(6));
 
