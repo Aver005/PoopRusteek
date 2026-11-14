@@ -99,6 +99,8 @@ fn pipe_into(tool: &Tool, payload: &[u8]) -> io::Result<()> {
 /// до приложения они доходят там, где терминал не вставляет (консоль Windows в raw-режиме).
 pub fn is_paste_shortcut(key: &crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
+    // Ctrl+М на русской раскладке — тот же Ctrl+V.
+    let key = crate::keyboard::layout_independent(*key, false);
     let mods = key.modifiers;
     match key.code {
         KeyCode::Char('v' | 'V') => {

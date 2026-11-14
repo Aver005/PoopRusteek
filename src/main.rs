@@ -16,6 +16,7 @@ mod error;
 mod gateway;
 mod harness;
 mod instructions;
+mod keyboard;
 mod logging;
 mod mcp;
 mod prompts;
