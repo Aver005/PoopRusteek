@@ -78,7 +78,7 @@ fn gateway_model(state: &AppState) -> Option<String> {
 }
 
 /// Модель, что отвечает: со шлюзом — по его выбору, без него — из конфига.
-fn model_label(state: &AppState, config: &Config) -> Option<String> {
+pub(super) fn model_label(state: &AppState, config: &Config) -> Option<String> {
     if state.gateway_view.enabled {
         gateway_model(state)
     } else {
@@ -110,12 +110,15 @@ fn context_segment(state: &AppState, config: &Config) -> Option<Segment> {
     )
 }
 
-fn left_segments(state: &AppState, config: &Config, work_shown: bool) -> Vec<Segment> {
+/// Части слева. На главной модель уже подписана под полем, а контекста ещё нет.
+fn left_segments(state: &AppState, config: &Config, work_shown: bool, home: bool) -> Vec<Segment> {
     let mut left = Vec::new();
-    if let Some(model) = model_label(state, config) {
-        left.push(Segment::new(1, Tone::Plain, format!(" {model}")));
+    if !home {
+        if let Some(model) = model_label(state, config) {
+            left.push(Segment::new(1, Tone::Plain, format!(" {model}")));
+        }
+        left.extend(context_segment(state, config));
     }
-    left.extend(context_segment(state, config));
     let queued = state.focused().queued.len();
     if queued > 0 {
         left.push(Segment::new(
@@ -178,27 +181,48 @@ fn left_segments(state: &AppState, config: &Config, work_shown: bool) -> Vec<Seg
     left
 }
 
+/// Кто отвечает: со шлюзом — аккаунт (и единственный тоже), без него — провайдер из конфига.
+fn provider_text(state: &AppState, config: &Config) -> String {
+    if let Some(indicator) = account_indicator(state) {
+        return indicator;
+    }
+    if state.gateway_view.enabled
+        && let Some(row) = state.gateway_view.account_rows().into_iter().next()
+    {
+        return row.label;
+    }
+    provider_label(config)
+}
+
+/// Счётчик ошибок: защищён от сокращения, пока работу не показывает док или панель.
+fn error_segment(state: &AppState, work_shown: bool) -> Option<Segment> {
+    if work_shown || state.error_count == 0 {
+        return None;
+    }
+    let glyph = crate::tui::glyphs::get().warn;
+    let noun = if state.error_count == 1 {
+        "error"
+    } else {
+        "errors"
+    };
+    Some(
+        Segment::new(
+            0,
+            Tone::Error,
+            format!(" {glyph} {} {noun}", state.error_count),
+        )
+        .or_short(format!(" {glyph} {}", state.error_count)),
+    )
+}
+
 /// Справа: ошибки и кто отвечает. Со шлюзом это аккаунт, без него — провайдер.
 fn right_segments(state: &AppState, config: &Config, work_shown: bool) -> Vec<Segment> {
-    let mut right = Vec::new();
-    if !work_shown && state.error_count > 0 {
-        let glyph = crate::tui::glyphs::get().warn;
-        let noun = if state.error_count == 1 {
-            "error"
-        } else {
-            "errors"
-        };
-        right.push(
-            Segment::new(
-                0,
-                Tone::Error,
-                format!(" {glyph} {} {noun}", state.error_count),
-            )
-            .or_short(format!(" {glyph} {}", state.error_count)),
-        );
-    }
-    let provider = account_indicator(state).unwrap_or_else(|| provider_label(config));
-    right.push(Segment::new(1, Tone::Plain, format!(" {provider} ")));
+    let mut right: Vec<Segment> = error_segment(state, work_shown).into_iter().collect();
+    right.push(Segment::new(
+        1,
+        Tone::Plain,
+        format!(" {} ", provider_text(state, config)),
+    ));
     right
 }
 
@@ -220,9 +244,19 @@ pub(super) fn footer_parts(
     width: usize,
     work_shown: bool,
 ) -> (Vec<Fitted>, Vec<Fitted>) {
+    parts_for(state, config, width, work_shown, false)
+}
+
+fn parts_for(
+    state: &AppState,
+    config: &Config,
+    width: usize,
+    work_shown: bool,
+    home: bool,
+) -> (Vec<Fitted>, Vec<Fitted>) {
     fit_segments(
         width.saturating_sub(RULE_COLS),
-        left_segments(state, config, work_shown),
+        left_segments(state, config, work_shown, home),
         right_segments(state, config, work_shown),
     )
 }
@@ -238,8 +272,74 @@ pub(super) fn render_footer(
     if area.height == 0 {
         return;
     }
+    let parts = footer_parts(state, config, usize::from(area.width), work_shown);
+    draw_rule(frame, area, parts, theme);
+}
+
+/// Нижняя линия главной: без модели и контекста, провайдер справа.
+pub(super) fn render_home_footer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    config: &Config,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let parts = parts_for(state, config, usize::from(area.width), false, true);
+    draw_rule(frame, area, parts, theme);
+}
+
+/// Нижняя строка листа, без линий: папка · модель · провайдер и то, что меняется,
+/// слева; ошибки и подсказка `hint` справа.
+pub(super) fn render_sheet_footer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    config: &Config,
+    theme: &Theme,
+    hint: &str,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let model = model_label(state, config).unwrap_or_default();
+    let mut left = vec![
+        Segment::new(
+            3,
+            Tone::Dim,
+            format!(" {} \u{00B7} {model} \u{00B7} ", state.workspace_path),
+        )
+        .or_short(format!(" {model} \u{00B7} ")),
+        Segment::new(1, Tone::Plain, provider_text(state, config)),
+    ];
+    left.extend(left_segments(state, config, false, true));
+    let mut right: Vec<Segment> = error_segment(state, false).into_iter().collect();
+    right.push(Segment::new(5, Tone::Dim, format!(" {hint} ")));
     let width = usize::from(area.width);
-    let (left, right) = footer_parts(state, config, width, work_shown);
+    let (left, right) = fit_segments(width, left, right);
+    let gap = width.saturating_sub(fitted_width(&left) + fitted_width(&right));
+    let mut spans: Vec<Span> = left
+        .into_iter()
+        .map(|part| Span::styled(part.text, tone_style(part.tone, theme)))
+        .collect();
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(
+        right
+            .into_iter()
+            .map(|part| Span::styled(part.text, tone_style(part.tone, theme))),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg)),
+        area,
+    );
+}
+
+/// Линия `─ части ──── части ─` ровно на ширину `area`.
+fn draw_rule(frame: &mut Frame, area: Rect, parts: (Vec<Fitted>, Vec<Fitted>), theme: &Theme) {
+    let width = usize::from(area.width);
+    let (left, right) = parts;
     let rule = Style::default().fg(theme.border).bg(theme.bg);
     // Края — по одной клетке линии; пробелы при надписях несут сами части.
     let fill = width.saturating_sub(fitted_width(&left) + fitted_width(&right) + 2);

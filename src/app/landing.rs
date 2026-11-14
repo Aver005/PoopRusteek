@@ -31,9 +31,10 @@ impl LandingSessions {
         self.cursor
     }
 
-    /// Вниз: из пустоты на первую строку, дальше до последней.
-    pub fn step_down(&mut self) {
-        let last = self.recent().len().checked_sub(1);
+    /// Вниз: из пустоты на первую строку, дальше до последней из `visible` —
+    /// тех, что главная сейчас нарисовала. Невидимую сессию выбрать нельзя.
+    pub fn step_down(&mut self, visible: usize) {
+        let last = self.recent().len().min(visible).checked_sub(1);
         self.cursor = match (self.cursor, last) {
             (_, None) => None,
             (None, Some(_)) => Some(0),
@@ -47,6 +48,15 @@ impl LandingSessions {
             Some(at) if at > 0 => Some(at - 1),
             _ => None,
         };
+    }
+
+    /// Поставить курсор на сессию номер `index` (с нуля), если она нарисована.
+    pub fn pick(&mut self, index: usize, visible: usize) -> bool {
+        let ok = index < self.recent().len().min(visible);
+        if ok {
+            self.cursor = Some(index);
+        }
+        ok
     }
 
     pub fn clear_cursor(&mut self) {
@@ -138,10 +148,10 @@ mod tests {
         let mut landing = LandingSessions::default();
         landing.apply(vec![summary("a"), summary("b")]);
         assert_eq!(landing.cursor(), None);
-        landing.step_down();
+        landing.step_down(SHOWN_SESSIONS);
         assert_eq!(landing.selected_id().as_deref(), Some("a"));
-        landing.step_down();
-        landing.step_down();
+        landing.step_down(SHOWN_SESSIONS);
+        landing.step_down(SHOWN_SESSIONS);
         assert_eq!(
             landing.selected_id().as_deref(),
             Some("b"),
@@ -157,12 +167,29 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_never_goes_past_what_is_drawn() {
+        let mut landing = LandingSessions::default();
+        landing.apply(vec![summary("a"), summary("b"), summary("c")]);
+        for _ in 0..5 {
+            landing.step_down(2);
+        }
+        assert_eq!(landing.selected_id().as_deref(), Some("b"));
+        let mut hidden = LandingSessions::default();
+        hidden.apply(vec![summary("a")]);
+        hidden.step_down(0);
+        assert_eq!(hidden.cursor(), None, "nothing drawn, nothing to pick");
+        assert!(!hidden.pick(0, 0));
+        assert!(hidden.pick(0, 1));
+        assert_eq!(hidden.selected_id().as_deref(), Some("a"));
+    }
+
+    #[test]
     fn a_shorter_list_never_leaves_the_cursor_past_its_end() {
         let mut landing = LandingSessions::default();
         landing.apply(vec![summary("a"), summary("b"), summary("c")]);
-        landing.step_down();
-        landing.step_down();
-        landing.step_down();
+        landing.step_down(SHOWN_SESSIONS);
+        landing.step_down(SHOWN_SESSIONS);
+        landing.step_down(SHOWN_SESSIONS);
         landing.apply(vec![summary("a")]);
         assert_eq!(landing.cursor(), None);
     }

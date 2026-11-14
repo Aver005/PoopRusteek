@@ -4,7 +4,7 @@
 //!
 //! Layout of this module tree, bottom layer first:
 //! - [`util`], [`segments`], [`layout`] — pure text/format/layout helpers
-//!   (no drawing); `layout::Regions` is the only place heights are computed
+//!   (no drawing); `layout::Regions` computes the chat screen, `welcome` its own home
 //! - [`popup`] — the shared popup/modal skeleton every modal builds on
 //! - [`header`], [`dock`], [`composer`], [`footer`], [`welcome`], [`onboarding`], [`mcp`],
 //!   [`modals`] — the actual views; [`draw_frame`] below only dispatches.
@@ -137,6 +137,16 @@ pub(crate) fn transcript_rows(state: &AppState) -> Option<u16> {
     )
 }
 
+/// Сколько недавних сессий главная рисует в текущем окне: курсор и цифры
+/// выбирают только их, невидимую сессию открыть нельзя.
+pub(crate) fn landing_visible_sessions(state: &AppState, config: &Config) -> usize {
+    let (cols, rows) = (state.terminal_cols, state.terminal_rows);
+    if cols < MIN_COLS || rows < MIN_ROWS || !is_welcome(state) {
+        return 0;
+    }
+    welcome::visible_sessions(state, config, Rect::new(0, 0, cols, rows))
+}
+
 /// Новая прокрутка (строки от низа), когда переписка стала `new` строк вместо
 /// `old`: верхняя строка остаётся той же. У самого низа (0) ничего не меняется —
 /// он приклеен. Ноль в `old` значит «прошлого кадра не было».
@@ -155,13 +165,12 @@ fn draw_chat_screen(
     config: &Config,
     theme: &Theme,
 ) -> Option<(u16, u16)> {
+    if is_welcome(state) {
+        return welcome::draw_welcome(frame, area, state, config, theme);
+    }
     let regions = chat_regions(state, area);
     header::render_header(frame, regions.header, state, theme);
-    if is_welcome(state) {
-        welcome::render_welcome(frame, regions.transcript, state, config, theme);
-    } else {
-        widgets::chat::render_chat(frame, regions.transcript, state, theme);
-    }
+    widgets::chat::render_chat(frame, regions.transcript, state, theme);
     if let Some(sidebar) = regions.sidebar {
         panel::render_panel(frame, sidebar, state, config, theme);
     }
@@ -332,39 +341,43 @@ mod tests {
         config
     }
 
-    /// Поле ввода стоит на одной и той же строке от низа на обоих экранах и
-    /// на любом размере окна: в рамке прямо над подвалом.
+    /// В чате поле стоит в рамке прямо над подвалом на любом размере окна;
+    /// на главной оно есть при любом виде и размере, но стоит где решил вид.
     #[test]
-    fn the_input_sits_on_the_same_row_from_the_bottom_on_every_screen_and_size() {
-        let config = config_with_unicode();
-        for (cols, rows) in SIZES {
-            for welcome in [true, false] {
-                let state = state_for(welcome, cols, rows);
-                let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
-                terminal
-                    .draw(|frame| {
-                        draw_frame(frame, &state, &config);
-                    })
-                    .unwrap();
-                assert_eq!(
-                    prompt_row(&terminal),
-                    Some(rows - 3),
-                    "{cols}x{rows} welcome={welcome}"
-                );
+    fn the_input_is_drawn_on_every_screen_and_size() {
+        use crate::config::LandingStyle;
+        for landing in [LandingStyle::Center, LandingStyle::Sheet] {
+            let mut config = config_with_unicode();
+            config.ui.landing = landing;
+            for (cols, rows) in SIZES {
+                for welcome in [true, false] {
+                    let state = state_for(welcome, cols, rows);
+                    let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            assert!(draw_frame(frame, &state, &config).is_some());
+                        })
+                        .unwrap();
+                    let row = prompt_row(&terminal);
+                    if welcome {
+                        assert!(row.is_some(), "{cols}x{rows} {landing:?}");
+                    } else {
+                        assert_eq!(row, Some(rows - 3), "{cols}x{rows}");
+                    }
+                }
             }
         }
     }
 
     #[test]
     fn the_regions_agree_with_the_drawn_input_row() {
+        // Главная раскладывается сама (`welcome`); раскладка чата — только для переписки.
         for (cols, rows) in SIZES {
-            for welcome in [true, false] {
-                let state = state_for(welcome, cols, rows);
-                let regions = chat_regions(&state, Rect::new(0, 0, cols, rows));
-                assert_eq!(regions.input.y, rows - 3, "{cols}x{rows}");
-                assert_eq!(regions.footer.y, rows - 1, "{cols}x{rows}");
-                assert_eq!(regions.input_box.bottom() + regions.footer.height, rows);
-            }
+            let state = state_for(false, cols, rows);
+            let regions = chat_regions(&state, Rect::new(0, 0, cols, rows));
+            assert_eq!(regions.input.y, rows - 3, "{cols}x{rows}");
+            assert_eq!(regions.footer.y, rows - 1, "{cols}x{rows}");
+            assert_eq!(regions.input_box.bottom() + regions.footer.height, rows);
         }
     }
 

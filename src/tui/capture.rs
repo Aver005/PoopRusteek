@@ -72,6 +72,20 @@ fn scenes() -> Vec<Scene> {
             first_run: false,
         },
         Scene {
+            name: "landing-sheet",
+            build: landing_sheet,
+            sizes: SIZES_MAIN,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
+            name: "landing-sheet-pick",
+            build: landing_sheet,
+            sizes: SIZES_MAIN,
+            themes: DEFAULT_THEME,
+            first_run: false,
+        },
+        Scene {
             name: "chat-long",
             build: chat_long,
             sizes: SIZES_ALL,
@@ -502,6 +516,12 @@ fn with_base(config: &mut Config, build: fn(AppState, &mut Config) -> AppState) 
 fn landing(config: &mut Config) -> AppState {
     let theme = config.ui.theme.clone();
     base(config, &theme)
+}
+
+/// Главная видом «лист» (`[ui] landing = "sheet"`).
+fn landing_sheet(config: &mut Config) -> AppState {
+    config.ui.landing = crate::config::LandingStyle::Sheet;
+    landing(config)
 }
 
 fn landing_typing(config: &mut Config) -> AppState {
@@ -1002,9 +1022,9 @@ fn capture(
     state
         .landing
         .apply(crate::session::list_sessions().unwrap_or_default());
-    if scene.name == "landing-pick" {
-        state.landing.step_down();
-        state.landing.step_down();
+    if scene.name.ends_with("-pick") {
+        state.landing.step_down(crate::app::landing::SHOWN_SESSIONS);
+        state.landing.step_down(crate::app::landing::SHOWN_SESSIONS);
     }
 
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");

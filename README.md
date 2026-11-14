@@ -165,7 +165,7 @@ It copies your own token into the clipboard — paste it into the token box and 
 | `↑` / `↓` | Input history / scroll |
 | `PageUp` / `PageDown` | Scroll history |
 
-The landing screen keeps the card and the session list on top and the input always at the bottom. While a turn, a sub-agent or the GOAL loop is running, the **activity dock** above the input shows what is happening (at most four rows, then `+N more`); it is not a log of background jobs. With the side panel open (automatic from 120 columns) the dock steps aside and the panel's **Now** section shows the same. Keys for that screen: `↓`/`↑` moves the session cursor, `Enter` opens, `Esc` returns to typing; typing wins over navigation.
+The home screen comes in two styles, chosen with `/landing` or `[ui] landing`: **center** (default) puts the input in a box in the middle with recent sessions below it, **sheet** is a frameless page with session chips. Once the chat has messages the input moves to the bottom. While a turn, a sub-agent or the GOAL loop is running, the **activity dock** above the input shows what is happening (at most four rows, then `+N more`); it is not a log of background jobs. With the side panel open (automatic from 120 columns) the dock steps aside and the panel's **Now** section shows the same. Keys for the home screen: `↓`/`↑` moves the session cursor, `Enter` or the session number opens it, `Esc` returns to typing; typing wins over navigation.
 
 ## 💬 Commands
 

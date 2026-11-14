@@ -31,7 +31,7 @@ const NARROW_COLUMN_COLS: u16 = 50;
 /// Столько строк под переписку оставляем при любых аппетитах остальных.
 const MIN_TRANSCRIPT_ROWS: u16 = 3;
 /// Верхняя и нижняя граница рамки поля ввода.
-const BOX_BORDERS: u16 = 2;
+pub(super) const BOX_BORDERS: u16 = 2;
 
 /// Что экран хочет занять.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

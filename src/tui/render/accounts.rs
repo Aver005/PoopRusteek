@@ -10,8 +10,8 @@ use crate::app::gateway_view::forms::{
     LIMIT_FIELDS, LimitsForm, SecretPrompt, TrustChoice, TrustDialog, TrustLineKind, trust_view,
 };
 use crate::app::gateway_view::rows::{
-    AccountRow, DEFAULT_HARD_PCT, DEFAULT_SOFT_PCT, LimitLine, Mark, RouteRow, Tone, chip_text,
-    last_decision, role_name, role_rows, route_rows, summary_text,
+    AccountRow, DEFAULT_HARD_PCT, DEFAULT_SOFT_PCT, LimitLine, Mark, RouteRow, Tone, last_decision,
+    role_name, role_rows, route_rows, summary_text,
 };
 use crate::app::gateway_view::wizard::{
     AccountWizard, KINDS, Kind, LOGIN_OWN, LOGIN_SHARED, PROTOCOLS, Step,
@@ -1334,55 +1334,6 @@ pub(super) fn render_trust(frame: &mut Frame, area: Rect, dialog: &TrustDialog, 
         Style::default().fg(theme.text_dim),
     )));
     draw_popup(frame, popup_area, inner, block, lines, theme);
-}
-
-/// Фишки аккаунтов для главной: `● claude-max 52% · ◔ opencode-go 2m 10s`.
-pub(super) fn account_chips(
-    view: &GatewayView,
-    width: usize,
-    theme: &Theme,
-) -> Option<Line<'static>> {
-    let rows = view.account_rows();
-    if rows.is_empty() {
-        return None;
-    }
-    let mut spans = vec![Span::styled(
-        " accounts  ",
-        Style::default().fg(theme.text_dim),
-    )];
-    let mut used = UnicodeWidthStr::width(" accounts  ");
-    let mut hidden = 0usize;
-    for (i, row) in rows.iter().enumerate() {
-        let chip = chip_text(row);
-        let cost = UnicodeWidthStr::width(chip.as_str()) + 4 + if i > 0 { 3 } else { 0 };
-        if used + cost + 6 > width && i > 0 {
-            hidden = rows.len() - i;
-            break;
-        }
-        if i > 0 {
-            spans.push(Span::styled(
-                " \u{00B7} ",
-                Style::default().fg(theme.text_dim),
-            ));
-            used += 3;
-        }
-        spans.push(Span::styled(
-            format!("{} ", mark_glyph(row.status.mark)),
-            Style::default().fg(tone_color(row.status.tone, theme)),
-        ));
-        spans.push(Span::styled(
-            chip.clone(),
-            Style::default().fg(theme.text_soft),
-        ));
-        used += UnicodeWidthStr::width(chip.as_str()) + 2;
-    }
-    if hidden > 0 {
-        spans.push(Span::styled(
-            format!("  +{hidden}"),
-            Style::default().fg(theme.text_dim),
-        ));
-    }
-    Some(Line::from(spans))
 }
 
 /// Кто сейчас отвечает: короткий индикатор для подвала. `None`, если аккаунтов меньше двух.

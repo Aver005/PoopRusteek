@@ -74,13 +74,21 @@ pub(super) fn fit_col(s: &str, width: usize) -> String {
     out
 }
 
-pub(super) fn format_date(rfc3339: &str) -> String {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        dt.format("%b %d %H:%M").to_string()
+/// Короткая дата для списков: время, если это `today`, иначе `Nov 05`.
+pub(super) fn short_date(rfc3339: &str, today: chrono::NaiveDate) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return truncate(rfc3339, SHORT_DATE_COLS);
+    };
+    let local = dt.with_timezone(&chrono::Local);
+    if local.date_naive() == today {
+        local.format("%H:%M").to_string()
     } else {
-        rfc3339.chars().take(16).collect()
+        local.format("%b %d").to_string()
     }
 }
+
+/// Ширина [`short_date`]: `Nov 05` и `14:02` влезают.
+pub(super) const SHORT_DATE_COLS: usize = 6;
 
 /// Сколько клеток левой части остаётся при любой длине правой.
 const MIN_LEFT_COLS: usize = 10;
@@ -219,6 +227,24 @@ mod tests {
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum()
+    }
+
+    #[test]
+    fn a_short_date_is_a_time_today_and_a_day_otherwise() {
+        let stamp = "2026-11-05T09:12:00+00:00";
+        let local = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        assert_eq!(
+            short_date(stamp, local.date_naive()),
+            local.format("%H:%M").to_string()
+        );
+        let other = local.date_naive().succ_opt().unwrap();
+        assert_eq!(short_date(stamp, other), local.format("%b %d").to_string());
+        assert_eq!(
+            UnicodeWidthStr::width(short_date("испорченная дата", other).as_str()),
+            6
+        );
     }
 
     #[test]

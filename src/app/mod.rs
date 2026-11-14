@@ -948,15 +948,12 @@ impl App {
     /// Does a tick actually change pixels? The spinner and elapsed-time stats
     /// animate while the **focused** conversation is streaming — background
     /// streams repaint via their own chunk events, and every renderer reads
-    /// only the focused conversation's `animation_tick`; the landing logo
-    /// animates while the chat is empty and no modal covers it. The `Tick`
-    /// handler advances `animation_tick` under this exact predicate — keep
-    /// them in lockstep, or idle ticks either redraw an unchanged frame or
-    /// freeze the spinner.
+    /// only the focused conversation's `animation_tick`; the onboarding title
+    /// pulses. The home screen is static. The `Tick` handler advances
+    /// `animation_tick` under this exact predicate — keep them in lockstep, or
+    /// idle ticks either redraw an unchanged frame or freeze the spinner.
     fn tick_is_visual(&self) -> bool {
-        self.state.view == View::Onboarding
-            || self.state.focused().is_streaming()
-            || (self.state.focused().messages.is_empty() && self.state.modal.is_none())
+        self.state.view == View::Onboarding || self.state.focused().is_streaming()
     }
 
     /// Set the status line and mirror the same text into the focused chat as

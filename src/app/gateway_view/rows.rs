@@ -489,21 +489,6 @@ pub fn last_decision_model(snapshot: &GatewaySnapshot) -> Option<String> {
     })
 }
 
-/// Короткие фишки для главной и подвала: `● claude-max 52%`.
-pub fn chip_text(row: &AccountRow) -> String {
-    match row.limits.first().and_then(|l| l.pct.map(|p| (l, p))) {
-        Some((line, pct)) => format!(
-            "{} {}{pct:.0}%",
-            row.label,
-            if line.estimate { "~" } else { "" }
-        ),
-        None => match row.status.mark {
-            Mark::Cooling => format!("{} {}", row.label, row.status.text.replace("cooling ", "")),
-            _ => row.label.clone(),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

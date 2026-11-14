@@ -172,18 +172,21 @@ impl App {
             self.state.landing.clear_cursor();
             return false;
         }
+        // Сколько сессий главная нарисовала в этом размере окна: только их и выбираем.
+        let visible = crate::tui::render::landing_visible_sessions(&self.state, &self.config);
+        let picking = self.state.landing.cursor().is_some();
         match key.code {
-            KeyCode::Down => self.state.landing.step_down(),
-            KeyCode::Up if self.state.landing.cursor().is_some() => self.state.landing.step_up(),
-            KeyCode::Esc if self.state.landing.cursor().is_some() => {
+            KeyCode::Down => self.state.landing.step_down(visible),
+            KeyCode::Up if picking => self.state.landing.step_up(),
+            KeyCode::Esc if picking => {
                 self.state.landing.clear_cursor();
             }
-            KeyCode::Enter if self.state.landing.cursor().is_some() => {
-                if let Some(id) = self.state.landing.selected_id() {
-                    self.state.landing.clear_cursor();
-                    if let Err(error) = self.handle_load_session(&id).await {
-                        self.state.status_message = format!("Cannot open the session: {error}");
-                    }
+            KeyCode::Enter if picking => self.open_landing_pick().await,
+            // Пока курсор на списке, цифра открывает сессию с этим номером.
+            KeyCode::Char(digit @ '1'..='9') if picking => {
+                let index = usize::from(digit as u8 - b'1');
+                if self.state.landing.pick(index, visible) {
+                    self.open_landing_pick().await;
                 }
             }
             // Любая печать возвращает ввод в поле: курсор уходит, клавиша идёт дальше.
@@ -194,6 +197,16 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Открыть сессию под курсором главной.
+    async fn open_landing_pick(&mut self) {
+        if let Some(id) = self.state.landing.selected_id() {
+            self.state.landing.clear_cursor();
+            if let Err(error) = self.handle_load_session(&id).await {
+                self.state.status_message = format!("Cannot open the session: {error}");
+            }
+        }
     }
 
     /// Handle plain Enter: backslash line-continuation, empty-goal nudges,
