@@ -355,6 +355,8 @@ async fn run_foreground(shell: &Shell, argv: Vec<String>, command: &str) -> Tool
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Метка «запущено инструментом агента»: trust и secrets за ней отказывают.
+    cmd.env(crate::secrets::human::AGENT_CHILD_ENV, "1");
     // Without this, dropping `child` (e.g. this future being cancelled)
     // would leave the process running with no supervisor left to kill
     // it — the same leak class as the unbounded-hang bug this fix
@@ -893,5 +895,85 @@ mod tests {
     fn timeout_marker_text_includes_the_configured_seconds() {
         let marker = format!("[command timed out after {FOREGROUND_TIMEOUT_SECS}s and was killed]");
         assert_eq!(marker, "[command timed out after 300s and was killed]");
+    }
+
+    /// Оболочка и команда, печатающая значение метки агента (на Windows — PowerShell).
+    fn probe() -> (Shell, String) {
+        let name = crate::secrets::human::AGENT_CHILD_ENV;
+        if cfg!(windows) {
+            (
+                Shell::powershell(),
+                format!("Write-Output \"[$env:{name}]\""),
+            )
+        } else {
+            (Shell::bash(), format!("echo \"[${name}]\""))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreground_command_is_marked_as_an_agent_child() {
+        let (shell, command) = probe();
+        let argv = (shell.make_args)(&command);
+        let result = run_foreground(&shell, argv, &command).await;
+        assert!(result.content.contains("[1]"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn a_background_command_is_marked_as_an_agent_child() {
+        // Свой запуск без оболочки инструмента: без консоли (DETACHED_PROCESS) PowerShell молчит.
+        let name = crate::secrets::human::AGENT_CHILD_ENV;
+        let (program, flag, command) = if cfg!(windows) {
+            ("cmd", "/C", format!("echo [%{name}%]"))
+        } else {
+            ("sh", "-c", format!("echo \"[${name}]\""))
+        };
+        let mut cmd = Command::new(program);
+        cmd.args([flag, command.as_str()]);
+        let outcome =
+            background::spawn_background(cmd, command, program.to_string(), 5.0, false, None)
+                .await
+                .unwrap();
+        assert!(
+            outcome.initial_output.contains("[1]"),
+            "{}",
+            outcome.initial_output
+        );
+    }
+
+    // На Windows вывод ConPTY (служебные ESC-последовательности) путает определение UTF-16
+    // в `sanitize_terminal_output`, поэтому проверка живёт на Unix; строка с меткой общая.
+    #[cfg(unix)]
+    #[test]
+    fn a_pty_command_is_marked_as_an_agent_child() {
+        let name = crate::secrets::human::AGENT_CHILD_ENV;
+        let (program, flag, command) = if cfg!(windows) {
+            ("cmd", "/C", format!("echo [%{name}%]"))
+        } else {
+            ("sh", "-c", format!("echo \"[${name}]\""))
+        };
+        let argv = vec![flag.to_string(), command.clone()];
+        // Читатель PTY висит в блокирующем потоке: обычный рантайм теста ждал бы его вечно.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let outcome = runtime
+            .block_on(background::spawn_interactive(
+                program,
+                &argv,
+                None,
+                command,
+                program.to_string(),
+                5.0,
+                100,
+                30,
+                false,
+                None,
+            ))
+            .unwrap();
+        runtime.shutdown_background();
+        // Терминал у ребёнка настоящий, поэтому защищает именно метка, а не проверка TTY.
+        assert!(
+            outcome.initial_output.contains("[1]"),
+            "{}",
+            outcome.initial_output
+        );
     }
 }

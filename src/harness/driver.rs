@@ -578,6 +578,9 @@ fn load_resumed(
 /// The trace says which of the two happened, so a run is never silently
 /// judged on a conversation it did not actually continue.
 async fn adopt_remote_session(provider: &Arc<dyn LLMProvider>, session: &crate::session::Session) {
+    if let Some(route) = &session.route_state {
+        provider.seed_route_state(route.clone());
+    }
     let remote = match (session.broken, session.provider_session_id.as_deref()) {
         (false, Some(id)) => id,
         (true, _) => return replay_locally(session, "session_marked_broken", None, provider).await,
@@ -650,6 +653,43 @@ fn log_resume(
     );
 }
 
+/// Шлюз прогона: `[gateway]`, `[[accounts]]`, `[[routes]]`, `[roles]` самого конфига (`--config`).
+/// Сборка читает секреты (`env:`, файлы, `cmd:`), поэтому идёт на `spawn_blocking`.
+async fn harness_gateway(config: &Config) -> AppResult<crate::gateway::handle::GatewayHandle> {
+    let settings = crate::gateway::engine::gateway_config(config);
+    check_gateway_config(&settings)?;
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::gateway::engine::build_gateway(
+            settings,
+            crate::gateway::engine::EngineDeps::for_config(&config),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Custom(format!("gateway build: {e}")))
+}
+
+/// Прогон на сломанном конфиге ничего не доказывает: отказ до первого хода.
+fn check_gateway_config(settings: &crate::gateway::types::GatewayConfig) -> AppResult<()> {
+    if !settings.gateway.enabled {
+        return Ok(());
+    }
+    let errors: Vec<String> = settings
+        .validate()
+        .into_iter()
+        .filter(|p| p.severity == crate::gateway::types::Severity::Error)
+        .map(|p| format!("{}: {}", p.path, p.message))
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Custom(format!(
+            "invalid gateway config: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
 /// Build provider, tools, skills, semantic service and system prompt.
 async fn assemble(
     config: &Config,
@@ -660,11 +700,14 @@ async fn assemble(
     // Пропавший `--attach` — отказ до сборки провайдера и ожидания индекса.
     let attachments =
         attached_files(options, std::path::Path::new(workspace)).map_err(AppError::Custom)?;
-    let provider = crate::provider::build_provider(config).ok_or_else(|| {
-        AppError::Custom(
-            "no provider configured: set [provider].token or pick a /providers entry".to_string(),
-        )
-    })?;
+    let gateway = harness_gateway(config).await?;
+    let provider =
+        crate::gateway::handle::main_provider(config, Some(&gateway)).ok_or_else(|| {
+            AppError::Custom(
+                "no provider configured: set [provider].token or pick a /providers entry"
+                    .to_string(),
+            )
+        })?;
 
     // Same shape as `App::new`: ask once, in the background, and let the
     // answer arrive as an event. A provider that cannot say never sends one,
@@ -851,7 +894,7 @@ impl Verdict {
     /// подтверждения: иначе `todo`, `task` и ход суб-агента не попадали в список.
     fn on_tool_event(&mut self, conversation: ConversationId, event: &AgentEvent) {
         match event {
-            AgentEvent::ToolStarted { name } => {
+            AgentEvent::ToolStarted { name, .. } => {
                 self.tools.push(ToolInvocation {
                     name: name.clone(),
                     approved: true,
@@ -1208,7 +1251,7 @@ async fn drive(
                                     "source": answered.source,
                                 }),
                             );
-                            verdict.questions.push(state.question.clone());
+                            verdict.questions.push(state.question);
                             record_question(&request, answered.answer.clone());
                             verdict.answered.push(answered);
                         }
@@ -1414,6 +1457,8 @@ fn persist(
         // локальной историей, — следующий `--resume` перескажет её заново.
         broken: conversation.broken && (interrupted || !remote.is_established()),
         remote,
+        route: provider.route_state(),
+        title: (!conversation.title.trim().is_empty()).then(|| conversation.title.clone()),
     };
     match crate::session::save_session(
         &conversation.session_id,
@@ -1562,6 +1607,7 @@ mod tests {
         let root = ConversationId::next();
         let started = |name: &str| AgentEvent::ToolStarted {
             name: name.to_string(),
+            summary: String::new(),
         };
         verdict.on_tool_event(root, &started("task"));
         verdict.on_tool_event(root, &started("look › bash"));
@@ -1896,5 +1942,148 @@ mod tests {
             liveness_label(&SessionLiveness::Unknown("answered text/html".into())),
             Some(("remote_session_unverified", "answered text/html"))
         );
+    }
+
+    // ── Шлюз в прогоне ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_broken_gateway_config_is_refused_before_the_first_turn() {
+        let broken: crate::gateway::types::GatewayConfig = toml::from_str(
+            "[gateway]
+enabled = true
+[[accounts]]
+id = \"a\"
+provider = \"custom\"
+base_url = \"http://h/v1\"
+secret = \"none\"
+[accounts.limits]
+max_concurrency = 0
+",
+        )
+        .unwrap();
+        let error = check_gateway_config(&broken).unwrap_err().to_string();
+        assert!(error.contains("max_concurrency"), "{error}");
+
+        let good: crate::gateway::types::GatewayConfig = toml::from_str(
+            "[gateway]
+enabled = true
+[[accounts]]
+id = \"a\"
+provider = \"custom\"
+base_url = \"http://h/v1\"
+secret = \"none\"
+model = \"m\"
+",
+        )
+        .unwrap();
+        assert!(check_gateway_config(&good).is_ok());
+        // Выключенный шлюз не проверяется: прежнее поведение.
+        let mut off = broken;
+        off.gateway.enabled = false;
+        assert!(check_gateway_config(&off).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_gateway_of_a_run_comes_from_the_config_itself() {
+        let off = harness_gateway(&Config::default()).await.unwrap();
+        assert!(!off.is_enabled());
+        let mut config = Config::default();
+        config.gateway.enabled = true;
+        config.accounts.push(
+            toml::from_str(
+                "id = \"a\"
+provider = \"custom\"
+base_url = \"http://127.0.0.1:1/v1\"
+secret = \"none\"
+model = \"m\"
+",
+            )
+            .unwrap(),
+        );
+        let on = harness_gateway(&config).await.unwrap();
+        assert!(on.is_enabled());
+        assert_eq!(on.snapshot().accounts.len(), 1);
+    }
+
+    fn history_with_native_calls() -> Vec<crate::provider::ChatMessage> {
+        use crate::provider::{ChatMessage, ToolCall};
+        let mut assistant = ChatMessage::assistant("looking");
+        assistant.tool_calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+            provider_state: Some(serde_json::json!({"thoughtSignature": "sig"})),
+        }];
+        vec![
+            ChatMessage::user("read it"),
+            assistant,
+            ChatMessage::tool("call_1", "contents"),
+            ChatMessage::user("and now?"),
+        ]
+    }
+
+    fn saved_with_origin(account: &str) -> crate::session::Session {
+        crate::session::Session {
+            version: crate::session::SESSION_VERSION,
+            id: "resumed".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            workspace_root: "/".to_string(),
+            model_type: "m".to_string(),
+            messages: history_with_native_calls(),
+            tag: None,
+            title: None,
+            provider_session_id: None,
+            provider_parent_message_id: None,
+            broken: false,
+            route_state: Some(crate::gateway::state::RouteState {
+                route: None,
+                account: crate::gateway::types::AccountId::parse(account).unwrap(),
+                model: format!("model-{account}"),
+            }),
+        }
+    }
+
+    async fn ask_history(
+        provider: &Arc<dyn LLMProvider>,
+        messages: Vec<crate::provider::ChatMessage>,
+    ) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        provider
+            .complete_stream(crate::gateway::testkit::request(messages), tx)
+            .await
+            .unwrap();
+    }
+
+    /// Настоящий путь `--resume`: подсказка о цели, затем `reset()` внутри `replay_locally`.
+    /// На старом коде `reset` стирал подсказку, и чужие подписи уходили второму аккаунту.
+    #[tokio::test]
+    async fn a_resumed_session_keeps_its_origin_through_the_reset_and_foreign_calls_are_flattened()
+    {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, rig};
+        let rig = rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        );
+        // История пришла с b, а ход идёт на a.
+        let provider = rig.main();
+        adopt_remote_session(&provider, &saved_with_origin("b")).await;
+        ask_history(&provider, history_with_native_calls()).await;
+        let seen = rig.fakes["a"].last_messages();
+        assert!(seen[1].tool_calls.is_empty(), "no foreign ids reach a");
+        assert!(seen[1].content.contains("<tool_use><name>read_file</name>"));
+        assert_eq!(
+            seen[2].content, "contents",
+            "the result keeps its call in the text"
+        );
+
+        // Обратная сторона: история пришла с самого a — вызовы остаются родными.
+        let own = rig.main();
+        adopt_remote_session(&own, &saved_with_origin("a")).await;
+        ask_history(&own, history_with_native_calls()).await;
+        assert_eq!(rig.fakes["a"].last_messages()[1].tool_calls.len(), 1);
     }
 }

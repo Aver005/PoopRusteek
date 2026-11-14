@@ -79,6 +79,10 @@ fn read_file_blocking(path_str: &str, offset: usize, limit: usize) -> Result<Str
     // читается с ошибкой, а пишется успешно.
     let path = crate::util::expand_tilde(path_str);
     ensure_regular_file(&path, path_str)?;
+    // Файл с ключами или конфиг с открытым ключом модели не отдаём.
+    if let Some(reason) = crate::config::protect::read_refusal(&path) {
+        return Err(reason);
+    }
 
     let bytes = std::fs::read(&path).map_err(|e| classify_io_error(path_str, &e))?;
     let text = crate::util::decode_process_output(&bytes);
@@ -172,6 +176,25 @@ mod tests {
         let result = read_file_blocking(path.to_str().unwrap(), 1, 400).unwrap();
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Конфиг проекта с ключом открытым текстом модели не отдаётся; без ключа читается.
+    #[test]
+    fn a_config_holding_a_plain_key_is_refused_but_a_clean_one_is_read() {
+        let dir = temp_dir("secretcfg");
+        let layer = dir.join(".pooprusteek");
+        std::fs::create_dir_all(&layer).unwrap();
+        let path = layer.join("config.toml");
+
+        std::fs::write(&path, "[provider]\ntoken = \"canary-read-file-token\"\n").unwrap();
+        let error = read_file_blocking(path.to_str().unwrap(), 1, 400).unwrap_err();
+        assert!(error.contains("Refusing to read"), "{error}");
+        assert!(!error.contains("canary"), "{error}");
+
+        std::fs::write(&path, "[ui]\ntheme = \"nord\"\n").unwrap();
+        assert!(read_file_blocking(path.to_str().unwrap(), 1, 400).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

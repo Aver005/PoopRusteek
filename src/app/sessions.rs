@@ -22,11 +22,16 @@ impl App {
                 self.state.focused_mut().session_id = s.id.clone();
                 self.state.focused_mut().tag = s.tag.clone();
                 self.state.focused_mut().broken = s.broken;
+                // Загруженный чат уже назван: второй раз модель его не называет.
+                self.state.focused_mut().title = s.title.clone().unwrap_or_default();
+                self.state.focused_mut().title_requested =
+                    !s.title.as_deref().unwrap_or("").trim().is_empty();
                 self.state.scroll_offset = 0;
                 self.state.input.buffer.clear();
                 self.state.input.cursor = 0;
                 self.state.input.selection_anchor = None;
                 self.state.autocomplete = Default::default();
+                self.state.restore_queued_to_input();
                 self.state.focused_mut().generation.active = false;
                 let aborted = self.state.conversations.focused_id();
                 self.abort_turn_of(aborted);
@@ -46,6 +51,9 @@ impl App {
 
                 let provider = self.state.focused().provider.clone();
                 let conversation = self.state.conversations.focused_id();
+                if let (Some(provider), Some(route)) = (&provider, &s.route_state) {
+                    provider.seed_route_state(route.clone());
+                }
 
                 match (provider, s.provider_session_id.clone()) {
                     (Some(provider), Some(remote_id)) => {
@@ -263,6 +271,7 @@ impl App {
             self.state.input.cursor = 0;
             self.state.input.selection_anchor = None;
             self.state.autocomplete = Default::default();
+            self.state.restore_queued_to_input();
         }
         if let Some(provider) = provider {
             // Local session-state reset only — no network.
@@ -283,6 +292,7 @@ impl App {
                 model_type: self.config.provider.model.clone(),
                 messages: snapshot,
                 tag: None,
+                title: None,
                 // Not wired to resume yet: `fetch_remote_history` (the only
                 // existing endpoint for this path) doesn't parse a message id
                 // out of `chat/history`'s items, so there's no reliable
@@ -293,6 +303,7 @@ impl App {
                 provider_session_id: None,
                 provider_parent_message_id: None,
                 broken: false,
+                route_state: None,
             },
             &self.config,
         ) {
@@ -474,6 +485,9 @@ impl App {
             tag: conv.tag.clone(),
             broken,
             remote,
+            route: conv.provider.as_ref().and_then(|p| p.route_state()),
+            // Заголовок модели переживает сохранение, которое о нём не знает.
+            title: (!conv.title.trim().is_empty()).then(|| conv.title.clone()),
         };
 
         // Snapshot everything now and hand the write (plus the follow-up
@@ -488,7 +502,7 @@ impl App {
                 messages: conv.messages.clone(),
                 config: Box::new(self.config.clone()),
                 workspace_path: self.state.workspace_path.clone(),
-                meta,
+                meta: Box::new(meta),
             });
         self.state.focused_mut().broken = broken;
     }
@@ -518,5 +532,108 @@ impl App {
             .focused_mut()
             .messages
             .push(ChatMessage::ui_system(&message));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gateway::state::RouteState;
+    use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, ask_with, rig};
+    use crate::gateway::types::AccountId;
+    use crate::provider::ToolCall;
+
+    fn history() -> Vec<ChatMessage> {
+        let mut assistant = ChatMessage::assistant("looking");
+        assistant.tool_calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+            provider_state: Some(serde_json::json!({"thoughtSignature": "sig"})),
+        }];
+        vec![
+            ChatMessage::user("read it"),
+            assistant,
+            ChatMessage::tool("call_1", "contents"),
+            ChatMessage::user("and now?"),
+        ]
+    }
+
+    /// Файл сессии, написанный на аккаунте `origin` (без серверной ссылки, как у API-маршрута).
+    fn save_from(origin: &str) -> String {
+        let id = format!("gw-load-{origin}-{}", uuid::Uuid::new_v4().simple());
+        let meta = session::SessionMeta {
+            route: Some(RouteState {
+                route: None,
+                account: AccountId::parse(origin).unwrap(),
+                model: format!("model-{origin}"),
+            }),
+            ..session::SessionMeta::default()
+        };
+        session::save_session(
+            &id,
+            "2026-01-01T00:00:00Z",
+            &history(),
+            &Config::default(),
+            "/",
+            &meta,
+        )
+        .expect("session saved");
+        id
+    }
+
+    async fn test_app() -> App {
+        let mut config = Config::default();
+        config.semantic.enabled = false;
+        config.update.auto = false;
+        App::new(config).await.expect("the app starts")
+    }
+
+    fn forget(id: &str) {
+        let _ = std::fs::remove_file(Config::sessions_dir().join(format!("{id}.json")));
+    }
+
+    /// Настоящий путь `/load`: подсказка о цели, затем `reset()` в ветке без серверной ссылки.
+    /// На старом коде `reset` стирал подсказку, и второй аккаунт получал чужие id и подписи.
+    #[tokio::test]
+    async fn a_loaded_session_never_hands_foreign_calls_to_another_account() {
+        let rig = rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        );
+        let mut app = test_app().await;
+
+        // История пришла с b, ход идёт на a: вызовы разворачиваются в текст.
+        let from_b = save_from("b");
+        let provider = rig.main();
+        app.state.focused_mut().provider = Some(Arc::clone(&provider));
+        app.handle_load_session(&from_b).await.unwrap();
+        let loaded = app.state.focused().messages.clone();
+        assert_eq!(loaded.len(), 4, "the saved history came back");
+        ask_with(&provider, loaded).await.0.unwrap();
+        let seen = rig.fakes["a"].last_messages();
+        forget(&from_b);
+        assert!(seen[1].tool_calls.is_empty(), "no foreign ids reach a");
+        assert!(seen[1].content.contains("<tool_use><name>read_file</name>"));
+        assert_eq!(seen[2].content, "contents", "the result is not orphaned");
+
+        // Обратная сторона: история с самого a остаётся родной.
+        let from_a = save_from("a");
+        let own = rig.main();
+        app.state.focused_mut().provider = Some(Arc::clone(&own));
+        app.handle_load_session(&from_a).await.unwrap();
+        let loaded = app.state.focused().messages.clone();
+        ask_with(&own, loaded).await.0.unwrap();
+        let seen = rig.fakes["a"].last_messages();
+        forget(&from_a);
+        assert_eq!(
+            seen[1].tool_calls.len(),
+            1,
+            "a gets its own calls back untouched"
+        );
     }
 }

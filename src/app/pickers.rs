@@ -61,7 +61,7 @@ impl App {
         }
 
         let mut picker = PickerState::new_with_kind(
-            " Auto-approved — Space toggles; ANYTHING means no limits",
+            " Auto-approved — Space toggles; «any» means no limits",
             items,
             PickerMode::Multi,
             PickerKind::Whitelist,

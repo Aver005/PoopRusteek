@@ -11,6 +11,7 @@
 //! stopless stream as a provider error (with a tool-call salvage path),
 //! while a sub-agent deliberately does not.
 
+use crate::provider::failure::FailureClass;
 use crate::provider::{CompletionRequest, LLMProvider, ToolCall};
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +75,24 @@ pub struct StreamOutcome {
     /// сам, без неё.
     pub stop_reason: Option<String>,
     pub end: StreamEnd,
+    /// Тип отказа провайдера, если `end` — `ProviderError` и тип известен.
+    pub failure: Option<StreamFailure>,
+}
+
+/// Класс отказа и просьба подождать: то, что теряет `ProviderError(String)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamFailure {
+    pub class: FailureClass,
+    pub retry_after: Option<Duration>,
+}
+
+impl StreamFailure {
+    fn of(error: &crate::error::AppError) -> Option<Self> {
+        Some(Self {
+            class: error.failure_class()?,
+            retry_after: error.retry_after(),
+        })
+    }
 }
 
 /// Как понимать конец стрима. Что с этим делать — дело цикла: главный считает
@@ -137,8 +156,14 @@ async fn collect(
     let stream_provider = Arc::clone(provider);
     // Гард, а не голый хэндл: отменённый ход роняет этот future, и задача
     // стрима умирает с ним, а не дочитывает ответ сиротой. Ранние `return` тоже.
+    // Отдельная задача теряет чат хода; шлюзу он нужен, чтобы положить шов в свой чат.
+    let chat = crate::gateway::handle::current_chat();
     let mut stream_task = crate::util::AbortOnDrop::spawn(async move {
-        stream_provider.complete_stream(request, tx).await
+        let call = stream_provider.complete_stream(request, tx);
+        match chat {
+            Some(chat) => crate::gateway::handle::with_chat(chat, call).await,
+            None => call.await,
+        }
     });
 
     let mut text = String::new();
@@ -157,6 +182,7 @@ async fn collect(
                     tool_calls,
                     stop_reason,
                     end: StreamEnd::IdleTimeout,
+                    failure: None,
                 };
             }
             Ok(None) => break,
@@ -170,6 +196,7 @@ async fn collect(
                             tool_calls,
                             stop_reason,
                             end: StreamEnd::ProviderError(oversized_stream_message()),
+                            failure: None,
                         };
                     }
                     on_progress(&text);
@@ -194,6 +221,7 @@ async fn collect(
                                 "tool-call arguments exceeded {} MiB — aborted",
                                 MAX_STREAM_BYTES / (1024 * 1024)
                             )),
+                            failure: None,
                         };
                     }
                 }
@@ -219,6 +247,10 @@ async fn collect(
     } else {
         Some((&mut stream_task).await)
     };
+    let failure = match &joined {
+        Some(Ok(Err(error))) => StreamFailure::of(error),
+        _ => None,
+    };
     let end = match joined {
         None | Some(Ok(Ok(()))) => StreamEnd::Completed,
         Some(Ok(Err(error))) => StreamEnd::ProviderError(error.to_string()),
@@ -233,6 +265,7 @@ async fn collect(
         tool_calls,
         stop_reason,
         end,
+        failure,
     }
 }
 
@@ -301,6 +334,7 @@ mod tests {
                 content: "done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".to_string()),
+                usage: None,
             });
             std::future::pending().await
         }
@@ -327,6 +361,53 @@ mod tests {
         .expect("collect_stream must not wait forever after a stop chunk");
         assert_eq!(outcome.text, "done");
         assert_eq!(outcome.verdict(), StreamVerdict::Ok);
+    }
+
+    /// Говорит, какой чат видит задача стрима.
+    struct ReportsItsChat;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for ReportsItsChat {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> crate::error::AppResult<crate::provider::CompletionResponse> {
+            unreachable!("collect_stream streams")
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+            tx: mpsc::UnboundedSender<crate::provider::CompletionChunk>,
+        ) -> crate::error::AppResult<()> {
+            let seen = crate::gateway::handle::current_chat();
+            let _ = tx.send(crate::provider::CompletionChunk {
+                content: format!("{seen:?}"),
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+            });
+            Ok(())
+        }
+
+        fn model(&self) -> &str {
+            "reports"
+        }
+
+        fn fork(&self) -> Arc<dyn LLMProvider> {
+            Arc::new(ReportsItsChat)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stream_task_keeps_the_chat_of_its_turn() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(ReportsItsChat);
+        let inside =
+            crate::gateway::handle::with_chat(7, collect_stream(&provider, request(), |_| {}))
+                .await;
+        assert_eq!(inside.text, "Some(7)", "the chat id crosses the spawn");
+        let outside = collect_stream(&provider, request(), |_| {}).await;
+        assert_eq!(outside.text, "None", "no turn, no chat");
     }
 
     #[tokio::test]

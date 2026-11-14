@@ -61,6 +61,8 @@ fn spawn_command(
         if let Some(c) = cwd {
             cmd.current_dir(c);
         }
+        // Сервер MCP — тоже не человек: trust и secrets из него отказывают.
+        cmd.env(crate::secrets::human::AGENT_CHILD_ENV, "1");
         if let Some(env_map) = env {
             for (k, v) in env_map {
                 cmd.env(k, v);

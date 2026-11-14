@@ -16,6 +16,10 @@ pub struct Session {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tag: Option<String>,
+    /// Короткий заголовок из служебной модели (`[roles] title`). Нет его —
+    /// список берёт запасной `derive_title`. Старые файлы читаются без поля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The DeepSeek-side (remote) session id this local file last
     /// successfully synced with, so a future load can try to continue the
     /// same server-side thread instead of silently starting a new one.
@@ -33,6 +37,10 @@ pub struct Session {
     /// session rather than re-checking a link already known dead.
     #[serde(default)]
     pub broken: bool,
+    /// Где беседа остановилась в шлюзе. Нужен, чтобы после перезапуска не отдать чужие
+    /// подписи вызовов другому аккаунту; старые файлы читаются без поля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state: Option<crate::gateway::state::RouteState>,
 }
 
 /// What a save knows about the provider's server-side session.
@@ -89,6 +97,10 @@ pub struct SessionMeta {
     pub tag: Option<String>,
     pub broken: bool,
     pub remote: RemoteLink,
+    /// Цель шлюза на момент сохранения; `None` — не знаем, прежнее значение остаётся.
+    pub route: Option<crate::gateway::state::RouteState>,
+    /// Заголовок чата; `None` — не знаем, сохранённый в файле остаётся.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,12 +141,17 @@ pub fn save_session(
     // «Не знаю» не имеет права затирать то, что уже сохранено: иначе прогон,
     // который не завёл серверной сессии (упал на токене, например), стирает
     // связь здоровой сессии, и следующий `--resume` подхватывать уже нечего.
+    // Файл читается не больше раза и только если что-то из трёх полей неизвестно.
+    let stored = std::cell::LazyCell::new(|| read_stored(&path));
     let (provider_session_id, provider_parent_message_id) = match &meta.remote {
         RemoteLink::Established {
             session_id,
             parent_message_id,
         } => (Some(session_id.clone()), *parent_message_id),
-        RemoteLink::Unknown => stored_link(&path),
+        RemoteLink::Unknown => (
+            stored.provider_session_id.clone(),
+            stored.provider_parent_message_id,
+        ),
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -150,6 +167,8 @@ pub fn save_session(
         provider_session_id,
         provider_parent_message_id,
         broken: meta.broken,
+        route_state: meta.route.clone().or_else(|| stored.route_state.clone()),
+        title: meta.title.clone().or_else(|| stored.title.clone()),
     };
 
     let json = serde_json::to_string_pretty(&session)?;
@@ -157,32 +176,30 @@ pub fn save_session(
     Ok(())
 }
 
-/// Связь с серверной сессией, уже лежащая в файле. Отсутствие файла или
-/// нечитаемый файл — не ошибка: сохранять надо в любом случае, просто
-/// переносить нечего.
-fn stored_link(path: &std::path::Path) -> (Option<String>, Option<i64>) {
-    /// Только два поля: разбирать весь транскрипт ради них незачем.
-    #[derive(Deserialize)]
-    struct StoredLink {
-        #[serde(default)]
-        provider_session_id: Option<String>,
-        #[serde(default)]
-        provider_parent_message_id: Option<i64>,
-    }
+/// Что уже лежит в файле сессии и не должно теряться от сохранения, которое этого не знает:
+/// связь с серверной сессией, цель шлюза, заголовок. Весь транскрипт разбирать незачем.
+#[derive(Deserialize, Default)]
+struct Stored {
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    provider_parent_message_id: Option<i64>,
+    #[serde(default)]
+    route_state: Option<crate::gateway::state::RouteState>,
+    #[serde(default)]
+    title: Option<String>,
+}
 
+/// Отсутствие файла или нечитаемый файл — не ошибка: сохранять надо в любом случае,
+/// просто переносить нечего.
+fn read_stored(path: &std::path::Path) -> Stored {
     let Ok(json) = std::fs::read_to_string(path) else {
-        return (None, None);
+        return Stored::default();
     };
-    match serde_json::from_str::<StoredLink>(&json) {
-        Ok(stored) => (
-            stored.provider_session_id,
-            stored.provider_parent_message_id,
-        ),
-        Err(error) => {
-            tracing::warn!("could not read the stored session link from {path:?}: {error}");
-            (None, None)
-        }
-    }
+    serde_json::from_str(&json).unwrap_or_else(|error| {
+        tracing::warn!("could not read the stored session fields from {path:?}: {error}");
+        Stored::default()
+    })
 }
 
 pub fn load_local(id: &str, _config: &Config) -> AppResult<Session> {
@@ -229,7 +246,11 @@ pub fn list_sessions() -> AppResult<Vec<SessionSummary>> {
                 continue;
             }
         };
-        let title = derive_title(&session.messages);
+        let title = session
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| derive_title(&session.messages));
         sessions.push(SessionSummary {
             id: session.id,
             created_at: session.created_at,
@@ -307,10 +328,41 @@ pub fn load_history() -> Vec<String> {
     if !path.exists() {
         return Vec::new();
     }
-    std::fs::read_to_string(&path)
+    let mut history: Vec<String> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Старые записи с ключами (`/providers … <ключ>`) вычищаем из файла.
+    let before = history.len();
+    history.retain(|entry| !is_sensitive_input(entry));
+    if history.len() != before {
+        write_history(&history);
+    }
+    history
+}
+
+/// Ввод, которого нет смысла и нельзя хранить в истории: команды, куда вписывают
+/// ключ, и всё, что похоже на ключ. История нужна для стрелки вверх, не для архива.
+pub fn is_sensitive_input(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    let Some(command) = trimmed.strip_prefix('/') else {
+        return crate::secrets::redact::looks_like_secret(trimmed);
+    };
+    let mut parts = command.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let rest: Vec<&str> = parts.collect();
+    match name {
+        "secrets" => true,
+        // `/providers add …` и быстрая форма с ключом последним аргументом.
+        // Ключ вписывают только в `/providers add …`; остальные подкоманды историю не пачкают.
+        "providers" => {
+            rest.first().is_some_and(|word| word.starts_with("add")) && rest.len() > 1
+                || rest.iter().any(|t| crate::config::looks_like_key(t))
+        }
+        // Одна строка добавления сервера несёт `env` и заголовки с токенами.
+        "mcp" => rest.first() == Some(&"add") && rest.len() > 1,
+        _ => crate::secrets::redact::looks_like_secret(trimmed),
+    }
 }
 
 /// Append `input` to an in-memory history list with the file's rules:
@@ -319,6 +371,9 @@ pub fn load_history() -> Vec<String> {
 /// up-arrow must see the new entry immediately) while the file write runs
 /// on the persist worker.
 pub fn push_history_entry(history: &mut Vec<String>, input: &str) {
+    if is_sensitive_input(input) {
+        return;
+    }
     if history.last().map(|s| s.as_str()) != Some(input) {
         history.push(input.to_string());
     }
@@ -337,8 +392,11 @@ pub const MAX_HISTORY_ENTRIES: usize = 500;
 pub fn write_history(history: &[String]) {
     match serde_json::to_string(history) {
         Ok(json) => {
-            if let Err(error) = crate::util::atomic_write(&history_path(), json.as_bytes()) {
-                tracing::warn!("prompt-history write failed: {error}");
+            let path = history_path();
+            match crate::util::atomic_write(&path, json.as_bytes()) {
+                // В истории бывают куски кода и пути: читать её нужно только владельцу.
+                Ok(()) => crate::config::restrict_to_owner(&path),
+                Err(error) => tracing::warn!("prompt-history write failed: {error}"),
             }
         }
         Err(error) => tracing::warn!("prompt-history serialize failed: {error}"),
@@ -427,6 +485,8 @@ mod tests {
                 session_id: "remote-123".to_string(),
                 parent_message_id: Some(9),
             },
+            route: None,
+            title: None,
         };
 
         save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &meta)
@@ -441,6 +501,134 @@ mod tests {
         assert!(session.broken);
         assert_eq!(session.provider_session_id.as_deref(), Some("remote-123"));
         assert_eq!(session.provider_parent_message_id, Some(9));
+    }
+
+    /// Старый файл без `route_state` грузится; известная цель шлюза не затирается
+    /// сохранением, которое её не знает (как `stored_link`).
+    #[test]
+    fn route_state_loads_from_old_files_and_survives_an_unaware_save() {
+        use crate::gateway::state::RouteState;
+        let id = "pooprusteek_test_session_route_state";
+        let config = Config::default();
+        let route = RouteState {
+            route: None,
+            account: crate::gateway::types::AccountId::parse("claude-work").unwrap(),
+            model: "opus".to_string(),
+        };
+        let known = SessionMeta {
+            route: Some(route.clone()),
+            ..SessionMeta::default()
+        };
+        save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &known).unwrap();
+        // Сохранение, не знающее цели (провайдер без шлюза), её не стирает.
+        save_session(
+            id,
+            "2020-01-01T00:00:00Z",
+            &[],
+            &config,
+            "/tmp",
+            &SessionMeta::default(),
+        )
+        .unwrap();
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+        let loaded = load_local(id, &config);
+        cleanup(&path);
+        assert_eq!(loaded.unwrap().route_state, Some(route));
+
+        let old = r#"{"version":1,"id":"x","created_at":"a","updated_at":"b","workspace_root":"/","model_type":"m","messages":[]}"#;
+        let session: Session = serde_json::from_str(old).unwrap();
+        assert!(session.route_state.is_none());
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(
+            !json.contains("route_state"),
+            "an absent state is not written: {json}"
+        );
+    }
+
+    /// Старый файл без заголовка грузится, а сохранение, которое заголовка не
+    /// знает, не стирает уже придуманный (как `route_state`).
+    #[test]
+    fn a_title_loads_from_old_files_and_survives_an_unaware_save() {
+        let id = "pooprusteek_test_session_title";
+        let config = Config::default();
+        let known = SessionMeta {
+            title: Some("Сборка проекта".to_string()),
+            ..SessionMeta::default()
+        };
+        save_session(id, "2020-01-01T00:00:00Z", &[], &config, "/tmp", &known).unwrap();
+        // Автосейв следующего хода о заголовке не знает.
+        save_session(
+            id,
+            "2020-01-01T00:00:00Z",
+            &[ChatMessage::user("ещё вопрос")],
+            &config,
+            "/tmp",
+            &SessionMeta::default(),
+        )
+        .unwrap();
+        let path = Config::sessions_dir().join(format!("{id}.json"));
+        let loaded = load_local(id, &config);
+        cleanup(&path);
+        assert_eq!(loaded.unwrap().title.as_deref(), Some("Сборка проекта"));
+
+        // Файл, написанный до появления поля.
+        let old = r#"{"version":1,"id":"x","created_at":"a","updated_at":"b","workspace_root":"/","model_type":"m","messages":[]}"#;
+        let session: Session = serde_json::from_str(old).unwrap();
+        assert!(session.title.is_none());
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(
+            !json.contains("\"title\""),
+            "an absent title is not written: {json}"
+        );
+    }
+
+    /// В списке сессий служебный заголовок важнее запасного из первой реплики.
+    #[test]
+    fn the_session_list_prefers_the_service_title_over_the_fallback() {
+        let config = Config::default();
+        let titled = "pooprusteek_test_session_list_title";
+        let fallback = "pooprusteek_test_session_list_fallback";
+        let meta = |title: Option<&str>| SessionMeta {
+            title: title.map(str::to_string),
+            ..SessionMeta::default()
+        };
+        save_session(
+            titled,
+            "2020-01-01T00:00:00Z",
+            &[ChatMessage::user("как собрать проект?")],
+            &config,
+            "/tmp",
+            &meta(Some("Сборка проекта")),
+        )
+        .unwrap();
+        save_session(
+            fallback,
+            "2020-01-01T00:00:00Z",
+            &[ChatMessage::user("как собрать проект?")],
+            &config,
+            "/tmp",
+            &meta(None),
+        )
+        .unwrap();
+
+        let listed = list_sessions().expect("the list reads");
+        let by_id = |id: &str| {
+            listed
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.title.clone())
+                .expect("the session is listed")
+        };
+        let titled_row = by_id(titled);
+        let fallback_row = by_id(fallback);
+        for id in [titled, fallback] {
+            cleanup(&Config::sessions_dir().join(format!("{id}.json")));
+        }
+        assert_eq!(titled_row, "Сборка проекта");
+        assert_eq!(
+            fallback_row, "как собрать проект?",
+            "no service title leaves the heuristic in charge"
+        );
     }
 
     #[test]
@@ -573,5 +761,51 @@ mod tests {
         let session = loaded.expect("the session must load back");
         assert_eq!(session.provider_session_id, None);
         assert_eq!(session.provider_parent_message_id, None);
+    }
+}
+
+#[cfg(test)]
+mod history_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn commands_that_carry_a_key_are_sensitive() {
+        for input in [
+            "/providers add lm http://localhost:1234/v1 qwen sk-secret-key-0000",
+            "/providers add lm http://x/v1",
+            "/providers lm openai http://x/v1 m abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+            "/secrets set global/x value",
+            "/secrets list",
+            "/mcp add {\"command\":\"x\",\"env\":{\"K\":\"v\"}}",
+            "use sk-proj-abcdefghijklmnopqrstuvwxyz please",
+        ] {
+            assert!(is_sensitive_input(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn ordinary_input_is_kept() {
+        for input in [
+            "/providers",
+            "/providers tools lmstudio native",
+            "/providers lm http://localhost:1234/v1 qwen mykey",
+            "/models qwen",
+            "/mcp reload",
+            "fix the failing test",
+            "/rate 500",
+        ] {
+            assert!(!is_sensitive_input(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn a_sensitive_line_never_enters_the_recall_list() {
+        let mut history = vec!["hello".to_string()];
+        push_history_entry(
+            &mut history,
+            "/providers add a http://x/v1 m sk-key-aaaaaaaaaaaaaaaa",
+        );
+        push_history_entry(&mut history, "world");
+        assert_eq!(history, ["hello", "world"]);
     }
 }

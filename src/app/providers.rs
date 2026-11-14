@@ -1,77 +1,7 @@
-//! State + pure logic for the `/providers` panel and its add-wizard:
-//! listing the built-in DeepSeek provider alongside `/providers`-managed
-//! OpenAI-compatible entries, switching the active one, and collecting a
-//! new entry via the step-by-step wizard or the quick
-//! `<name> <base_url> [model] [api_key]` command form. Kept as its own
-//! module (like `mcp_add.rs`) so the flow's state and validation stay
-//! cohesive instead of scattered across the key handlers.
+//! Остатки старого `/providers`: быстрая форма добавления, проверка адреса, обновление списков
+//! моделей и переключение модели. Экран и мастер теперь в `app::gateway_view`.
 
-use crate::app::input::InputState;
 use crate::config::{BUILTIN_PROVIDER_NAME, Config, ProviderEntry, ProviderProtocol};
-
-/// Live state of the `/providers` full-screen panel.
-#[derive(Debug, Clone, Default)]
-pub struct ProvidersViewState {
-    pub selected: usize,
-    pub status_message: String,
-}
-
-/// One row of the panel: the built-in DeepSeek provider first, then every
-/// config entry in order.
-#[derive(Debug, Clone)]
-pub struct ProviderRow {
-    pub name: String,
-    /// Bracketed protocol tag shown in the panel ("built-in",
-    /// "openai-compat", "anthropic-compat").
-    pub tag: &'static str,
-    pub detail: String,
-    pub active: bool,
-    pub builtin: bool,
-}
-
-pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
-    let custom_active = config
-        .active_provider_entry()
-        .map(|entry| entry.name.clone());
-    let mut rows = vec![ProviderRow {
-        name: BUILTIN_PROVIDER_NAME.to_string(),
-        tag: "built-in",
-        detail: format!(
-            "built-in DeepSeek web · {} · {}",
-            config.provider.model,
-            if config.provider.token.is_empty() {
-                "no token"
-            } else {
-                "token set"
-            },
-        ),
-        active: custom_active.is_none(),
-        builtin: true,
-    }];
-    for entry in &config.providers {
-        rows.push(ProviderRow {
-            name: entry.name.clone(),
-            tag: entry.protocol.label(),
-            detail: format!(
-                "{} · {}{}",
-                entry.base_url,
-                if entry.model.is_empty() {
-                    "(no default model)"
-                } else {
-                    &entry.model
-                },
-                if entry.api_key.is_some() {
-                    " · key set"
-                } else {
-                    ""
-                },
-            ),
-            active: custom_active.as_deref() == Some(entry.name.as_str()),
-            builtin: false,
-        });
-    }
-    rows
-}
 
 /// Fetch model lists for `entries` off the event loop and report back via
 /// `AppEvent::ProviderModelsRefreshed`. The one spawn point for every
@@ -84,7 +14,7 @@ pub fn spawn_models_refresh(
     force: bool,
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::app::events::AppEvent>,
 ) {
-    if entries.is_empty() {
+    if entries.is_empty() && !cache.gateway_enabled() {
         return;
     }
     tokio::spawn(async move {
@@ -94,36 +24,6 @@ pub fn spawn_models_refresh(
             failed: outcome.failed.len(),
         });
     });
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderWizardStep {
-    Name,
-    Protocol,
-    BaseUrl,
-    ApiKey,
-    Model,
-    Confirm,
-}
-
-/// Wizard order of the protocol choices (`protocol_selected` indexes this).
-pub const PROTOCOL_CHOICES: [ProviderProtocol; 3] = [
-    ProviderProtocol::Openai,
-    ProviderProtocol::Anthropic,
-    ProviderProtocol::Gemini,
-];
-
-/// Human description for the wizard's protocol list.
-pub fn protocol_choice_label(protocol: ProviderProtocol) -> &'static str {
-    match protocol {
-        ProviderProtocol::Openai => {
-            "OpenAI Chat Completions (LM Studio, Ollama /v1, vLLM, xAI/Grok, OpenRouter)"
-        }
-        ProviderProtocol::Anthropic => {
-            "Anthropic Messages (Anthropic API, Claude-compatible proxies)"
-        }
-        ProviderProtocol::Gemini => "Google Generative Language (Gemini)",
-    }
 }
 
 /// Example base URL shown under the wizard's Base URL step.
@@ -137,85 +37,6 @@ pub fn base_url_example(protocol: ProviderProtocol) -> &'static str {
     }
 }
 
-impl ProviderWizardStep {
-    pub fn number(self) -> usize {
-        match self {
-            ProviderWizardStep::Name => 1,
-            ProviderWizardStep::Protocol => 2,
-            ProviderWizardStep::BaseUrl => 3,
-            ProviderWizardStep::ApiKey => 4,
-            ProviderWizardStep::Model => 5,
-            ProviderWizardStep::Confirm => 6,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ProviderWizardStep::Name => "Name",
-            ProviderWizardStep::Protocol => "Protocol",
-            ProviderWizardStep::BaseUrl => "Base URL (usually ends with /v1)",
-            ProviderWizardStep::ApiKey => "API key (blank = none)",
-            ProviderWizardStep::Model => "Default model id (blank = use the provider's model list)",
-            ProviderWizardStep::Confirm => "Confirm",
-        }
-    }
-}
-
-/// The `/providers add` wizard: four text steps + confirm. All fields are
-/// single-line (`apply_text_key` with newlines off).
-#[derive(Debug, Clone)]
-pub struct ProviderAddState {
-    pub step: ProviderWizardStep,
-    pub name: InputState,
-    /// Index into [`PROTOCOL_CHOICES`].
-    pub protocol_selected: usize,
-    pub base_url: InputState,
-    pub api_key: InputState,
-    pub model: InputState,
-    pub error: Option<String>,
-}
-
-impl ProviderAddState {
-    pub fn new() -> Self {
-        Self {
-            step: ProviderWizardStep::Name,
-            name: InputState::default(),
-            protocol_selected: 0,
-            base_url: InputState::default(),
-            api_key: InputState::default(),
-            model: InputState::default(),
-            error: None,
-        }
-    }
-
-    /// Build the final entry from the collected fields. Steps validate on
-    /// advance, so failures here mean the two validations disagree — kept
-    /// fallible rather than assumed-infallible (same stance as
-    /// `mcp_add::WizardState::build_config`).
-    pub fn protocol(&self) -> ProviderProtocol {
-        PROTOCOL_CHOICES[self.protocol_selected.min(PROTOCOL_CHOICES.len() - 1)]
-    }
-
-    pub fn build_entry(&self, config: &Config) -> Result<ProviderEntry, String> {
-        let name = self.name.buffer.trim().to_string();
-        validate_name(&name, config)?;
-        let base_url = validate_base_url(self.base_url.buffer.trim())?;
-        // Optional since the fetched model list (`model_cache`) can drive
-        // the API catalog; TUI activation prompts for a /models pick.
-        let model = self.model.buffer.trim().to_string();
-        let api_key = self.api_key.buffer.trim();
-        Ok(ProviderEntry {
-            name,
-            base_url,
-            api_key: (!api_key.is_empty()).then(|| api_key.to_string()),
-            model,
-            protocol: self.protocol(),
-            // Мастер родной протокол не предлагает: `/providers tools`.
-            tools: crate::config::ToolProtocol::default(),
-        })
-    }
-}
-
 pub fn validate_name(name: &str, config: &Config) -> Result<(), String> {
     if name.is_empty() {
         return Err("name can't be empty".to_string());
@@ -225,7 +46,12 @@ pub fn validate_name(name: &str, config: &Config) -> Result<(), String> {
             "'{BUILTIN_PROVIDER_NAME}' is the built-in provider"
         ));
     }
-    if config.providers.iter().any(|entry| entry.name == name) {
+    if config.providers.iter().any(|entry| entry.name == name)
+        || config
+            .accounts
+            .iter()
+            .any(|a| a.id.as_str() == name || a.display_name().eq_ignore_ascii_case(name))
+    {
         return Err(format!("'{name}' already exists"));
     }
     Ok(())
@@ -294,7 +120,7 @@ impl crate::app::App {
     /// Cheap elapsed check on the event loop; the fetch itself is spawned.
     pub(crate) fn maybe_refetch_provider_models(&mut self) {
         let period_ms = self.config.provider_models.refetch_ms;
-        if period_ms == 0 || self.config.providers.is_empty() {
+        if period_ms == 0 || (self.config.providers.is_empty() && !self.gateway.is_enabled()) {
             return;
         }
         if (self.last_models_refetch.elapsed().as_millis() as u64) < period_ms {
@@ -304,18 +130,6 @@ impl crate::app::App {
         spawn_models_refresh(
             std::sync::Arc::clone(&self.provider_models),
             self.config.providers.clone(),
-            self.config.provider_models.cache_ms,
-            true,
-            self.event_tx.clone(),
-        );
-    }
-
-    /// Force-fetch one just-added provider's models so the API catalog and
-    /// `/serve` status pick it up immediately.
-    pub(crate) fn fetch_models_for_new_entry(&self, entry: &ProviderEntry) {
-        spawn_models_refresh(
-            std::sync::Arc::clone(&self.provider_models),
-            vec![entry.clone()],
             self.config.provider_models.cache_ms,
             true,
             self.event_tx.clone(),
@@ -476,73 +290,103 @@ impl crate::app::App {
         )));
     }
 
-    /// `/providers tools <name> <native|prompt>`. Флаг зашит в клиент при
-    /// сборке, поэтому активную запись пересобираем.
-    pub(crate) fn apply_provider_tools(&mut self, name: &str, tools: crate::config::ToolProtocol) {
-        if name == BUILTIN_PROVIDER_NAME {
-            self.state.push_system(
-                "The built-in DeepSeek web client has no tool-calling channel — its tools are always described in the prompt.",
-            );
-            return;
-        }
-        let Some(entry) = self
-            .config
-            .providers
-            .iter_mut()
-            .find(|entry| entry.name == name)
-        else {
+    /// Со шлюзом модель меняется у аккаунта, что отвечает сейчас (а у DeepSeek — в `[provider]`).
+    fn switch_account_model(&mut self, model: &str) {
+        use crate::gateway::types::AccountProvider;
+        let snapshot = self.gateway.snapshot();
+        // Закреплённый чат отвечает своим аккаунтом: модель меняется у него, а не у маршрутного.
+        let pinned = self
+            .state
+            .gateway_view
+            .pins
+            .get(&self.state.conversations.focused_id())
+            .map(|pin| pin.account.to_string());
+        let current = pinned
+            .or_else(|| crate::app::gateway_view::rows::current_account(&snapshot))
+            .or_else(|| {
+                crate::app::gateway_view::edits::main_route(&snapshot)
+                    .and_then(|r| r.steps.first())
+                    .map(|s| s.account.to_string())
+            })
+            .and_then(|id| crate::gateway::types::AccountId::parse(&id).ok());
+        let Some(account) = current.and_then(|id| self.account_config(&id)) else {
             self.state
-                .push_system(&format!("No provider named '{name}' — see /providers."));
+                .push_system("No account is answering yet: add one in /accounts.");
             return;
         };
-        let previous = std::mem::replace(&mut entry.tools, tools);
-        if let Err(message) = crate::config::save_or_message(&self.config) {
-            if let Some(entry) = self.config.providers.iter_mut().find(|e| e.name == name) {
-                entry.tools = previous;
+        if account.provider == AccountProvider::DeepseekWeb {
+            self.config.provider.model = model.to_string();
+            if let Err(message) = crate::config::save_or_message(&self.config) {
+                self.state.push_system(&message);
+                return;
             }
-            self.state.push_system(&message);
-            return;
-        }
-        let active = self
-            .config
-            .active_provider_entry()
-            .is_some_and(|entry| entry.name == name);
-        if active {
+            // Адаптер DeepSeek читает модель при сборке: пересобираем шлюз.
+            self.restart_gateway();
             self.rebuild_provider();
-        }
-        let mode = match tools {
-            crate::config::ToolProtocol::Native => {
-                "native (the API's tool-calling field; the endpoint must support it)"
+        } else {
+            let mut next = account.clone();
+            next.model = Some(model.to_string());
+            if !self.gateway_edit(
+                crate::gateway::handle::ConfigEdit::UpsertAccount(Box::new(next)),
+                "",
+            ) {
+                let reason = self
+                    .state
+                    .gateway_view
+                    .screen
+                    .notice
+                    .as_ref()
+                    .map_or_else(String::new, |n| n.text.clone());
+                self.state.push_system(&reason);
+                return;
             }
-            crate::config::ToolProtocol::Prompt => "prompt (<tool_use> blocks in the text)",
-        };
+            self.invalidate_provider_context_window();
+        }
         self.state
-            .push_system(&format!("Provider '{name}' now declares tools: {mode}."));
+            .push_system(&format!("{} now uses {model}.", account.display_name()));
     }
 
     /// Switch the active provider's model: the active `/providers` entry's
     /// `model` field, or `[provider].model` for the built-in DeepSeek.
     pub(crate) fn apply_model_switch(&mut self, model: &str) {
+        if self.gateway.is_enabled() {
+            self.switch_account_model(model);
+            return;
+        }
         let active_name = self
             .config
             .active_provider_entry()
             .map(|entry| entry.name.clone());
-        match active_name {
-            Some(name) => {
+        let saved = match &active_name {
+            // Записи `[[providers]]` в сериализацию конфига не входят: модель пишется в файл точечно.
+            Some(name) => crate::config::set_provider_field_at(
+                &self
+                    .config
+                    .source
+                    .write_path
+                    .clone()
+                    .unwrap_or_else(crate::config::Config::path),
+                name,
+                "model",
+                model,
+            )
+            .map(|()| {
                 if let Some(entry) = self
                     .config
                     .providers
                     .iter_mut()
-                    .find(|entry| entry.name == name)
+                    .find(|entry| &entry.name == name)
                 {
                     entry.model = model.to_string();
                 }
-            }
+            })
+            .map_err(|error| format!("Failed to save config: {error}")),
             None => {
                 self.config.provider.model = model.to_string();
+                crate::config::save_or_message(&self.config)
             }
-        }
-        match crate::config::save_or_message(&self.config) {
+        };
+        match saved {
             Ok(()) => {
                 self.rebuild_provider();
                 self.state
@@ -578,30 +422,6 @@ mod tests {
             protocol: ProviderProtocol::default(),
             tools: Default::default(),
         }
-    }
-
-    #[test]
-    fn rows_mark_builtin_active_by_default() {
-        let rows = provider_rows(&config_with(vec![entry("lmstudio")], None));
-        assert_eq!(rows.len(), 2);
-        assert!(rows[0].builtin && rows[0].active);
-        assert!(!rows[1].builtin && !rows[1].active);
-    }
-
-    #[test]
-    fn rows_mark_custom_active() {
-        let rows = provider_rows(&config_with(vec![entry("lmstudio")], Some("lmstudio")));
-        assert!(!rows[0].active);
-        assert!(rows[1].active);
-    }
-
-    #[test]
-    fn stale_active_name_falls_back_to_builtin() {
-        let rows = provider_rows(&config_with(vec![entry("lmstudio")], Some("gone")));
-        assert!(
-            rows[0].active,
-            "unknown active name must fall back to the built-in provider"
-        );
     }
 
     #[test]
@@ -652,32 +472,6 @@ mod tests {
         assert!(parse_quick_add("new ftp://host/v1", &config).is_err());
         assert!(parse_quick_add("toomany http://x/v1 model key extra", &config).is_err());
     }
-
-    #[test]
-    fn wizard_builds_entry_with_optional_key() {
-        let mut wizard = ProviderAddState::new();
-        wizard.name.buffer = "vllm".to_string();
-        wizard.base_url.buffer = "https://gpu-box:8000/v1/".to_string();
-        wizard.model.buffer = "qwen".to_string();
-        let entry = wizard.build_entry(&Config::default()).unwrap();
-        assert_eq!(entry.base_url, "https://gpu-box:8000/v1");
-        assert_eq!(entry.api_key, None);
-
-        wizard.api_key.buffer = "sk-123".to_string();
-        let entry = wizard.build_entry(&Config::default()).unwrap();
-        assert_eq!(entry.api_key.as_deref(), Some("sk-123"));
-    }
-
-    #[test]
-    fn wizard_allows_blank_model() {
-        // Blank model = "use the provider's fetched model list" — the API
-        // catalog and /models activation flow handle the rest.
-        let mut wizard = ProviderAddState::new();
-        wizard.name.buffer = "x".to_string();
-        wizard.base_url.buffer = "http://h/v1".to_string();
-        let entry = wizard.build_entry(&Config::default()).unwrap();
-        assert!(entry.model.is_empty());
-    }
 }
 
 impl crate::app::App {
@@ -685,7 +479,8 @@ impl crate::app::App {
     /// работа; отказ показываем строкой, иначе мёртвый эндпоинт молчит.
     pub(crate) fn on_provider_models_refreshed(&mut self, summary: String, failed: usize) {
         self.state.status_message = summary.clone();
-        if failed > 0 {
+        // На пустом чате заметка убрала бы главную: хватит строки статуса.
+        if failed > 0 && !self.state.focused().messages.is_empty() {
             self.state
                 .focused_mut()
                 .messages

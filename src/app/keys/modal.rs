@@ -10,11 +10,24 @@ use crate::app::{App, conversation};
 use crate::error::AppResult;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-/// How many argument lines the tool-approval modal shows at once. The
-/// keyboard scroll clamp here and the mouse-wheel clamp in `keys::mouse`
-/// must agree, or one input method can scroll past the other's limit —
-/// they used to be two independent magic `12`s.
-pub(crate) const TOOL_APPROVAL_VISIBLE_LINES: usize = 12;
+/// Дальше какой строки аргументы подтверждения не прокрутить. Считается тем
+/// же кодом, что рисует окно: клавиши и колесо не уйдут дальше конца.
+pub(crate) fn approval_max_scroll(
+    state: &crate::app::AppState,
+    tool_name: &str,
+    arguments: &str,
+    origin: Option<&str>,
+    scope: Option<&crate::whitelist::Scope>,
+) -> usize {
+    let shape = crate::tui::render::ApprovalShape {
+        arguments,
+        tool_name,
+        has_origin: origin.is_some(),
+        scope,
+    };
+    crate::tui::render::approval_viewport(state.terminal_cols, state.terminal_rows, &shape)
+        .max_scroll()
+}
 
 /// What a keystroke means to the tool-approval modal.
 #[derive(Debug, PartialEq, Eq)]
@@ -121,10 +134,13 @@ impl App {
                         });
                     }
                     Some(ApprovalKey::ScrollDown) => {
-                        let max_scroll = arguments
-                            .lines()
-                            .count()
-                            .saturating_sub(TOOL_APPROVAL_VISIBLE_LINES);
+                        let max_scroll = approval_max_scroll(
+                            &self.state,
+                            &tool_name,
+                            &arguments,
+                            origin.as_deref(),
+                            scope.as_ref(),
+                        );
                         self.state.modal = Some(Modal::ToolApproval {
                             tool_name,
                             arguments,
@@ -238,7 +254,10 @@ impl App {
                 Ok(false)
             }
             Modal::McpAdd(state) => self.handle_mcp_add_key(key, state).await,
-            Modal::ProviderAdd(state) => self.handle_provider_add_key(key, state).await,
+            Modal::AccountWizard(state) => self.handle_account_wizard_key(key, state).await,
+            Modal::SecretPrompt(state) => self.handle_secret_prompt_key(key, state).await,
+            Modal::AccountLimits(state) => self.handle_limits_key(key, state).await,
+            Modal::Trust(state) => self.handle_trust_key(key, state).await,
         }
     }
 
@@ -307,14 +326,6 @@ impl App {
                     .map(|item| item.value.clone())
                 {
                     self.apply_model_switch(&model);
-                }
-            }
-            _ => {
-                if let Some(idx) = indices.first()
-                    && let Some(item) = picker.items.get(*idx)
-                {
-                    let id = item.value.clone();
-                    self.handle_load_session(&id).await?;
                 }
             }
         }

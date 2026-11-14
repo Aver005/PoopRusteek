@@ -189,6 +189,7 @@ impl LLMProvider for FakeProvider {
                 content: piece.iter().collect(),
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                usage: None,
             });
         }
         let should_abrupt = {
@@ -216,6 +217,7 @@ impl LLMProvider for FakeProvider {
             content: String::new(),
             tool_calls: calls,
             finish_reason: Some(reason),
+            usage: None,
         });
         Ok(())
     }

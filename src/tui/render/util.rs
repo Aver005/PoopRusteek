@@ -4,7 +4,6 @@
 
 use crate::config::Config;
 use crate::tui::theme::Theme;
-use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -16,6 +15,10 @@ use unicode_width::UnicodeWidthStr;
 pub(super) fn truncate(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
+    }
+    if max == 0 {
+        // Нулевая ширина: многоточие шириной в одну клетку вышло бы за предел.
+        return String::new();
     }
     let budget = max.saturating_sub(1);
     let mut out = String::new();
@@ -71,28 +74,55 @@ pub(super) fn fit_col(s: &str, width: usize) -> String {
     out
 }
 
-pub(super) fn format_date(rfc3339: &str) -> String {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        dt.format("%b %d %H:%M").to_string()
+/// Короткая дата для списков: время, если это `today`, иначе `Nov 05`.
+pub(super) fn short_date(rfc3339: &str, today: chrono::NaiveDate) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return truncate(rfc3339, SHORT_DATE_COLS);
+    };
+    let local = dt.with_timezone(&chrono::Local);
+    if local.date_naive() == today {
+        local.format("%H:%M").to_string()
     } else {
-        rfc3339.chars().take(16).collect()
+        local.format("%b %d").to_string()
     }
 }
 
-pub(super) fn centered_h(area: Rect, width: u16) -> Rect {
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    Rect::new(x, area.y, width.min(area.width), area.height)
+/// Ширина [`short_date`]: `Nov 05` и `14:02` влезают.
+pub(super) const SHORT_DATE_COLS: usize = 6;
+
+/// Сколько клеток левой части остаётся при любой длине правой.
+const MIN_LEFT_COLS: usize = 10;
+
+/// Части по порядку, урезанные до `max` клеток: режется первая не влезшая, с `…`.
+fn fit_spans<'a>(spans: Vec<Span<'a>>, max: usize) -> (Vec<Span<'a>>, usize) {
+    let mut used = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        let width = UnicodeWidthStr::width(span.content.as_ref());
+        if used + width <= max {
+            used += width;
+            out.push(span);
+            continue;
+        }
+        let cut = truncate(span.content.as_ref(), max - used);
+        used += UnicodeWidthStr::width(cut.as_str());
+        out.push(Span::styled(cut, span.style));
+        break;
+    }
+    (out, used)
 }
 
-/// Padding between the left/center/right segments of the status bar, sized
-/// by display width (not byte length) so multibyte content — Cyrillic
-/// status text, emoji in the goal/MCP tags — doesn't overstate how much
-/// horizontal space a segment occupies and push `right` off-screen.
-pub(super) fn status_bar_gap(left: &str, center: &str, right: &str, width: u16) -> usize {
-    let segments_width = UnicodeWidthStr::width(left)
-        + UnicodeWidthStr::width(center)
-        + UnicodeWidthStr::width(right);
-    width.saturating_sub(segments_width as u16).max(1) as usize
+/// Строка ровно в `width` клеток: слева суть, справа метка. Правая часть не
+/// отнимает у левой больше, чем оставляет ей [`MIN_LEFT_COLS`].
+pub(super) fn split_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
+    let (right, right_w) = fit_spans(right, width.saturating_sub(MIN_LEFT_COLS + 1));
+    let gap = usize::from(right_w > 0);
+    let (mut spans, left_w) = fit_spans(left, width.saturating_sub(right_w + gap));
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(left_w + right_w)),
+    ));
+    spans.extend(right);
+    Line::from(spans)
 }
 
 pub(super) fn provider_label(config: &Config) -> String {
@@ -192,6 +222,62 @@ pub(super) fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
 
+    fn cells(line: &Line) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    #[test]
+    fn a_short_date_is_a_time_today_and_a_day_otherwise() {
+        let stamp = "2026-11-05T09:12:00+00:00";
+        let local = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        assert_eq!(
+            short_date(stamp, local.date_naive()),
+            local.format("%H:%M").to_string()
+        );
+        let other = local.date_naive().succ_opt().unwrap();
+        assert_eq!(short_date(stamp, other), local.format("%b %d").to_string());
+        assert_eq!(
+            UnicodeWidthStr::width(short_date("испорченная дата", other).as_str()),
+            6
+        );
+    }
+
+    #[test]
+    fn a_split_line_is_exactly_as_wide_as_asked() {
+        for width in 0..40 {
+            let line = split_line(
+                vec![Span::raw("claude-max"), Span::raw(" · подписка")],
+                vec![Span::raw("oauth token expired, run /accounts auth")],
+                width,
+            );
+            assert_eq!(cells(&line), width, "width {width}");
+        }
+    }
+
+    #[test]
+    fn a_long_right_side_never_eats_the_whole_left() {
+        let line = split_line(
+            vec![Span::raw("claude-max")],
+            vec![Span::raw("oauth token expired, run /accounts auth")],
+            29,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("claude-max"), "{text}");
+        assert!(text.contains('…'), "{text}");
+    }
+
+    #[test]
+    fn truncate_to_zero_width_gives_nothing_not_an_ellipsis() {
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("", 0), "");
+        assert_eq!(truncate("abc", 1), "\u{2026}");
+    }
+
     #[test]
     fn fit_col_pads_short_and_truncates_long() {
         // Short content is right-padded to the exact column width.
@@ -214,47 +300,6 @@ mod tests {
         let out = fit_col("世界世", 5);
         assert_eq!(out, "世界…");
         assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
-    }
-
-    #[test]
-    fn status_bar_gap_ascii_matches_byte_length_math() {
-        // Pure-ASCII case: display width equals byte length, so this should
-        // match what the old `.len()`-based formula produced.
-        let gap = status_bar_gap(" left ", " center ", " right ", 40);
-        assert_eq!(gap, 40usize.saturating_sub(6 + 8 + 7));
-    }
-
-    #[test]
-    fn status_bar_gap_multibyte_uses_display_width_not_byte_length() {
-        // Cyrillic text: each character is 2 bytes in UTF-8 but 1 display
-        // cell. A byte-length-based gap would undercount available space
-        // and push `right` further than it should.
-        let left = " статус "; // 8 chars, display width 8 cells, byte len 14 (6 Cyrillic letters x 2 bytes + 2 ASCII spaces)
-        let center = " ";
-        let right = " right ";
-        let gap_by_width = status_bar_gap(left, center, right, 40);
-
-        let byte_len_gap =
-            40usize.saturating_sub((left.len() + center.len() + right.len()).min(40));
-        assert_ne!(
-            gap_by_width, byte_len_gap,
-            "multibyte content should make the width- and byte-length-based gaps diverge"
-        );
-
-        let expected = 40usize.saturating_sub(
-            UnicodeWidthStr::width(left)
-                + UnicodeWidthStr::width(center)
-                + UnicodeWidthStr::width(right),
-        );
-        assert_eq!(gap_by_width, expected);
-    }
-
-    #[test]
-    fn status_bar_gap_never_zero() {
-        // `.max(1)` guards against a fully-collapsed gap even when segments
-        // overflow the available width.
-        let gap = status_bar_gap(&"x".repeat(100), "y", "z", 10);
-        assert_eq!(gap, 1);
     }
 
     fn theme() -> Theme {

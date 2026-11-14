@@ -215,6 +215,7 @@ do_install() {
 }
 
 # ── удаление ─────────────────────────────────────────────────────────────
+# Данные и кэш (на Linux это и новое место), плюс прежние папки конфига, оставшиеся после переезда.
 data_dirs() {
   if [ "$(uname -s)" = "Darwin" ]; then
     echo "$HOME/Library/Application Support/pooprusteek"
@@ -258,6 +259,19 @@ do_uninstall() {
       printf '%s  kept %s%s\n' "$dim" "$dir" "$reset"
     fi
   done
+
+  # Общий конфиг лежит в ~/.pooprusteek рядом с вашими правилами (AGENTS.md, скиллы): без вопроса
+  # не трогаем ничего, а при согласии убираем только файл настроек и его копии.
+  config_dir="$HOME/.pooprusteek"
+  if [ -f "$config_dir/config.toml" ] || [ -f "$config_dir/config.toml.pre-gateway" ]; then
+    if confirm "Also delete your settings file $config_dir/config.toml (and its backups)? Your rules, skills and account logins there are kept."; then
+      rm -f "$config_dir/config.toml" "$config_dir/config.toml.pre-gateway" "$config_dir/config.toml.lock"
+      rmdir "$config_dir" 2>/dev/null || true
+      ok "Deleted the settings file in $config_dir"
+    else
+      printf '%s  kept %s%s\n' "$dim" "$config_dir" "$reset"
+    fi
+  fi
   printf '\n'
 }
 

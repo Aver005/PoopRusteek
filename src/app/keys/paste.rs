@@ -15,9 +15,8 @@
 //! box, the wizard "extra" step) keep them.
 
 use crate::app::App;
-use crate::app::events::{Modal, View};
+use crate::app::events::{AppEvent, Modal, View};
 use crate::app::mcp_add::{McpAddState, WizardStep};
-use crate::app::providers::ProviderWizardStep;
 use crate::app::search::SearchFocus;
 use crate::app::themes::ThemeWizardStep;
 
@@ -29,7 +28,28 @@ fn sanitize(text: &str, allow_newline: bool) -> String {
         .collect()
 }
 
+/// Секрет в скрытое поле идёт одной строкой: перевод строки в середине молча склеил бы другое значение.
+fn single_line_secret(text: &str) -> Result<&str, &'static str> {
+    let value = text.trim_end_matches(['\n', '\r']);
+    if value.contains(['\n', '\r']) {
+        return Err("the value has line breaks; paste a single-line token");
+    }
+    Ok(value)
+}
+
 impl App {
+    /// Читает буфер обмена в фоне и отдаёт текст в тот же путь, что и обычная вставка.
+    pub(crate) fn paste_from_clipboard(&self) {
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let event = match crate::clipboard::read() {
+                Ok(text) => AppEvent::Paste(text),
+                Err(error) => AppEvent::PasteFailed(error.to_string()),
+            };
+            let _ = event_tx.send(event);
+        });
+    }
+
     /// Брошенные файлы — чипами в поле ввода у курсора.
     fn attach_dropped(&mut self, paths: &[std::path::PathBuf]) {
         let workspace = self.state.workspace();
@@ -88,16 +108,26 @@ impl App {
                     },
                     McpAddState::ChooseMethod { .. } => {}
                 },
-                Modal::ProviderAdd(wiz) => {
+                Modal::AccountWizard(wiz) => {
+                    use crate::app::gateway_view::wizard::Step;
                     let clean = sanitize(&text, false);
                     match wiz.step {
-                        ProviderWizardStep::Name => wiz.name.insert_str(&clean),
-                        ProviderWizardStep::BaseUrl => wiz.base_url.insert_str(&clean),
-                        ProviderWizardStep::ApiKey => wiz.api_key.insert_str(&clean),
-                        ProviderWizardStep::Model => wiz.model.insert_str(&clean),
-                        ProviderWizardStep::Protocol | ProviderWizardStep::Confirm => {}
+                        Step::Label => wiz.label.insert_str(&clean),
+                        Step::BaseUrl => wiz.base_url.insert_str(&clean),
+                        Step::Model => wiz.model.insert_str(&clean),
+                        Step::Secret => match single_line_secret(&text) {
+                            Ok(value) => wiz.secret.push_str(value),
+                            Err(error) => wiz.error = Some(error.to_string()),
+                        },
+                        _ => {}
                     }
                 }
+                // Вставка секрета идёт мимо поля ввода и истории: только в скрытое поле.
+                Modal::SecretPrompt(prompt) => match single_line_secret(&text) {
+                    Ok(value) => prompt.value.push_str(value),
+                    Err(error) => prompt.error = Some(error.to_string()),
+                },
+                Modal::AccountLimits(form) => form.current().insert_str(&sanitize(&text, false)),
                 // No text field: tool-approval, delete-sessions, confirm, and a
                 // non-custom (option-list) question.
                 _ => {}
@@ -107,6 +137,10 @@ impl App {
 
         // View-specific text inputs (no modal in front).
         match self.state.view {
+            View::Resume => {
+                self.state.resume.filter.insert_str(&sanitize(&text, false));
+                self.refilter_resume();
+            }
             View::Search => {
                 if self.state.search.focus == SearchFocus::Query {
                     self.state.search.query.insert_str(&sanitize(&text, false));
@@ -124,7 +158,7 @@ impl App {
             }
             // Providers/Mcp management screens open their text entry as a modal
             // (handled above); their base views are list navigation only.
-            View::Providers | View::Mcp => {}
+            View::Accounts | View::Mcp => {}
             _ => {
                 // Перетащенные мышью файлы: терминал вставляет их пути.
                 if let Some(paths) = crate::app::dropped_paths::parse(&text) {

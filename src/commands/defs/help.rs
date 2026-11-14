@@ -45,8 +45,12 @@ impl HelpCommand {
 
         out.push_str(
             "\nKeyboard shortcuts:\n\
-             \x20 Ctrl+C         — Cancel generation (if active), otherwise quit\n\
-             \x20 Ctrl+L         — Clear chat\n\
+             \x20 Esc            — Cancel generation; when idle, leave the chat for home\n\
+             \x20 Ctrl+C         — Cancel generation; in a chat go home, on home quit\n\
+             \x20 Ctrl+B         — Show or hide the side panel\n\
+             \x20 Ctrl+V / right click — Paste\n\
+             \x20 Shift+mouse drag — Select text to copy (the app owns the plain mouse)\n\
+             \x20 Ctrl+L         — Redraw the screen and jump to the latest message\n\
              \x20 Enter          — Send message\n\
              \x20 Shift+Enter    — New line in prompt\n\
              \x20 `\\` + Enter   — New line in prompt (line continuation)\n\
@@ -56,7 +60,8 @@ impl HelpCommand {
              \x20 Ctrl+Left/Right — Move by word\n\
              \x20 Ctrl+Shift+Left/Right — Select by word\n\
              \x20 Shift+Left/Right — Select by char\n\
-             \x20 Ctrl+A         — Select all",
+             \x20 Ctrl+A         — Select all\n\
+             \x20 Ctrl+T         — Retype the input (or selection) in the other layout: ghbdtn <-> привет",
         );
 
         out

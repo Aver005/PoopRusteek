@@ -42,7 +42,8 @@ impl Command for CwdCommand {
                     if let Some(notice) = crate::app::reload_instructions(state, config) {
                         state.push_ui_system(&notice);
                     }
-                    CommandResult::Handled
+                    // Проектный слой конфига зависит от папки: читаем его заново.
+                    CommandResult::ReloadConfig
                 }
                 Err(e) => {
                     CommandResult::Error(format!("Cannot change to {}: {e}", absolute.display()))

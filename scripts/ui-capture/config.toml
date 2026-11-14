@@ -1,0 +1,19 @@
+active_provider = "mock"
+
+[provider]
+kind = "deepseek"
+token = "throwaway-not-a-real-token"
+model = "deepseek-chat"
+
+[ui]
+theme = "default"
+
+[update]
+auto = false
+
+[[providers]]
+name = "mock"
+base_url = "http://127.0.0.1:8811/v1"
+api_key = "mock"
+model = "mock-model"
+protocol = "openai"

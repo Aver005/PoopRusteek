@@ -10,6 +10,7 @@
 
 use super::catalog::{self, ResolvedModel};
 use super::http::{ApiBody, LogDetail, ServerContext, full_body, json_response};
+use super::routing;
 use super::tools::{BridgedReply, ToolBridge, flatten_history};
 use crate::agent::continuation::continue_cut_off;
 use crate::agent::stream::{
@@ -18,24 +19,35 @@ use crate::agent::stream::{
 };
 use crate::config::ProviderProtocol;
 use crate::error::AppError;
+use crate::provider::failure::FailureClass;
 use crate::provider::openai_compat::{
     self, ChatCompletionRequest, ChatCompletionResponse, Choice, CompletionMeta, ErrorResponse,
     MessageContent, ReasoningStreamSplitter, WireToolCall,
 };
-use crate::provider::{ChatMessage, CompletionRequest, CompletionResponse, LLMProvider};
+use crate::provider::{
+    ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, LLMProvider, Usage,
+};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Requests are buffered before parsing; cap them so a misbehaving client
 /// can't balloon memory. 16 MiB fits any realistic chat history.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Выбранный бэкенд: провайдер, модель для журнала и признак «идёт через шлюз».
+struct Chosen {
+    provider: Arc<dyn LLMProvider>,
+    model: String,
+    routed: bool,
+}
+
 /// A resolved backend, or a ready-to-return error response (boxed — see
 /// [`resolve_backend`]).
-type BackendResult = Result<(ResolvedModel, Arc<dyn LLMProvider>), Box<Response<ApiBody>>>;
+type BackendResult = Result<Chosen, Box<Response<ApiBody>>>;
 
 /// Dispatch one request. `None` = not a route of this dialect (the caller
 /// answers 404).
@@ -95,6 +107,10 @@ fn model_not_found(message: String) -> Response<ApiBody> {
 /// ready-to-return error response (boxed — a `Response` dwarfs the Ok
 /// tuple, and clippy rightly flags a fat `Err`). Shared by chat + legacy.
 fn resolve_backend(model_id: &str, context: &ServerContext) -> BackendResult {
+    let gateway = context.gateway.get();
+    if gateway.is_enabled() {
+        return resolve_routed(&gateway, model_id, context);
+    }
     let resolved = catalog::resolve_model(
         model_id,
         context.deepseek.is_some(),
@@ -122,22 +138,98 @@ fn resolve_backend(model_id: &str, context: &ServerContext) -> BackendResult {
                 Box::new(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &ErrorResponse::server_error(format!(
-                        "failed to initialize provider '{}': {error}",
-                        entry.name
+                        "failed to initialize provider '{}': {}",
+                        entry.name,
+                        routing::scrub(&error.to_string())
                     )),
                 ))
             })?
         }
     };
-    Ok((resolved, provider))
+    Ok(Chosen {
+        provider,
+        model: resolved.internal_model().to_string(),
+        routed: false,
+    })
+}
+
+/// Адрес через шлюз: каталог проверяет `account/model` и `auto/<route>`, шлюз выбирает аккаунт.
+/// Адрес, базовый URL и заголовки аккаунта клиент задать не может.
+fn resolve_routed(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    model_id: &str,
+    context: &ServerContext,
+) -> BackendResult {
+    use crate::gateway::handle::{BuildState, CallSource, ResolveError};
+    match gateway.build_state() {
+        BuildState::Ready => {}
+        BuildState::Starting => return Err(Box::new(starting_response())),
+        BuildState::Failed(reason) => return Err(Box::new(failed_response(&reason))),
+    }
+    let snapshot = gateway.snapshot();
+    let address = routing::check_address(&snapshot, &context.models.snapshot(), model_id)
+        .map_err(|message| Box::new(model_not_found(message)))?;
+    match gateway.provider_for_model_id(&address, CallSource::Serve) {
+        Ok(provider) => Ok(Chosen {
+            provider,
+            model: address,
+            routed: true,
+        }),
+        Err(ResolveError::Starting) => Err(Box::new(starting_response())),
+        Err(ResolveError::Failed(reason)) => Err(Box::new(failed_response(&reason))),
+        Err(ResolveError::Unknown(_)) => Err(Box::new(model_not_found(format!(
+            "model '{}' not found — see GET /v1/models for what this server exposes",
+            model_id.trim()
+        )))),
+        Err(error @ ResolveError::Disabled) => Err(Box::new(
+            UpstreamError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()).response(),
+        )),
+    }
+}
+
+/// Шлюз собирается: клиент должен повторить, а не получить «модели нет».
+fn starting_response() -> Response<ApiBody> {
+    let mut error = UpstreamError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the gateway is still starting, retry in a moment".to_string(),
+    );
+    error.code = Some("gateway_starting");
+    error.retry_after = Some(std::time::Duration::from_secs(2));
+    error.response()
+}
+
+/// Заголовки `x-pooprusteek-*` по тому, куда ушёл вызов. Без шлюза ничего не добавляется.
+/// Ошибочный ответ их не получает: «ответил такой-то» про отказ было бы неправдой.
+fn add_route_headers(response: &mut Response<ApiBody>, provider: &Arc<dyn LLMProvider>) {
+    if !response.status().is_success() {
+        return;
+    }
+    if let Some(served) = provider.served_by() {
+        for (name, value) in routing::route_headers(&served) {
+            response.headers_mut().insert(name, value);
+        }
+    }
 }
 
 fn models_response(context: &ServerContext) -> Response<ApiBody> {
-    let ids = catalog::list_model_ids(
-        context.deepseek.is_some(),
-        &context.entries,
-        &context.models.snapshot(),
-    );
+    let gateway = context.gateway.get();
+    if gateway.is_enabled() {
+        // Пустой список во время сборки клиент запомнил бы как «моделей нет».
+        match gateway.build_state() {
+            crate::gateway::handle::BuildState::Ready => {}
+            crate::gateway::handle::BuildState::Starting => return starting_response(),
+            crate::gateway::handle::BuildState::Failed(reason) => return failed_response(&reason),
+        }
+    }
+    let ids = if gateway.is_enabled() {
+        routing::model_ids(&gateway.snapshot(), &context.models.snapshot())
+    } else {
+        catalog::list_model_ids(
+            context.deepseek.is_some(),
+            &context.entries,
+            &context.models.snapshot(),
+        )
+    };
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
     let created = chrono::Utc::now().timestamp().max(0) as u64;
     json_response(
@@ -175,10 +267,15 @@ async fn chat_completions(
         }
     };
 
-    let (resolved, provider) = match resolve_backend(&wire.model, context) {
-        Ok(pair) => pair,
+    let Chosen {
+        provider,
+        model: chosen_model,
+        routed,
+    } = match resolve_backend(&wire.model, context) {
+        Ok(chosen) => chosen,
         Err(response) => return *response,
     };
+    let include_usage = wants_usage(&body);
 
     // The response echoes the id the caller asked for, per OpenAI protocol.
     let public_model = wire.model.clone();
@@ -191,7 +288,7 @@ async fn chat_completions(
             );
         }
     };
-    internal.model = resolved.internal_model().to_string();
+    internal.model = chosen_model.clone();
     // Родной протокол знает вызовы в истории; остальным они нужны текстом.
     let native = provider.native_tools();
     if !native {
@@ -208,20 +305,42 @@ async fn chat_completions(
     let meta = CompletionMeta::generate(&public_model);
     let streaming = internal.stream;
     let with_tools = bridge.is_some();
-    let mut response = match (bridge, streaming) {
-        (Some(bridge), true) => tool_stream(provider, internal, bridge, meta),
-        (Some(bridge), false) => tool_blocking(provider, internal, bridge, meta).await,
-        (None, true) => stream_completion(provider, internal, meta),
-        (None, false) => blocking_completion(provider, internal, meta).await,
+    let observer = Arc::clone(&provider);
+    let mut response = match (bridge, streaming, routed) {
+        (Some(bridge), true, false) => tool_stream(provider, internal, bridge, meta),
+        (Some(bridge), true, true) => tool_stream_held(provider, internal, bridge, meta).await,
+        (Some(bridge), false, _) => tool_blocking(provider, internal, bridge, meta).await,
+        (None, true, false) => stream_completion(provider, internal, meta, include_usage),
+        (None, true, true) => held_stream_completion(provider, internal, meta, include_usage).await,
+        (None, false, _) => blocking_completion(provider, internal, meta).await,
     };
+    if routed {
+        add_route_headers(&mut response, &observer);
+    }
     // Enriches the proxy access log; free otherwise.
     response.extensions_mut().insert(LogDetail(format!(
-        "model={public_model} → {}{}{}",
-        resolved.internal_model(),
+        "model={public_model} → {chosen_model}{}{}",
         if streaming { " (stream)" } else { "" },
         if with_tools { " (tools)" } else { "" }
     )));
     response
+}
+
+/// Клиент просил расход в потоке: `stream_options.include_usage`.
+fn wants_usage(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Probe {
+        stream_options: Option<StreamOptions>,
+    }
+    #[derive(Deserialize)]
+    struct StreamOptions {
+        include_usage: Option<bool>,
+    }
+    serde_json::from_slice::<Probe>(body)
+        .ok()
+        .and_then(|probe| probe.stream_options)
+        .and_then(|options| options.include_usage)
+        .unwrap_or(false)
 }
 
 /// Как часто пустой SSE-комментарий держит соединение, пока ответ с
@@ -236,14 +355,35 @@ const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 
 /// Ошибка апстрима и её HTTP-код: клиент должен отличать «подожди» (429),
 /// «не дождались» (504) и «апстрим сломан» (502) — всё было 500.
+const UPSTREAM_AUTH_MESSAGE: &str =
+    "the upstream provider rejected this server's credentials; see the server log";
+
+const UPSTREAM_UNREACHABLE_MESSAGE: &str = "the upstream provider could not be reached";
+
 struct UpstreamError {
     status: StatusCode,
     message: String,
+    /// Сколько апстрим просил подождать: уходит клиенту заголовком `Retry-After`.
+    retry_after: Option<std::time::Duration>,
+    /// Тег ошибки в теле: по нему клиенты OpenAI решают, повторять ли.
+    kind: &'static str,
+    code: Option<&'static str>,
 }
 
 impl UpstreamError {
     fn new(status: StatusCode, message: String) -> Self {
-        Self { status, message }
+        let (kind, code) = if status == StatusCode::TOO_MANY_REQUESTS {
+            ("rate_limit_error", Some("rate_limit_exceeded"))
+        } else {
+            ("server_error", None)
+        };
+        Self {
+            status,
+            message,
+            retry_after: None,
+            kind,
+            code,
+        }
     }
 
     fn from_app(error: &AppError) -> Self {
@@ -254,12 +394,77 @@ impl UpstreamError {
         {
             message = message.replace(url.as_str(), "<upstream>");
         }
-        let status = match error {
-            AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
-            AppError::Http(http) if http.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
-            _ => StatusCode::BAD_GATEWAY,
+        // Остальное (шлюз прячет ту же ошибку в `AppError::Upstream`) скрабит `body()`.
+        Self::from_class(message, error.failure_class(), error.retry_after())
+    }
+
+    /// Код и тег по классу отказа; без класса — 502.
+    fn from_class(
+        message: String,
+        class: Option<FailureClass>,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        let mut mapped = Self::new(StatusCode::BAD_GATEWAY, message);
+        mapped.retry_after = retry_after;
+        let Some(class) = class else {
+            return mapped;
         };
-        Self::new(status, message)
+        let (status, kind, code) = match class {
+            FailureClass::RateLimit { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                Some("rate_limit_exceeded"),
+            ),
+            // Квота кончилась: ждать секунды бесполезно, `Retry-After` не шлём.
+            FailureClass::QuotaExhausted { .. } | FailureClass::SpendCap => {
+                mapped.retry_after = None;
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "insufficient_quota",
+                    Some("insufficient_quota"),
+                )
+            }
+            FailureClass::Overloaded => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                Some("overloaded"),
+            ),
+            FailureClass::Timeout => (StatusCode::GATEWAY_TIMEOUT, "server_error", None),
+            // Ключ апстрима — забота сервера. Текст отказа может раскрыть ключ или аккаунт.
+            FailureClass::Auth | FailureClass::AccountBlocked => {
+                mapped.message = UPSTREAM_AUTH_MESSAGE.to_string();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    Some("upstream_auth"),
+                )
+            }
+            FailureClass::ContextTooLong => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("context_length_exceeded"),
+            ),
+            FailureClass::ModelNotFound => (
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                Some("model_not_found"),
+            ),
+            FailureClass::ContentFilter | FailureClass::BadRequest => {
+                (StatusCode::BAD_REQUEST, "invalid_request_error", None)
+            }
+            // Сетевая ошибка называет адрес аккаунта: клиенту хватает класса.
+            FailureClass::Network => {
+                mapped.message = UPSTREAM_UNREACHABLE_MESSAGE.to_string();
+                return mapped;
+            }
+            FailureClass::Server | FailureClass::Protocol | FailureClass::Cancelled => {
+                return mapped;
+            }
+        };
+        mapped.status = status;
+        mapped.kind = kind;
+        mapped.code = code;
+        mapped
     }
 
     fn idle() -> Self {
@@ -281,10 +486,17 @@ impl UpstreamError {
         )
     }
 
-    fn from_verdict(verdict: StreamVerdict) -> Option<Self> {
+    fn from_verdict(
+        verdict: StreamVerdict,
+        failure: Option<&crate::agent::stream::StreamFailure>,
+    ) -> Option<Self> {
         match verdict {
             StreamVerdict::IdleTimeout => Some(Self::idle()),
-            StreamVerdict::Failed(error) => Some(Self::new(StatusCode::BAD_GATEWAY, error)),
+            StreamVerdict::Failed(error) => Some(Self::from_class(
+                error,
+                failure.map(|f| f.class.clone()),
+                failure.and_then(|f| f.retry_after),
+            )),
             StreamVerdict::ClosedWithoutStop => Some(Self::closed_early()),
             StreamVerdict::Ok | StreamVerdict::Finished(_) => None,
         }
@@ -292,20 +504,23 @@ impl UpstreamError {
 
     /// Тело в духе OpenAI: по `rate_limit_error` клиенты решают, повторять ли.
     fn body(&self) -> ErrorResponse {
-        if self.status != StatusCode::TOO_MANY_REQUESTS {
-            return ErrorResponse::server_error(self.message.clone());
-        }
         ErrorResponse {
             error: openai_compat::ErrorBody {
-                message: self.message.clone(),
-                kind: "rate_limit_error".to_string(),
-                code: Some("rate_limit_exceeded".to_string()),
+                message: routing::scrub(&self.message),
+                kind: self.kind.to_string(),
+                code: self.code.map(str::to_string),
             },
         }
     }
 
     fn response(&self) -> Response<ApiBody> {
-        json_response(self.status, &self.body())
+        let mut response = json_response(self.status, &self.body());
+        if let Some(wait) = self.retry_after
+            && let Ok(value) = header::HeaderValue::from_str(&wait.as_secs().max(1).to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 
     /// Та же ошибка кадром SSE: статус 200 уже ушёл клиенту.
@@ -351,7 +566,7 @@ async fn tool_attempt(
     bridge: &ToolBridge,
 ) -> Result<(BridgedReply, String, String), UpstreamError> {
     let outcome = collect_stream(provider, request.clone(), |_| {}).await;
-    if let Some(error) = UpstreamError::from_verdict(outcome.verdict()) {
+    if let Some(error) = UpstreamError::from_verdict(outcome.verdict(), outcome.failure.as_ref()) {
         return Err(error);
     }
     if !request.tools.is_empty() {
@@ -435,7 +650,55 @@ fn tool_response(
             },
             finish_reason: Some(finish),
         }],
-        usage,
+        usage: Some(usage.into()),
+    }
+}
+
+/// Задача ответа с инструментами; гард гасит её, когда клиент ушёл.
+type ToolWork = crate::util::AbortOnDrop<Result<(BridgedReply, String), UpstreamError>>;
+
+fn spawn_tool_work(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    bridge: ToolBridge,
+) -> ToolWork {
+    crate::util::AbortOnDrop::spawn(async move {
+        run_tool_completion(&provider, &request, &bridge).await
+    })
+}
+
+/// Кадры по итогу задачи: ответ, ошибка кадром или сбой самой задачи.
+fn tool_outcome_frames(
+    joined: Result<Result<(BridgedReply, String), UpstreamError>, tokio::task::JoinError>,
+    meta: &CompletionMeta,
+) -> Vec<Bytes> {
+    match joined {
+        Ok(Ok((reply, finish))) => tool_frames(reply, &finish, meta),
+        Ok(Err(error)) => vec![error.frame()],
+        Err(join_error) => {
+            vec![UpstreamError::task_failed("the completion task", &join_error).frame()]
+        }
+    }
+}
+
+/// Пока ответ копится — keep-alive, затем готовые кадры.
+async fn finish_tool_stream(
+    mut work: ToolWork,
+    meta: CompletionMeta,
+    body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+) {
+    let joined = loop {
+        match tokio::time::timeout(KEEPALIVE, &mut work).await {
+            Ok(joined) => break joined,
+            Err(_elapsed) => {
+                if body_tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    for frame in tool_outcome_frames(joined, &meta) {
+        let _ = body_tx.send(frame);
     }
 }
 
@@ -447,30 +710,8 @@ fn tool_stream(
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
     sse_stream_response(move |body_tx| async move {
-        // Гард: ушедший клиент гасит и задачу ответа, а не оставляет её сиротой.
-        let mut work = crate::util::AbortOnDrop::spawn(async move {
-            run_tool_completion(&provider, &request, &bridge).await
-        });
-        let joined = loop {
-            match tokio::time::timeout(KEEPALIVE, &mut work).await {
-                Ok(joined) => break joined,
-                Err(_elapsed) => {
-                    if body_tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() {
-                        return;
-                    }
-                }
-            }
-        };
-        let frames = match joined {
-            Ok(Ok((reply, finish))) => tool_frames(reply, &finish, &meta),
-            Ok(Err(error)) => vec![error.frame()],
-            Err(join_error) => {
-                vec![UpstreamError::task_failed("the completion task", &join_error).frame()]
-            }
-        };
-        for frame in frames {
-            let _ = body_tx.send(frame);
-        }
+        let work = spawn_tool_work(provider, request, bridge);
+        finish_tool_stream(work, meta, body_tx).await;
     })
 }
 
@@ -545,9 +786,198 @@ fn stream_completion(
     provider: Arc<dyn LLMProvider>,
     request: CompletionRequest,
     meta: CompletionMeta,
+    include_usage: bool,
 ) -> Response<ApiBody> {
-    sse_stream_response(move |body_tx| bridge_stream(provider, request, meta, body_tx))
+    sse_stream_response(move |body_tx| async move {
+        // Прежний путь расход не ждёт: берётся только уже пришедший.
+        let pump = Pump::new(
+            VecDeque::new(),
+            include_usage,
+            &meta,
+            std::time::Duration::ZERO,
+        );
+        chat_bridge(Upstream::start(provider, request), pump, meta, body_tx).await;
+    })
 }
+
+/// Поток через шлюз: ответа нет, пока апстрим не дал первый чанк; отказ до него — честный HTTP-код.
+/// Заголовки `x-pooprusteek-*` называют аккаунт, который действительно отвечает.
+async fn held_stream_completion(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    meta: CompletionMeta,
+    include_usage: bool,
+) -> Response<ApiBody> {
+    let pump_meta = meta.clone();
+    held_sse(
+        provider,
+        request,
+        include_usage,
+        &pump_meta,
+        move |upstream, pump, body_tx| chat_bridge(upstream, pump, meta, body_tx),
+    )
+    .await
+}
+
+/// Удержание до первого чанка для любого SSE-диалекта: диалект даёт только мост.
+async fn held_sse<F, Fut>(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    include_usage: bool,
+    meta: &CompletionMeta,
+    bridge: F,
+) -> Response<ApiBody>
+where
+    F: FnOnce(Upstream, Pump, tokio::sync::mpsc::UnboundedSender<Bytes>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut upstream = Upstream::start(provider, request);
+    let backlog = match await_first(&mut upstream).await {
+        Ok(backlog) => backlog,
+        Err(error) => return error.response(),
+    };
+    let pump = Pump::new(backlog, include_usage, meta, USAGE_WAIT_ROUTED);
+    sse_stream_response(move |body_tx| bridge(upstream, pump, body_tx))
+}
+
+/// Ответ с инструментами через шлюз: если он готов в пределах порога, отказ остаётся честным
+/// кодом; дольше порога — SSE с keep-alive (заголовки называют аккаунт текущей попытки).
+async fn tool_stream_held(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    bridge: ToolBridge,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    let mut work = spawn_tool_work(provider, request, bridge);
+    match tokio::time::timeout(TOOL_HOLD, &mut work).await {
+        Ok(Ok(Ok((reply, finish)))) => {
+            let mut body = Vec::new();
+            for frame in tool_frames(reply, &finish, &meta) {
+                body.extend_from_slice(&frame);
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(full_body(body))
+                .expect("static response parts are valid")
+        }
+        Ok(Ok(Err(error))) => error.response(),
+        Ok(Err(join_error)) => {
+            UpstreamError::task_failed("the completion task", &join_error).response()
+        }
+        Err(_elapsed) => sse_stream_response(move |body_tx| async move {
+            // Первые байты уходят сразу: клиент видит, что соединение живо.
+            let _ = body_tx.send(Bytes::from_static(KEEPALIVE_FRAME));
+            finish_tool_stream(work, meta, body_tx).await;
+        }),
+    }
+}
+
+/// Сколько держим ответ с инструментами ради честного кода, прежде чем начать keep-alive.
+#[cfg(not(test))]
+const TOOL_HOLD: std::time::Duration = KEEPALIVE;
+#[cfg(test)]
+const TOOL_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Задача апстрима, её канал чанков и уборка за ней.
+struct Upstream {
+    task: crate::util::AbortOnDrop<crate::error::AppResult<()>>,
+    chunks: tokio::sync::mpsc::UnboundedReceiver<CompletionChunk>,
+    discard: crate::provider::SessionDiscard,
+}
+
+impl Upstream {
+    fn start(provider: Arc<dyn LLMProvider>, request: CompletionRequest) -> Self {
+        let discard = crate::provider::SessionDiscard::new(Arc::clone(&provider));
+        let (chunk_tx, chunks) = tokio::sync::mpsc::unbounded_channel();
+        // Гард: ушедший клиент гасит и задачу апстрима, а не оставляет её сиротой.
+        let task = crate::util::AbortOnDrop::spawn(async move {
+            provider.complete_stream(request, chunk_tx).await
+        });
+        Self {
+            task,
+            chunks,
+            discard,
+        }
+    }
+}
+
+/// Первый чанк, по которому можно отвечать: текст, вызов или конец. Чанки только с расходом
+/// ждут вместе с ним. Ошибка до него — ответ-ошибка, а не 200 с обрывом.
+async fn await_first(upstream: &mut Upstream) -> Result<VecDeque<CompletionChunk>, UpstreamError> {
+    let mut seen = VecDeque::new();
+    loop {
+        match tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream.chunks.recv()).await {
+            Err(_elapsed) => return Err(UpstreamError::idle()),
+            Ok(Some(chunk)) => {
+                let decisive = !chunk.content.is_empty()
+                    || !chunk.tool_calls.is_empty()
+                    || chunk.finish_reason.is_some();
+                seen.push_back(chunk);
+                if decisive {
+                    return Ok(seen);
+                }
+            }
+            Ok(None) => {
+                return match (&mut upstream.task).await {
+                    Ok(Ok(())) if !seen.is_empty() => Ok(seen),
+                    Ok(Ok(())) => Err(UpstreamError::closed_early()),
+                    Ok(Err(error)) => Err(UpstreamError::from_app(&error)),
+                    Err(join_error) => Err(UpstreamError::task_failed(
+                        "the upstream stream",
+                        &join_error,
+                    )),
+                };
+            }
+        }
+    }
+}
+
+/// Кадр расхода для клиента, который его просил.
+type UsageFrame = Box<dyn FnOnce(&Usage) -> Bytes + Send>;
+
+/// Что насосу известно сверх канала: снятые при удержании чанки, кадр расхода и сколько ждать расход.
+struct Pump {
+    backlog: VecDeque<CompletionChunk>,
+    usage_frame: Option<UsageFrame>,
+    usage_wait: std::time::Duration,
+}
+
+impl Pump {
+    fn new(
+        backlog: VecDeque<CompletionChunk>,
+        include_usage: bool,
+        meta: &CompletionMeta,
+        usage_wait: std::time::Duration,
+    ) -> Self {
+        let meta = meta.clone();
+        Self {
+            backlog,
+            usage_wait,
+            usage_frame: include_usage.then(|| {
+                Box::new(move |usage: &Usage| {
+                    // Как у OpenAI: последний чанк с пустым `choices` и полем `usage`.
+                    let mut chunk = openai_compat::final_chunk("stop", &meta);
+                    chunk.choices.clear();
+                    chunk.usage = Some(usage.clone().into());
+                    sse_data(&chunk)
+                }) as UsageFrame
+            }),
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            backlog: VecDeque::new(),
+            usage_frame: None,
+            usage_wait: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Через шлюз расход идёт отдельным чанком сразу за концом: ждём его недолго, и только если просили.
+const USAGE_WAIT_ROUTED: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Respond immediately with an SSE body fed by a detached bridge task —
 /// the channel/poll_fn/header scaffolding both dialects used to duplicate.
@@ -575,15 +1005,15 @@ where
 /// reasoning into `reasoning_content` deltas live, so a reasoning model's
 /// chain-of-thought reaches clients in the right field instead of
 /// polluting the answer (see openai_compat::split_reasoning).
-async fn bridge_stream(
-    provider: Arc<dyn LLMProvider>,
-    request: CompletionRequest,
+async fn chat_bridge(
+    upstream: Upstream,
+    pump: Pump,
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) {
     drive_sse_bridge(
-        provider,
-        request,
+        upstream,
+        pump,
         body_tx,
         |reasoning, content, is_first| {
             if reasoning.is_empty() && content.is_empty() {
@@ -608,41 +1038,62 @@ async fn bridge_stream(
 }
 
 /// Общий насос обоих SSE-мостов; диалекты дают только кадры: дельту (`None` —
-/// пока нечего слать), удержанный хвост и финальный кадр.
+/// пока нечего слать), удержанный хвост и финальный кадр. Клиент ушёл — апстрим гасится сразу.
 async fn drive_sse_bridge(
-    provider: Arc<dyn LLMProvider>,
-    request: CompletionRequest,
+    upstream: Upstream,
+    mut pump: Pump,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     mut delta_frame: impl FnMut(&str, &str, bool) -> Option<Bytes> + Send,
     tail_frame: impl FnOnce(&str, &str, bool) -> Option<Bytes> + Send,
     final_frame: impl FnOnce(&str, &str) -> Bytes + Send,
 ) {
-    let discard = crate::provider::SessionDiscard::new(Arc::clone(&provider));
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Гард: ушедший клиент гасит и задачу апстрима, а не оставляет её сиротой.
-    let mut upstream = {
-        let provider = Arc::clone(&provider);
-        crate::util::AbortOnDrop::spawn(
-            async move { provider.complete_stream(request, chunk_tx).await },
-        )
-    };
+    let Upstream {
+        mut task,
+        mut chunks,
+        discard,
+    } = upstream;
 
     let mut splitter = ReasoningStreamSplitter::new();
     let mut finish_reason: Option<String> = None;
+    let mut usage: Option<Usage> = None;
+    let mut finish_seen: Option<tokio::time::Instant> = None;
     let mut sent_any = false;
     let mut aborted = false;
     let mut received = 0usize;
     let mut last_sent = tokio::time::Instant::now();
+    let wants_usage = pump.usage_frame.is_some();
     loop {
-        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, chunk_rx.recv()).await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break, // апстрим закрыл канал — разбор ниже
-            Err(_elapsed) => {
-                let _ = body_tx.send(UpstreamError::idle().frame());
-                aborted = true;
-                break;
+        let chunk = match pump.backlog.pop_front() {
+            Some(chunk) => chunk,
+            None => {
+                let wait = match finish_seen {
+                    Some(seen) => pump.usage_wait.saturating_sub(seen.elapsed()),
+                    None => STREAM_IDLE_TIMEOUT,
+                };
+                tokio::select! {
+                    biased;
+                    // Клиент закрыл соединение: дальше платить за токены некому.
+                    () = body_tx.closed() => {
+                        aborted = true;
+                        break;
+                    }
+                    next = tokio::time::timeout(wait, chunks.recv()) => match next {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break, // апстрим закрыл канал — разбор ниже
+                        Err(_elapsed) if finish_seen.is_some() => break,
+                        Err(_elapsed) => {
+                            let _ = body_tx.send(UpstreamError::idle().frame());
+                            aborted = true;
+                            break;
+                        }
+                    },
+                }
             }
         };
+        if chunk.usage.is_some() {
+            // Последнее слово сервера: расход приходит один раз и не суммируется.
+            usage = chunk.usage.clone();
+        }
         if chunk.finish_reason.is_some() {
             finish_reason = chunk.finish_reason.clone();
         }
@@ -682,7 +1133,11 @@ async fn drive_sse_bridge(
             None => {}
         }
         if finish_reason.is_some() {
-            break;
+            // Расход OpenAI идёт отдельным чанком после конца: ждём его, только если просили.
+            if !wants_usage || usage.is_some() {
+                break;
+            }
+            finish_seen.get_or_insert_with(tokio::time::Instant::now);
         }
     }
 
@@ -691,35 +1146,35 @@ async fn drive_sse_bridge(
         if let Some(frame) = tail_frame(&reasoning, &content, !sent_any) {
             let _ = body_tx.send(frame);
         }
-        // После финиша ответ уже весь: шлюз, держащий соединение, не держит нас.
-        let joined = match &finish_reason {
-            Some(_) => tokio::time::timeout(AFTER_STOP_GRACE, &mut upstream)
-                .await
-                .unwrap_or(Ok(Ok(()))),
-            None => (&mut upstream).await,
-        };
-        let failure = upstream_failure(joined);
         match finish_reason.as_deref() {
             // Причина конца пришла — ответ целый, поздняя ошибка его не портит.
             Some(reason) => {
-                if let Some(failure) = failure {
+                let _ = body_tx.send(final_frame(&content, reason));
+                if let (Some(make), Some(usage)) = (pump.usage_frame.take(), usage.as_ref()) {
+                    let _ = body_tx.send(make(usage));
+                }
+                let _ = body_tx.send(Bytes::from_static(DONE_FRAME));
+                // Клиент получил всё: поток закрывается сразу, а задача апстрима дописывает учёт.
+                drop(body_tx);
+                if let Ok(joined) = tokio::time::timeout(AFTER_STOP_GRACE, &mut task).await
+                    && let Some(failure) = upstream_failure(joined)
+                {
                     tracing::debug!(
                         "server: upstream failed after finishing: {}",
                         failure.message
                     );
                 }
-                let _ = body_tx.send(final_frame(&content, reason));
-                let _ = body_tx.send(Bytes::from_static(DONE_FRAME));
             }
             None => {
-                let failure = failure.unwrap_or_else(UpstreamError::closed_early);
+                let failure =
+                    upstream_failure((&mut task).await).unwrap_or_else(UpstreamError::closed_early);
                 let _ = body_tx.send(failure.frame());
             }
         }
     }
 
     // Сначала гасим апстрим: иначе он жжёт токены, пока сессию удаляют.
-    drop(upstream);
+    drop(task);
     discard.now().await;
 }
 
@@ -798,8 +1253,12 @@ async fn legacy_completions(
         }
     };
 
-    let (resolved, provider) = match resolve_backend(&wire.model, context) {
-        Ok(pair) => pair,
+    let Chosen {
+        provider,
+        model: chosen_model,
+        routed,
+    } = match resolve_backend(&wire.model, context) {
+        Ok(chosen) => chosen,
         Err(response) => return *response,
     };
 
@@ -807,7 +1266,7 @@ async fn legacy_completions(
     let internal = CompletionRequest {
         messages: vec![ChatMessage::user(&prompt)],
         tools: Vec::new(),
-        model: resolved.internal_model().to_string(),
+        model: chosen_model.clone(),
         temperature: wire.temperature.unwrap_or(context.defaults.temperature),
         max_tokens: wire.max_tokens.unwrap_or(context.defaults.max_tokens),
         stream: wire.stream.unwrap_or(false),
@@ -816,14 +1275,17 @@ async fn legacy_completions(
     let meta = CompletionMeta::generate(&public_model);
     let streaming = internal.stream;
 
-    let mut response = if streaming {
-        legacy_stream(provider, internal, meta)
-    } else {
-        legacy_blocking(provider, &prompt, internal, meta).await
+    let observer = Arc::clone(&provider);
+    let mut response = match (streaming, routed) {
+        (true, true) => legacy_held_stream(provider, internal, meta).await,
+        (true, false) => legacy_stream(provider, internal, meta),
+        (false, _) => legacy_blocking(provider, &prompt, internal, meta).await,
     };
+    if routed {
+        add_route_headers(&mut response, &observer);
+    }
     response.extensions_mut().insert(LogDetail(format!(
-        "legacy model={public_model} → {}{}",
-        resolved.internal_model(),
+        "legacy model={public_model} → {chosen_model}{}",
         if streaming { " (stream)" } else { "" }
     )));
     response
@@ -872,16 +1334,40 @@ fn legacy_stream(
     request: CompletionRequest,
     meta: CompletionMeta,
 ) -> Response<ApiBody> {
-    sse_stream_response(move |body_tx| bridge_legacy_stream(provider, request, meta, body_tx))
+    sse_stream_response(move |body_tx| {
+        legacy_bridge(
+            Upstream::start(provider, request),
+            Pump::none(),
+            meta,
+            body_tx,
+        )
+    })
+}
+
+/// Тот же поток через шлюз: с удержанием до первого чанка и честным кодом отказа.
+async fn legacy_held_stream(
+    provider: Arc<dyn LLMProvider>,
+    request: CompletionRequest,
+    meta: CompletionMeta,
+) -> Response<ApiBody> {
+    let pump_meta = meta.clone();
+    held_sse(
+        provider,
+        request,
+        false,
+        &pump_meta,
+        move |upstream, pump, body_tx| legacy_bridge(upstream, pump, meta, body_tx),
+    )
+    .await
 }
 
 /// Legacy `text_completion` frame shaping over [`drive_sse_bridge`].
 /// Reasoning is dropped (the legacy shape has no field for it), so only
 /// the post-`<think>` content is streamed as `text`; the splitter's tail
 /// rides in the final frame together with the finish reason.
-async fn bridge_legacy_stream(
-    provider: Arc<dyn LLMProvider>,
-    request: CompletionRequest,
+async fn legacy_bridge(
+    upstream: Upstream,
+    pump: Pump,
     meta: CompletionMeta,
     body_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) {
@@ -895,8 +1381,8 @@ async fn bridge_legacy_stream(
         }))
     };
     drive_sse_bridge(
-        provider,
-        request,
+        upstream,
+        pump,
         body_tx,
         |_reasoning, content, _is_first| {
             if content.is_empty() {
@@ -943,6 +1429,11 @@ async fn passthrough(
         );
     };
     let model_id = model_id.to_string();
+
+    let gateway = context.gateway.get();
+    if gateway.is_enabled() {
+        return routed_passthrough(&gateway, context, payload, &model_id, path_suffix).await;
+    }
 
     let resolved = match catalog::resolve_model(
         &model_id,
@@ -1008,6 +1499,71 @@ async fn passthrough(
         }
         Err(error) => failed(error),
     }
+}
+
+/// `/embeddings` и `/rerank` за шлюзом: прямо на аккаунт по `<account>/<model>`, с его адресом и
+/// ключом. Выбор аккаунта по маршруту здесь не имеет смысла, а подписки CLI не раздаются.
+async fn routed_passthrough(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    context: &ServerContext,
+    mut payload: serde_json::Value,
+    model_id: &str,
+    path_suffix: &str,
+) -> Response<ApiBody> {
+    use crate::gateway::handle::BuildState;
+    match gateway.build_state() {
+        BuildState::Ready => {}
+        BuildState::Starting => return starting_response(),
+        BuildState::Failed(reason) => return failed_response(&reason),
+    }
+    if model_id.trim().starts_with("auto/") {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(format!(
+                "{path_suffix} needs an `<account>/<model>` address: `auto/<route>` picks an account per request and is not supported here"
+            )),
+        );
+    }
+    let snapshot = gateway.snapshot();
+    let address = match routing::check_address(&snapshot, &context.models.snapshot(), model_id) {
+        Ok(address) => address,
+        Err(message) => return model_not_found(message),
+    };
+    let Some((account, model)) = address.split_once('/') else {
+        return model_not_found(format!("model '{model_id}' not found"));
+    };
+    let backend = crate::gateway::types::AccountId::parse(account)
+        .ok()
+        .and_then(|id| gateway.backend_for(&id));
+    let Some(backend) = backend else {
+        return model_not_found(format!("model '{model_id}' not found"));
+    };
+    payload["model"] = serde_json::json!(model);
+    match backend.proxy_json(path_suffix, payload).await {
+        Ok(reply) => Response::builder()
+            .status(StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(full_body(reply.body))
+            .expect("static response parts are valid"),
+        Err(error) => {
+            let mut failure = UpstreamError::from_class(error.message, Some(error.class), None);
+            // Отказ класса «неверный запрос» объясняем как есть, остальное сводится к классу.
+            if failure.status == StatusCode::BAD_REQUEST {
+                failure.kind = "invalid_request_error";
+            }
+            failure.response()
+        }
+    }
+}
+
+/// Сборка шлюза упала: повтор не поможет, пока не исправят конфиг.
+fn failed_response(reason: &str) -> Response<ApiBody> {
+    let mut error = UpstreamError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("the gateway failed to start: {reason}"),
+    );
+    error.code = Some("gateway_failed");
+    error.response()
 }
 
 #[cfg(test)]
@@ -1156,6 +1712,8 @@ mod tests {
                 tools: Default::default(),
             }],
             request_log: false,
+            allowed_hosts: Vec::new(),
+            gateway: Default::default(),
         }
     }
 
@@ -1438,7 +1996,7 @@ mod tests {
     use crate::provider::{
         ChatMessage, CompletionChunk, CompletionRequest, CompletionResponse, LLMProvider,
     };
-    use hyper::StatusCode;
+    use hyper::{StatusCode, header};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1456,6 +2014,117 @@ mod tests {
         let error = UpstreamError::from_app(&AppError::Provider("boom".to_string()));
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.body().error.kind, "server_error");
+    }
+
+    fn typed(class: crate::provider::failure::FailureClass) -> AppError {
+        AppError::Upstream(Box::new(crate::provider::failure::ProviderFailure {
+            class,
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            message: "upstream said no".to_string(),
+            limits: None,
+        }))
+    }
+
+    /// 429 апстрима с `Retry-After` — 429 клиенту с тем же заголовком, а не 502.
+    #[test]
+    fn an_upstream_429_stays_429_and_passes_retry_after_on() {
+        use crate::provider::failure::FailureClass;
+        let wait = Duration::from_secs(42);
+        let error = UpstreamError::from_app(&typed(FailureClass::RateLimit {
+            retry_after: Some(wait),
+        }));
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.body().error.kind, "rate_limit_error");
+        let response = error.response();
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "42");
+    }
+
+    #[test]
+    fn an_upstream_429_without_a_delay_has_no_retry_after_header() {
+        use crate::provider::failure::FailureClass;
+        let error = UpstreamError::from_app(&typed(FailureClass::RateLimit { retry_after: None }));
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            error
+                .response()
+                .headers()
+                .get(header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    /// Квота кончилась: 429, но без `Retry-After` — ждать секунды бесполезно.
+    #[test]
+    fn an_exhausted_quota_is_429_insufficient_quota_without_a_delay() {
+        use crate::provider::failure::FailureClass;
+        let error = UpstreamError::from_app(&typed(FailureClass::SpendCap));
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error.body().error.code.as_deref(),
+            Some("insufficient_quota")
+        );
+        assert!(
+            error
+                .response()
+                .headers()
+                .get(header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    /// Чужой ключ клиенту не виден: отказ авторизации апстрима — 502, не 401.
+    #[test]
+    fn upstream_auth_and_context_failures_map_to_honest_statuses() {
+        use crate::provider::failure::FailureClass;
+        let auth = UpstreamError::from_app(&typed(FailureClass::Auth));
+        assert_eq!(auth.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(auth.body().error.code.as_deref(), Some("upstream_auth"));
+        assert_eq!(auth.body().error.message, super::UPSTREAM_AUTH_MESSAGE);
+        let blocked = UpstreamError::from_app(&typed(FailureClass::AccountBlocked));
+        assert_eq!(blocked.body().error.message, super::UPSTREAM_AUTH_MESSAGE);
+        let context = UpstreamError::from_app(&typed(FailureClass::ContextTooLong));
+        assert_eq!(context.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            context.body().error.code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        let overloaded = UpstreamError::from_app(&typed(FailureClass::Overloaded));
+        assert_eq!(overloaded.status, StatusCode::SERVICE_UNAVAILABLE);
+        let server = UpstreamError::from_app(&typed(FailureClass::Server));
+        assert_eq!(server.status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// Путь с инструментами идёт через `collect_stream`: тип отказа не должен
+    /// теряться по дороге (раньше он превращался в строку и в 502).
+    #[tokio::test]
+    async fn a_typed_failure_survives_the_tool_path() {
+        use crate::provider::failure::FailureClass;
+        let provider: Arc<dyn LLMProvider> = Arc::new(Scripted {
+            chunks: Vec::new(),
+            end: ScriptEnd::Fail(|| {
+                AppError::Upstream(Box::new(crate::provider::failure::ProviderFailure {
+                    class: FailureClass::RateLimit {
+                        retry_after: Some(Duration::from_secs(9)),
+                    },
+                    status: Some(StatusCode::TOO_MANY_REQUESTS),
+                    message: "slow".to_string(),
+                    limits: None,
+                }))
+            }),
+        });
+        let request = CompletionRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            model: "m".to_string(),
+            temperature: 0.0,
+            max_tokens: 8,
+            stream: true,
+        };
+        let outcome = crate::agent::stream::collect_stream(&provider, request, |_| {}).await;
+        let error = UpstreamError::from_verdict(outcome.verdict(), outcome.failure.as_ref())
+            .expect("a failed stream is an error");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.retry_after, Some(Duration::from_secs(9)));
     }
 
     /// Таймаут — 504, а URL апстрима (с ключом в запросе) клиенту не уходит.
@@ -1509,6 +2178,7 @@ mod tests {
                     content: content.to_string(),
                     tool_calls: Vec::new(),
                     finish_reason: finish.map(str::to_string),
+                    usage: None,
                 });
             }
             match &self.end {
@@ -1542,9 +2212,9 @@ mod tests {
             stream: true,
         };
         let meta = crate::provider::openai_compat::CompletionMeta::generate("m");
-        tokio::spawn(super::bridge_stream(
-            Arc::new(provider),
-            request,
+        tokio::spawn(super::chat_bridge(
+            super::Upstream::start(Arc::new(provider), request),
+            super::Pump::none(),
             meta,
             body_tx,
         ));

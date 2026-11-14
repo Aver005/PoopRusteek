@@ -32,6 +32,11 @@ pub(super) struct LogDetail(pub String);
 /// Per-launch state shared by every connection.
 pub(super) struct ServerContext {
     pub api: ServerApi,
+    pub host: String,
+    /// Имена сверх loopback, разрешённые в `Host` (защита от DNS rebinding).
+    pub allowed_hosts: Vec<String>,
+    /// Порт, на котором сервер действительно слушает (известен после привязки).
+    pub bound_port: std::sync::atomic::AtomicU16,
     pub api_key: Option<String>,
     pub defaults: RequestDefaults,
     /// Base DeepSeek client — `fork()`ed per request — when a token is
@@ -44,6 +49,8 @@ pub(super) struct ServerContext {
     /// Reused client for endpoints proxied verbatim to an upstream
     /// (`/embeddings`, `/rerank`) — see `openai::passthrough`.
     pub http_client: reqwest::Client,
+    /// Живой шлюз: включённый ведёт все запросы, выключенный оставляет прежний путь.
+    pub gateway: super::GatewayCell,
     pub stats: Arc<ServerStats>,
     /// `Some` when per-request access-log events are wanted (proxy mode).
     pub log_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -73,6 +80,8 @@ impl ServerContext {
         // Passthrough calls (embeddings/rerank) can be slow on big batches;
         // give them a generous read timeout, fail fast on dead endpoints.
         let http_client = reqwest::Client::builder()
+            // Ключ записи уходит заголовком: за редиректом на другой хост не идём.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             // Пакет эмбеддингов на CPU бывает долгим: срок щедрее, чем у чата.
             .read_timeout(std::time::Duration::from_secs(300))
@@ -80,12 +89,16 @@ impl ServerContext {
             .unwrap_or_default();
         Self {
             api: settings.api,
+            host: settings.host,
+            allowed_hosts: settings.allowed_hosts,
+            bound_port: std::sync::atomic::AtomicU16::new(settings.port),
             api_key: settings.api_key,
             defaults: settings.defaults,
             deepseek,
             entries: settings.entries,
             models,
             http_client,
+            gateway: settings.gateway,
             stats,
             log_tx,
         }
@@ -139,6 +152,9 @@ pub(super) async fn run(
     }
 
     let bound = listener.local_addr().ok();
+    if let Some(addr) = bound {
+        context.bound_port.store(addr.port(), Ordering::Relaxed);
+    }
     tracing::info!(
         "server: listening on {} ({} dialect)",
         bound
@@ -230,23 +246,62 @@ async fn handle_request(
 }
 
 async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Response<ApiBody> {
+    // Сервер на loopback отвечает только тем, кто назвал себя loopback-именем: иначе страница
+    // чужого сайта после DNS rebinding читала бы ответы как свои.
+    if super::is_loopback_host(&context.host) {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok());
+        let port = context.bound_port.load(Ordering::Relaxed);
+        if !super::routing::host_allowed(host, port, &context.allowed_hosts) {
+            return json_response(
+                StatusCode::FORBIDDEN,
+                &ErrorResponse::invalid_request(
+                    "unexpected Host header; add the name to [server] allowed_hosts to use it",
+                ),
+            );
+        }
+    }
+
+    // Без ключа чужая страница, расширение или `null` отклоняются: простой кросс-доменный POST
+    // исполнился бы, даже если ответ ей недоступен (CSRF). С ключом `Origin` не смотрим вовсе:
+    // чужая страница ключа не знает, а webview и расширения должны работать (их ловит 401).
+    if context.api_key.is_none()
+        && let Some(origin) = request.headers().get(header::ORIGIN)
+        && !origin_is_allowed(context, origin)
+    {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &ErrorResponse::invalid_request(
+                "set [server] api_key to allow this client (web pages are allowed only from this server or [server] allowed_hosts)",
+            ),
+        );
+    }
+
     if request.method() == Method::OPTIONS {
         return empty_response(StatusCode::NO_CONTENT);
     }
 
     let path = request.uri().path().to_string();
     if request.method() == Method::GET && (path == "/" || path == "/health") {
+        // Открытый путь: за шлюзом имена аккаунтов наружу без ключа не идут.
+        let models = if context.gateway.get().is_enabled() {
+            Vec::new()
+        } else {
+            catalog::list_model_ids(
+                context.deepseek.is_some(),
+                &context.entries,
+                &context.models.snapshot(),
+            )
+        };
         return json_response(
             StatusCode::OK,
             &serde_json::json!({
                 "status": "ok",
                 "server": "pooprusteek",
                 "api": context.api.label(),
-                "models": catalog::list_model_ids(
-                    context.deepseek.is_some(),
-                    &context.entries,
-                    &context.models.snapshot(),
-                ),
+                "models": models,
             }),
         );
     }
@@ -273,6 +328,25 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
         }
     }
 
+    // Тело POST — только JSON: `text/plain` и формы шлёт «простой» запрос без предзапроса.
+    if request.method() == Method::POST && !is_json_content_type(request.headers()) {
+        return json_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            &ErrorResponse::invalid_request(
+                "POST bodies must be sent as Content-Type: application/json",
+            ),
+        );
+    }
+
+    if request.method() == Method::GET
+        && matches!(
+            path.as_str(),
+            "/pooprusteek/status" | "/v1/pooprusteek/status"
+        )
+    {
+        return status_response(context);
+    }
+
     let handled = match context.api {
         ServerApi::Openai => openai::route(request, context).await,
         // Reserved dialects: the config parses, the seam exists, the
@@ -292,6 +366,49 @@ async fn route(request: Request<Incoming>, context: &Arc<ServerContext>) -> Resp
             &ErrorResponse::invalid_request(format!("no route for {path}")),
         )
     })
+}
+
+/// Страница с таким `Origin` своя серверу или названа в `allowed_hosts`.
+fn origin_is_allowed(context: &ServerContext, origin: &header::HeaderValue) -> bool {
+    let port = context.bound_port.load(Ordering::Relaxed);
+    origin.to_str().is_ok_and(|origin| {
+        super::routing::origin_allowed(origin, port, &context.host, &context.allowed_hosts)
+    })
+}
+
+/// `Content-Type: application/json` (параметры вроде `charset` допустимы, регистр не важен).
+fn is_json_content_type(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Статус шлюза. Ключ сервера уже проверен выше; без ключа отдаётся урезанный вид и только
+/// при привязке к loopback: иначе чужой в сети увидел бы состояние чужих подписок.
+fn status_response(context: &ServerContext) -> Response<ApiBody> {
+    let gateway = context.gateway.get();
+    if !gateway.is_enabled() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &ErrorResponse::invalid_request("the gateway is disabled: nothing to report"),
+        );
+    }
+    use super::routing::{StatusAccess, status_access};
+    let access = status_access(context.api_key.is_some(), &context.host);
+    if access == StatusAccess::Forbidden {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &ErrorResponse::invalid_request(
+                "set [server] api_key to read the gateway status beyond loopback",
+            ),
+        );
+    }
+    json_response(
+        StatusCode::OK,
+        &super::routing::status_body(&gateway.snapshot(), access == StatusAccess::Detailed),
+    )
 }
 
 // ── Response helpers (shared with the dialect modules) ─────────────────
@@ -336,6 +453,8 @@ mod tests {
             deepseek: None,
             entries: Vec::new(),
             request_log: false,
+            allowed_hosts: Vec::new(),
+            gateway: Default::default(),
         }
     }
 
@@ -412,6 +531,7 @@ mod tests {
         let bad = client
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth("sekret")
+            .header("content-type", "application/json")
             .body("{not json")
             .send()
             .await
@@ -493,5 +613,213 @@ mod tests {
             cors_headers_present(Some("sekret")).await,
             "api_key configured → CORS headers present (bearer check is the real gate)"
         );
+    }
+
+    /// Поднять сервер на свободном порту и вернуть адрес вместе с ручкой остановки.
+    async fn start(
+        settings: ServerSettings,
+    ) -> (
+        String,
+        crate::server::ServerHandle,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let models = crate::provider::model_cache::ProviderModelCache::empty_for_tests();
+        let handle = spawn(settings, models, 1, event_tx);
+        let addr = match event_rx.recv().await {
+            Some(AppEvent::ServerStarted { addr, .. }) => addr,
+            _ => panic!("expected ServerStarted"),
+        };
+        (addr.to_string(), handle, event_rx)
+    }
+
+    fn chat_body() -> serde_json::Value {
+        serde_json::json!({"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    /// Простой кросс-доменный POST (`text/plain`) исполнился бы без предзапроса: сервер отказывает.
+    #[tokio::test]
+    async fn a_post_that_is_not_json_is_refused() {
+        let (addr, handle, _events) = start(test_settings(None)).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/chat/completions");
+        for content_type in [
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            None,
+        ] {
+            let mut request = client.post(&url).body(chat_body().to_string());
+            if let Some(value) = content_type {
+                request = request.header("content-type", value);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                415,
+                "{content_type:?}"
+            );
+        }
+        // Обычный клиент SDK: JSON, в том числе с параметром и в другом регистре.
+        for value in ["application/json", "Application/JSON; charset=utf-8"] {
+            let reply = client
+                .post(&url)
+                .header("content-type", value)
+                .body(chat_body().to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                reply.status(),
+                404,
+                "unknown model reaches the handler: {value}"
+            );
+        }
+        // Чтение (GET) типа тела не требует.
+        let models = client
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 200);
+        handle.request_shutdown();
+    }
+
+    /// Без ключа чужая страница, расширение и `null` получают понятный отказ, а читать ответ им нельзя.
+    #[tokio::test]
+    async fn without_a_key_a_foreign_origin_is_refused_with_a_hint() {
+        let (addr, handle, _events) = start(test_settings(None)).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/chat/completions");
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://127.0.0.1:1",
+            "http://localhost",
+            "vscode-webview://abc",
+            "chrome-extension://abc",
+            "file://",
+        ] {
+            let reply = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("origin", origin)
+                .body(chat_body().to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 403, "{origin}");
+            assert!(
+                !reply.headers().contains_key("access-control-allow-origin"),
+                "a refused page must not be allowed to read the reply"
+            );
+            let body = reply.text().await.unwrap();
+            assert!(
+                body.contains("set [server] api_key to allow this client"),
+                "{body}"
+            );
+        }
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), 403);
+        handle.request_shutdown();
+    }
+
+    /// С ключом `Origin` не мешает: чужая страница ключа не знает, а webview и расширения работают.
+    #[tokio::test]
+    async fn with_a_key_any_origin_works_and_only_the_bearer_decides() {
+        let (addr, handle, _events) = start(test_settings(Some("sekret"))).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/chat/completions");
+        for origin in [
+            "vscode-webview://abc",
+            "chrome-extension://abc",
+            "file://",
+            "null",
+            "https://evil.example",
+        ] {
+            let ok = client
+                .post(&url)
+                .bearer_auth("sekret")
+                .header("content-type", "application/json")
+                .header("origin", origin)
+                .body(chat_body().to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), 404, "{origin}: reaches the handler");
+            assert_eq!(
+                ok.headers()
+                    .get("access-control-allow-origin")
+                    .map(|v| v.to_str().unwrap()),
+                Some("*"),
+                "{origin}: CORS follows the key"
+            );
+            let no_key = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("origin", origin)
+                .body(chat_body().to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(no_key.status(), 401, "{origin}: the bearer is the gate");
+            // Предзапрос браузера идёт без ключа и должен проходить.
+            let preflight = client
+                .request(reqwest::Method::OPTIONS, &url)
+                .header("origin", origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(preflight.status(), 204, "{origin}");
+        }
+        handle.request_shutdown();
+    }
+
+    /// Своя страница сервера и имена из `allowed_hosts` проходят и без ключа; клиенты без `Origin` не задеты.
+    #[tokio::test]
+    async fn own_pages_allowed_hosts_and_sdk_clients_pass() {
+        let mut settings = test_settings(None);
+        settings.allowed_hosts = vec!["webui.example".to_string()];
+        let (addr, handle, _events) = start(settings).await;
+        let port = addr.rsplit(':').next().unwrap().to_string();
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/chat/completions");
+        for origin in [
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+            "https://webui.example".to_string(),
+            "https://WebUI.example:8443".to_string(),
+        ] {
+            let reply = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("origin", &origin)
+                .body(chat_body().to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 404, "{origin} reaches the handler");
+            assert!(
+                !reply.headers().contains_key("access-control-allow-origin"),
+                "no key, no CORS: the browser's own policy keeps the reply from other pages"
+            );
+        }
+        // SDK: без Origin, JSON; `/v1/embeddings` доходит до обработчика (нет провайдера → 404, не 415/403).
+        let embeddings = client
+            .post(format!("http://{addr}/v1/embeddings"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"model": "text-embedding-3-small", "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            ![403u16, 415].contains(&embeddings.status().as_u16()),
+            "{}",
+            embeddings.status()
+        );
+        handle.request_shutdown();
     }
 }

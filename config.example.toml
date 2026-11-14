@@ -1,0 +1,122 @@
+# Pooprusteek: пример конфига. Копия живёт в ~/.pooprusteek/config.toml.
+#
+# Два слоя. Общий (~/.pooprusteek/config.toml) и необязательный проектный
+# (.pooprusteek/config.toml в репозитории: ищется вверх от папки запуска до корня git,
+# вне git смотрится только папка запуска). Проектный слой переопределяет общий и
+# может храниться в git, поэтому в нём только ссылки на секреты. Что в нём запрещено,
+# показывает `pooprusteek doctor`: ключи, [server], [update], [instructions],
+# [[providers]], cmd:/file:-ссылки, direct_token, home.
+#
+# Секреты в этом файле не лежат. Вместо ключа стоит ссылка:
+#   keyring:global/имя      системное хранилище (задать: pooprusteek secrets set имя)
+#   env:ИМЯ_ПЕРЕМЕННОЙ      переменная окружения (удобно для CI; менее защищено)
+#   cmd:["op","read","op://vault/item/key"]   вывод команды, без оболочки (только общий слой)
+#   file:/путь/к/ключу      файл с ключом (только общий слой; на unix права 0600)
+#   none                    секрет не нужен (локальный сервер, CLI со своим входом)
+#
+# Старые открытые ключи при запуске сами переезжают в хранилище: записали, прочитали
+# обратно, сравнили, и только потом файл меняется. Хранилища нет (Docker, CI, сервер) —
+# ключ остаётся на месте, перенос повторится позже. Перед первой правкой лежит копия
+# config.toml.pre-gateway; после запуска, где все ссылки читаются, в ней ключи затираются.
+
+[gateway]
+schema = 1
+enabled = false          # true включает маршруты и аккаунты ниже
+
+# ── API-аккаунты ────────────────────────────────────────────────────────
+# id не меняется никогда (на него ссылаются маршруты и секреты), label можно править.
+
+[[accounts]]
+id = "openai-work"
+label = "OpenAI (работа)"
+provider = "openai"                  # openai | anthropic | gemini | custom
+base_url = "https://api.openai.com/v1"
+secret = "keyring:global/openai-work"
+model = "gpt-5.5"
+# tools = "native"                   # prompt (по умолчанию) | native; смесь в одном маршруте
+                                     # требует allow_mixed_tools = true у маршрута
+favorites = ["gpt-5.5", "your-cheap-model"]
+
+[accounts.limits]
+soft_pct = 85                        # с этого процента окна аккаунт уходит вниз по списку
+hard_pct = 97                        # с этого — не берётся вовсе
+requests_per_minute = 30
+budget_usd_month = 50
+max_concurrency = 4
+
+[[accounts]]
+id = "anthropic-api"
+label = "Anthropic API"
+provider = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+secret = "env:ANTHROPIC_API_KEY"
+model = "claude-sonnet-5-5"
+favorites = ["claude-sonnet-5-5", "claude-haiku-5-5"]
+
+[[accounts]]
+id = "lmstudio"
+label = "LM Studio (локально)"
+provider = "custom"                  # любой OpenAI-совместимый сервер
+base_url = "http://127.0.0.1:1234/v1"
+secret = "none"
+model = "qwen2.5-coder"
+
+# ── Подписки через официальный CLI ──────────────────────────────────────
+# Ключей здесь нет: вход ведёт сам CLI в своей папке `home`.
+# Подписку Claude читает только настоящий Claude Code; прямые токены для неё запрещены.
+
+[[accounts]]
+id = "claude-work"
+label = "Claude Code (CLI, работа)"
+provider = "cli:claude"
+home = "~/.claude-work"
+favorites = ["claude-opus-5-5"]
+
+[[accounts]]
+id = "opencode"
+label = "OpenCode (CLI)"
+provider = "cli:opencode"
+home = "~/.opencode-account"
+
+# ── Маршруты и роли ─────────────────────────────────────────────────────
+# Порядок шагов и есть приоритет. Переход к следующему шагу — по причинам из `on`.
+
+[[routes]]
+id = "coding"
+switch_at_pct = 90
+on = ["rate_limit", "quota", "spend_cap", "overloaded", "timeout", "server_error", "auth"]
+steps = [
+  { account = "claude-work", model = "claude-opus-5-5" },
+  { account = "openai-work" },
+  { account = "lmstudio" },
+]
+
+# Служебные вызовы: заголовки чатов и сводки /compact. Им нужен быстрый аккаунт,
+# поэтому дешёвая модель, а не CLI: холодный старт в 3–4 с дороже самого ответа.
+[[routes]]
+id = "cheap"
+steps = [{ account = "openai-work", model = "your-cheap-model" }]
+
+[roles]
+main = "coding"
+title = "cheap"
+summary = "cheap"
+
+# ── Подтверждённые хосты секретов ───────────────────────────────────────
+# Аккаунт из проектного конфига получает ключ только для хоста, который вы подтвердили
+# (pooprusteek secrets bind <ссылка> <хост>). Эту таблицу проект менять не может.
+
+[secrets.bindings]
+"keyring:global/openai-work" = ["api.openai.com"]
+
+# ── Остальное ───────────────────────────────────────────────────────────
+
+[provider]                           # встроенный DeepSeek: токен тоже ссылка
+token = "keyring:global/deepseek-token"
+model = "deepseek-chat"
+
+[ui]
+theme = "default"
+
+[agent]
+max_retries = 0

@@ -206,7 +206,74 @@ pub struct ChatCompletionResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<Choice>,
-    pub usage: Usage,
+    /// У ответа апстрима может не быть: часть совместимых серверов её не шлёт.
+    #[serde(default)]
+    pub usage: Option<WireUsage>,
+}
+
+/// Расход в форме OpenAI. Счётчики необязательны на входе: сервер без них
+/// остаётся нулями, а не ошибкой разбора.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WireUsage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+}
+
+impl From<WireUsage> for Usage {
+    fn from(wire: WireUsage) -> Self {
+        Usage {
+            prompt_tokens: wire.prompt_tokens,
+            completion_tokens: wire.completion_tokens,
+            total_tokens: if wire.total_tokens == 0 {
+                wire.prompt_tokens + wire.completion_tokens
+            } else {
+                wire.total_tokens
+            },
+            cache_read_tokens: wire.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_write_tokens: None,
+            reasoning_tokens: wire
+                .completion_tokens_details
+                .and_then(|d| d.reasoning_tokens),
+        }
+    }
+}
+
+impl From<Usage> for WireUsage {
+    fn from(usage: Usage) -> Self {
+        WireUsage {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            prompt_tokens_details: usage.cache_read_tokens.map(|cached| PromptTokensDetails {
+                cached_tokens: Some(cached),
+            }),
+            completion_tokens_details: usage.reasoning_tokens.map(|reasoning| {
+                CompletionTokensDetails {
+                    reasoning_tokens: Some(reasoning),
+                }
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +291,10 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// Приходит последним чанком с пустым `choices`, если просили
+    /// `stream_options.include_usage`; у остальных чанков `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<WireUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,6 +612,7 @@ pub fn estimated_usage(prompt_texts: &[&str], completion: &str) -> Usage {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
+        ..Usage::default()
     }
 }
 
@@ -577,7 +649,7 @@ pub fn response_to_openai(
                     .unwrap_or_else(|| "stop".to_string()),
             ),
         }],
-        usage: response.usage.clone().unwrap_or(fallback_usage),
+        usage: Some(response.usage.clone().unwrap_or(fallback_usage).into()),
     }
 }
 
@@ -604,6 +676,7 @@ pub fn split_delta_chunk(
             },
             finish_reason: None,
         }],
+        usage: None,
     }
 }
 
@@ -620,6 +693,7 @@ pub fn final_chunk(finish_reason: &str, meta: &CompletionMeta) -> ChatCompletion
             delta: Delta::default(),
             finish_reason: Some(finish_reason.to_string()),
         }],
+        usage: None,
     }
 }
 
@@ -636,7 +710,7 @@ pub fn response_from_openai(response: ChatCompletionResponse) -> CompletionRespo
     CompletionResponse {
         content,
         finish_reason,
-        usage: Some(response.usage),
+        usage: response.usage.map(Usage::from),
     }
 }
 
@@ -1297,5 +1371,45 @@ mod tests {
         assert_eq!(messages[1]["role"], "user");
         assert!(messages[1]["content"].as_str().unwrap().contains("42"));
         assert!(messages[1].get("tool_call_id").is_none());
+    }
+}
+
+#[cfg(test)]
+mod usage_wire_tests {
+    use super::*;
+
+    #[test]
+    fn wire_usage_details_become_cache_and_reasoning() {
+        let wire: WireUsage = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":6},"completion_tokens_details":{"reasoning_tokens":2}}"#,
+        )
+        .unwrap();
+        let usage = Usage::from(wire);
+        assert_eq!(usage.cache_read_tokens, Some(6));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+    }
+
+    /// Без счётчиков и без `total_tokens` сумма считается сама, а не остаётся нулём.
+    #[test]
+    fn a_missing_total_is_filled_in() {
+        let wire: WireUsage =
+            serde_json::from_str(r#"{"prompt_tokens":3,"completion_tokens":4}"#).unwrap();
+        assert_eq!(Usage::from(wire).total_tokens, 7);
+    }
+
+    /// Наружу (`/serve`) форма прежняя: лишних полей нет, пока нечего сообщить.
+    #[test]
+    fn outbound_usage_keeps_the_classic_three_counters() {
+        let json = serde_json::to_value(WireUsage::from(Usage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            ..Usage::default()
+        }))
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"prompt_tokens":1,"completion_tokens":2,"total_tokens":3})
+        );
     }
 }

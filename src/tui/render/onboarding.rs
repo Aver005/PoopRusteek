@@ -8,7 +8,6 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use std::cell::Cell;
 
 pub(super) fn render_onboarding(
     frame: &mut Frame,
@@ -16,8 +15,7 @@ pub(super) fn render_onboarding(
     ob: &OnboardingState,
     animation_tick: u64,
     theme: &Theme,
-    cursor_cell: &Cell<Option<(u16, u16)>>,
-) {
+) -> Option<(u16, u16)> {
     // ── Layout constants ───────────────────────────────────────────
     const MAX_W: u16 = 72;
     // logo(1) + gap(1) + tagline(1) + gap(1) + steps_panel(STEPS_H) + gap(1)
@@ -101,7 +99,8 @@ pub(super) fn render_onboarding(
     };
     let visible_chars: String = input_chars[visible_start..total_chars].iter().collect();
     // Truncate to box width using char-aware slicing (never byte-slice — invariant).
-    let display: String = visible_chars.chars().take(box_w).collect();
+    // Токен на экране не показываем: скроллбек, tmux и запись экрана хранят всё нарисованное.
+    let display: String = mask_token(&visible_chars).chars().take(box_w).collect();
     let cursor_col = (cursor - visible_start) as u16;
 
     frame.render_widget(
@@ -112,10 +111,11 @@ pub(super) fn render_onboarding(
         .style(Style::default().bg(theme.input_bg)),
         input_inner,
     );
-    // Place block cursor at the right terminal cell.
-    cursor_cell.set(Some((input_inner.x + cursor_col, input_inner.y)));
+    // Курсор ставит вызывающий — единственным способом, `Frame::set_cursor_position`.
+    let cursor = Some((input_inner.x + cursor_col, input_inner.y));
 
     // ── 8. Model selector ────────────────────────────────────────
+    let glyph = crate::tui::glyphs::get();
     let (chat_style, reasoner_style, chat_dot, reasoner_dot) = if ob.model_reasoner {
         (
             Style::default().fg(theme.text_dim).bg(theme.bg),
@@ -123,8 +123,8 @@ pub(super) fn render_onboarding(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
                 .bg(theme.bg),
-            "○",
-            "●",
+            glyph.radio_off,
+            glyph.radio_on,
         )
     } else {
         (
@@ -133,8 +133,8 @@ pub(super) fn render_onboarding(
                 .add_modifier(Modifier::BOLD)
                 .bg(theme.bg),
             Style::default().fg(theme.text_dim).bg(theme.bg),
-            "●",
-            "○",
+            glyph.radio_on,
+            glyph.radio_off,
         )
     };
     let model_line = Line::from(vec![
@@ -184,10 +184,16 @@ pub(super) fn render_onboarding(
             chunks[11],
         );
     }
+    cursor
 }
 
 /// Строк в панели шагов, с рамкой.
 const STEPS_H: u16 = 9;
+
+/// Точки вместо символов токена: длина видна, значение нет.
+fn mask_token(text: &str) -> String {
+    text.chars().map(|_| '\u{2022}').collect()
+}
 
 fn key_span(key: &'static str, theme: &Theme) -> Span<'static> {
     Span::styled(
@@ -284,10 +290,11 @@ mod tests {
 
     fn screen(width: u16, ob: &OnboardingState) -> String {
         let theme = Theme::default_dark();
-        let cursor = Cell::new(None);
         let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
         terminal
-            .draw(|f| render_onboarding(f, f.area(), ob, 0, &theme, &cursor))
+            .draw(|f| {
+                render_onboarding(f, f.area(), ob, 0, &theme);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -312,6 +319,19 @@ mod tests {
         assert!(text.contains("Ctrl+C quit"), "{text}");
     }
 
+    /// Токен не должен оказаться ни на экране, ни в скроллбеке терминала.
+    #[test]
+    fn the_token_is_drawn_as_dots_never_as_text() {
+        let ob = OnboardingState {
+            input: "canary-token-0123456789".to_string(),
+            cursor: 23,
+            ..OnboardingState::default()
+        };
+        let text = screen(80, &ob);
+        assert!(!text.contains("canary"), "{text}");
+        assert!(text.contains("\u{2022}\u{2022}\u{2022}\u{2022}"), "{text}");
+    }
+
     /// Узкий и низкий терминал режет текст, но не роняет отрисовку.
     #[test]
     fn a_tiny_terminal_does_not_panic() {
@@ -322,10 +342,11 @@ mod tests {
             ..OnboardingState::default()
         };
         for (width, height) in [(2, 30), (40, 12), (60, 20)] {
-            let cursor = Cell::new(None);
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|f| render_onboarding(f, f.area(), &ob, 0, &theme, &cursor))
+                .draw(|f| {
+                    render_onboarding(f, f.area(), &ob, 0, &theme);
+                })
                 .unwrap();
         }
     }

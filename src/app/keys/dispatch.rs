@@ -18,18 +18,38 @@ impl App {
     pub(super) async fn apply_command_result(&mut self, result: CommandResult) -> AppResult<bool> {
         match result {
             CommandResult::Handled => {}
+            CommandResult::Detached(job) => {
+                let tx = self.event_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let message = job();
+                    let first = message.lines().next().unwrap_or("").to_string();
+                    let _ = tx.send(events::AppEvent::UpdateStatus {
+                        message,
+                        notable: true,
+                    });
+                    // Строка состояния — одна строка: полный текст уже в чате.
+                    let _ = tx.send(events::AppEvent::UpdateStatus {
+                        message: first,
+                        notable: false,
+                    });
+                });
+            }
             CommandResult::LoadSession(id) => {
                 self.handle_load_session(&id).await?;
+            }
+            CommandResult::SetPanel(mode) => self.set_panel(mode),
+            CommandResult::SetLanding(style) => self.set_landing(style),
+            CommandResult::OpenResume => self.open_resume(),
+            CommandResult::GoHome => {
+                self.go_home();
             }
             CommandResult::Quit => {
                 let _ = self.state.background.shutdown_all().await;
                 return Ok(true);
             }
             CommandResult::ResetProvider => {
-                if let Ok(config) = crate::config::load() {
-                    self.config = config;
-                }
-                self.rebuild_provider();
+                // Конфиг читается вне цикла событий; провайдер пересобирается по ответу.
+                self.reload_config_async();
             }
             CommandResult::TtlUpdate(ttl) => {
                 self.config.mcp.cache_ttl = ttl;
@@ -84,9 +104,15 @@ impl App {
                         self.spawn_mcp_add(entries);
                     }
                     Err(reason) => {
-                        self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                                    &format!("Couldn't parse \"/mcp add {raw}\" as a quick config ({reason}) \u{2014} pick a method:"),
-                                ));
+                        // Строку не повторяем: в ней env и заголовки с токенами.
+                        let hidden: Vec<&str> = raw
+                            .split(|c: char| c.is_whitespace() || "\"'{}[],:=".contains(c))
+                            .filter(|word| word.chars().count() >= 6)
+                            .collect();
+                        let reason = crate::app::gateway_view::echo_safe(&reason, &hidden);
+                        self.state.push_ui_system(&format!(
+                            "Couldn't read the quick config ({reason}) \u{2014} pick a method:"
+                        ));
                         self.state.modal = Some(Modal::McpAdd(McpAddState::choose_method()));
                     }
                 },
@@ -160,51 +186,55 @@ impl App {
             CommandResult::SwitchModel(id) => {
                 self.request_models(Some(id));
             }
-            CommandResult::OpenProviders => {
-                self.state.view = View::Providers;
-                self.state.providers_view.selected = 0;
-                self.state.providers_view.status_message.clear();
+            CommandResult::OpenAccounts(focus) => self.open_accounts(focus),
+            CommandResult::EnableGateway => {
+                self.open_accounts(crate::app::gateway_view::Focus::Accounts);
+                self.enable_gateway();
+            }
+            CommandResult::DisableGateway => {
+                self.open_accounts(crate::app::gateway_view::Focus::Accounts);
+                if self.gateway.is_enabled() {
+                    self.state.gateway_view.screen.confirm_disable = true;
+                } else {
+                    self.state
+                        .gateway_view
+                        .screen
+                        .say("The gateway is already off.");
+                }
             }
             CommandResult::SetProviderTools { name, tools } => {
-                self.apply_provider_tools(&name, tools);
+                self.set_account_tools(&name, tools);
             }
-            CommandResult::OpenProviderAdd(args) => match args {
-                None => {
-                    self.state.modal = Some(Modal::ProviderAdd(Box::new(
-                        crate::app::providers::ProviderAddState::new(),
-                    )));
-                }
-                Some(raw) => {
-                    match crate::app::providers::parse_quick_add(&raw, &self.config) {
+            CommandResult::OpenAccountAdd(args) => {
+                let wizard = match args.as_deref() {
+                    None => crate::app::gateway_view::wizard::AccountWizard::new(),
+                    Some(raw) => match crate::app::providers::parse_quick_add(raw, &self.config) {
                         Ok(entry) => {
-                            let name = entry.name.clone();
-                            self.config.providers.push(entry.clone());
-                            match crate::config::save_or_message(&self.config) {
-                                Ok(()) => {
-                                    // Pull its model list right away so the
-                                    // API catalog knows the new backend.
-                                    self.fetch_models_for_new_entry(&entry);
-                                    self.state.push_system(&format!(
-                                        "Provider '{name}' added. Open /providers and press Enter on it to activate."
-                                    ));
-                                }
-                                Err(message) => {
-                                    self.config.providers.pop();
-                                    self.state.push_system(&message);
-                                }
-                            }
+                            crate::app::gateway_view::wizard::AccountWizard::from_quick(&entry)
                         }
                         Err(reason) => {
-                            self.state.focused_mut().messages.push(ChatMessage::ui_system(
-                                &format!("Couldn't parse \"/providers add {raw}\" ({reason}) \u{2014} opening the wizard:"),
+                            // Строку не повторяем: в ней может быть ключ.
+                            let key: Vec<&str> = crate::app::gateway_view::quick_key_token(raw)
+                                .into_iter()
+                                .collect();
+                            let reason = crate::app::gateway_view::echo_safe(&reason, &key);
+                            self.state.push_ui_system(&format!(
+                                "Couldn't read the quick form ({reason}) - opening the wizard:"
                             ));
-                            self.state.modal = Some(Modal::ProviderAdd(Box::new(
-                                crate::app::providers::ProviderAddState::new(),
-                            )));
+                            crate::app::gateway_view::wizard::AccountWizard::new()
                         }
-                    }
-                }
-            },
+                    },
+                };
+                self.state.modal = Some(Modal::AccountWizard(Box::new(wizard)));
+            }
+            CommandResult::Pin(arg) => self.pin_chat(&arg),
+            CommandResult::ShowUsage => self.show_usage(),
+            CommandResult::PromptSecret(name) => {
+                self.state.modal = Some(Modal::SecretPrompt(Box::new(
+                    crate::app::gateway_view::forms::SecretPrompt::named(&name),
+                )));
+            }
+            CommandResult::ReloadConfig => self.reload_config_async(),
             CommandResult::Rag(action) => self.apply_rag_action(action),
             CommandResult::Instructions(enabled) => self.apply_instructions_action(enabled),
             CommandResult::ConfirmUndo {
@@ -535,5 +565,126 @@ impl App {
             self.config.semantic.min_dense_score,
             self.config.semantic.mcp_schemas,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::CommandResult;
+
+    const CANARY: &str = "sk-test-canary-0123456789abcdef";
+
+    async fn app() -> App {
+        let mut config = crate::config::Config::default();
+        config.semantic.enabled = false;
+        config.update.auto = false;
+        App::new(config).await.expect("the app starts")
+    }
+
+    fn everything_said(app: &App) -> String {
+        app.state
+            .focused()
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `/home` ставит пустую беседу на место текущей, а занятую не трогает.
+    /// Беседа пустая: сохранять нечего, тест не пишет в настоящую папку данных.
+    #[tokio::test]
+    async fn going_home_swaps_in_a_blank_chat_but_never_a_busy_one() {
+        let mut app = app().await;
+        let before = app.state.conversations.focused_id();
+        app.state.focused_mut().generation.active = true;
+        app.apply_command_result(CommandResult::GoHome)
+            .await
+            .unwrap();
+        assert_eq!(app.state.conversations.focused_id(), before);
+        assert!(app.state.status_message.contains("still working"));
+
+        app.state.focused_mut().generation.active = false;
+        app.apply_command_result(CommandResult::GoHome)
+            .await
+            .unwrap();
+        let after = app.state.conversations.focused_id();
+        assert_ne!(after, before);
+        assert!(!app.state.conversations.contains(before));
+        assert_eq!(app.state.conversations.iter().count(), 1);
+    }
+
+    /// Ошибка разбора быстрой формы с ключом: ни строка, ни ключ не попадают в чат и сессию.
+    #[tokio::test]
+    async fn a_failed_quick_add_never_echoes_the_line_or_the_key() {
+        let mut app = app().await;
+        let raw = format!("lm http://localhost:1234/v1 model {CANARY} extra");
+        app.apply_command_result(CommandResult::OpenAccountAdd(Some(raw)))
+            .await
+            .unwrap();
+        let said = everything_said(&app);
+        assert!(said.contains("Couldn't read the quick form"), "{said}");
+        assert!(
+            !said.contains("canary") && !said.contains("localhost:1234"),
+            "{said}"
+        );
+        let session = serde_json::to_string(&app.state.focused().messages).unwrap();
+        assert!(
+            !session.contains("canary"),
+            "not in the saved session either"
+        );
+    }
+
+    /// Ключ на месте имени: сообщение «имя занято/неверно» тоже ключа не показывает.
+    #[tokio::test]
+    async fn a_key_pasted_where_the_name_goes_is_masked_in_the_reason() {
+        let mut app = app().await;
+        let raw = format!("{CANARY} not-a-url");
+        app.apply_command_result(CommandResult::OpenAccountAdd(Some(raw)))
+            .await
+            .unwrap();
+        assert!(!everything_said(&app).contains("canary"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_mcp_quick_add_does_not_echo_env_or_tokens() {
+        let mut app = app().await;
+        let raw = format!(r#"{{"servers": {{"x": {{"env": {{"TOKEN": "{CANARY}"}}, }}}}"#);
+        app.apply_command_result(CommandResult::OpenMcpAdd(Some(raw)))
+            .await
+            .unwrap();
+        let said = everything_said(&app);
+        assert!(said.contains("Couldn't read the quick config"), "{said}");
+        assert!(
+            !said.contains("canary") && !said.contains("TOKEN"),
+            "{said}"
+        );
+    }
+
+    /// Любая заметка, что уходит в чат и модели, вычёркивает ключи: и точные, и по виду.
+    #[tokio::test]
+    async fn system_notes_redact_key_shapes_before_they_reach_history() {
+        let mut app = app().await;
+        app.state
+            .push_system(&format!("Unknown tool protocol '{CANARY}'"));
+        app.state
+            .push_ui_system(&format!("No account named '{CANARY}'"));
+        assert!(!everything_said(&app).contains("canary"));
+        // Обратная сторона: обычный текст не страдает.
+        app.state.push_ui_system("Pinned this chat to claude-max.");
+        assert!(everything_said(&app).contains("claude-max"));
+    }
+
+    #[tokio::test]
+    async fn the_accounts_disable_command_asks_before_it_does_anything() {
+        let mut app = app().await;
+        let rig = crate::gateway::testkit::rig(crate::gateway::testkit::TWO_ACCOUNTS, Vec::new());
+        app.gateway = Arc::new(rig.engine);
+        app.apply_command_result(CommandResult::DisableGateway)
+            .await
+            .unwrap();
+        assert!(app.state.gateway_view.screen.confirm_disable);
+        assert!(app.gateway.is_enabled(), "nothing happened yet");
     }
 }

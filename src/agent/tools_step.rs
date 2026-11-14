@@ -108,8 +108,10 @@ pub(super) async fn run_tool_calls(
             chars_sent: for_model.chars().count(),
         });
 
+        // В ленту идёт не 200 байт: у команды важен хвост с итогом и кодом выхода.
+        let display = result_display(&name, &text, whole);
         let message =
-            ChatMessage::tool_with_display(&tool_id, &name, &for_model, &preview, is_error);
+            ChatMessage::tool_with_display(&tool_id, &name, &for_model, &display, is_error);
         messages.push(message.clone());
         collected.push(ToolCallInfo {
             name,
@@ -158,11 +160,45 @@ impl ToolExecContext<'_> {
 
     /// «Инструмент пошёл»: три ветки исполнения шлют это одинаково, каждая
     /// перед своей работой.
-    fn emit_tool_started(&self, name: &str) {
+    fn emit_tool_started(&self, name: &str, arguments: &serde_json::Value) {
         self.emit(AgentEvent::ToolStarted {
             name: name.to_string(),
+            summary: tool_call_summary(arguments),
         });
     }
+}
+
+/// Ключи аргументов, по которым узнаётся суть вызова, по убыванию важности.
+const SUMMARY_KEYS: [&str; 8] = [
+    "command",
+    "cmd",
+    "path",
+    "file_path",
+    "pattern",
+    "query",
+    "url",
+    "prompt",
+];
+/// Длина строки сути вызова в символах.
+const SUMMARY_CHARS: usize = 100;
+
+/// Одна короткая строка про вызов для панели работы: команда, путь, запрос.
+/// Значения секретных полей не берутся, а в самой строке секреты маскируются.
+/// Пусто, если в аргументах нет ни одной подходящей строки.
+pub(crate) fn tool_call_summary(arguments: &serde_json::Value) -> String {
+    let text = SUMMARY_KEYS
+        .iter()
+        .find_map(|key| arguments.get(key).and_then(|value| value.as_str()))
+        .or_else(|| {
+            arguments
+                .as_object()?
+                .iter()
+                .filter(|(name, _)| !super::redact::is_secret_name(name))
+                .find_map(|(_, value)| value.as_str())
+        })
+        .unwrap_or_default();
+    // Сначала маска, потом усечение: обрезка не должна оставить кусок секрета.
+    crate::util::one_line_label(&super::redact::redact_secrets(text), SUMMARY_CHARS)
 }
 
 /// Человек посмотрел и отказал.
@@ -204,7 +240,7 @@ fn manage_timer(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOutcome
         return ToolOutcome::failed("Timers are not available to background agents.");
     }
     // «Пошёл» — только для правда запущенного: отказ сводка не считает.
-    ctx.emit_tool_started(TIMER_TOOL_NAME);
+    ctx.emit_tool_started(TIMER_TOOL_NAME, &call.arguments);
     let timers = ctx.tools.timers();
     let owner = ctx.conversation.0;
     let now = chrono::Local::now();
@@ -306,7 +342,7 @@ async fn ask_the_user(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolO
     let _ = ctx
         .event_tx
         .send(AppEvent::RequestQuestion(request.clone(), qs));
-    ctx.emit_tool_started(&call.name);
+    ctx.emit_tool_started(&call.name, &call.arguments);
     let answer = request.wait().await;
     if answer.is_empty() {
         ToolOutcome::failed("User cancelled the question")
@@ -348,7 +384,7 @@ async fn spawn_task(call: &ParsedToolCall, ctx: &ToolExecContext<'_>) -> ToolOut
             "Started background sub-agent: {label}. Its result will be added to this conversation when it finishes; you are not woken up for it."
         ));
     }
-    ctx.emit_tool_started(TASK_TOOL_NAME);
+    ctx.emit_tool_started(TASK_TOOL_NAME, &call.arguments);
     crate::agent::sub_agent::run_task(ctx, &label, prompt).await
 }
 
@@ -370,26 +406,39 @@ async fn run_generic_tool(call: ParsedToolCall, ctx: &ToolExecContext<'_>) -> To
     if needs_approval && !ask_person(&call, ctx, person).await {
         return ToolOutcome::failed(DENIED_BY_USER);
     }
-    ctx.emit_tool_started(&call.name);
+    ctx.emit_tool_started(&call.name, &call.arguments);
     dispatch_generic_tool(ctx.tools, ctx.mcp, &call.name, call.arguments).await
 }
 
-/// Окно подтверждения. `always` — белый список не действует, а в окне
-/// сказано, почему спрашиваем.
-async fn ask_person(call: &ParsedToolCall, ctx: &ToolExecContext<'_>, always: bool) -> bool {
+/// Запрос подтверждения. `always` — белый список не действует; команда про доверие и секреты
+/// получает это сама, и причина стоит первой строкой окна.
+fn build_approval(
+    call: &ParsedToolCall,
+    conversation: ConversationId,
+    always: bool,
+) -> ToolApprovalRequest {
     // Не сырой JSON: он экранирует переводы строк, и содержимое файла в
     // модалке становится одной нечитаемой строкой.
     let mut preview = crate::tools::approval_preview(&call.name, &call.arguments);
+    let risky = crate::tools::sensitive_shell_reason(&call.name, &call.arguments);
+    if let Some(reason) = risky {
+        preview = format!("{reason}\n{preview}");
+    }
     if let Some(warning) = call.origin.warning() {
         preview = format!("{warning}\n{preview}");
     }
-    let approval = ToolApprovalRequest::new(
-        ctx.conversation,
+    ToolApprovalRequest::new(
+        conversation,
         call.name.clone(),
         preview,
         crate::tools::approval_scope(&call.name, &call.arguments),
     )
-    .asking_always(always);
+    .asking_always(always || risky.is_some())
+}
+
+/// Окно подтверждения.
+async fn ask_person(call: &ParsedToolCall, ctx: &ToolExecContext<'_>, always: bool) -> bool {
+    let approval = build_approval(call, ctx.conversation, always);
     let _ = ctx
         .event_tx
         .send(AppEvent::RequestToolApproval(approval.clone()));
@@ -465,6 +514,34 @@ fn refuse_non_object(name: &str, arguments: &serde_json::Value) -> Option<ToolOu
     )))
 }
 
+/// Сколько байт вывода команды хранится в ленте: хвост, а не начало.
+const SHELL_DISPLAY_BYTES: usize = 6_000;
+
+/// Оболочки: их вывод показывается с конца, и там же подпись `[exit code N]`.
+pub(crate) fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "powershell")
+}
+
+/// Текст результата для ленты и сохранённой истории (модель получает другой).
+/// Команды держат хвост вместе с кодом выхода, остальные инструменты — короткую выжимку.
+pub(crate) fn result_display(name: &str, text: &str, whole: bool) -> String {
+    if whole {
+        return text.to_string();
+    }
+    if !is_shell_tool(name) {
+        return summarize_tool_result(text);
+    }
+    let trimmed = text.trim();
+    if trimmed.len() <= SHELL_DISPLAY_BYTES {
+        return trimmed.to_string();
+    }
+    let from = trimmed.ceil_char_boundary(trimmed.len() - SHELL_DISPLAY_BYTES);
+    let tail = &trimmed[from..];
+    // Обрезанную посередине строку отбрасываем целиком.
+    let tail = tail.split_once('\n').map_or(tail, |(_, rest)| rest);
+    format!("\u{2026}\n{tail}")
+}
+
 /// Короткая выжимка для строки состояния и для трассы. Режет по границе
 /// символа через общий помощник (инвариант 4), а не своей копией.
 fn summarize_tool_result(result: &str) -> String {
@@ -481,6 +558,45 @@ fn summarize_tool_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bash_call(command: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            id: None,
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": command }),
+            origin: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_trust_command_ignores_the_whitelist_and_says_why() {
+        let everything =
+            crate::whitelist::Whitelist::from_rules(vec![crate::whitelist::Rule::tool("bash")]);
+        let request = build_approval(
+            &bash_call("pooprusteek trust --yes"),
+            ConversationId::next(),
+            false,
+        );
+        assert!(request.always_ask);
+        assert!(
+            request.arguments.starts_with("risky:"),
+            "{}",
+            request.arguments
+        );
+        // Решение белого списка в приложении и харнессе — `!always_ask && allows`.
+        assert!(everything.allows("bash", request.scope.as_ref()));
+        assert!(
+            request.always_ask,
+            "so the whitelist verdict is not consulted"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_command_still_follows_the_whitelist() {
+        let request = build_approval(&bash_call("cargo test"), ConversationId::next(), false);
+        assert!(!request.always_ask);
+        assert!(!request.arguments.starts_with("risky:"));
+    }
 
     /// Родной протокол хранит битые аргументы строкой — такое не исполняется,
     /// и модель узнаёт настоящую причину.
@@ -536,7 +652,52 @@ mod tests {
     }
 
     #[test]
+    fn a_command_keeps_its_tail_and_exit_code_in_the_feed() {
+        let body = (0..2_000)
+            .map(|n| format!("line {n} ü"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = format!("{body}\ntest result: FAILED. 1 failed\n[exit code 101]");
+        let shown = result_display("bash", &result, false);
+        assert!(shown.ends_with("[exit code 101]"), "{shown}");
+        assert!(shown.contains("1 failed"));
+        assert!(shown.len() <= SHELL_DISPLAY_BYTES + 8, "{}", shown.len());
+        assert!(shown.starts_with('\u{2026}'), "the cut is marked");
+        // Начало и не-команды остаются короткой выжимкой.
+        assert!(!shown.contains("line 0 "));
+        assert!(result_display("read_file", &result, false).len() <= 203);
+        assert_eq!(result_display("read_file", &result, true), result);
+        assert_eq!(result_display("bash", " ok \n", false), "ok");
+    }
+
+    #[test]
     fn an_empty_result_stays_empty() {
         assert_eq!(summarize_tool_result(""), "");
+    }
+
+    #[test]
+    fn the_summary_never_shows_a_secret_field() {
+        let args = serde_json::json!({"access_token": "tok-123", "server": "main"});
+        let summary = tool_call_summary(&args);
+        assert_eq!(summary, "main");
+        let only_secret = serde_json::json!({"password": "hunter2"});
+        assert_eq!(tool_call_summary(&only_secret), "");
+    }
+
+    #[test]
+    fn the_summary_masks_secrets_inside_a_command() {
+        let args = serde_json::json!({"command": "deploy --token s3cr3t && API_KEY=abc run"});
+        let summary = tool_call_summary(&args);
+        assert!(summary.contains("deploy"), "{summary}");
+        assert!(
+            !summary.contains("s3cr3t") && !summary.contains("abc"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn the_summary_of_a_plain_command_is_unchanged() {
+        let args = serde_json::json!({"command": "cargo test items::range"});
+        assert_eq!(tool_call_summary(&args), "cargo test items::range");
     }
 }

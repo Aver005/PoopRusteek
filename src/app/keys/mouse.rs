@@ -17,31 +17,43 @@ const WHEEL_STEP: usize = 3;
 
 impl App {
     pub(crate) fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
+        use crossterm::event::{MouseButton, MouseEventKind};
         let up = match mouse.kind {
             MouseEventKind::ScrollUp => true,
             MouseEventKind::ScrollDown => false,
-            // Clicks, drags and moves are not wired to anything yet.
+            // Захват мыши забирает у консоли её вставку по правому клику — делаем её сами.
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.paste_from_clipboard();
+                return;
+            }
+            // Other clicks, drags and moves are not wired to anything yet.
             _ => return,
         };
 
         // A modal owns the screen when present — scroll it, not the chat behind.
         if let Some(Modal::ToolApproval {
+            tool_name,
             arguments,
+            origin,
+            scope,
             scroll_offset,
             ..
-        }) = self.state.modal.as_mut()
+        }) = self.state.modal.as_ref()
         {
-            if up {
-                *scroll_offset = scroll_offset.saturating_sub(WHEEL_STEP);
+            let max_scroll = super::modal::approval_max_scroll(
+                &self.state,
+                tool_name,
+                arguments,
+                origin.as_deref(),
+                scope.as_ref(),
+            );
+            let next = if up {
+                scroll_offset.saturating_sub(WHEEL_STEP)
             } else {
-                // Mirror the key handler's clamp so the wheel can't scroll past
-                // the end of the argument block.
-                let max_scroll = arguments
-                    .lines()
-                    .count()
-                    .saturating_sub(super::modal::TOOL_APPROVAL_VISIBLE_LINES);
-                *scroll_offset = (*scroll_offset + WHEEL_STEP).min(max_scroll);
+                (*scroll_offset + WHEEL_STEP).min(max_scroll)
+            };
+            if let Some(Modal::ToolApproval { scroll_offset, .. }) = self.state.modal.as_mut() {
+                *scroll_offset = next;
             }
             return;
         }
@@ -66,6 +78,14 @@ impl App {
                     view.selected = nav.move_within(view.selected, len, page(rows::SERVER));
                 }
             }
+            View::Resume => {
+                let len = self.state.resume.visible(&self.state.workspace_path).len();
+                let page = crate::app::list::page_rows(
+                    self.state.terminal_rows,
+                    crate::app::list::rows::SESSION,
+                );
+                self.state.resume.navigate(nav, len, page);
+            }
             View::Search => {
                 let len = self.state.search.visible().len();
                 let search = &mut self.state.search;
@@ -76,10 +96,15 @@ impl App {
                 let selected = self.state.themes.selected;
                 self.state.themes.selected = nav.move_within(selected, len, page(rows::THEME));
             }
-            View::Providers => {
-                let len = crate::app::providers::provider_rows(&self.config).len();
-                let selected = self.state.providers_view.selected;
-                self.state.providers_view.selected =
+            View::Accounts => {
+                let len = self
+                    .state
+                    .gateway_view
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |s| s.accounts.len());
+                let selected = self.state.gateway_view.screen.selected;
+                self.state.gateway_view.screen.selected =
                     nav.move_within(selected, len, page(rows::PROVIDER));
             }
             _ => {

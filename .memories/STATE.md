@@ -1,5 +1,39 @@
 # STATE
 > Live project snapshot. Update on every meaningful change.
+> **2026-11-14 (2) — новый вид TUI.** Шапка и подвал-линии, поле в рамке, панель
+> 30 колонок (Ctrl+B, `/panel`, `[ui] panel`), главные center/sheet (`/landing`,
+> `[ui] landing`), `/resume` (= `/sessions`) на весь экран. 2118 тестов.
+> Подробности и отложенное — `JOURNAL/2026-11-14-tui-redesign.md`.
+> **2026-11-14 — вставка в консоли Windows.**
+> - Ctrl+V, Shift+Insert и правый клик читают буфер сами (`clipboard::read`,
+>   `App::paste_from_clipboard`): в conhost они не работали ни в v0.1.1, ни в ветке.
+>   То же в `secrets set`. Подробности и ручные правки данных пользователя —
+>   `JOURNAL/2026-11-14-paste-and-data.md`.
+> **2026-11-07 — релиз шлюза аккаунтов: документация и два сценария.**
+> - Ветка `t3/125684c9` (от `develop`) содержит весь релиз: шлюз
+>   (`src/gateway/`), секреты и слои конфига (`src/secrets/`, `src/config/`),
+>   экран `/accounts`, `/pin`, `/usage`, `/serve` через маршруты, роли
+>   `title/summary/evaluator`, новый лейаут TUI. Шлюз выключен по умолчанию.
+> - Сделано в этом заходе: README (новый путь конфига, секреты, две подписки
+>   пошагово, `/serve`, честные ограничения), `reference/{CONFIG,COMMANDS,
+>   PROVIDER,GATEWAY,HARNESS,RELEASING}.md`, `sandbox/README.md`, MAP/
+>   ARCHITECTURE/GLOSSARY/QUICKSTART, `CLAUDE.md` (подсистемы + инварианты
+>   13–15 + проверка `git ls-files --ignored`), `LEARNINGS.md`, `BUGS.md`
+>   (остаток релиза), `PLANS.md` (CLI-агент, Codex, лента, A-01…A-06),
+>   `.docs/ideas-inbox.md` (статусы I-01…I-12), `CHANGELOG.md`.
+> - Исправлены и прогнаны два старых mock-сценария: `reads-project-instructions`
+>   (герметичная область — ровно 1 файл правил, было 2) и
+>   `rung-one-clears-tool-output` (убрано ожидание фонового
+>   `harness.context.window`, которое проигрывает гонку; сама лестница
+>   проверяется `context.prune`). Оба 3/3 на временном конфиге и `--data-dir`.
+> - **CI PR #1 зелёный** (`013aa93`): сборка, тесты, fmt и clippy на Windows, Linux и macOS.
+> - **Не подтверждено:** живые две подписки одного рода, живые CLI вне Windows,
+>   релизная сборка всех целей и установщик (`build.yml` в PR не идёт), Codex в режиме
+>   модели, диалект Anthropic в `/serve` (501), настоящие образцы исчерпания лимита CLI.
+>   Открытые пункты — `BUGS.md` (2026-11-07), дальше — `PLANS.md`.
+> - Сборка `cargo build --bin pooprusteek` на этой машине прошла (5m31s,
+>   MSVC 14.50); тесты и clippy в этом заходе не перегонялись — последние
+>   известные цифры релиза: 2001 тест, clippy/fmt чисто (`ab9a556`).
 > **2026-10-19 — аудит «проект как суб-агент»: этапы 0–6 закрыты, этап 7 (документация) и ревью этапа 6 — нет.**
 > - Ход больше не виснет и не врёт: паника задачи, тишина провайдера, оборванный поток, команда с живыми внуками, сломанные вызовы — всё кончается `Failed` с причиной, модель и человек её видят (`32e3153`, `053f2db`).
 > - Суб-агент `task` — обычный `run_agent_loop` через `run_guarded`; его инструменты спрашивают подтверждение у того, кто подтверждает за родителя. `auto_approve` удалён, вместо него `unattended`. `exec` отдаёт `warnings`/`answered`/`sub_agent_results`, ошибка аргументов — код 3 (`fa6b95c`).

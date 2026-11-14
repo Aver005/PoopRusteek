@@ -6,6 +6,7 @@ use super::popup::{
     center_popup, draw_popup, fill_panel_space, modal_block, option_row, push_text_box_lines,
     separator_line,
 };
+use super::util::fit_col;
 use crate::app::list::{ListWindow, NAV_HINT};
 use crate::mcp::types::McpViewState;
 use crate::tui::theme::Theme;
@@ -70,46 +71,36 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
     // -1 под строку заголовка.
     let list_height = area.height.saturating_sub(1) as usize;
 
+    // Колонки заголовка и строк считаются из одних и тех же ширин.
+    const STATUS_W: usize = 9;
+    const NAME_W: usize = 21;
+    const TYPE_W: usize = 6;
+    let header_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
     let header_line = Line::from(vec![
-        Span::styled(
-            "  STATUS  ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "SERVER",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(
-            " ".repeat(area.width.saturating_sub(30) as usize)
-                .min(" ".repeat(20)),
-        ),
-        Span::styled(
-            "TYPE   TOOLS",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("{:<STATUS_W$}", " STATUS"), header_style),
+        Span::styled(format!("{:<NAME_W$}", "SERVER"), header_style),
+        Span::styled(format!("{:<TYPE_W$}", "TYPE"), header_style),
+        Span::styled("TOOLS", header_style),
     ]);
     frame.render_widget(Paragraph::new(header_line), area);
 
+    let glyph = crate::tui::glyphs::get();
     let window = ListWindow::anchored(mcp.selected, visible_indices.len(), list_height);
     for (i, pos) in window.range().enumerate() {
         let idx = visible_indices[pos];
         let server = &mcp.servers[idx];
         let selected = pos == mcp.selected;
-        let bg = if selected { theme.accent_dim } else { theme.bg };
+        let bg = if selected { theme.selection } else { theme.bg };
 
         let status_icon = match server.status.as_str() {
-            "disabled" => " ○ ",
-            _ if server.status.starts_with("error") => " ✗ ",
-            "connected" => " ● ",
-            "auth required" => " ⚿ ",
-            "pending" | "connecting" => " ◌ ",
-            _ => " ? ",
+            "disabled" => glyph.radio_off,
+            _ if server.status.starts_with("error") => glyph.cross,
+            "connected" => glyph.radio_on,
+            "auth required" => glyph.warn,
+            "pending" | "connecting" => "...",
+            _ => "?",
         };
         let status_color = match server.status.as_str() {
             "disabled" => theme.text_dim,
@@ -132,32 +123,35 @@ fn render_mcp_list(frame: &mut Frame, area: Rect, mcp: &McpViewState, theme: &Th
 
         let line = Line::from(vec![
             Span::styled(
-                format!(" {} ", status_short),
+                if selected { glyph.sel_bar } else { " " },
+                Style::default().fg(theme.accent).bg(bg),
+            ),
+            Span::styled(
+                format!("{}{status_short} ", fit_col(status_icon, 3)),
                 Style::default()
                     .fg(status_color)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" {} ", status_icon), dim_style),
             Span::styled(
-                format!("{:<20} ", server.name),
-                if selected {
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.fg).bg(bg)
-                },
+                fit_col(&server.name, NAME_W - 1) + " ",
+                Style::default()
+                    .fg(theme.fg)
+                    .bg(bg)
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
-            Span::styled(format!("{:<6}", server.transport), dim_style),
+            Span::styled(fit_col(&server.transport, TYPE_W), dim_style),
             Span::styled(
-                format!("{}t", server.tool_count),
+                server.tool_count.to_string(),
                 Style::default().fg(theme.fg).bg(bg),
             ),
         ]);
         frame.render_widget(
-            Paragraph::new(line),
+            Paragraph::new(line).style(Style::default().bg(bg)),
             Rect::new(area.x, area.y + 1 + i as u16, area.width, 1),
         );
     }
@@ -283,7 +277,7 @@ pub(super) fn render_mcp_add(
             if let Some(err) = error {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    format!("  \u{26A0} {err}"),
+                    format!("  {} {err}", crate::tui::glyphs::get().warn),
                     Style::default().fg(theme.error),
                 )));
             }
@@ -379,7 +373,7 @@ pub(super) fn render_mcp_add(
             if let Some(err) = &wiz.error {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    format!("  \u{26A0} {err}"),
+                    format!("  {} {err}", crate::tui::glyphs::get().warn),
                     Style::default().fg(theme.error),
                 )));
             }

@@ -1,6 +1,27 @@
 # PLANS
 > Roadmap, active priorities, and ideas.
-> Last updated: 2026-09-13 (Windows installer + CI/CD release pipeline SHIPPED — moved off LONG-TERM). Before: 2026-08-26 (context-compaction ladder decided, not built — SHORT-TERM P0 + `.docs/context-compaction.md`). Before: 2026-07-06 (OpenAI-compatible server mode SHIPPED — moved off ACTIVE)
+> Last updated: 2026-11-07 (release of the account gateway shipped; next:
+> CLI agent mode, Codex, route feed, ideas A-01…A-06). Before: 2026-09-13
+> (Windows installer + CI/CD release pipeline SHIPPED — moved off LONG-TERM).
+> Before: 2026-08-26 (context-compaction ladder decided, not built —
+> SHORT-TERM P0 + `.docs/context-compaction.md`). Before: 2026-07-06
+> (OpenAI-compatible server mode SHIPPED — moved off ACTIVE)
+
+## NEXT AFTER THE GATEWAY RELEASE (2026-11-07)
+
+| Priority | What | Why / first step |
+|----------|------|------------------|
+| P0 | **Agent mode for CLI accounts** | The release runs `cli:*` as a plain model (our loop, our tools). A later release lets the CLI use its own tools, which needs a different approval and context contract: the CLI owns the loop, so our `AppEvent` stream and tool approval do not apply. Start by writing the contract and a live probe; do not reuse `RoutedProvider` blindly. |
+| P0 | **Codex support** | Today direct-token only; as a plain model it is refused (`NotPureModel`). Needs the owner's live probe of whether every tool can be disabled in `codex exec` and a captured sample of its failure stream. `CodexBackend::probe().detail` already carries the reason. |
+| P1 | **Route feed** | Only the short footer indicator and the `SEAM` history line shipped. A full chain of accounts in the footer/header (which account, why, what is next) was deferred from GW-TUI §5 — it did not fit the footer. Design with real screenshots before coding. |
+| P1 | **A-01 — explain decisions** | `Decision::explain()` and the `h` decision history exist. Missing: a dry-run mode that shows the chosen route without sending a request, and a postmortem after a failed turn. |
+| P1 | **A-02 — forecast and budget** | Limits carry source and age; there is no “limit ends in N minutes” forecast, no per-turn/chat budget, and `budget_usd_month` is validated but unused (no verified price source). |
+| P2 | **A-03 — wait instead of switching** | `Decision::retry_at` is computed but unused; if the nearest reset is close, waiting may be cheaper than burning the fallback. Needs a user-visible wait and a cancel path. |
+| P2 | **A-04 — pin and failure analysis** | `/pin` shipped. Missing: the postmortem of a refusal and a cache-hit metric; reset credits are not modelled. |
+| P2 | **A-05 — route feed** | Same as the P1 “Route feed” row; listed separately because it came from the UI critique (`.docs/research-2026-11/07-ui-critique-round-2.md`). |
+| P2 | **A-06 — persist the queue** | Queue lives in `Conversation::queued` only. Needs a draft file or a `Session` field, with the same “never lose a typed message” rule as the current Esc/Ctrl+C return path. |
+| P2 | **Anthropic dialect in `/serve`** | `/v1/messages` is 501. See `BUGS.md` and the plan in `JOURNAL/2026-11-06-gw-serve.md`. |
+
 
 ## RECENTLY SHIPPED (`[DONE]` — was on this roadmap)
 

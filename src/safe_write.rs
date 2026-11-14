@@ -83,6 +83,14 @@ fn is_inside(path: &Path, dir: &Path) -> bool {
     path.len() > dir.len() && path[..dir.len()] == dir[..]
 }
 
+/// Есть ли в пути папка `.pooprusteek` (слой проекта и общая папка): регистр на Windows не важен.
+fn passes_through_project_layer(path: &Path) -> bool {
+    path.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        name == ".pooprusteek" || (cfg!(windows) && name.eq_ignore_ascii_case(".pooprusteek"))
+    })
+}
+
 /// Пути, которые модель не правит ни инструментом, ни откатом: собственная
 /// конфигурация агента и MCP-конфиги (последние исполняются как команды при
 /// следующем старте).
@@ -96,17 +104,29 @@ pub fn refuse_protected(target: &Path, shown_as: &str) -> Result<(), String> {
         ));
     }
 
-    let guarded = [
-        Some(crate::config::Config::data_dir()),
-        crate::config::Config::path()
-            .parent()
-            .map(Path::to_path_buf),
-        crate::instructions::global_dir(),
-    ];
-    for dir in guarded.into_iter().flatten() {
+    // Проектный слой `.pooprusteek/` на любой глубине: иначе модель сама подменит `base_url`.
+    // Смотрим и путь как дан, и разрешённый: ссылка и `..` не должны открывать обход.
+    if passes_through_project_layer(target)
+        || passes_through_project_layer(&resolve_for_compare(target))
+    {
+        return Err(format!(
+            "Refusing to write {shown_as}: .pooprusteek/ holds the project's agent configuration, which decides where requests go. Ask the user to change it."
+        ));
+    }
+    // Папки и отдельные файлы конфигурации агента, в том числе старые места и `--config`.
+    for file in crate::config::protect::protected_files() {
+        if resolve_for_compare(target) == resolve_for_compare(&file) {
+            return Err(format!(
+                "Refusing to write {shown_as}: it belongs to this agent's own configuration. Use the slash commands (/mcp, /providers, /secrets, /whitelist) instead."
+            ));
+        }
+    }
+    let mut guarded: Vec<PathBuf> = crate::config::protect::protected_dirs();
+    guarded.extend(crate::instructions::global_dir());
+    for dir in guarded {
         if is_inside(target, &dir) {
             return Err(format!(
-                "Refusing to write {shown_as}: it belongs to this agent's own configuration. Use the slash commands (/mcp, /providers, /whitelist) instead."
+                "Refusing to write {shown_as}: it belongs to this agent's own configuration. Use the slash commands (/mcp, /providers, /secrets, /whitelist) instead."
             ));
         }
     }
@@ -120,6 +140,8 @@ pub fn write_preserving(path: &Path, shown_as: &str, contents: &[u8]) -> Result<
     // Без канонизации `rename` кладёт обычный файл ПОВЕРХ самой ссылки:
     // ссылка исчезает, а целевой файл остаётся старым.
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Путь, каким его назвали, тоже: каноническая форма ссылки не содержит `.pooprusteek`.
+    refuse_protected(path, shown_as)?;
     refuse_protected(&target, shown_as)?;
 
     let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
@@ -281,6 +303,57 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(false);
         std::fs::set_permissions(&path, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Общий конфиг и его папка закрыты для записи моделью, как и данные агента.
+    #[test]
+    fn the_shared_config_folder_and_data_dir_are_protected() {
+        let config = crate::config::Config::global_path();
+        assert!(refuse_protected(&config, "config.toml").is_err());
+        let data = crate::config::Config::data_dir().join("whitelist.json");
+        assert!(refuse_protected(&data, "whitelist.json").is_err());
+    }
+
+    /// Проектный слой закрыт для записи моделью на любой глубине, новый и существующий,
+    /// через `..` и через ссылку; соседние файлы проекта пишутся как раньше.
+    #[test]
+    fn a_project_layer_cannot_be_written_by_the_model_however_the_path_is_spelled() {
+        let dir = temp_dir("project-layer");
+        let layer = dir.join("repo").join("pkg").join(".pooprusteek");
+        let config = layer.join("config.toml");
+        // Ещё не существует: создать его и означало бы подменить `base_url`.
+        assert!(refuse_protected(&config, "config.toml").is_err());
+        assert!(write_preserving(&config, "config.toml", b"x").is_err());
+        assert!(!config.exists(), "nothing was written");
+        let sneaky = dir
+            .join("repo")
+            .join("pkg")
+            .join("src")
+            .join("..")
+            .join(".pooprusteek")
+            .join("config.toml");
+        assert!(refuse_protected(&sneaky, "config.toml").is_err());
+        // Верхний уровень репозитория (поиск идёт вверх до корня git).
+        let top = dir.join("repo").join(".pooprusteek").join("config.toml");
+        assert!(refuse_protected(&top, "config.toml").is_err());
+        // Другая сторона: обычные файлы проекта пишутся.
+        let ordinary = dir.join("repo").join("pkg").join("notes.md");
+        assert!(refuse_protected(&ordinary, "notes.md").is_ok());
+        write_preserving(&ordinary, "notes.md", b"ok").unwrap();
+        // Через ссылку: имя другое, цель внутри `.pooprusteek`.
+        std::fs::create_dir_all(&layer).unwrap();
+        let link = dir.join("repo").join("innocent");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&layer, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&layer, &link).is_ok();
+        if linked {
+            let through = link.join("config.toml");
+            assert!(refuse_protected(&through, "config.toml").is_err());
+            assert!(write_preserving(&through, "config.toml", b"x").is_err());
+            assert!(!config.exists());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -98,7 +98,7 @@ COPY --chown=agent:agent sandbox/prompts /opt/sandbox/prompts
 # Skills come from the repo so RAG scenarios have something real to retrieve.
 COPY --chown=agent:agent skills /opt/sandbox/skills
 RUN chmod +x /opt/sandbox/entrypoint.sh \
- && mkdir -p /home/agent/.config/pooprusteek \
+ && mkdir -p /home/agent/.pooprusteek \
              /home/agent/.local/share/pooprusteek \
              /work /out \
  && chown -R agent:agent /home/agent /work /out

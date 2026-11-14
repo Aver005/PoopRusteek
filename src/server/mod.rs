@@ -25,7 +25,24 @@ pub mod catalog;
 mod http;
 mod openai;
 pub mod proxy;
+pub mod routing;
 mod tools;
+
+#[cfg(test)]
+mod gateway_tests;
+#[cfg(test)]
+mod testkit;
+
+pub use routing::GatewayCell;
+
+/// Адрес привязки только для этой машины.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
 
 use crate::app::events::AppEvent;
 use crate::config::{Config, ProviderConfig, ProviderEntry, ServerApi};
@@ -53,6 +70,10 @@ pub struct ServerSettings {
     /// Emit an `AppEvent::ServerRequestLog` per request. On for proxy mode
     /// (the log IS the UI there); off for the TUI, which shows counters.
     pub request_log: bool,
+    /// Имена сверх loopback, разрешённые в заголовке `Host`.
+    pub allowed_hosts: Vec<String>,
+    /// Живой шлюз. Выключенный — прежний путь по `entries` и `deepseek`.
+    pub gateway: GatewayCell,
 }
 
 /// What `DeepseekProvider::new` needs, detached from the live `Config`.
@@ -87,6 +108,8 @@ impl ServerSettings {
             }),
             entries: config.providers.clone(),
             request_log: false,
+            allowed_hosts: config.server.allowed_hosts.clone(),
+            gateway: GatewayCell::default(),
         }
     }
 }
@@ -112,6 +135,8 @@ pub struct ServerHandle {
     pub bound_addr: Option<std::net::SocketAddr>,
     pub started_at: std::time::Instant,
     pub stats: Arc<ServerStats>,
+    /// Живой шлюз сервера: приложение подменяет его при пересборке.
+    pub gateway: GatewayCell,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -141,6 +166,7 @@ pub fn spawn(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let stats = Arc::new(ServerStats::default());
     let handle_stats = Arc::clone(&stats);
+    let gateway = settings.gateway.clone();
     let (host, port, api) = (settings.host.clone(), settings.port, settings.api);
     let task = tokio::spawn(http::run(
         settings,
@@ -158,6 +184,7 @@ pub fn spawn(
         bound_addr: None,
         started_at: std::time::Instant::now(),
         stats: handle_stats,
+        gateway,
         shutdown: shutdown_tx,
         task,
     }

@@ -1,6 +1,12 @@
 # MAP
 > Codebase map — file → purpose. Navigation aid. (~15k LOC)
-> Last updated: 2026-09-13 (self-update rewrite: `src/update.rs` → `src/update/` module; CI split into `checks.yml`/`build.yml`/`release.yml` + `ci.yml`; `packaging/` and `scripts/ci/` added). Before: 2026-08-27 (+ `scripts/` и `.githooks/`; 2026-08-25 — `src/harness/` и `sandbox/`; размеры приблизительные, опираться на имена, не на строки)
+> Last updated: 2026-11-07 (gateway, secrets, accounts screen, CLI adapters,
+> layered config; counts are approximate). Before: 2026-09-13 (self-update
+> rewrite: `src/update.rs` → `src/update/` module; CI split into
+> `checks.yml`/`build.yml`/`release.yml` + `ci.yml`; `packaging/` and
+> `scripts/ci/` added). Before: 2026-08-27 (+ `scripts/` и `.githooks/`;
+> 2026-08-25 — `src/harness/` и `sandbox/`; размеры приблизительные, опираться
+> на имена, не на строки)
 
 ## ENTRY / ROOT
 | File | Purpose | Lines |
@@ -66,6 +72,49 @@
 | `src/agent/sub_agent.rs` | `run_sub_agent(SubAgentSpec)` — безголовый изолированный прогон (свой форк провайдера, авто-аппрув), стрим с пустым колбэком, возвращает финальный текст. С 2026-08-27 разбирает конец стрима общим `StreamOutcome::verdict()` и повторяет пустой ответ через `RetryBudget` — раньше отдавал пустоту родителю как успех; на исчерпании шагов берёт последний **непустой** текст, иначе ошибка | ~170 |
 | `src/agent/tool_parser.rs` | Parse/strip tool calls (XML / `[TOOL:]` / JSON), stream-visible text. Still truncates visible text at the first bare `<` and the legacy regex still can't parse nested-brace JSON (both open, see BUGS.md) | ~175 |
 
+## GATEWAY (Domain — 2026-11-06, see `reference/GATEWAY.md`)
+| File | Purpose |
+|------|---------|
+| `src/gateway/types.rs` | `Account`, `AccountProvider`, `Credential`, `AccountLimits`, `Route`, `Step`, `Strategy`, `FallbackTrigger`, `ToolMode`, `Role`/`Roles`, `GatewaySettings`, `GatewayConfig::validate/from_legacy`, `DIRECT_TOKEN_WARNING` |
+| `src/gateway/backend.rs` | `Backend` trait (`call/list_models/probe/fork/context_window/accepts_attachment/remote sessions/proxy_json`), `Capabilities`, `CallContext`, `CallReport`, `BackendError`, `EmitTracker` |
+| `src/gateway/handle.rs` | `Gateway` facade, `GatewaySnapshot`, `AccountView`, `Decision`/`Why`/`SkipReason`, `LimitSnapshot`/`LimitSource`, `ConfigEdit`, `CallSource`, `ServedBy`, `DisabledGateway`, `main_provider` |
+| `src/gateway/engine.rs` | `Engine`, `Core::select`, `apply_edit`, `BackendFactory`/`BuiltinFactory`, `EngineDeps`, `build_gateway`, `gateway_config`, `ConfigPersist` |
+| `src/gateway/routed.rs` | `RoutedProvider`: fallback before the first emitted chunk, per-account semaphore, `flatten_for_switch`, `CancelGuard`, `route_state`/`seed_route_state`, `served_by` |
+| `src/gateway/state.rs` | `AccountState`, cooldown policy, `RouteState`, `HintStore` (`data_dir/gateway/state.json`) |
+| `src/gateway/ledger.rs` | `EngineLedger` — `usage.json`, 30 s merge via `atomic_write`, dedup by `(request_id, attempt, account)` |
+| `src/gateway/api_backend.rs` | `ApiBackend` over `build_entry_provider`; `drive_provider` drains the stream for OpenAI's late usage chunk; `proxy_json` for embeddings |
+| `src/gateway/deepseek_backend.rs` | `DeepseekBackend` over the built-in web client |
+| `src/gateway/history.rs` | `flatten_for_switch` — foreign tool calls become text on a target change |
+| `src/gateway/pending.rs` | `PendingGateway`/`PendingHandle`/`PendingProvider` — build off the loop, `AppEvent::GatewayBuilt` |
+| `src/gateway/clock.rs` | `Clock`, `SystemClock`, `ManualClock` (tests) |
+| `src/gateway/cli/` | Claude/OpenCode/Codex adapters: `discover` (binary, version), `launch` (`Scratch`, env), `process` (process tree, idle guard), `claude`/`opencode`/`codex`, `classify` (failure samples), `adapter`, `factory`, `dialect::verify` |
+| `src/gateway/{testkit,engine_tests,routed_tests,wiring_tests}.rs` | Test doubles and cross-track wiring tests |
+
+## SECRETS AND CONFIG (Infrastructure — 2026-11-06)
+| File | Purpose |
+|------|---------|
+| `src/secrets/store.rs` | `SecretStore` over keyring, process cache, `set_verified` (write → read back → compare) |
+| `src/secrets/chunked.rs` | Long values split at 900 bytes, generations, `psec1`/`psec2` headers, crash-safe switch |
+| `src/secrets/reference.rs` | `SecretRef::parse` — `keyring:`, `env:`, `cmd:`, `file:`, `none`; project-layer limits |
+| `src/secrets/resolver.rs` | `SecretResolver`/`StoreResolver`, host binding, `resolve_for` |
+| `src/secrets/redact.rs` | Removes known values and key shapes from logs, traces and CLI output |
+| `src/secrets/secret.rs` | `Secret` without `Display`, `Debug = <secret>`, zeroed on drop |
+| `src/secrets/ops.rs` | `list/set/rm/test/bind`, `Row` for `doctor` |
+| `src/config/paths.rs` | New/old config, data dir, project layer search, `--config`, marker |
+| `src/config/layers.rs`, `load.rs` | Two-layer merge, forbidden project keys, `TrustConfig`, `pending_trust` |
+| `src/config/write.rs`, `queue.rs` | Diff via `toml_edit` under a file lock; one save worker, errors as events |
+| `src/config/migrate.rs` | Data-dir copy list, `.legacy` collisions, config copy, key migration, backup scrub |
+| `src/config/startup.rs` | Chooses the data dir; first-run notices |
+| `src/config/{fields,describe,protect}.rs` | Secret-shaped fields, TOML errors without values, config-file protection |
+| `src/cli/{secrets,doctor,trust}.rs` | The three subcommands; `src/cli/file_mentions.rs` — `@path` expansion |
+
+**New app/TUI files for the screens:** `src/app/gateway_view.rs` (state, snapshot
+cache, `App` glue) + `gateway_view/{rows,edits,wizard,forms}.rs` (pure logic and
+the account wizard), `src/app/keys/accounts.rs`, `src/app/titles.rs` (service
+role `title`), `src/tui/render/accounts.rs`, `src/tui/render/{layout,dock,
+composer,footer,segments,chrome}.rs` (new skeleton and activity dock),
+`src/app/{reduce,interaction,list,landing,queue,file_scan}.rs`.
+
 ## TOOLS (Domain)
 | File | Purpose | Lines |
 |------|---------|-------|
@@ -97,14 +146,14 @@
 | `src/tui/markdown.rs` | Markdown + syntect highlight renderer; bold/italic/strikethrough now actually apply their style (were previously no-ops) | ~300 |
 | `src/tui/widgets/input.rs` | Multi-line input, cursor, selection, wrapping | ~270 |
 | `src/tui/widgets/chat.rs` | Chat history widget; now has a per-message thread-local markdown/syntect render cache (fingerprint-keyed, 4096-entry eviction) plus cached token estimates — the core fix for the render-perf critical | ~500 |
-| `src/tui/widgets/panel.rs` | Right stats panel; `mcp_row_layout` extracted and made testable, fixing the gap-underflow crash | ~330 |
+| `src/tui/render/panel.rs` | Right side panel of the chat (2026-11-14, replaced `widgets/panel.rs`): fixed `SIDEBAR_WIDTH` 30, sections Now (from `dock::model`) / Context / Accounts (shared `accounts::gauge_cells`) / Tools; empty sections hidden. `render/header.rs` — header line + `chat_title`; footer is its mirror | ~350 |
 | `src/tui/widgets/status.rs` | Status bar; display-width gap fixed | ~110 |
 
 ## COMMANDS
 | File | Purpose |
 |------|---------|
 | `src/commands/mod.rs` | `Command` trait, `CommandRegistry`, `CommandResult` (`NeedsAgent` dead variant removed; `OpenConfirm` variant added for confirm-modal routing) |
-| `src/commands/defs/*.rs` | 42 files, 48 registry entries (count corrected 2026-08-26 — a few files register a second/third related command, e.g. `cwd`, `agent`, `chats`) — incl. `/btw`, `/new`+`/chats`, `/agent`+`/agents`, `/goal` (leading-slash registration bug fixed), `/logout`, `/wipe` — see `reference/COMMANDS.md`. `/help` is now generated from the live registry instead of a hand-maintained list. |
+| `src/commands/defs/*.rs` | 57 command files / 59 registered names (count checked against `register_defaults` 2026-11-07; a few files register a second/third related command, e.g. `cwd`, `agent`, `chats`) — incl. `/accounts`, `/routes`, `/roles`, `/pin`, `/usage`, `/secrets`, `/doctor` — see `reference/COMMANDS.md`. `/help` is generated from the live registry. |
 | `src/commands/defs/compact.rs` | `/compact [1|2|3]` (2026-08-26, replacing the stub) — parses the mode only and returns `CommandResult::Compact`; a synchronous command cannot make a model call, so `App::spawn_compaction` (`src/app/multichat.rs`) does the work off-loop and answers with `AppEvent::CompactFinished` |
 | `src/commands/defs/default_compact.rs` | `/default-compact [1|2|3]` (2026-08-26) — persists `[context] compact_mode`, the fallback for chats that have not set `Conversation.compact_mode`; with no argument it reports the current default and lists the modes |
 | `src/commands/defs/logout.rs` | `/logout` — confirm → `cancel_all_turns`, clear `provider.token`, `config::save`, `reset_to_onboarding` ("Logged out") |
@@ -132,7 +181,8 @@
 | `src/harness/scenario.rs` | `Scenario` + `Expect` TOML (`deny_unknown_fields` on both — a mistyped expectation must not silently pass), `Expect::check` → failure reasons, `execute` fans repeats out as **child processes** (`exec --json`, `kill_on_drop` + timeout+60s backstop, `GlobalFlags` (`--config`/`--data-dir`) forwarded), `plant_session` сажает копию фикстуры `session_template` под свежим id на каждый повтор, `collect_scenarios`, `EXIT_EXPECTATIONS_FAILED = 4` | ~530 |
 | `src/harness/report.rs` | `RunReport`/`ScenarioReport`/`SuiteReport`, `Aggregate` + `Stat` (min/mean/**median**/max — one timeout otherwise swamps the mean), failure buckets, `render_run`/`render_scenario`/`render_suite`. Reports are written as JSON so runs are diffable across code changes | ~420 |
 | `src/harness/mine.rs` | Pattern mining: `normalize` (quoted spans→`<str>`, path-like tokens→`<path>`, digit runs→`<n>` — in that order) → `Counter` → ranked `Bucket`s (`malformed-tool-calls`, `tool-errors`, `stream-problems`, `hints-without-tool-use`, `repeated-answers`), over traces and the saved-session corpus (`--sessions`) | ~430 |
-| `src/harness/mock.rs` | Scripted OpenAI-compatible endpoint (hyper): `GET /v1/models`, `POST /v1/chat/completions` blocking + SSE. `Reply {when, content, delay_ms, status}`, positional order with the last reply repeating. JSON hand-rolled on purpose — a double sharing wire code with the thing under test cannot catch a wire bug | ~370 |
+| `src/harness/mock.rs` | Scripted OpenAI-compatible endpoint (hyper): `GET /v1/models` (with `context_length`), `POST /v1/chat/completions` blocking + SSE. `Reply {when, content, delay_ms, status, account, retry_after}`, positional order with the last reply repeating, `/<account>/v1/…` scripts with their own cursors. JSON hand-rolled on purpose — a double sharing wire code with the thing under test cannot catch a wire bug |
+| `src/harness/mock_cli.rs` | Stand-in for `claude`/`opencode` (`pooprusteek mock-cli <scenario>`), used through `POOPRUSTEEK_CLI_*` on harness runs. Scenarios cover success, 429, silence, cut-off, grandchildren, exit codes, old version. |
 
 ## SANDBOX (Docker — see `sandbox/README.md`)
 | File | Purpose |
@@ -141,9 +191,10 @@
 | `sandbox/docker-compose.yml` | `sandbox` (one-shot `run --rm`, data volume + `./out` bind, `cap_drop: ALL`, `no-new-privileges`, pids/mem caps) + `mock` (long-running scripted provider, reachable as `http://mock:811/v1`) |
 | `sandbox/entrypoint.sh` | Renders `config.template.toml` with `POOPRUSTEEK_TOKEN` at run time (never in an image layer), points skills at `/opt/sandbox/skills`, lets bare harness subcommands omit the binary name |
 | `sandbox/sandbox.ps1` / `.sh` | Control CLI: `build`/`doctor`/`shell`/`exec`/`scenario`/`suite`/`mine`/`mock`/`stop`/`report`/`reset` |
-| `sandbox/scenarios/live/*.toml` | 5 live scenarios: no-tool answer, shell reads workspace, denied-approval reporting, sub-agent spawn, RAG hint fires |
-| `sandbox/scenarios/mock/*.toml` | 2 deterministic scenarios: malformed-tool-call recovery, clean failure on 429 |
-| `sandbox/mock-scripts/*.toml` | Scripted replies: `plain-answer`, `malformed-then-recovers`, `rate-limited` |
+| `sandbox/scenarios/live/*.toml` | Live scenarios: no-tool answer, shell reads workspace, denied-approval reporting, sub-agent spawn, RAG hint fires |
+| `sandbox/scenarios/mock/*.toml` | Deterministic scenarios: malformed-tool-call recovery, clean failure on 429, gateway fallback (`falls-back-after-429`), CLI refusal → API (`cli-refusal-falls-back-to-api`), compaction rung 1, resume, project instructions, edits/plan/DSML |
+| `sandbox/mock-scripts/*.toml` | Scripted replies for the mock provider, incl. per-account gateway scripts (`gateway-fallback`, `cli-fallback`) |
+| `sandbox/gateway/*.toml` | Full configs for gateway scenarios (`two-mock-accounts`, `cli-then-api`) — `--config` for the run |
 | `sandbox/fixtures/tiny-repo/` | Read-only workspace scenarios run against (declares version `0.4.2`, which expectations assert on) |
 
 ## OTHER
@@ -172,6 +223,9 @@
 | `src/tools/tool_search.rs` | `tool_search` builtin — capability search over MCP tools, returns full definitions; lexical fallback pre-init. The escape hatch for deferred MCP schemas |
 | `src/tools/history_search.rs` | `history_search` builtin — agent-facing search over past sessions (session id + title + date + excerpt per hit) |
 | `src/app/search.rs` | `View::Search` state: query `InputState`, matches in ranker order, pure `visible_indices` (role filter → per-session dedup → sort), `spawn_history_search` |
+| `src/app/resume.rs`, `src/app/keys/resume.rs`, `src/tui/render/resume.rs` | `/resume` (= `/sessions`) full-screen session picker: folder scope + Tab, title filter, scrollbar (2026-11-14). Row shared with the home screen: `src/tui/render/session_row.rs` |
+| `src/tui/render/welcome.rs` | Home screen, drawn on its own: `center` (logo, boxed input, recent sessions) and `sheet` (question, chips); `visible_sessions` feeds the landing keys (2026-11-14) |
+| `src/app/ui_prefs.rs`, `src/commands/defs/view.rs` | `/panel`, `/landing` and Ctrl+B: change `[ui] panel` / `[ui] landing` and save |
 | `src/app/keys/search.rs` | Search-screen keys — two focus zones (query text vs results hotkeys: s/r/u/Enter-open/q) |
 | `src/tui/render/search.rs` | Search-screen render: query box w/ drawn cursor, filter chips bar, 3-row result items, selection-derived scroll |
 | `src/util.rs` | `atomic_write` (now actually used everywhere), `expand_tilde` (single shared impl), `truncate_at_char_boundary` |

@@ -74,6 +74,8 @@ pub async fn spawn_background(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Метка «запущено инструментом агента»: trust и secrets за ней отказывают.
+        .env(crate::secrets::human::AGENT_CHILD_ENV, "1")
         .kill_on_drop(true);
 
     // DETACHED_PROCESS: prevent console sharing on Windows so the child
@@ -236,6 +238,8 @@ pub async fn spawn_interactive(
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // PTY даёт ребёнку терминал, поэтому одной проверки TTY мало: метка нужна и здесь.
+    cmd.env(crate::secrets::human::AGENT_CHILD_ENV, "1");
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let child_pid = child.process_id();

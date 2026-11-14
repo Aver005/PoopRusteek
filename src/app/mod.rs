@@ -3,11 +3,14 @@ pub mod background_stats;
 pub mod conversation;
 pub mod dropped_paths;
 pub mod events;
+mod file_scan;
+pub mod gateway_view;
 pub mod generation;
 mod goal;
 pub mod input;
 mod interaction;
 mod keys;
+pub mod landing;
 pub mod list;
 pub mod mcp_add;
 pub mod mcp_status;
@@ -16,7 +19,9 @@ pub mod paste_burst;
 mod persist;
 mod pickers;
 pub mod providers;
+mod queue;
 pub mod reduce;
+pub mod resume;
 pub(crate) mod runtime;
 pub mod search;
 mod serve;
@@ -24,6 +29,8 @@ mod sessions;
 pub mod system_prompt;
 pub mod themes;
 mod timers;
+pub mod titles;
+mod ui_prefs;
 pub mod view_state;
 
 use crate::commands::CommandRegistry;
@@ -61,7 +68,7 @@ fn status_for(event: &AgentEvent) -> Option<String> {
         AgentEvent::Started => "Thinking...".to_string(),
         AgentEvent::Done(_) => "Ready".to_string(),
         AgentEvent::Failed(error) => error.clone(),
-        AgentEvent::ToolStarted { name } => format!("Running {name}..."),
+        AgentEvent::ToolStarted { name, .. } => format!("Running {name}..."),
         AgentEvent::ToolDone { .. } => "Tool finished".to_string(),
         AgentEvent::ToolError { error } => format!("Tool error: {error}"),
         AgentEvent::ToolOutputCleared {
@@ -122,6 +129,12 @@ fn switch_provider(
     epoch_cell: &Arc<AtomicU64>,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    // История остаётся, поэтому новый провайдер узнаёт, откуда она: чужие вызовы в ней он развернёт.
+    if let (Some(old), Some(new)) = (&state.focused().provider, &provider)
+        && let Some(origin) = old.route_state()
+    {
+        new.seed_route_state(origin);
+    }
     state.focused_mut().provider = provider;
     state.focused_mut().session_id = crate::session::create_session_id();
     let epoch = invalidate_context_window(state, epoch_cell);
@@ -168,6 +181,111 @@ pub struct App {
     /// Bumped on every provider/model switch. A window poll answers with the
     /// epoch it started under, so a slow one can never overwrite a newer.
     provider_window_epoch: Arc<AtomicU64>,
+    /// Шлюз аккаунтов и маршрутов. Выключенный не вмешивается в сборку провайдера.
+    gateway: crate::gateway::handle::GatewayHandle,
+    /// Пока движок собирается на `spawn_blocking`, `gateway` — ждущая ручка, а здесь её хозяин.
+    pending_gateway: Option<Arc<crate::gateway::pending::PendingGateway>>,
+}
+
+/// Строка статуса при старте, если конфиг включённого шлюза содержит ошибки.
+fn gateway_startup_note(gateway: &crate::gateway::handle::GatewayHandle) -> Option<String> {
+    use crate::gateway::types::Severity;
+    if !gateway.is_enabled() {
+        return None;
+    }
+    let errors: Vec<_> = gateway
+        .snapshot()
+        .problems
+        .into_iter()
+        .filter(|problem| problem.severity == Severity::Error)
+        .collect();
+    let first = errors.first()?;
+    Some(format!(
+        "Gateway config has {} error(s), the accounts and routes they touch are off. First: {}: {}",
+        errors.len(),
+        first.path,
+        first.message
+    ))
+}
+
+/// Шлюз для запуска. Выключенный готов сразу и ничего не читает; включённый собирается
+/// на `spawn_blocking` (секреты: хранилище, `cmd:`, файлы), результат приходит `GatewayBuilt`.
+/// Пока он не готов, ввод и панели живы, а запрос ждёт готовности.
+pub(crate) fn start_gateway(
+    config: &Config,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> (
+    crate::gateway::handle::GatewayHandle,
+    Option<Arc<crate::gateway::pending::PendingGateway>>,
+) {
+    let settings = crate::gateway::engine::gateway_config(config);
+    if !settings.gateway.enabled {
+        let deps = gateway_view::engine_deps(config, event_tx);
+        return (crate::gateway::engine::build_gateway(settings, deps), None);
+    }
+    let pending = crate::gateway::pending::PendingGateway::new(settings.clone());
+    let config = config.clone();
+    let tx = event_tx.clone();
+    let persist_tx = event_tx.clone();
+    tokio::spawn(async move {
+        let built = tokio::task::spawn_blocking(move || {
+            let deps = gateway_view::engine_deps(&config, &persist_tx);
+            crate::gateway::engine::build_gateway(settings, deps)
+        })
+        .await
+        .map_err(|error| error.to_string());
+        let _ = tx.send(AppEvent::GatewayBuilt(events::BuiltGateway(built)));
+    });
+    let handle: crate::gateway::handle::GatewayHandle =
+        Arc::new(crate::gateway::pending::PendingHandle(Arc::clone(&pending)));
+    (handle, Some(pending))
+}
+
+/// Нужна ли пересборка шлюза после перечитывания конфига.
+fn gateway_is_stale(gateway: &crate::gateway::handle::GatewayHandle, config: &Config) -> bool {
+    use crate::gateway::handle::{AccountStatus, BuildState};
+    let wanted = crate::gateway::engine::gateway_config(config)
+        .gateway
+        .enabled;
+    if wanted != gateway.is_enabled() {
+        return true;
+    }
+    if !wanted {
+        return false;
+    }
+    match gateway.build_state() {
+        BuildState::Failed(_) => true,
+        BuildState::Starting => false,
+        BuildState::Ready => gateway
+            .snapshot()
+            .accounts
+            .iter()
+            .any(|a| matches!(a.status, AccountStatus::Unavailable { .. })),
+    }
+}
+
+/// Передать события шлюза в цикл приложения. Задача кончается вместе со шлюзом.
+fn spawn_gateway_events(
+    gateway: &crate::gateway::handle::GatewayHandle,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    if !gateway.is_enabled() {
+        return;
+    }
+    let mut events = gateway.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event_tx.send(AppEvent::Gateway(event)).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// Run one self-update pass off the event loop and report through
@@ -230,9 +348,15 @@ pub struct AppState {
     pub error_count: usize,
     pub last_error: Option<String>,
     pub scroll_offset: u32,
+    /// Высота области переписки в прошлом кадре: от неё считается, на сколько
+    /// сдвинуть прокрутку, когда панель работы или поле ввода меняют высоту.
+    pub last_transcript_rows: u16,
     /// Высота терминала, обновляется на `Resize`. Клавиши приходят раньше
     /// отрисовки, а шаг `PageUp`/`PageDown` должен совпадать с экраном.
     pub terminal_rows: u16,
+    /// Ширина терминала, обновляется на `Resize`: окно подтверждения по ней
+    /// считает перенос строк, а клавиши прокрутки обязаны считать так же.
+    pub terminal_cols: u16,
     pub modal: Option<Modal>,
     /// Правила авто-одобрения. С областью, а не только с именем
     /// инструмента: см. `crate::whitelist`.
@@ -243,24 +367,33 @@ pub struct AppState {
     /// …and the ones parked behind it, FIFO. See `present_next_interaction`.
     pub pending_interactions: std::collections::VecDeque<PendingInteraction>,
     pub autocomplete: AutocompleteState,
+    /// Сканы папок для `@путь`: живёт отдельно, чтобы сброс меню не терял идущий скан.
+    pub(crate) file_scans: file_scan::ScanTracker,
+    /// Недавние сессии для главного экрана; читает фоновая задача.
+    pub landing: landing::LandingSessions,
     pub view: View,
     pub onboarding: OnboardingState,
     pub mcp_status: mcp_status::McpStatus,
-    pub providers_view: providers::ProvidersViewState,
+    pub gateway_view: gateway_view::GatewayView,
     pub search: search::SearchViewState,
+    pub resume: resume::ResumeState,
     pub themes: themes::ThemesViewState,
     pub workspace_path: String,
     /// Секция системного промпта из `AGENTS.md` рабочей папки и глобальных
     /// правил. Кэш: собирается при старте, на `/cwd` и по `/instructions
     /// reload`, а не на каждый ход (инвариант 1).
     pub instructions_section: String,
-    pub show_stats_panel: bool,
+    /// Боковая панель: `None` — по ширине окна (с `SIDEBAR_AUTO_COLS` колонок
+    /// включена), `Some` — решение человека (`Ctrl+B`, `/panel`, `[ui] panel`).
+    pub show_stats_panel: Option<bool>,
     pub attached_files: Vec<crate::provider::AttachedFile>,
 
     // Goal mode state
     pub goal: goal::GoalState,
 
     pub needs_terminal_restore: bool,
+    /// Перерисовать всё без выхода из альтернативного экрана (`Ctrl+L`).
+    pub needs_full_redraw: bool,
     pub background: background_stats::BackgroundCounters,
     /// Сколько таймеров взведено — для строки состояния. Обновляется тем же
     /// тиком, что их и будит (`app::timers`).
@@ -300,6 +433,23 @@ pub fn reload_instructions(state: &mut AppState, config: &Config) -> Option<Stri
 }
 
 impl AppState {
+    /// Показывается ли боковая панель в окне шириной `cols`.
+    pub fn stats_panel_visible(&self, cols: u16) -> bool {
+        self.show_stats_panel
+            .unwrap_or(cols >= crate::tui::render::SIDEBAR_AUTO_COLS)
+    }
+
+    /// Почему боковая панель сейчас не видна, хотя её включили: на приветствии
+    /// её нет, а узкому окну не хватает места. `None` — ничто не мешает.
+    pub fn stats_panel_blocker(&self) -> Option<String> {
+        if self.focused().messages.is_empty() && !self.focused().generation.active {
+            return Some("The side panel appears once the chat has messages".to_string());
+        }
+        let need = crate::tui::render::SIDEBAR_MIN_COLS;
+        (self.terminal_cols < need)
+            .then(|| format!("The side panel needs a window at least {need} columns wide"))
+    }
+
     /// Рабочая папка путём: от неё считаются `@file`, `/attach` и автодополнение.
     pub fn workspace(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.workspace_path)
@@ -315,26 +465,32 @@ impl AppState {
             error_count: 0,
             last_error: None,
             scroll_offset: 0,
+            last_transcript_rows: 0,
             terminal_rows: 0,
+            terminal_cols: 0,
             modal: None,
             approved_tools: crate::whitelist::Whitelist::default(),
             pending_tool_approval: None,
             pending_question: None,
             pending_interactions: std::collections::VecDeque::new(),
             autocomplete: AutocompleteState::default(),
+            file_scans: file_scan::ScanTracker::default(),
+            landing: landing::LandingSessions::default(),
             view: View::Chat,
             onboarding: OnboardingState::default(),
             mcp_status: mcp_status::McpStatus::default(),
-            providers_view: providers::ProvidersViewState::default(),
+            gateway_view: gateway_view::GatewayView::default(),
             search: search::SearchViewState::default(),
+            resume: resume::ResumeState::default(),
             themes: themes::ThemesViewState::default(),
             workspace_path: String::new(),
             instructions_section: String::new(),
-            show_stats_panel: true,
+            show_stats_panel: None,
             attached_files: Vec::new(),
             goal: goal::GoalState::default(),
             timers_pending: 0,
             needs_terminal_restore: false,
+            needs_full_redraw: false,
             background: background_stats::BackgroundCounters::default(),
             provider_context_window: 0,
         }
@@ -357,17 +513,20 @@ impl AppState {
 
     /// Append a system message to the focused conversation.
     pub fn push_system(&mut self, content: &str) {
+        // Заметка уходит в сессию и модели: ключ, попавший в текст, вычёркивается здесь.
+        let content = crate::secrets::redact::redact(content);
         self.focused_mut()
             .messages
-            .push(ChatMessage::system(content));
+            .push(ChatMessage::system(&content));
     }
 
     /// Сообщение только для человека. Не путать с `push_system`: тот уезжает
     /// модели в каждом последующем запросе, а такие заметки ей не нужны.
     pub fn push_ui_system(&mut self, content: &str) {
+        let content = crate::secrets::redact::redact(content);
         self.focused_mut()
             .messages
-            .push(ChatMessage::ui_system(content));
+            .push(ChatMessage::ui_system(&content));
     }
 
     /// Reset the focused conversation's chat view: wipe its messages and
@@ -377,6 +536,8 @@ impl AppState {
         self.focused_mut().messages.clear();
         self.scroll_offset = 0;
         self.autocomplete = AutocompleteState::default();
+        // Очередь относится к стёртой истории; её текст не пропадает молча.
+        self.restore_queued_to_input();
     }
 }
 
@@ -396,8 +557,20 @@ impl App {
         // Bridge ERROR-level logs to the in-UI red marker now that a channel
         // exists (see logging::setup). Idempotent across App re-creation.
         crate::logging::set_error_sink(event_tx.clone());
+        // Сохранение конфига ждёт файловый замок и пишет на диск: оно идёт в фоне, а
+        // ошибка приходит событием. Порядок правок очередь сохраняет.
+        let save_tx = event_tx.clone();
+        crate::config::enable_background_saves(move |message| {
+            let _ = save_tx.send(AppEvent::UpdateStatus {
+                message,
+                notable: true,
+            });
+        });
 
-        let provider: Option<Arc<dyn LLMProvider>> = crate::provider::build_provider(&config);
+        let (gateway, pending_gateway) = start_gateway(&config, &event_tx);
+        spawn_gateway_events(&gateway, event_tx.clone());
+        let provider: Option<Arc<dyn LLMProvider>> =
+            crate::gateway::handle::main_provider(&config, Some(&gateway));
 
         let mcp = Arc::new(tokio::sync::Mutex::new(MCPManager::new()));
         let tools = Arc::new(ToolRegistry::new());
@@ -426,6 +599,7 @@ impl App {
         // Всё остальное — значения по умолчанию из `AppState::new`; здесь
         // только то, что читается с диска и что решает наличие провайдера.
         let mut state = AppState::new(main_conversation);
+        state.show_stats_panel = config.ui.panel.forced();
         state.input.history = crate::session::load_history();
         let whitelist = crate::whitelist::load();
         state.approved_tools = whitelist.whitelist;
@@ -444,6 +618,11 @@ impl App {
             state.status_message = whitelist_notice
                 .or(instructions_notice)
                 .unwrap_or_else(|| "Ready".to_string());
+        } else if let Some(problem) = config.startup_problem() {
+            // Файл или хранилище не прочитались: это не «первый запуск». Онбординг поверх
+            // заставил бы вводить токен заново и затёр бы то, что лежит на диске.
+            state.status_message = problem.clone();
+            state.push_ui_system(&problem);
         } else {
             state.status_message = "No token configured".to_string();
             state.view = View::Onboarding;
@@ -455,6 +634,13 @@ impl App {
         // the chat non-empty and replace the home screen on every launch.
         if !config.migration_notices.is_empty() {
             state.status_message = config.migration_notices.join(" · ");
+        }
+
+        // Ошибки конфига шлюза: приложение запускается, а отключённые аккаунты названы.
+        if let Some(note) = gateway_startup_note(&gateway) {
+            state.status_message = note;
+        } else if pending_gateway.is_some() {
+            state.status_message = "Starting the gateway…".to_string();
         }
 
         // Semantic matcher: background init (first run downloads the
@@ -473,7 +659,8 @@ impl App {
         // manager (sending a turn, the /mcp view) stay responsive while
         // servers connect. Counts and the semantic MCP corpus catch up via
         // the 2s stats poll and `McpInitialized`.
-        {
+        // Тесты не поднимают настоящие серверы пользователя и не ловят чужое событие в канале.
+        if !cfg!(test) {
             let mcp = Arc::clone(&mcp);
             let semantic = Arc::clone(&semantic);
             let event_tx = event_tx.clone();
@@ -498,6 +685,7 @@ impl App {
         // entries in the background (`cache_ms` decides what "stale" means;
         // a fresh cache makes this a no-op network-wise).
         let provider_models = crate::provider::model_cache::ProviderModelCache::load();
+        provider_models.set_gateway(gateway.clone());
         if !config.providers.is_empty() {
             providers::spawn_models_refresh(
                 Arc::clone(&provider_models),
@@ -542,14 +730,23 @@ impl App {
             last_models_refetch: std::time::Instant::now(),
             update_in_flight,
             provider_window_epoch,
+            gateway,
+            pending_gateway,
+        })
+        .map(|mut app| {
+            // Проектный слой ждёт решения: спрашиваем сразу, не пряча молчаливый отказ в заметке.
+            app.refresh_gateway_view();
+            app.open_trust_dialog_if_needed();
+            app
         })
     }
 
     pub async fn run(&mut self) -> AppResult<()> {
         let mut terminal = crate::tui::init()?;
         // До первого Resize размер знает только терминал.
-        if let Ok((_, rows)) = crossterm::terminal::size() {
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
             self.state.terminal_rows = rows;
+            self.state.terminal_cols = cols;
         }
         let result = self.run_loop(&mut terminal).await;
         crate::tui::restore(&mut terminal)?;
@@ -587,6 +784,16 @@ impl App {
         // saves run on the persist worker now, and quitting right after a
         // turn completes must not lose that turn's save. Bounded like the
         // remote discards above: exiting must not hang on a wedged disk.
+        // Сохранения конфига дойдут до диска: на занятом диске запись занимает секунды.
+        // Пустая очередь не ждёт, а срыв срока видно в журнале, а не потеря молчком.
+        let flushed = tokio::task::spawn_blocking(|| {
+            crate::config::flush_saves(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap_or(false);
+        if !flushed {
+            tracing::error!("config saves did not reach the disk before exit");
+        }
         self.persister
             .flush(std::time::Duration::from_secs(3))
             .await;
@@ -680,6 +887,10 @@ impl App {
             }
         }
 
+        // Единственный выход очереди: что бы ни освободило чат — ход,
+        // `/compact`, отмена, — следующее сообщение уходит отсюда.
+        dirty |= self.drain_idle_queue().await;
+
         if self.state.view == View::Mcp {
             dirty |= self.state.mcp_status.refresh_view(&self.mcp).await;
         }
@@ -708,24 +919,44 @@ impl App {
             dirty = true;
         }
 
+        self.keep_scroll_when_layout_changes();
+
+        if std::mem::take(&mut self.state.needs_full_redraw) {
+            // Только сброс буфера: выхода из альтернативного экрана не нужно.
+            terminal.clear()?;
+            dirty = true;
+        }
+
         if dirty {
             self.render(terminal)?;
         }
         Ok(false)
     }
 
+    /// Человек читает историю с прокруткой вверх, а панель работы выросла или
+    /// ввод стал выше: область переписки сузилась, и без поправки текст уехал
+    /// бы на эти строки. Верхний край остаётся на месте.
+    fn keep_scroll_when_layout_changes(&mut self) {
+        let Some(rows) = crate::tui::render::transcript_rows(&self.state) else {
+            return;
+        };
+        self.state.scroll_offset = crate::tui::render::scroll_after_height_change(
+            self.state.scroll_offset,
+            self.state.last_transcript_rows,
+            rows,
+        );
+        self.state.last_transcript_rows = rows;
+    }
+
     /// Does a tick actually change pixels? The spinner and elapsed-time stats
     /// animate while the **focused** conversation is streaming — background
     /// streams repaint via their own chunk events, and every renderer reads
-    /// only the focused conversation's `animation_tick`; the landing logo
-    /// animates while the chat is empty and no modal covers it. The `Tick`
-    /// handler advances `animation_tick` under this exact predicate — keep
-    /// them in lockstep, or idle ticks either redraw an unchanged frame or
-    /// freeze the spinner.
+    /// only the focused conversation's `animation_tick`; the onboarding title
+    /// pulses. The home screen is static. The `Tick` handler advances
+    /// `animation_tick` under this exact predicate — keep them in lockstep, or
+    /// idle ticks either redraw an unchanged frame or freeze the spinner.
     fn tick_is_visual(&self) -> bool {
-        self.state.view == View::Onboarding
-            || self.state.focused().is_streaming()
-            || (self.state.focused().messages.is_empty() && self.state.modal.is_none())
+        self.state.view == View::Onboarding || self.state.focused().is_streaming()
     }
 
     /// Set the status line and mirror the same text into the focused chat as
@@ -744,8 +975,14 @@ impl App {
         match event {
             AppEvent::Key(key) => return self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
-            AppEvent::Resize { rows } => self.state.terminal_rows = rows,
+            AppEvent::Resize { cols, rows } => {
+                self.state.terminal_rows = rows;
+                self.state.terminal_cols = cols;
+            }
             AppEvent::Paste(text) => self.handle_paste(text),
+            AppEvent::PasteFailed(reason) => {
+                self.state.status_message = format!("Paste failed: {reason}");
+            }
             AppEvent::OnboardingActionDone { action, ok } => {
                 self.state.onboarding.report(action, ok);
             }
@@ -884,11 +1121,76 @@ impl App {
             AppEvent::ProviderModelsRefreshed { summary, failed } => {
                 self.on_provider_models_refreshed(summary, failed);
             }
+            AppEvent::Gateway(event) => self.on_gateway_event(event),
+            AppEvent::GatewayBuilt(built) => self.on_gateway_built(built),
+            AppEvent::ChatTitle {
+                conversation,
+                title,
+            } => self.on_chat_title(conversation, title),
+            AppEvent::GatewayPersist(next) => self.on_gateway_persist(*next),
+            AppEvent::AccountStored(plan) => self.on_account_stored(*plan),
+            AppEvent::LegacyProviderStored(plan) => self.on_legacy_provider_stored(*plan),
+            AppEvent::GatewayEnabled(result) => self.on_gateway_enabled(*result),
+            AppEvent::GatewayDisabled(result) => self.on_gateway_disabled(*result),
+            AppEvent::ConfigReloaded(loaded) => self.on_config_reloaded(*loaded),
+            AppEvent::ProjectConfigStamp(stamp) => self.on_project_stamp(stamp),
             AppEvent::HistorySearchDone { query, matches } => {
                 self.state.search.apply_results(&query, matches);
             }
+            AppEvent::LandingSessionsLoaded(sessions) => self.state.landing.apply(sessions),
+            AppEvent::ResumeSessionsLoaded(sessions) => self.on_resume_loaded(sessions),
+            AppEvent::AutocompleteReady { generation, items } => {
+                self.on_autocomplete_ready(generation, items);
+            }
         }
         Ok(false)
+    }
+
+    /// Событие шлюза. Экран аккаунтов читает снимок сам; здесь только строка статуса.
+    /// Движок собран: ждущие запросы продолжаются, дальше все берут провайдеров прямо у него.
+    fn on_gateway_built(&mut self, built: events::BuiltGateway) {
+        let Some(pending) = self.pending_gateway.take() else {
+            return;
+        };
+        match built.0 {
+            Ok(gateway) => {
+                pending.fulfil(Arc::clone(&gateway));
+                self.gateway = gateway;
+                self.provider_models.set_gateway(self.gateway.clone());
+                self.sync_server_gateway();
+                // Адаптеры собраны: каталог моделей аккаунтов можно наполнять.
+                providers::spawn_models_refresh(
+                    Arc::clone(&self.provider_models),
+                    self.config.providers.clone(),
+                    self.config.provider_models.cache_ms,
+                    false,
+                    self.event_tx.clone(),
+                );
+                self.state.status_message =
+                    gateway_startup_note(&self.gateway).unwrap_or_else(|| "Gateway ready".into());
+                self.refresh_gateway_view();
+                self.refresh_pins();
+                self.adopt_provider_after_edit();
+            }
+            Err(reason) => {
+                pending.fail(reason.clone());
+                let message = format!("The gateway failed to start: {reason}");
+                self.state.push_ui_system(&message);
+                self.state.status_message = message;
+            }
+        }
+    }
+
+    fn on_gateway_event(&mut self, event: crate::gateway::handle::GatewayEvent) {
+        use crate::gateway::handle::GatewayEvent;
+        if let GatewayEvent::FallbackTaken {
+            from, to, class, ..
+        } = &event
+        {
+            self.state.status_message =
+                format!("{from} failed ({}), switched to {to}", class.code());
+        }
+        self.on_gateway_event_view(&event);
     }
 
     /// Такт анимации и периодическая дозагрузка моделей.
@@ -898,6 +1200,11 @@ impl App {
             generation.animation_tick = generation.animation_tick.wrapping_add(1);
         }
         self.maybe_refetch_provider_models();
+        self.tick_gateway_view();
+        // Главный экран показывает сессии: держим список свежим, не трогая диск в кадре.
+        if self.state.view == View::Chat && self.state.focused().messages.is_empty() {
+            self.state.landing.refresh_if_stale(&self.event_tx);
+        }
     }
 
     /// Единственный вход агентских событий: историю меняет `reduce`, здесь
@@ -921,6 +1228,7 @@ impl App {
         let goal_end = end
             .clone()
             .filter(|_| self.state.goal.conversation == Some(target));
+        let finished = matches!(end, Some(reduce::TurnEnd::Done));
         match reduce::turn_tail(end, reduce::TurnOwner::classify(focused, background)) {
             reduce::TurnTail::None => {}
             reduce::TurnTail::Background(error) => self.finish_background(target, error),
@@ -928,6 +1236,10 @@ impl App {
                 self.record_gen_stats();
                 self.auto_save_session();
             }
+        }
+        // Ответ пришёл: заголовок просит служебная модель, в фоне и один раз на чат.
+        if finished {
+            self.maybe_request_chat_title(target);
         }
         // GOAL идёт по своему чату, а не по фокусу: смена чата его не клинит.
         match goal_end {
@@ -981,13 +1293,18 @@ impl App {
         // чаты Esc больше не гасит.
         let killed = self.state.background.cleanup_turn_of(conversation).await;
         self.state.focused_mut().generation.active = false;
+        self.state.focused_mut().current_tool = None;
+        let queued = self.state.restore_queued_to_input();
         // The aborted task may have been a `/compact`: drop its claim here, or
         // the command stays refused for this chat forever.
         self.state.focused_mut().compacting = None;
-        self.state.status_message = if killed > 0 {
-            format!("Cancelled; killed {killed} background process(es)")
-        } else {
-            "Cancelled".to_string()
+        self.state.status_message = match (killed, queued) {
+            (0, 0) => "Cancelled".to_string(),
+            (0, n) => format!("Cancelled; {n} queued message(s) returned to the input"),
+            (k, 0) => format!("Cancelled; killed {k} background process(es)"),
+            (k, n) => format!(
+                "Cancelled; killed {k} background process(es), {n} queued message(s) returned to the input"
+            ),
         };
         self.state.needs_terminal_restore = true;
         {
@@ -1144,14 +1461,33 @@ impl App {
 
     /// Execute `/wipe`: delete all app-owned data dirs, factory-reset in memory.
     pub(crate) async fn execute_wipe(&mut self) {
+        if let Some(reason) = crate::config::wipe_blocked_reason(crate::config::is_isolated()) {
+            self.state.status_message = reason.to_string();
+            self.state.push_ui_system(reason);
+            return;
+        }
         self.cancel_all_turns().await;
         // Drain queued writes first — a still-in-flight session save could
         // otherwise re-create files inside the directories deleted below.
         self.persister
             .flush(std::time::Duration::from_secs(3))
             .await;
+        // Поставленное в очередь сохранение не должно воскресить файл после удаления.
+        let _ = tokio::task::spawn_blocking(|| {
+            crate::config::flush_saves(std::time::Duration::from_secs(5))
+        })
+        .await;
         let roots = wipe_roots();
         let mut errors: Vec<String> = Vec::new();
+        // Ключи в системном хранилище, токены MCP и файлы конфига: папки их не содержат.
+        let config_snapshot = self.config.clone();
+        let leftovers = tokio::task::spawn_blocking(move || {
+            let servers: Vec<String> = crate::mcp::config::load_mcp_config().into_keys().collect();
+            crate::config::wipe_secrets_and_files(&config_snapshot, &servers)
+        })
+        .await
+        .unwrap_or_default();
+        errors.extend(leftovers);
         for root in &roots {
             match std::fs::remove_dir_all(root) {
                 Ok(()) => {}
@@ -1160,6 +1496,15 @@ impl App {
             }
         }
         self.config = crate::config::Config::default();
+        // Живой шлюз держит аккаунты и разрешённые секреты из стёртого конфига: пересобираем.
+        self.gateway = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&self.config),
+            gateway_view::engine_deps(&self.config, &self.event_tx),
+        );
+        // Сборка, которая шла в этот момент, больше не нужна: конфиг стёрт.
+        self.pending_gateway = None;
+        self.provider_models.set_gateway(self.gateway.clone());
+        self.sync_server_gateway();
         self.state.approved_tools = crate::whitelist::Whitelist::default();
         self.state.input.history.clear();
         if errors.is_empty() {
@@ -1212,10 +1557,34 @@ impl App {
     /// (used after config edits and `/providers` switches) and start a
     /// fresh session id so the next turn can't thread onto state that
     /// belonged to the previous provider.
+    /// Шлюз собирается заново, когда конфиг перечитан, а прежняя сборка упала, включена или
+    /// выключена правкой, либо оставила аккаунты недоступными (секрет, бинарь): правку видно сразу.
+    fn rebuild_gateway_if_stale(&mut self) {
+        if !gateway_is_stale(&self.gateway, &self.config) {
+            return;
+        }
+        let (gateway, pending) = start_gateway(&self.config, &self.event_tx);
+        self.gateway = gateway;
+        self.pending_gateway = pending;
+        self.provider_models.set_gateway(self.gateway.clone());
+        self.sync_server_gateway();
+    }
+
     pub(crate) fn rebuild_provider(&mut self) {
+        self.rebuild_gateway_if_stale();
+        // Закреплённый чат остаётся на своём аккаунте: пин пересобирается, а не сбрасывается.
+        self.refresh_pins();
+        if self
+            .state
+            .gateway_view
+            .pins
+            .contains_key(&self.state.conversations.focused_id())
+        {
+            return;
+        }
         switch_provider(
             &mut self.state,
-            crate::provider::build_provider(&self.config),
+            crate::gateway::handle::main_provider(&self.config, Some(&self.gateway)),
             &self.provider_window_epoch,
             &self.event_tx,
         );
@@ -1267,7 +1636,7 @@ impl App {
             }
             Event::Mouse(mouse) => AppEvent::Mouse(mouse),
             Event::Paste(text) => AppEvent::Paste(text),
-            Event::Resize(_, rows) => AppEvent::Resize { rows },
+            Event::Resize(cols, rows) => AppEvent::Resize { cols, rows },
             _ => return Ok((false, false)),
         };
         let quit = self.handle_event(app_event).await?;
@@ -1313,15 +1682,16 @@ async fn gather_paste_burst(
     burst.coalesce(batch, started, std::time::Instant::now())
 }
 
-/// Returns the deduplicated list of directories that own all app-owned data.
-/// On Windows config and data typically live in the same parent; on Linux they
-/// may differ (XDG_CONFIG_HOME vs XDG_DATA_HOME).
+/// Папки, чьё содержимое принадлежит приложению: данные и старые места конфига и данных.
+/// `~/.pooprusteek` сюда не входит — там лежат правила пользователя (`AGENTS.md`);
+/// файлы конфига удаляет `config::wipe_secrets_and_files`.
 fn wipe_roots() -> Vec<std::path::PathBuf> {
-    let config_dir = crate::config::Config::path()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(crate::config::Config::path);
-    let mut roots = vec![config_dir, crate::config::Config::data_dir()];
+    let mut roots = vec![crate::config::Config::data_dir()];
+    roots.extend(crate::config::legacy_data_dir());
+    roots.extend(
+        crate::config::legacy_config_file()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf)),
+    );
     roots.sort();
     roots.dedup();
     roots
@@ -1477,6 +1847,254 @@ mod window_tests {
                 .await
                 .is_err(),
             "the provider we switched away from must not overwrite the new window"
+        );
+    }
+
+    fn history_with_calls() -> Vec<ChatMessage> {
+        let mut assistant = ChatMessage::assistant("looking");
+        assistant.tool_calls = vec![crate::provider::ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+            provider_state: Some(serde_json::json!({"thoughtSignature": "sig"})),
+        }];
+        vec![
+            ChatMessage::user("read it"),
+            assistant,
+            ChatMessage::tool("call_1", "contents"),
+            ChatMessage::user("and now?"),
+        ]
+    }
+
+    /// Переключение провайдера оставляет историю, поэтому новый узнаёт, откуда она.
+    #[tokio::test]
+    async fn switching_provider_hands_the_route_origin_to_the_new_one() {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, ask, ask_with, rig};
+        let rig = rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut state = test_state();
+
+        // Беседа шла на a, потом a остыл: новый провайдер уйдёт на b и не должен получить подписи a.
+        let old = rig.main();
+        ask(&old, "hi").await.0.unwrap();
+        state.focused_mut().provider = Some(old);
+        rig.cool("a", 300);
+        let fresh = rig.main();
+        switch_provider(&mut state, Some(Arc::clone(&fresh)), &epoch, &tx);
+        ask_with(&fresh, history_with_calls()).await.0.unwrap();
+        let seen = rig.fakes["b"].last_messages();
+        assert!(seen[1].tool_calls.is_empty(), "b never sees a's ids");
+        assert!(seen[1].content.contains("<tool_use>"));
+
+        // Обратная сторона: цель не сменилась — вызовы остаются как были.
+        let rig = rig_pair();
+        let old = rig.main();
+        ask(&old, "hi").await.0.unwrap();
+        state.focused_mut().provider = Some(old);
+        let same = rig.main();
+        switch_provider(&mut state, Some(Arc::clone(&same)), &epoch, &tx);
+        ask_with(&same, history_with_calls()).await.0.unwrap();
+        assert_eq!(rig.fakes["a"].last_messages()[1].tool_calls.len(), 1);
+    }
+
+    fn rig_pair() -> crate::gateway::testkit::Rig {
+        use crate::gateway::testkit::{FakeBackend, TWO_ACCOUNTS, rig};
+        rig(
+            TWO_ACCOUNTS,
+            vec![
+                ("a", FakeBackend::new(vec![])),
+                ("b", FakeBackend::new(vec![])),
+            ],
+        )
+    }
+
+    /// Отзыв доверия или `/cd` пересобирает шлюз в «выключен»; запущенный `/serve` не должен
+    /// продолжать отдавать аккаунты прежнего движка.
+    #[tokio::test]
+    async fn restarting_into_a_disabled_gateway_takes_the_running_server_with_it() {
+        let mut config = Config::default();
+        config.semantic.enabled = false;
+        config.update.auto = false;
+        config.server.port = 0;
+        let mut app = App::new(config).await.expect("the app starts");
+        app.gateway = Arc::new(rig_pair().engine);
+        app.start_server("test");
+        let addr = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), app.event_rx.recv())
+                .await
+                .expect("the server starts")
+                .expect("channel open")
+            {
+                AppEvent::ServerStarted { addr, .. } => break addr,
+                _ => continue,
+            }
+        };
+        let models = || async {
+            reqwest::get(format!("http://{addr}/v1/models"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["data"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(usize::MAX)
+        };
+        assert!(models().await > 0, "the live engine's accounts are served");
+
+        // Конфиг приложения — выключенный шлюз (слой пропал): пересборка.
+        app.restart_gateway();
+        assert!(!app.gateway.is_enabled());
+        assert_eq!(models().await, 0, "the server follows the rebuilt gateway");
+        app.server.as_ref().unwrap().request_shutdown();
+    }
+
+    #[test]
+    fn a_gateway_with_config_errors_is_named_at_startup_and_a_healthy_one_is_silent() {
+        use crate::gateway::handle::GatewayHandle;
+        use crate::gateway::testkit::TWO_ACCOUNTS;
+        let bad = TWO_ACCOUNTS.replace(
+            "model = \"model-a\"",
+            "model = \"model-a\"\n[accounts.limits]\nmax_concurrency = 0",
+        );
+        let broken: GatewayHandle = Arc::new(crate::gateway::testkit::rig(&bad, Vec::new()).engine);
+        let note = gateway_startup_note(&broken).expect("the errors are named");
+        assert!(
+            note.contains("1 error") && note.contains("max_concurrency"),
+            "{note}"
+        );
+        let healthy: GatewayHandle = Arc::new(rig_pair().engine);
+        assert_eq!(gateway_startup_note(&healthy), None);
+        let off: GatewayHandle = Arc::new(crate::gateway::handle::DisabledGateway::new());
+        assert_eq!(gateway_startup_note(&off), None);
+    }
+}
+
+#[cfg(test)]
+mod gateway_start_tests {
+    use super::*;
+
+    /// Секрет читается медленно (`cmd:` ждёт), а запуск не ждёт: ручка отдаётся сразу, ввод и
+    /// панели живы, движок приходит событием.
+    #[tokio::test]
+    async fn a_slow_secret_never_stalls_startup_and_the_engine_arrives_as_an_event() {
+        let slow = if cfg!(windows) {
+            r#"cmd:["cmd","/C","ping -n 3 127.0.0.1 > nul && echo slow-key"]"#
+        } else {
+            r#"cmd:["sh","-c","sleep 2; echo slow-key"]"#
+        };
+        let config = crate::config::parse(&format!(
+            "[gateway]\nenabled = true\n[[accounts]]\nid = \"a\"\nprovider = \"custom\"\nbase_url = \"http://127.0.0.1:1/v1\"\nsecret = '{slow}'\nmodel = \"m\"\n[[routes]]\nid = \"main\"\nsteps = [{{ account = \"a\" }}]\n[roles]\nmain = \"main\"\n"
+        ))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let (handle, pending) = start_gateway(&config, &tx);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "startup must not wait for the secret, took {:?}",
+            started.elapsed()
+        );
+        assert!(pending.is_some() && handle.is_enabled());
+        assert!(handle.snapshot().problems[0].message.contains("starting"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the engine must arrive")
+            .expect("channel open");
+        let AppEvent::GatewayBuilt(built) = event else {
+            panic!("expected GatewayBuilt, got {event:?}");
+        };
+        let engine = built.0.expect("built");
+        assert_eq!(
+            engine.snapshot().accounts.len(),
+            1,
+            "the secret was resolved off the loop"
+        );
+    }
+
+    /// Упавшая сборка, правка включённости и недоступный аккаунт требуют пересборки; здоровый — нет.
+    #[tokio::test]
+    async fn a_reloaded_config_rebuilds_a_broken_gateway_and_leaves_a_healthy_one() {
+        let text = |enabled: bool, secret: &str| {
+            format!(
+                "[gateway]
+enabled = {enabled}
+[[accounts]]
+id = \"a\"
+provider = \"custom\"
+base_url = \"http://127.0.0.1:1/v1\"
+secret = \"{secret}\"
+model = \"m\"
+"
+            )
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let good = crate::config::parse(&text(true, "none")).unwrap();
+        let off = crate::config::parse(&text(false, "none")).unwrap();
+        let missing =
+            crate::config::parse(&text(true, "env:POOPRUSTEEK_STALE_TEST_MISSING")).unwrap();
+
+        let (disabled, _) = start_gateway(&off, &tx);
+        assert!(!gateway_is_stale(&disabled, &off), "off and wanted off");
+        assert!(
+            gateway_is_stale(&disabled, &good),
+            "the file now enables it"
+        );
+
+        let engine = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&good),
+            crate::gateway::engine::EngineDeps {
+                data_dir: None,
+                ..crate::gateway::engine::EngineDeps::for_config(&good)
+            },
+        );
+        assert!(
+            !gateway_is_stale(&engine, &good),
+            "a healthy gateway is left alone"
+        );
+        assert!(gateway_is_stale(&engine, &off), "the file now disables it");
+
+        let broken = crate::gateway::engine::build_gateway(
+            crate::gateway::engine::gateway_config(&missing),
+            crate::gateway::engine::EngineDeps {
+                data_dir: None,
+                ..crate::gateway::engine::EngineDeps::for_config(&missing)
+            },
+        );
+        assert!(
+            gateway_is_stale(&broken, &missing),
+            "an unavailable account is retried on reload"
+        );
+
+        let failed = crate::gateway::pending::PendingGateway::new(
+            crate::gateway::engine::gateway_config(&good),
+        );
+        failed.fail("task panicked".into());
+        let handle: crate::gateway::handle::GatewayHandle =
+            Arc::new(crate::gateway::pending::PendingHandle(failed));
+        assert!(
+            gateway_is_stale(&handle, &good),
+            "a failed build is retried"
+        );
+    }
+
+    /// Выключенный шлюз готов сразу и ничего не читает: прежний путь.
+    #[tokio::test]
+    async fn a_disabled_gateway_is_ready_at_once_and_reads_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (handle, pending) = start_gateway(&Config::default(), &tx);
+        assert!(pending.is_none() && !handle.is_enabled());
+        assert!(
+            rx.try_recv().is_err(),
+            "no build event for a disabled gateway"
         );
     }
 }

@@ -90,6 +90,35 @@ impl InputState {
         true
     }
 
+    /// Ctrl+T: перевести набранное не в той раскладке (ghbdtn ↔ привет). Только
+    /// выделение, если оно есть, иначе всё поле; чипы не трогаются. `false` — нечего.
+    pub fn switch_layout(&mut self) -> bool {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let (start, end) = match self.selection_anchor {
+            Some(anchor) if anchor != self.cursor => {
+                (anchor.min(self.cursor), anchor.max(self.cursor))
+            }
+            _ => (0, chars.len()),
+        };
+        let chips = self.chip_spans();
+        let in_scope =
+            |i: usize| i >= start && i < end && !chips.iter().any(|&(s, e)| i >= s && i < e);
+        let source: String = (0..chars.len())
+            .filter(|&i| in_scope(i))
+            .map(|i| chars[i])
+            .collect();
+        let Some(shift) = crate::keyboard::LayoutShift::for_text(&source) else {
+            return false;
+        };
+        // Знак переводится в знак: длина та же, курсор и выделение остаются на месте.
+        self.buffer = chars
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| if in_scope(i) { shift.convert(c) } else { c })
+            .collect();
+        true
+    }
+
     /// Места чипов в буфере — индексы знаков, конец не включён.
     fn chip_spans(&self) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
@@ -291,6 +320,61 @@ impl InputState {
         self.selection_anchor = None;
         self.pastes.clear();
         self.file_chips.clear();
+    }
+
+    /// Файловые чипы, которые ещё стоят в тексте: с ними сообщение уходит в очередь.
+    pub fn present_chips(&self) -> Vec<FileChip> {
+        self.file_chips
+            .iter()
+            .filter(|chip| self.buffer.contains(&chip.placeholder))
+            .cloned()
+            .collect()
+    }
+
+    /// Вернуть в поле текст, который из него уже ушёл (очередь отменённого
+    /// хода): ниже того, что человек успел набрать, курсор в конце. Чипы
+    /// встают настоящими вложениями; одноимённый чип, что уже есть в поле,
+    /// переименовывается, чтобы два файла не слились в один.
+    pub fn append_restored(&mut self, text: &str, chips: Vec<FileChip>) {
+        let mut text = text.to_string();
+        let mut kept = Vec::new();
+        for mut chip in chips {
+            if !text.contains(&chip.placeholder) {
+                continue;
+            }
+            if self.placeholder_taken(&chip.placeholder) {
+                let inner = chip
+                    .placeholder
+                    .trim_start_matches("[📎 ")
+                    .trim_end_matches(']')
+                    .to_string();
+                let renamed = (2..)
+                    .map(|n| format!("[📎 {inner} #{n}]"))
+                    .find(|candidate| {
+                        !self.placeholder_taken(candidate) && !text.contains(candidate)
+                    })
+                    .unwrap_or_else(|| chip.placeholder.clone());
+                text = text.replace(&chip.placeholder, &renamed);
+                chip.placeholder = renamed;
+            }
+            kept.push(chip);
+        }
+        if text.is_empty() {
+            return;
+        }
+        if !self.buffer.is_empty() {
+            self.buffer.push('\n');
+        }
+        self.buffer.push_str(&text);
+        self.file_chips.extend(kept);
+        self.cursor = self.buffer.chars().count();
+        self.selection_anchor = None;
+    }
+
+    /// Занят ли такой чип: он уже стоит в тексте или записан в черновике.
+    fn placeholder_taken(&self, candidate: &str) -> bool {
+        self.buffer.contains(candidate)
+            || self.file_chips.iter().any(|c| c.placeholder == candidate)
     }
 
     /// Insert a newline at the cursor, replacing any selection first.
@@ -600,6 +684,24 @@ mod tests {
         // Cursor sits after the chip; the newlines never entered the buffer.
         assert!(!s.buffer.contains('\n'));
         assert_eq!(s.expanded(), "hi line one\nline two\nline three");
+    }
+
+    /// Ctrl+T переводит всё поле или только выделение и не ломает чипы.
+    #[test]
+    fn switching_the_layout_keeps_chips_and_respects_the_selection() {
+        let mut s = at("ghbdtn ", 7);
+        s.insert_paste("a\nb".to_string());
+        assert!(s.switch_layout());
+        assert_eq!(s.buffer, "привет [Pasted #1, 2 lines]");
+        assert_eq!(s.expanded(), "привет a\nb");
+
+        let mut s = at("hello ghbdtn", 12);
+        s.selection_anchor = Some(6);
+        assert!(s.switch_layout());
+        assert_eq!(s.buffer, "hello привет");
+        assert_eq!((s.selection_anchor, s.cursor), (Some(6), 12));
+
+        assert!(!at("123", 3).switch_layout());
     }
 
     #[test]
@@ -946,5 +1048,24 @@ two"
         s.insert_newline();
         assert!(s.buffer.starts_with("[📎 a.pdf]\n"), "{:?}", s.buffer);
         assert_eq!(s.chip_files().len(), 1);
+    }
+
+    #[test]
+    fn restored_text_goes_below_what_was_typed_and_moves_the_cursor_to_the_end() {
+        let mut input = InputState::default();
+        input.buffer = "typed".to_string();
+        input.cursor = 5;
+        input.append_restored("first\nsecond", Vec::new());
+        assert_eq!(input.buffer, "typed\nfirst\nsecond");
+        assert_eq!(input.cursor, input.buffer.chars().count());
+    }
+
+    #[test]
+    fn restoring_into_an_empty_input_adds_no_leading_newline() {
+        let mut input = InputState::default();
+        input.append_restored("only", Vec::new());
+        assert_eq!(input.buffer, "only");
+        input.append_restored("", Vec::new());
+        assert_eq!(input.buffer, "only");
     }
 }

@@ -12,7 +12,18 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "net",
+    "process",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+    "io-std",
+] }
 # TUI
 # `unstable-rendered-line-info` exposes Paragraph::line_count — the real
 # WordWrapper row count used for scroll math (estimates diverge on CJK/wrap).
@@ -41,7 +52,9 @@ clap = { version = "4", features = ["derive"] }
 
 # Config
 toml = "1"
-dirs = "6"
+# Точечная правка TOML: комментарии и порядок ключей переживают сохранение.
+toml_edit = "0.25"
+dirs = "7"
 
 # Logging / tracing
 tracing = "0.1"
@@ -53,31 +66,29 @@ async-trait = "0.1"
 
 # Markdown / syntax
 pulldown-cmark = "0.13"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "default-themes",
+    "regex-fancy",
+] }
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-textwrap = "0.16"
 unicode-width = "0.2"
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 regex = "1"
-wasmtime = "27"
+wasmtime = { version = "36", default-features = false, features = [
+    "std",
+    "cranelift",
+    "runtime",
+] }
 
 # MCP OAuth: encrypted token storage, browser launch, PKCE challenge
-keyring = "4"
-# `keyring` 4.1.3's own default-store auto-init (`v1::Entry::new`) has a
-# logic bug (`AtomicBool::compare_exchange(false, true, ..) == Ok(true)` can
-# never be true on the success path — CAS success from `false` always
-# returns `Ok(false)`) that leaves no store registered, so every `Entry::new`
-# fails with `NoDefaultStore`. `oauth_store.rs` works around it by doing the
-# same one-time init itself via `keyring-core::set_default_store` — these
-# are the same backend crates `keyring`'s own `v1` feature already pulls in
-# per target (see the `[target...]` tables below), just named directly so we
-# can call the setter ourselves.
-keyring-core = "1"
+keyring = "4.2"
 open = "5"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # PTY for interactive CLI tools (arrow-key menus, REPLs)
 portable-pty = "0.9"
@@ -92,13 +103,16 @@ fastembed = { version = "5.17.2", default-features = false, features = [
 rust-stemmers = "1.2.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = "1"
 # GlobalMemoryStatusEx (auto-size embedder batch) + SetStdHandle (redirect
 # stderr into errors.log so ONNX Runtime's output can't corrupt the TUI) +
 # Job Objects (kill-on-close so detached background jobs can't outlive a
 # force-closed app; see tools::background::types::win_job) + Registry (sync the
-# installer's DisplayVersion after a self-update; see update::install_record).
+# installer's DisplayVersion after a self-update; see update::install_record) +
+# clipboard read (conhost in raw mode does not paste for us; see clipboard::read).
 windows-sys = { version = "0.60", features = [
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Console",
@@ -108,16 +122,10 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Threading",
 ] }
 
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-apple-native-keyring-store = { version = "1", features = ["keychain"] }
-
 # libc for: total physical RAM (macOS sysctl hw.memsize; auto-size embedder
 # batch) and stderr fd redirect into errors.log (dup2, all unix).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
-zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 # Rust 1.97's new `linker_messages` lint surfaces everything the linker
 # prints. MSVC's link.exe unconditionally emits an informational "Creating

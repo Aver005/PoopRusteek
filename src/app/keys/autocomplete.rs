@@ -1,9 +1,18 @@
 //! Autocomplete: dropdown navigation interception, suggestion refresh (both
 //! `/command` and `@file` modes), and acceptance of the selected entry.
 
+use crate::app::events::AppEvent;
+use crate::app::file_scan::{FileScan, Launch, next_scan_generation};
 use crate::app::{AUTOCOMPLETE_VISIBLE, App, AutocompleteState};
 use crate::commands::CommandSuggestion;
-use crate::util::format_size;
+
+/// Какой `@путь` стоит в буфере: его скан и нужен, если ввод сейчас можно
+/// дополнять. `None` — файловых подсказок не нужно.
+fn wanted_scan(buffer: &str, workspace: &std::path::Path) -> Option<FileScan> {
+    let at_pos = buffer.rfind('@')?;
+    let path_part = buffer[at_pos + 1..].split_whitespace().next().unwrap_or("");
+    (!path_part.is_empty()).then(|| FileScan::parse(path_part, workspace))
+}
 
 impl App {
     /// Intercept dropdown-navigation keys while the autocomplete popup is
@@ -48,73 +57,16 @@ impl App {
     pub(super) fn refresh_autocomplete(&mut self) {
         let buf = self.state.input.buffer.clone();
 
-        // Check for @-triggered file path completion
-        if let Some(at_pos) = buf.rfind('@') {
-            let after_at = &buf[at_pos + 1..];
-            let path_part = after_at.split_whitespace().next().unwrap_or("");
-            if !path_part.is_empty()
-                && !self.state.focused_mut().generation.active
-                && self.state.modal.is_none()
-            {
-                // От рабочей папки, как `@file` в тексте и `/attach`.
-                let cwd = self.state.workspace();
-                let search_path = if path_part.contains('/') || path_part.contains('\\') {
-                    std::path::Path::new(path_part).to_path_buf()
-                } else {
-                    cwd.join(path_part)
-                };
-                let parent = search_path.parent().unwrap_or(&cwd);
-                let prefix = search_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-
-                let mut items = Vec::new();
-                if let Ok(read_dir) =
-                    std::fs::read_dir(if path_part.contains('/') || path_part.contains('\\') {
-                        if parent.is_absolute() {
-                            parent.to_path_buf()
-                        } else {
-                            cwd.join(parent)
-                        }
-                    } else {
-                        cwd.clone()
-                    })
-                {
-                    for entry in read_dir.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.to_lowercase().starts_with(&prefix) {
-                            let full_path = entry.path();
-                            let display = full_path.to_string_lossy().to_string();
-                            let is_dir = full_path.is_dir();
-                            let suffix = if is_dir { "/" } else { "" };
-                            let desc = if is_dir {
-                                "dir".to_string()
-                            } else {
-                                let meta = full_path.metadata().ok();
-                                let size = meta.map(|m| m.len()).unwrap_or(0);
-                                format_size(size)
-                            };
-                            items.push(CommandSuggestion {
-                                name: format!("{}{}", name, suffix),
-                                description: desc,
-                                usage: display.clone(),
-                            });
-                        }
-                    }
-                }
-                items.sort_by(|a, b| {
-                    let a_dir = a.usage.ends_with('/');
-                    let b_dir = b.usage.ends_with('/');
-                    a_dir.cmp(&b_dir).then(a.name.cmp(&b.name))
-                });
-                self.state.autocomplete.items = items;
-                self.state.autocomplete.visible = !self.state.autocomplete.items.is_empty();
-                self.state.autocomplete.cursor.reset();
-                self.state.autocomplete.file_mode = true;
-                return;
+        // `@путь`: папку читает фоновая задача, результат придёт событием.
+        if !self.state.focused_mut().generation.active
+            && self.state.modal.is_none()
+            && let Some(scan) = wanted_scan(&buf, &self.state.workspace())
+        {
+            self.state.autocomplete.file_mode = true;
+            if let Some(launch) = self.state.file_scans.want(scan, next_scan_generation()) {
+                self.spawn_file_scan(launch);
             }
+            return;
         }
 
         // Command autocomplete
@@ -126,6 +78,9 @@ impl App {
             && !self.state.focused_mut().generation.active
             && self.state.modal.is_none()
             && !buf[1..].contains(char::is_whitespace);
+        // Ответ запоздавшего скана файлов теперь никому не нужен; идущий скан
+        // доработает сам, но показан не будет.
+        self.state.file_scans.leave();
         if !active {
             self.state.autocomplete.visible = false;
             self.state.autocomplete.items.clear();
@@ -137,6 +92,39 @@ impl App {
         self.state.autocomplete.visible = !self.state.autocomplete.items.is_empty();
         self.state.autocomplete.cursor.reset();
         self.state.autocomplete.file_mode = false;
+    }
+
+    /// Запустить скан папки на блокирующем потоке; ответ придёт событием.
+    fn spawn_file_scan(&self, (generation, scan): Launch) {
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let items = scan.run();
+            let _ = event_tx.send(AppEvent::AutocompleteReady { generation, items });
+        });
+    }
+
+    /// Скан папки закончился. Устаревший ответ (ввод успел измениться, закрыться
+    /// или уйти из `@`) отбрасывается; освободившийся слот берёт самый свежий
+    /// отложенный запрос.
+    pub(crate) fn on_autocomplete_ready(&mut self, generation: u64, items: Vec<CommandSuggestion>) {
+        let (show, next) = self
+            .state
+            .file_scans
+            .finish(generation, next_scan_generation);
+        // Меню могли закрыть Esc или Enter, не сказав сканам: сверяем с буфером.
+        let still_wanted = wanted_scan(&self.state.input.buffer, &self.state.workspace()).is_some()
+            && !self.state.focused().generation.active
+            && self.state.modal.is_none();
+        if show && still_wanted {
+            let autocomplete = &mut self.state.autocomplete;
+            autocomplete.visible = !items.is_empty();
+            autocomplete.items = items;
+            autocomplete.cursor.reset();
+            autocomplete.file_mode = true;
+        }
+        if let Some(launch) = next {
+            self.spawn_file_scan(launch);
+        }
     }
 
     /// Автодополнение ходит по кругу — своя политика, общее окно.
@@ -167,7 +155,8 @@ impl App {
 
         if self.state.autocomplete.file_mode {
             let path = std::path::Path::new(&suggestion.usage);
-            if path.is_dir() {
+            // Папку отличает косая черта в имени: `is_dir()` ходил бы на диск.
+            if suggestion.name.ends_with('/') {
                 let at_pos = self.state.input.buffer.rfind('@').unwrap_or(0);
                 let before_at = self.state.input.buffer[..at_pos].to_string();
                 let new_buf = format!("{}@{}/", before_at, suggestion.name.trim_end_matches('/'));

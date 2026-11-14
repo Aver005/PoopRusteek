@@ -51,9 +51,11 @@ impl Command for ImportCommand {
                 model_type: config.provider.model.clone(),
                 messages: messages.clone(),
                 tag: Some("Imported".to_string()),
+                title: None,
                 provider_session_id: None,
                 provider_parent_message_id: None,
                 broken: false,
+                route_state: None,
             };
 
             if let Err(e) = crate::session::save_local(&session, config) {
@@ -73,6 +75,7 @@ impl Command for ImportCommand {
             state.input.buffer.clear();
             state.input.cursor = 0;
             state.input.selection_anchor = None;
+            state.restore_queued_to_input();
             state.focused_mut().generation.active = false;
 
             state.status_message = format!(

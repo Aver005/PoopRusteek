@@ -58,6 +58,8 @@ Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
 [CustomMessages]
 en.DeleteUserData=Also delete your settings, sessions and downloaded model?%n%n%1
 ru.DeleteUserData=Удалить также настройки, сессии и скачанную модель?%n%n%1
+en.DeleteConfigFiles=Also delete your settings file (config.toml and its backups) in %1?%n%nYour own rules (AGENTS.md), skills and account logins in that folder are kept.
+ru.DeleteConfigFiles=Удалить также файл настроек (config.toml и его копии) в %1?%n%nВаши правила (AGENTS.md), скиллы и входы аккаунтов в этой папке останутся.
 en.DirNotWritable=Can't write to %1.%n%nChoose a folder in your user profile — updates are installed there too.
 ru.DirNotWritable=Нет прав на запись в %1.%n%nВыберите папку в профиле пользователя — туда же ставятся обновления.
 en.Downgrade=A newer version (%1) is already installed.%n%nReplace it with the older %2?
@@ -194,16 +196,63 @@ begin
     AddToUserPath(ExpandConstant('{app}'));
 end;
 
+// Файлы настроек в ~\.pooprusteek. Остальное там (AGENTS.md, скиллы, входы аккаунтов) — ваше.
+procedure AskDeleteConfigFiles;
+var
+  ConfigDir: String;
+  Names: array of String;
+  I: Integer;
+  Found: Boolean;
+begin
+  ConfigDir := ExpandConstant('{%USERPROFILE}\.pooprusteek');
+  SetArrayLength(Names, 3);
+  Names[0] := 'config.toml';
+  Names[1] := 'config.toml.pre-gateway';
+  Names[2] := 'config.toml.lock';
+  Found := False;
+  for I := 0 to GetArrayLength(Names) - 1 do
+    if FileExists(ConfigDir + '\' + Names[I]) then
+      Found := True;
+  if not Found then
+    Exit;
+  if MsgBox(FmtMessage(CustomMessage('DeleteConfigFiles'), [ConfigDir]),
+            mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+  begin
+    for I := 0 to GetArrayLength(Names) - 1 do
+      DeleteFile(ConfigDir + '\' + Names[I]);
+    // Пустую папку убираем, непустую (ваши правила) RemoveDir не тронет.
+    RemoveDir(ConfigDir);
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  DataDir: String;
+  NewData, OldData, Shown: String;
 begin
   if CurUninstallStep = usUninstall then
     RemoveFromUserPath(ExpandConstant('{app}'));
-  // Конфиг и данные — dirs::config_dir()/data_dir(), на Windows оба в Roaming.
-  DataDir := ExpandConstant('{userappdata}\pooprusteek');
-  if (CurUninstallStep = usPostUninstall) and not UninstallSilent and DirExists(DataDir) then
-    if MsgBox(FmtMessage(CustomMessage('DeleteUserData'), [DataDir]),
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-      DelTree(DataDir, True, True, True);
+  if (CurUninstallStep <> usPostUninstall) or UninstallSilent then
+    Exit;
+  // Данные и кэш живут в локальной папке; прежнее место (до переезда) — Roaming.
+  NewData := ExpandConstant('{localappdata}\pooprusteek');
+  OldData := ExpandConstant('{userappdata}\pooprusteek');
+  Shown := '';
+  if DirExists(NewData) then
+    Shown := NewData;
+  if DirExists(OldData) then
+  begin
+    if Shown <> '' then
+      Shown := Shown + #13#10;
+    Shown := Shown + OldData;
+  end;
+  if (Shown <> '') and
+     (MsgBox(FmtMessage(CustomMessage('DeleteUserData'), [Shown]),
+             mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES) then
+  begin
+    if DirExists(NewData) then
+      DelTree(NewData, True, True, True);
+    if DirExists(OldData) then
+      DelTree(OldData, True, True, True);
+  end;
+  AskDeleteConfigFiles;
 end;

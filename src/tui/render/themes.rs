@@ -7,6 +7,7 @@
 
 use super::chrome::{panel_footer, panel_frame};
 use super::popup::{option_row, push_text_box_lines};
+use super::util::{fit_col, truncate};
 use crate::app::list::{ListWindow, NAV_HINT, rows as list_rows};
 use crate::app::themes::{
     ThemeRowKind, ThemeWizardState, ThemeWizardStep, ThemesViewState, theme_rows,
@@ -84,25 +85,30 @@ fn render_theme_list(
         let row = &rows[i];
         let selected = i == view.selected;
         let bg = if selected { theme.selection } else { theme.bg };
-        let marker = if row.active { " ● " } else { "   " };
+        let glyph = crate::tui::glyphs::get();
+        let marker = format!(
+            " {} ",
+            fit_col(if row.active { glyph.radio_on } else { "" }, 3)
+        );
         let label_style = match row.kind {
             _ if selected => Style::default()
-                .fg(theme.accent)
+                .fg(theme.fg)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
             ThemeRowKind::Create => Style::default().fg(theme.accent_soft),
             _ => Style::default().fg(theme.fg),
         };
+        let detail_room = (inner.width as usize).saturating_sub(7);
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(theme.success).bg(bg)),
             Span::styled(
-                if selected { "▶ " } else { "  " },
+                if selected { glyph.sel_bar } else { " " },
                 Style::default().fg(theme.accent).bg(bg),
             ),
             Span::styled(row.label.clone(), label_style),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("      {}", row.detail),
+            format!("      {}", truncate(&row.detail, detail_room)),
             Style::default().fg(theme.text_dim),
         )));
     }
@@ -230,7 +236,7 @@ fn render_wizard_panel(frame: &mut Frame, area: Rect, wizard: &ThemeWizardState,
     if let Some(error) = &wizard.error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("  ⚠ {error}"),
+            format!("  {} {error}", crate::tui::glyphs::get().warn),
             Style::default().fg(theme.error),
         )));
     }
@@ -257,9 +263,12 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
         None => None,
     };
 
+    let glyph = crate::tui::glyphs::get();
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "  PoopRusteek \u{1F9FB}",
+        format!("  PoopRusteek {}", glyph.brand)
+            .trim_end()
+            .to_string(),
         Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
@@ -271,7 +280,7 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
         Span::styled(
-            " you ▸ make the terminal beautiful ",
+            format!(" you {} make the terminal beautiful ", glyph.pointer),
             Style::default().fg(theme.fg).bg(theme.user_bg),
         ),
     ]));
@@ -286,7 +295,7 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
         Span::styled(
-            " ⚙ shell ",
+            format!(" {} shell ", glyph.tool),
             Style::default().fg(theme.accent_soft).bg(theme.tool_bg),
         ),
         Span::styled(
@@ -295,9 +304,18 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  ✔ success  ", Style::default().fg(theme.success)),
-        Span::styled("⚠ warning  ", Style::default().fg(theme.warning)),
-        Span::styled("✖ error  ", Style::default().fg(theme.error)),
+        Span::styled(
+            format!("  {} success  ", glyph.check),
+            Style::default().fg(theme.success),
+        ),
+        Span::styled(
+            format!("{} warning  ", glyph.warn),
+            Style::default().fg(theme.warning),
+        ),
+        Span::styled(
+            format!("{} error  ", glyph.cross),
+            Style::default().fg(theme.error),
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
@@ -306,7 +324,10 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
             Style::default().fg(theme.fg).bg(theme.selection),
         ),
         Span::styled("  ", Style::default()),
-        Span::styled(" ❯ input", Style::default().fg(theme.fg).bg(theme.input_bg)),
+        Span::styled(
+            format!(" {} input", glyph.prompt),
+            Style::default().fg(theme.fg).bg(theme.input_bg),
+        ),
         Span::styled("█", Style::default().fg(theme.accent).bg(theme.input_bg)),
         Span::styled("        ", Style::default().bg(theme.input_bg)),
     ]));
@@ -323,7 +344,7 @@ fn render_preview_panel(frame: &mut Frame, area: Rect, view: &ThemesViewState, t
             let color = theme.get(role.key).unwrap_or_default();
             let is_editing = editing_role == Some(column);
             spans.push(Span::styled(
-                if is_editing { "▶" } else { " " },
+                if is_editing { glyph.pointer } else { " " },
                 Style::default().fg(theme.accent),
             ));
             spans.push(Span::styled("██ ", Style::default().fg(color)));

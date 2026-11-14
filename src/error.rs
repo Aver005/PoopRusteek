@@ -23,6 +23,11 @@ pub enum AppError {
     #[error("Rate limited: {0}")]
     RateLimited(String),
 
+    /// Отказ апстрима с классом, `Retry-After` и заголовками лимитов.
+    /// Текст тот же, что был у `Provider("{status}: {message}")`.
+    #[error("Provider error: {0}")]
+    Upstream(Box<crate::provider::failure::ProviderFailure>),
+
     #[error("MCP error: {0}")]
     Mcp(String),
 
@@ -37,6 +42,29 @@ pub enum AppError {
 
     #[error("{0}")]
     Custom(String),
+}
+
+impl AppError {
+    /// Класс отказа, если он известен по типу, а не по тексту.
+    pub fn failure_class(&self) -> Option<crate::provider::failure::FailureClass> {
+        use crate::provider::failure::FailureClass;
+        match self {
+            Self::Upstream(failure) => Some(failure.class.clone()),
+            Self::RateLimited(_) => Some(FailureClass::RateLimit { retry_after: None }),
+            Self::Http(error) if error.is_timeout() => Some(FailureClass::Timeout),
+            Self::Http(_) => Some(FailureClass::Network),
+            Self::Json(_) => Some(FailureClass::Protocol),
+            _ => None,
+        }
+    }
+
+    /// Подсказка «через сколько повторить», если апстрим её назвал.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Upstream(failure) => failure.retry_after(),
+            _ => None,
+        }
+    }
 }
 
 impl From<color_eyre::Report> for AppError {

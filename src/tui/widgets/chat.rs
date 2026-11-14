@@ -15,7 +15,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// Above this many entries the per-message cache is dropped wholesale
@@ -71,9 +71,7 @@ type TokenCacheValue = (u32, u64);
 thread_local! {
     static MSG_CACHE: RefCell<HashMap<CacheKey, CachedMsg>> = RefCell::new(HashMap::new());
     /// Token estimates keyed without `wrap_width` (unlike [`MSG_CACHE`]),
-    /// since a token count doesn't depend on the viewport. Shared with the
-    /// stats panel (`widgets::panel::compute_totals`) so it doesn't need to
-    /// know the chat viewport's wrap width just to look up a token count.
+    /// since a token count doesn't depend on the viewport.
     static TOKEN_CACHE: RefCell<HashMap<TokenCacheKey, TokenCacheValue>> = RefCell::new(HashMap::new());
     /// Wrapped row counts (value: `(fingerprint, rows)`) for non-assistant
     /// bubbles — user/system/tool messages and the empty-assistant
@@ -83,6 +81,24 @@ thread_local! {
     /// bubble on every frame, which together with viewport culling is what
     /// keeps typing latency flat on long transcripts.
     static ROWS_CACHE: RefCell<HashMap<CacheKey, (u64, usize)>> = RefCell::new(HashMap::new());
+}
+
+thread_local! {
+    /// Отпечаток темы, под которую собран `MSG_CACHE`.
+    static CACHE_THEME: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Сбросить кэш готовых строк, если тема сменилась: в строках вшиты цвета
+/// палитры, и без этого ответы ассистента остались бы в старых цветах.
+/// Числа строк от темы не зависят и сохраняются.
+fn sync_cache_theme(theme: &Theme) {
+    // Набор знаков тоже вшит в готовые строки (чекбоксы, полосы цитат).
+    let id = theme
+        .cache_id()
+        .wrapping_add(u64::from(crate::tui::glyphs::get().ascii));
+    if CACHE_THEME.replace(id) != id {
+        MSG_CACHE.with(|cache| cache.borrow_mut().clear());
+    }
 }
 
 /// Resolved token count for message `index` in conversation `conversation_id`,
@@ -164,14 +180,19 @@ fn format_time(rfc3339: &str) -> String {
     }
 }
 
-fn meta_line(msg: &ChatMessage, tokens: u32, theme: &Theme) -> Line<'static> {
+/// `lead` выравнивает подпись по тексту: у пользователя текст с полем в пробел, у ответа без.
+fn meta_line(msg: &ChatMessage, tokens: u32, theme: &Theme, lead: &str) -> Line<'static> {
     let time = format_time(&msg.created_at);
-    let mut parts = vec![format!(" {}  {}t ", time, tokens)];
+    let mut parts = vec![format!("{lead}{time}  {tokens} tok")];
     if msg.think_elapsed_secs > 0.0 {
         parts.push(format!("think {:.1}s", msg.think_elapsed_secs));
     }
     if msg.references_count > 0 {
-        parts.push(format!("\u{1F4CE}{}", msg.references_count));
+        parts.push(format!(
+            "{}{}",
+            crate::tui::glyphs::get().clip,
+            msg.references_count
+        ));
     }
     let meta = parts.join("  ");
     Line::from(vec![Span::styled(
@@ -223,7 +244,7 @@ fn with_assistant_cached<R>(
         };
         let wrapped_rows = wrapped_row_count(rendered_lines.clone(), wrap_width as usize);
         let meta_rows = wrapped_row_count(
-            vec![meta_line(msg, token_estimate, theme)],
+            vec![meta_line(msg, token_estimate, theme, "")],
             wrap_width as usize,
         );
 
@@ -276,18 +297,33 @@ fn build_segment_lines(
                 )]));
             }
             let tokens = cached_token_estimate(conversation_id, index, msg);
-            lines.push(meta_line(msg, tokens, theme));
+            lines.push(meta_line(msg, tokens, theme, " "));
         }
         Role::Assistant => {
             // Only the empty-content placeholder goes through here; the
             // markdown path is `with_assistant_cached`.
+            let mut head = assistant_header(msg, theme);
+            head.push(Span::styled(
+                " Thinking\u{2026}",
+                Style::default().fg(theme.text_dim),
+            ));
+            lines.push(Line::from(head));
+        }
+        Role::System if msg.status.as_deref() == Some(crate::app::gateway_view::SEAM_STATUS) => {
+            // Шов: тонкая строка о смене аккаунта, чтобы человек видел, кто отвечал.
             lines.push(Line::from(vec![
-                assistant_header(msg, theme),
-                Span::styled(" Thinking...", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    " \u{2500}\u{2500} ",
+                    Style::default().fg(theme.border).bg(theme.bg),
+                ),
+                Span::styled(
+                    msg.visible_content().to_string(),
+                    Style::default().fg(theme.text_soft).bg(theme.bg),
+                ),
             ]));
         }
         Role::System => {
-            let body = msg.visible_content();
+            let body = crate::tui::glyphs::console_text(msg.visible_content());
             let body_lines: Vec<&str> = body.lines().collect();
             // A `Span`'s text is one terminal row — embedded `\n`s inside
             // it don't create new rows, they just get glued onto the same
@@ -296,12 +332,16 @@ fn build_segment_lines(
             // + usage) actually render as separate lines.
             if body_lines.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
-                    " \u{2139} ",
+                    format!(" {} ", crate::tui::glyphs::get().info),
                     Style::default().fg(theme.warning).bg(theme.bg),
                 )]));
             } else {
                 for (i, line_text) in body_lines.iter().enumerate() {
-                    let prefix = if i == 0 { " \u{2139} " } else { "   " };
+                    let prefix = if i == 0 {
+                        format!(" {} ", crate::tui::glyphs::get().info)
+                    } else {
+                        "   ".to_string()
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(prefix, Style::default().fg(theme.warning).bg(theme.bg)),
                         Span::styled(
@@ -312,95 +352,37 @@ fn build_segment_lines(
                 }
             }
         }
-        Role::Tool => {
-            let tool_name = msg.name.as_deref().unwrap_or("unknown");
-            let icon = if msg.tool_error {
-                "\u{2717}"
-            } else {
-                "\u{2713}"
-            };
-            let status_color = if msg.tool_error {
-                theme.error
-            } else {
-                theme.success
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {icon} "),
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(status_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" {tool_name} "),
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(if msg.tool_error {
-                            theme.error
-                        } else {
-                            theme.accent
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    if msg.tool_error { " failed " } else { " done " },
-                    Style::default().fg(theme.text_dim).bg(theme.tool_bg),
-                ),
-            ]));
-
-            let body = msg.visible_content();
-            let body_lines: Vec<&str> = body.lines().collect();
-            if body_lines.iter().all(|l| l.trim().is_empty()) {
-                lines.push(Line::from(vec![Span::styled(
-                    "  (no output)",
-                    Style::default().fg(theme.text_dim).bg(theme.tool_bg),
-                )]));
-            } else {
-                for line_text in &body_lines {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            " \u{2502} ",
-                            Style::default().fg(theme.accent_soft).bg(theme.tool_bg),
-                        ),
-                        Span::styled(
-                            (*line_text).to_string(),
-                            Style::default()
-                                .fg(if msg.tool_error {
-                                    theme.error
-                                } else {
-                                    theme.text_soft
-                                })
-                                .bg(theme.tool_bg),
-                        ),
-                    ]));
-                }
-            }
-        }
+        Role::Tool => lines.extend(super::tool_block::tool_lines(msg, theme)),
     }
     lines
 }
 
-/// The colored ` pooprusteek (model) ` header span of an assistant bubble.
-fn assistant_header(msg: &ChatMessage, theme: &Theme) -> Span<'static> {
-    let header_color = match msg.status.as_deref() {
+/// Заголовок ответа ассистента: тонкая полоса цвета состояния и имя модели.
+/// Возвращает несколько кусков одной строки.
+fn assistant_header(msg: &ChatMessage, theme: &Theme) -> Vec<Span<'static>> {
+    let bar_color = match msg.status.as_deref() {
         Some("ABORTED") => theme.error,
         Some("WIP") => theme.warning,
         _ => theme.success,
     };
     let model_tag = if !msg.model.is_empty() {
-        format!(" ({})", msg.model)
+        format!(" \u{00B7} {}", msg.model)
     } else {
         String::new()
     };
-    Span::styled(
-        format!(" pooprusteek{} ", model_tag),
-        Style::default()
-            .fg(theme.bg)
-            .bg(header_color)
-            .add_modifier(Modifier::BOLD),
-    )
+    vec![
+        Span::styled(
+            format!(" {} ", crate::tui::glyphs::get().bar),
+            Style::default().fg(bar_color).bg(theme.bg),
+        ),
+        Span::styled(
+            format!("pooprusteek{model_tag}"),
+            Style::default()
+                .fg(theme.text_dim)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]
 }
 
 /// Whether `msg` renders through the cached-markdown assistant path (true)
@@ -459,6 +441,7 @@ fn message_rows(
 }
 
 pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    sync_cache_theme(theme);
     let conversation_id = state.conversations.focused_id().0;
     let wrap_width = area.width;
     let messages = &state.focused().messages;
@@ -511,9 +494,22 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 theme,
                 |cached, tokens| (cached.lines.clone(), tokens),
             );
-            lines.push(Line::from(vec![assistant_header(msg, theme)]));
+            lines.push(Line::from(assistant_header(msg, theme)));
+            let mut md_lines = md_lines;
+            let writing = index + 1 == messages.len() && state.focused().generation.active;
+            if writing
+                && state.focused().generation.animation_tick.is_multiple_of(2)
+                && let Some(last) = md_lines.last_mut()
+                && last.width() < usize::from(wrap_width)
+            {
+                // Курсор «пишу» в конце текста; в строку без запаса не ставится, чтобы не сдвинуть счёт рядов.
+                last.spans.push(Span::styled(
+                    crate::tui::glyphs::get().caret,
+                    Style::default().fg(theme.accent),
+                ));
+            }
             lines.extend(md_lines);
-            lines.push(meta_line(msg, tokens, theme));
+            lines.push(meta_line(msg, tokens, theme, ""));
         } else {
             lines.extend(build_segment_lines(conversation_id, index, msg, theme));
         }
@@ -523,7 +519,8 @@ pub fn render_chat(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(theme.bg))
         .wrap(Wrap { trim: false })
-        .scroll((local_offset as u16, 0));
+        // Выше 65 535 строк одного сообщения смещение упирается в потолок, а не оборачивается.
+        .scroll((u16::try_from(local_offset).unwrap_or(u16::MAX), 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -729,5 +726,77 @@ mod tests {
 
         assert_ne!(short_tokens, long_tokens);
         assert_eq!(long_tokens, estimate_tokens(&long.content));
+    }
+
+    /// Смена темы перекрашивает ответ ассистента, а не оставляет старые цвета.
+    #[test]
+    fn switching_the_theme_recolors_cached_assistant_messages() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = AppState {
+            terminal_rows: 10,
+            ..AppState::new(crate::app::conversation::Conversation::fresh_main(None))
+        };
+        state
+            .focused_mut()
+            .messages
+            .push(ChatMessage::assistant("plain answer text"));
+        let dark = Theme::default_dark();
+        let light = Theme::resolve(&crate::config::UiConfig {
+            theme: "paper".to_string(),
+            ..Default::default()
+        });
+        assert_ne!(dark.fg, light.fg);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let text_color = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .find(|&(x, y)| {
+                    buffer[(x, y)].symbol() == "p" && buffer[(x + 1, y)].symbol() == "l"
+                })
+                .map(|(x, y)| buffer[(x, y)].fg)
+        };
+        terminal
+            .draw(|f| render_chat(f, f.area(), &state, &dark))
+            .unwrap();
+        assert_eq!(text_color(&terminal), Some(dark.fg));
+        terminal
+            .draw(|f| render_chat(f, f.area(), &state, &light))
+            .unwrap();
+        assert_eq!(text_color(&terminal), Some(light.fg));
+    }
+
+    /// Панель работы выросла на две строки: прокрученный вверх текст не прыгает.
+    #[test]
+    fn the_top_line_stays_put_when_the_transcript_gets_shorter() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = AppState::new(crate::app::conversation::Conversation::fresh_main(None));
+        for index in 0..40 {
+            state
+                .focused_mut()
+                .messages
+                .push(ChatMessage::user(&format!("message number {index}")));
+        }
+        let theme = Theme::default_dark();
+        let first_row = |state: &AppState, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
+            terminal
+                .draw(|f| render_chat(f, f.area(), state, &theme))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
+
+        state.scroll_offset = 25;
+        let before = first_row(&state, 20);
+        state.scroll_offset = crate::tui::render::scroll_after_height_change(25, 20, 17);
+        let after = first_row(&state, 17);
+        assert_eq!(before.trim(), after.trim());
+        assert!(before.contains("message number"), "{before}");
     }
 }

@@ -1,5 +1,75 @@
 # BUGS
 > Known defects, sorted by impact. Update on discovery/fix.
+
+## OPEN 2026-11-07 — остаток релиза шлюза
+
+Пункты, которые остались после слияния дорожек и итоговых ревью
+(`JOURNAL/2026-11-06-gw-*.md`, `.dev/research/review-*.md`,
+`.dev/research/final-review-*.md`). Ни один не является регрессией текущей
+ветки; все подтверждены чтением кода или прогоном.
+
+- `[BUG]` LOW — **автодополнение на главной в окне 40×10 может лечь на шапку:**
+  поле стоит у самого верха, а окно подсказок не ниже трёх строк.
+  `→ src/tui/render/modals.rs::render_autocomplete`
+- `[BUG]` LOW — **`/resume` без поколения ответа:** закрыть и сразу открыть —
+  первый ответ ляжет на новый экран (данные те же). `→ src/app/keys/resume.rs`
+- `[BUG]` LOW — **Enter в `/resume` (и `/load`) читает файл сессии на цикле
+  событий** — инвариант 1; большой файл заморозит кадр. `→ src/app/sessions.rs`
+- `[?]` LOW — **главная показывает сессии всех папок, `/resume` — текущей:**
+  решить, нужна ли главной та же выборка. `→ src/app/landing.rs`
+- `[BUG]` LOW — **старый конфиг копируется один раз.** Если после переноса
+  запустить v0.1.1 и сменить в ней токен, новая версия его не увидит: она
+  читает только `~/.pooprusteek` и хранилище. Так у автора разошлись токены
+  6.11 и 13.11 (`JOURNAL/2026-11-14-paste-and-data.md`). `→ src/config/migrate.rs`
+- `[BUG]` LOW — **метка переноса без списка сессий отключает дополнение
+  навсегда.** Такую метку писали только тестовые сборки до релиза.
+  `→ src/config/migrate.rs::top_up_sessions`
+- `[BUG]` MEDIUM — **очередь сообщений живёт только в памяти.** Текст,
+  набранный во время хода, лежит в `Conversation::queued`
+  (`src/app/queue.rs`); при убийстве процесса он теряется. Esc/Ctrl+C/`/clear`
+  возвращают очередь в поле, но это не замена черновику на диске. Идея A-06.
+  `→ src/app/conversation.rs, src/app/queue.rs`
+- `[BUG]` MEDIUM — **`expand_file_mentions` работает на цикле событий.**
+  Обычный Enter разворачивает `@путь` чтением файлов синхронно, инвариант 1.
+  Вынос в `spawn_blocking` меняет порядок отправки, поэтому оставлено на
+  отдельную правку. `→ src/cli/file_mentions.rs`, `src/app/keys/chat.rs`
+- `[?]` LOW — **`update::swap` однажды упал** у автора дорожки SECRETS; не
+  воспроизводится, причина не выяснена. `→ src/update/swap.rs`
+- `[BUG]` MEDIUM — **диалект Anthropic в `/serve` не сделан:** `/v1/messages`
+  отвечает 501. Нужен разбор блоков `text/image/tool_use/tool_result`,
+  `x-api-key` + `anthropic-version`, события `message_start`/`content_block_*`/
+  `message_delta`/`message_stop` и конверт ошибок. План — в
+  `JOURNAL/2026-11-06-gw-serve.md`. `→ src/server/http.rs`, `src/server/openai.rs`
+- `[BUG]` MEDIUM — **настоящий расход последнего вызова не выведен в
+  `LLMProvider`.** `CallReport.usage` есть у шлюза, но индикатор окна у
+  API-аккаунтов считает прежнюю оценку `len/4` (`context_used`). Это правка
+  трейта, вне дорожки ролей. `→ src/agent/runner.rs::context_used`,
+  `src/provider/mod.rs`
+- `[?]` LOW — **живой conhost с бедными цветами не проверялся.** ASCII-набор
+  проверен тестом «нет небезопасных символов», но не глазами в настоящей
+  консоли; цвета на нём могут выглядеть иначе. `→ src/tui/glyphs.rs`,
+  `src/tui/theme.rs`
+- `[?]` MEDIUM — **нет настоящих образцов исчерпания лимита CLI.** У Claude
+  ловится только структурно (`rate_limit_event` со статусом `rejected`) или по
+  HTTP-статусу; у OpenCode — как неопознанный `Server` с коротким cooldown.
+  Нужны записанные потоки при исчерпанном 5-часовом/недельном окне и при
+  лимите OpenCode Go, по строке в `CLAUDE_SAMPLES`/`OPENCODE_SAMPLES` и тест
+  рядом. `→ src/gateway/cli/classify.rs`
+- `[?]` LOW — **код `cfg(unix)` проверен только тестами CI.** Linux и macOS зелёные на
+  `013aa93`, но `ProcessTree` и `Scratch` не гонялись с настоящими CLI вне Windows, а
+  релизная сборка всех целей в PR не идёт. `→ src/gateway/cli/process.rs`,
+  `src/gateway/cli/launch.rs`, `src/secrets/*`
+- `[DEBT]` LOW — **`config::migrate_data_dir` не держит межпроцессный замок.**
+  Итоговое ревью (`final-review-regressions` major-3) показало: два
+  одновременных первых запуска могут оба копировать и оставить ложную метку.
+  Метка ставится после успеха, но гонка между проверкой и копией остаётся.
+  Возможно, закрывается отдельной правкой — уточнить при слиянии.
+  `→ src/config/migrate.rs`
+
+Проверено на этой ветке 2026-11-07: `reads-project-instructions` и
+`rung-one-clears-tool-output` проходят 3/3 после исправления ожиданий
+(герметичная область загрузки; гонка фонового `harness.context.window`).
+
 > Last updated: 2026-08-26 (**five-agent review of the day's context-compaction work**, **42** findings filed below under the prefix `compaction-review-2026-08-26 #N`. Now: **17 closed the same day** (the five data-loss fixes, then **#1, #2, #3, #16, #17**, then the evening batch **#4, #5, #6, #7, #8, #11, #26** — see the RESOLVED entries), **24 open** (#9, #10, #12-#15, #18-#25, #27-#36, spread HIGH 2 / MEDIUM 15 / LOW 7) and **1 accepted** (#37, `chars / 3`, owner decision). **#25 is two thirds closed** and stays open with its scope narrowed to the one third that remains (a verbatim `<template>` echo still validates). The evening batch closed the measurement-and-summary group: the context window is re-polled on every provider/model switch and goes to *unknown* — ladder off — the moment one starts, an old `[agent] auto_compact = false` is migrated instead of silently reversed, the prior summary reaches the summariser once instead of twice, mode 2 folds its chunk summaries into one form mechanically and gives each chunk its own upstream session, the harness driver applies `ToolOutputCleared` the way the TUI does, and mode 1 no longer drops what sits ahead of the first user message. Before, same day: the harness group is closed: the ladder is now reachable from a scenario (`[context]` table + provider-window discovery in the driver), a scenario can assert a rung actually fired (`[[expect.trace]]`), a run that produced nothing to judge is a failure, and the reserve no longer switches the ladder off on windows ≤ 20k. First scenario that exercises rung 1 end to end: `sandbox/scenarios/mock/rung-one-clears-tool-output.toml` (2/2; fails with exit 4 and `0 'context.prune' record(s)` once the window is taken away). `.docs/context-compaction.md` corrected in the same pass and given a «Известные расхождения» section. Before, same day: **context compaction steps 5-6**: rung 3 + `/compact` shipped, closing findings **#3** and **#4**. Tally re-counted against the entries below, because the two header lines had drifted apart: of the review's 20 findings, **9 are closed** (1, 2, 3, 4, 5, 11, 12, 15, 16), **1 refuted** (17), **10 open** (6, 7, 8, 9, 10, 13, 14, 18, 19, 20). Two new HIGH entries opened by the same work, both found by reading rather than by running: `/compact` is a no-op on DeepSeek and pollutes its server-side branch, and a stale doc comment in `src/context/summary.rs`. Before, same day: full-codebase review `.docs/review-2026-08-26-rust.md`, 20 findings — same-day fix batch closed 6 (1,2,5,11,12,16), see RESOLVED and `JOURNAL/2026-08-26.md`; the other 14 added below by severity, source of record is the review doc. Before, same day: the harness's first finding — UTF-16 tool output decoded as UTF-8 — found and fixed; see RESOLVED and `reference/HARNESS.md` §10. Before: 2026-07-15 quality audit +8 entries, same-day defect batch fixed 7 — see RESOLVED; full audit: `reference/AUDIT-2026-07-15-QUALITY.md`)
 > Full audit digests: `reference/AUDIT-2026-07-02.md` (defects), `reference/AUDIT-2026-07-15-QUALITY.md` (quality/structure), `.docs/review-2026-08-26-rust.md` (2026-08-26 full-codebase review, 20 numbered findings — 9 closed, 1 refuted, 10 open as of the evening of 2026-08-26; referenced by number below)
 

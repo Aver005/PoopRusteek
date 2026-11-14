@@ -9,13 +9,20 @@ mod config;
 mod context;
 mod debug_log;
 mod error;
+#[expect(
+    dead_code,
+    reason = "контракты шлюза: потребители появятся в следующих дорожках"
+)]
+mod gateway;
 mod harness;
 mod instructions;
+mod keyboard;
 mod logging;
 mod mcp;
 mod prompts;
 mod provider;
 mod safe_write;
+mod secrets;
 mod semantic;
 mod server;
 mod session;
@@ -29,7 +36,6 @@ mod whitelist;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use config::Config;
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "pooprusteek", version)]
@@ -79,6 +85,12 @@ struct Args {
 enum Command {
     #[command(flatten)]
     Harness(harness::Command),
+    /// Manage secrets in the system keyring (values are never printed).
+    Secrets(cli::secrets::SecretsArgs),
+    /// Show where config values and secrets come from and what is wrong.
+    Doctor(cli::doctor::DoctorArgs),
+    /// Confirm a project's .pooprusteek config that wants to change where requests go.
+    Trust(cli::trust::TrustArgs),
 }
 
 /// Ошибка аргументов — это `setup_failed` (код 3). Код 2 от clap совпадал с
@@ -120,6 +132,11 @@ fn main() -> Result<()> {
         eprintln!("Error: {error}");
         std::process::exit(3);
     }
+    // Флаги изоляции задают и конфиг: без них — перенос старой папки данных.
+    if let Some(path) = &args.config {
+        config::mark_explicit_config(path);
+    }
+    let mut startup_notices = config::choose_data_dir();
 
     // Tracing goes to files, never stdout/stderr: the TUI owns the terminal
     // (an INFO line mid-frame paints garbage over the interface) and in
@@ -133,12 +150,28 @@ fn main() -> Result<()> {
     let headless = args.acp || args.proxy || (args.serve && args.uiless) || args.command.is_some();
     logging::setup(!headless);
 
+    // `secrets` и `doctor` не требуют рабочего конфига: сломанный файл — как раз их случай.
+    if matches!(
+        args.command,
+        Some(Command::Secrets(_)) | Some(Command::Doctor(_)) | Some(Command::Trust(_))
+    ) {
+        let code = match args.command {
+            Some(Command::Secrets(secrets_args)) => cli::secrets::run(secrets_args),
+            Some(Command::Doctor(doctor_args)) => {
+                cli::doctor::run(doctor_args, args.config.as_deref())
+            }
+            Some(Command::Trust(trust_args)) => cli::trust::run(trust_args, args.config.as_deref()),
+            _ => 0,
+        };
+        std::process::exit(code);
+    }
+
     // Подкоманды харнесса пишут трассу сами (`exec --trace`); общий `--debug-log`
     // открыл бы журнал раньше, и трасса ушла бы не в тот файл.
     if args.command.is_none() {
         debug_log::init(args.debug_log)?;
     }
-    let config: Config = match config::load_from_optional(args.config.as_deref()) {
+    let mut config: Config = match config::load_from_optional(args.config.as_deref()) {
         Ok(c) => c,
         // A config that cannot be read is fatal for anything non-interactive:
         // falling back to defaults would run against the wrong provider, or
@@ -152,9 +185,21 @@ fn main() -> Result<()> {
         }
         Err(e) => {
             eprintln!("Warning: failed to load config, using defaults: {e}");
-            Config::default()
+            // Не «первый запуск»: файл есть, но не прочитан. Онбординг поверх него не нужен,
+            // а сохранение затёрло бы то, что человек правил руками.
+            let mut fallback = Config::default();
+            fallback.source.blocked = Some(e.to_string());
+            fallback
         }
     };
+
+    // Заметки о переносе данных и секретов показывает `App::new` один раз.
+    startup_notices.append(&mut config.migration_notices);
+    config.migration_notices = startup_notices;
+    // Все ссылки прочитаны: копия файла перед миграцией больше не хранит ключи.
+    if config.source.unresolved.is_empty() {
+        config::after_verified_load(&Config::global_path());
+    }
 
     // До развилки по режимам: инструменты правки пишут журнал откатов в любом
     // из них, и папка у всех должна быть одна.
@@ -230,20 +275,72 @@ async fn run_async(args: Args, config: Config) -> Result<Option<i32>> {
     Ok(None)
 }
 
+/// Готовый шлюз отдаётся ждущему запросу. Чужое событие ждущего не трогает.
+fn settle_pending(
+    event: app::events::AppEvent,
+    pending: &mut Option<std::sync::Arc<gateway::pending::PendingGateway>>,
+) {
+    let app::events::AppEvent::GatewayBuilt(built) = event else {
+        return;
+    };
+    if let Some(waiting) = pending.take() {
+        match built.0 {
+            Ok(ready) => waiting.fulfil(ready),
+            Err(reason) => waiting.fail(reason),
+        }
+    }
+}
+
 fn run_acp_server(config: &Config) -> Result<()> {
-    if config.provider.token.is_empty() {
+    // Как в приложении: шлюз собирается вне цикла, запрос в это время ждёт готовности.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (gateway, mut pending) = app::start_gateway(config, &event_tx);
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            settle_pending(event, &mut pending);
+        }
+    });
+    let Some(provider) = gateway::handle::main_provider(config, Some(&gateway)) else {
         eprintln!("Error: No token configured. Run without --acp to set up.");
         std::process::exit(1);
-    }
-
-    let provider = crate::provider::deepseek::DeepseekProvider::new(
-        &config.provider,
-        config.agent.rate_limit_ms,
-        config.agent.rate_limit_per_minute,
-        config.agent.max_retries,
-    )?;
-    let provider = Arc::new(provider);
+    };
     let mut server = acp::server::AcpServer::new(provider);
     server.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waiting() -> std::sync::Arc<gateway::pending::PendingGateway> {
+        gateway::pending::PendingGateway::new(gateway::types::GatewayConfig::default())
+    }
+
+    /// Чужое событие не съедает ждущий шлюз: иначе запрос `--acp` повис бы навсегда.
+    #[test]
+    fn a_foreign_event_leaves_the_waiting_gateway_in_place() {
+        let pending = waiting();
+        let mut slot = Some(std::sync::Arc::clone(&pending));
+        settle_pending(
+            app::events::AppEvent::UpdateStatus {
+                message: "unrelated".to_string(),
+                notable: false,
+            },
+            &mut slot,
+        );
+        assert!(slot.is_some(), "still waiting for its own event");
+        assert!(pending.is_building());
+
+        let built: gateway::handle::GatewayHandle =
+            std::sync::Arc::new(gateway::handle::DisabledGateway::new());
+        settle_pending(
+            app::events::AppEvent::GatewayBuilt(app::events::BuiltGateway(Ok(built))),
+            &mut slot,
+        );
+        assert!(
+            slot.is_none() && !pending.is_building(),
+            "settled by GatewayBuilt"
+        );
+    }
 }

@@ -142,28 +142,11 @@ impl DeepseekProvider {
     }
 
     pub(super) fn redact_value(key: &str, value: &str) -> String {
-        let lower = key.to_ascii_lowercase();
-        if lower == "authorization" {
-            if value.len() > 24 {
-                let head = crate::util::truncate_at_char_boundary(value, 16);
-                let tail_start = value.len().saturating_sub(8);
-                let tail_start = if value.is_char_boundary(tail_start) {
-                    tail_start
-                } else {
-                    let mut i = tail_start;
-                    while i < value.len() && !value.is_char_boundary(i) {
-                        i += 1;
-                    }
-                    i
-                };
-                return format!("{}...{}", head, &value[tail_start..]);
-            }
-            return "<redacted>".to_string();
-        }
-        if lower == "x-ds-pow-response" {
+        if key.eq_ignore_ascii_case("x-ds-pow-response") {
             return format!("<base64:{} chars>", value.len());
         }
-        value.to_string()
+        // Authorization, cookie и родня скрыты целиком: префикс и хвост ключа — тоже ключ.
+        crate::secrets::redact::header_value(key, value)
     }
 
     pub(super) fn headers_to_debug_json(headers: &HeaderMap) -> Value {

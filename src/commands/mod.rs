@@ -98,7 +98,18 @@ pub enum ProviderModelsAction {
 
 pub enum CommandResult {
     Handled,
+    /// Работа вне цикла событий (хранилище ключей, чтение файлов): задание идёт на
+    /// `spawn_blocking`, текст результата приходит в чат событием.
+    Detached(Box<dyn FnOnce() -> String + Send>),
     LoadSession(String),
+    /// `/panel` — показать, скрыть, автомат; `None` — переключить.
+    SetPanel(Option<crate::config::PanelMode>),
+    /// `/landing` — вид главной; `None` — переключить.
+    SetLanding(Option<crate::config::LandingStyle>),
+    /// `/resume`, `/sessions` — экран выбора сессии.
+    OpenResume,
+    /// `/home` — на главную: пустая беседа вместо текущей, та остаётся в `/resume`.
+    GoHome,
     ResetProvider,
     Quit,
     Error(String),
@@ -142,13 +153,23 @@ pub enum CommandResult {
     },
     /// `/logout` and `/wipe` — open the generic confirmation modal.
     OpenConfirm(crate::app::events::ConfirmAction),
-    /// `/providers` — open the provider-management panel.
-    OpenProviders,
-    /// `/providers add [args]` — with no args, open the step-by-step
-    /// wizard; with args, the handler tries the quick
-    /// `<name> <base_url> [model] [api_key]` form and falls back to the
-    /// wizard on parse failure.
-    OpenProviderAdd(Option<String>),
+    /// `/accounts`, `/routes`, `/roles`, `/providers` — экран аккаунтов с нужным фокусом.
+    OpenAccounts(crate::app::gateway_view::Focus),
+    /// `/accounts add`, `/providers add [args]` — мастер аккаунта; в быстрой форме
+    /// `<name> <base_url> [model] [api_key]` поля заполнены, при ошибке мастер пустой.
+    OpenAccountAdd(Option<String>),
+    /// `/accounts enable` — включить шлюз: старые записи становятся аккаунтами.
+    EnableGateway,
+    /// `/accounts disable` — выключить шлюз (с вопросом): `[[providers]]` снова ведут.
+    DisableGateway,
+    /// `/pin <аккаунт>` и `/pin off`.
+    Pin(String),
+    /// `/usage` — расход за сутки.
+    ShowUsage,
+    /// `/secrets set <имя>` без значения — скрытый ввод в модалке.
+    PromptSecret(String),
+    /// Перечитать конфиг вне цикла событий (после правки, `/cd`).
+    ReloadConfig,
     /// `/providers tools <name> <native|prompt>` — как запись объявляет инструменты.
     SetProviderTools {
         name: String,
@@ -267,11 +288,21 @@ impl CommandRegistry {
         self.register(Box::new(defs::last::LastCommand));
         self.register(Box::new(defs::load::LoadCommand));
         self.register(Box::new(defs::session_info::SessionInfoCommand));
-        self.register(Box::new(defs::session_list::SessionListCommand));
+        self.register(Box::new(defs::session_list::SessionListCommand {
+            name: "resume",
+        }));
+        self.register(Box::new(defs::session_list::SessionListCommand {
+            name: "sessions",
+        }));
         self.register(Box::new(defs::reset::ResetCommand));
         self.register(Box::new(defs::rate::RateCommand));
         self.register(Box::new(defs::retry::RetryCommand));
         self.register(Box::new(defs::mcp::McpCommand));
+        self.register(Box::new(defs::accounts::AccountsCommand));
+        self.register(Box::new(defs::routes::RoutesCommand));
+        self.register(Box::new(defs::roles::RolesCommand));
+        self.register(Box::new(defs::usage::UsageCommand));
+        self.register(Box::new(defs::pin::PinCommand));
         self.register(Box::new(defs::providers::ProvidersCommand));
         self.register(Box::new(defs::models::ModelsCommand));
         self.register(Box::new(defs::tools::ToolsCommand));
@@ -299,10 +330,14 @@ impl CommandRegistry {
         self.register(Box::new(defs::rag_limit::RagLimitCommand));
         self.register(Box::new(defs::search::SearchCommand));
         self.register(Box::new(defs::themes::ThemesCommand));
+        self.register(Box::new(defs::view::PanelCommand));
+        self.register(Box::new(defs::view::LandingCommand));
         self.register(Box::new(defs::serve::ServeCommand));
         self.register(Box::new(defs::serve::ServerCommand));
         self.register(Box::new(defs::provider_models::RefetchProvidersCommand));
         self.register(Box::new(defs::provider_models::CacheProvidersCommand));
+        self.register(Box::new(defs::secrets::SecretsCommand));
+        self.register(Box::new(defs::doctor::DoctorCommand));
         self.register(Box::new(defs::update::UpdateCommand));
         self.register(Box::new(defs::update::AutoUpdateCommand));
 

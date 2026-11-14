@@ -112,6 +112,8 @@ pub enum AgentEvent {
     /// Пошёл вызов инструмента.
     ToolStarted {
         name: String,
+        /// Короткая строка аргументов для панели «идёт работа» (`cargo test`, путь файла).
+        summary: String,
     },
     ToolDone {
         /// Выжимка результата; суб-агент пересылает её родителю.
@@ -139,20 +141,36 @@ pub enum AgentEvent {
     ContextUsage(u32),
 }
 
+/// Итог сборки движка шлюза: сам движок или причина, по которой задача не дошла до конца.
+#[derive(Clone)]
+pub struct BuiltGateway(pub Result<crate::gateway::handle::GatewayHandle, String>);
+
+impl std::fmt::Debug for BuiltGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Ok(_) => f.write_str("BuiltGateway(ready)"),
+            Err(reason) => write!(f, "BuiltGateway(failed: {reason})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     // TUI events
     Key(crossterm::event::KeyEvent),
     // Mouse wheel scrolls the focused window (chat transcript, MCP details,
-    // approval modal, search results). Clicks are ignored for now.
+    // approval modal, search results); a right click pastes.
     Mouse(crossterm::event::MouseEvent),
-    // A bracketed paste (whole clipboard as one chunk). Routed to whatever
-    // text field currently has focus so multi-line pastes never fire an early
-    // submit. See `keys::paste`.
+    // A bracketed paste (whole clipboard as one chunk), or the clipboard read
+    // on Ctrl+V / Shift+Insert / right click. Routed to whatever text field
+    // currently has focus so multi-line pastes never fire an early submit. See `keys::paste`.
     Paste(String),
-    /// Отрисовка сама спрашивает размер у терминала; высота нужна клавишам —
-    /// они приходят раньше кадра, а шаг страницы обязан совпасть с экраном.
+    /// Буфер обмена не прочитался: причина уходит в строку статуса.
+    PasteFailed(String),
+    /// Отрисовка сама спрашивает размер у терминала; размер нужен клавишам —
+    /// они приходят раньше кадра, а шаг страницы и перенос строк обязаны совпасть с экраном.
     Resize {
+        cols: u16,
         rows: u16,
     },
     Tick,
@@ -273,6 +291,18 @@ pub enum AppEvent {
         matches: Vec<crate::semantic::history::HistoryMatch>,
     },
 
+    /// Фоновое чтение списка сессий для главного экрана закончилось.
+    LandingSessionsLoaded(Vec<crate::session::SessionSummary>),
+    /// Список для экрана `/resume`, прочитанный в фоне.
+    ResumeSessionsLoaded(Vec<crate::session::SessionSummary>),
+
+    /// Фоновый скан папки для `@путь` закончился. `generation` — номер
+    /// запроса: ответ на устаревший запрос отбрасывается.
+    AutocompleteReady {
+        generation: u64,
+        items: Vec<crate::commands::CommandSuggestion>,
+    },
+
     // API server lifecycle (`/serve`, `--serve`). Each event carries the
     // launch generation so a replaced server's late events can't clobber
     // the handle of its successor.
@@ -303,6 +333,33 @@ pub enum AppEvent {
         summary: String,
         failed: usize,
     },
+
+    /// Событие шлюза аккаунтов (смена статуса, лимиты, переход на запасной).
+    Gateway(crate::gateway::handle::GatewayEvent),
+
+    /// Движок шлюза собран на `spawn_blocking`: секреты прочитаны вне цикла событий.
+    GatewayBuilt(BuiltGateway),
+
+    /// Короткий заголовок чата из служебной модели (`[roles] title`). Приходит
+    /// из фоновой задачи; пустая строка не приходит никогда.
+    ChatTitle {
+        conversation: ConversationId,
+        title: String,
+    },
+    /// Движок принял правку: новый конфиг шлюза нужно сохранить (очередь записи конфига).
+    GatewayPersist(Box<crate::gateway::types::GatewayConfig>),
+    /// Мастер аккаунта: секрет записан в хранилище вне цикла событий, можно править шлюз.
+    AccountStored(Box<crate::app::gateway_view::AccountPlan>),
+    /// То же при выключенном шлюзе: запись `[[providers]]` записана, ключ — в хранилище.
+    LegacyProviderStored(Box<crate::app::gateway_view::LegacyPlan>),
+    /// Включение шлюза закончено вне цикла событий: новый конфиг шлюза или причина отказа.
+    GatewayEnabled(Box<Result<crate::gateway::types::GatewayConfig, String>>),
+    /// То же для выключения.
+    GatewayDisabled(Box<Result<(), String>>),
+    /// Конфиг перечитан вне цикла событий (после команды, `/cd`, подтверждения проекта).
+    ConfigReloaded(Box<Result<crate::config::Config, String>>),
+    /// Время изменения файла проектного слоя (`None` — файла нет).
+    ProjectConfigStamp(Option<std::time::SystemTime>),
 
     /// A self-update pass (manual `/update` or the startup auto-check)
     /// finished — see `crate::update`. With `notable: false` (startup check
@@ -403,10 +460,12 @@ pub enum View {
     Chat,
     Mcp,
     Onboarding,
-    /// `/providers` — the provider-management panel.
-    Providers,
+    /// `/accounts` (и `/providers`) — аккаунты, маршруты, роли.
+    Accounts,
     /// `/search` — the history-search screen.
     Search,
+    /// `/resume` и `/sessions` — выбор сессии на весь экран.
+    Resume,
     /// `/themes` — the theme gallery + create wizard.
     Themes,
 }

@@ -16,6 +16,7 @@
 //! `events::handle_picker_key` family) so it stays testable without an
 //! `App`.
 
+mod accounts;
 mod autocomplete;
 mod chat;
 mod dispatch;
@@ -24,12 +25,12 @@ mod modal;
 mod mouse;
 mod onboarding;
 mod paste;
-mod providers;
+mod resume;
 mod search;
 mod themes;
 
 use crate::app::App;
-use crate::app::events::View;
+use crate::app::events::{Modal, View};
 use crate::app::input::InputState;
 use crate::error::AppResult;
 
@@ -85,7 +86,34 @@ fn apply_text_key(
 }
 
 impl App {
+    /// Буквы здесь — команды (y/n, j/k, s/r…), а не текст: их переводим с русской раскладки.
+    fn letters_are_commands(&self) -> bool {
+        if let Some(modal) = &self.state.modal {
+            return matches!(
+                modal,
+                Modal::ToolApproval { .. }
+                    | Modal::DeleteSessions(_)
+                    | Modal::Confirm(_)
+                    | Modal::Trust(_)
+            );
+        }
+        match self.state.view {
+            View::Mcp | View::Accounts => true,
+            View::Themes => self.state.themes.wizard.is_none(),
+            View::Search => self.state.search.focus == crate::app::search::SearchFocus::Results,
+            View::Chat | View::Onboarding | View::Resume => false,
+        }
+    }
+
     pub(crate) async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+        // Сочетания и буквы-команды — по месту клавиши, а не по раскладке.
+        let key = crate::keyboard::layout_independent(key, self.letters_are_commands());
+        // Вставка одинакова везде: текст уходит в то поле, что сейчас в фокусе.
+        if crate::clipboard::is_paste_shortcut(&key) {
+            self.paste_from_clipboard();
+            return Ok(false);
+        }
+
         // Onboarding view captures all keys while it is active.
         if self.state.view == View::Onboarding {
             return self.handle_onboarding_key(key).await;
@@ -104,8 +132,12 @@ impl App {
             return self.handle_mcp_key(key).await;
         }
 
-        if self.state.view == View::Providers {
-            return self.handle_providers_key(key).await;
+        if self.state.view == View::Accounts {
+            return self.handle_accounts_key(key).await;
+        }
+
+        if self.state.view == View::Resume {
+            return self.handle_resume_key(key).await;
         }
 
         if self.state.view == View::Search {

@@ -1,14 +1,18 @@
 # ARCHITECTURE
 > How the pieces fit and how data flows. Read after MAP.md.
-> Last updated: 2026-07-02 (post stability/perf overhaul — event-driven GOAL evaluator, drain+dirty render, interaction queue)
+> Last updated: 2026-11-07 (шлюз аккаунтов и маршрутов, секреты, новые слои
+> конфига). Before: 2026-07-02 (post stability/perf overhaul — event-driven
+> GOAL evaluator, drain+dirty render, interaction queue)
 
 ## LAYERS (clean-ish, layered architecture)
 
 ```
 Presentation   tui/ (render, widgets, theme, markdown)
 Application     app/ (App + AppState, event loop, key handling), config/, session.rs
-Domain          agent/ (loop, tool parser), provider/ (LLMProvider, DeepSeek), tools/
-Infrastructure  mcp/ (clients, transports, discovery), acp/ (server mode), skills/
+Domain          agent/ (loop, tool parser), provider/ (LLMProvider, failures),
+                gateway/ (accounts, routes, roles, backend adapters), tools/
+Infrastructure  mcp/ (clients, transports, discovery), secrets/ (keyring, references),
+                acp/ (server mode), skills/, harness/
 ```
 
 `.docs/architecture.md` describes the *intended* design and is partly **aspirational** (it names `AgentLoop`/`ContextManager`/`StreamingResponse` structs that don't exist — the real thing is the free function `run_agent_loop`). Trust the code + this folder over `.docs/`.
@@ -98,7 +102,7 @@ Cross-task request/response uses `Arc<Mutex<Option<T>>> + tokio::Notify`:
 
 ## AGENT-TURN LAUNCH (`AgentRuntime` + `TurnSpec`)
 
-Every agent turn — normal, sidechat, or sub-agent — is described by a `TurnSpec { conversation, provider, messages, system_prompt, model, temperature, max_tokens, max_steps, max_tools_per_step, auto_approve }` and launched by `AgentRuntime::spawn(spec)` (`app/runtime.rs`), which `tokio::spawn`s `run_agent_loop(...)`. `auto_approve=false` for the focused user turn (interactive approval modal); `auto_approve=true` for background turns (sidechats/sub-agents) so they never block on a modal nobody is watching.
+Every agent turn — normal, sidechat, or sub-agent — is described by a `TurnSpec { conversation, provider, messages, system_prompt, model, temperature, max_tokens, max_steps, max_tools_per_step, context, unattended }` and launched by `AgentRuntime::spawn(spec)` (`app/runtime.rs`), which `tokio::spawn`s `run_agent_loop(...)`. `unattended` only removes what needs a watching human (questions, timers, nested `task`); tools still ask, and the harness answers those requests from an `ApprovePolicy`. There is no approval bypass.
 
 ## SUB-AGENTS (`agent/sub_agent.rs`, `runner.rs`, `/agent` `/agents`)
 
@@ -115,7 +119,85 @@ Reference: Claude Code. Spawned by **the model** (a `task` tool call, special-ca
 
 ## PROVIDER FORKING (`LLMProvider::fork`)
 
-`fork(&self) -> Arc<dyn LLMProvider>` (`provider/mod.rs:211`) returns a fresh-session sibling sharing config/token. `DeepseekProvider::fork` (`deepseek.rs:1712`) rebuilds from stored config with a new `SessionState` (`fork_session` at `:144`); `FakeProvider::fork` (`fake.rs:86`) returns a new instance. Unit-tested for independent session state (`deepseek.rs:1773`). This is the analog of poopseek's `provider.clone()` and the foundation that makes concurrent conversations safe.
+`fork(&self) -> Arc<dyn LLMProvider>` (`provider/mod.rs`) returns a fresh-session sibling sharing config/token. `DeepseekProvider::fork` rebuilds from stored config with a new `SessionState` (`fork_session`); `FakeProvider::fork` returns a new instance. Unit-tested for independent session state. This is the analog of poopseek's `provider.clone()` and the foundation that makes concurrent conversations safe.
+
+**With the gateway on, `fork()` goes through `RoutedProvider`:** the fork keeps the engine, the account semaphores and the route state, but gets a fresh backend (`Backend::fork()`) and a fresh provider session. A turn may change target mid-conversation; `history::flatten_for_switch` then rewrites foreign tool calls into text before the new backend sees the history.
+
+## GATEWAY — ACCOUNTS, ROUTES, ROLES (`src/gateway/`)
+
+The gateway is a peer of `provider/`, not a replacement: it owns *which*
+provider answers, while the provider owns the wire protocol.
+
+```
+Config { gateway, accounts, routes, roles }
+        │
+        ├─ Engine (Gateway trait) ── Core::select ── AccountState + LimitSnapshot
+        │        │                         └─ Decision { why, skipped[], retry_at }
+        │        ├─ BackendFactory: BuiltinFactory (DeepSeek + API) · CliFactory (claude/opencode/codex)
+        │        └─ ConfigPersist → AppEvent::GatewayPersist → config::save
+        │
+        └─ RoutedProvider (Arc<dyn LLMProvider>) ── the only provider the rest sees
+                 ├─ EmitTracker: fallback only before the first visible chunk
+                 ├─ semaphore per account, cooldown, Retry-After
+                 ├─ ledger (data_dir/gateway/usage.json)
+                 └─ served_by() for /serve headers
+```
+
+- **Build off the loop.** `main_provider()` sits behind `gateway::pending`:
+  `PendingGateway` starts `build_gateway` on `spawn_blocking` (secrets are
+  blocking), the app gets `PendingHandle`, and `AppEvent::GatewayBuilt` swaps it
+  in. A request that arrives during the build waits; a disabled gateway is ready
+  immediately and reads nothing.
+- **One selection function.** `Core::select` is the only place that decides;
+  the screen, `/serve` and roles read the same `Decision` and the same
+  `snapshot()`.
+- **UI is read-only.** `app/gateway_view*` renders `Gateway::snapshot()` and
+  writes only `Gateway::apply_edit()`. `View::Accounts` (commands `/accounts`,
+  `/routes`, `/roles`) is one screen with three focuses; the wizard and the
+  masked secret prompt are `Modal::{AccountWizard, SecretPrompt, AccountLimits,
+  Trust}`.
+- **Roles are separate calls, not separate chats.** `provider_for_role` returns
+  an `Arc<dyn LLMProvider>` for `title`, `summary`, `evaluator`; callers fork it,
+  so a service call never touches the conversation or its server session.
+- **`/serve`** holds a `GatewayCell` (`server/routing.rs`) and asks
+  `provider_for_model_id(..., CallSource::Serve)`. `CallSource::Serve` never
+  selects `cli:*`; the catalog is `auto/<route>` and `<account>/<model>` only.
+- **Accounting is append-and-merge.** `EngineLedger` accumulates in memory,
+  flushes every ~30 s via `atomic_write`, dedups by `(request_id, attempt,
+  account)` and merges another process's file instead of overwriting it.
+
+Deeper: `reference/GATEWAY.md`.
+
+## SECRETS AND LAYERED CONFIG (`src/secrets/`, `src/config/`)
+
+Config is no longer one file at a fixed path:
+
+```
+~/.pooprusteek/config.toml          shared layer (written by default)
+<repo>/.pooprusteek/config.toml     optional project layer (untrusted)
+--config <file>                     replaces both for one run (harness)
+dirs::data_local_dir()/pooprusteek  data, cache, model
+```
+
+- **Secrets are references**, resolved by `StoreResolver` at adapter build
+  time: `keyring:`, `env:`, `cmd:`, `file:`, `none`. `Secret` has no `Display`,
+  `Debug` prints `<secret>`, and its buffer is zeroed on drop.
+- **Project layer is fail-closed.** It may not contain keys, `[server]`,
+  `[update]`, `[instructions]`, `[[providers]]`, `[secrets]`, `[trust]`, CLI
+  `home`, or `cmd:`/`file:` references. Anything that changes where requests go
+  (`[gateway]`, `[[accounts]]`, `[[routes]]`, `[roles]`) waits for
+  `pooprusteek trust` — a SHA-256 of the file recorded in the shared layer.
+  Editing the file asks again. Confirming the file does not hand over a secret:
+  `pooprusteek secrets bind <ref> <host>` trusts a reference for a host.
+- **Saving preserves the file.** `config::save` diffs against what was loaded
+  and applies the difference through `toml_edit`, under `config.toml.lock`,
+  on one worker thread (the event loop never waits for the disk). A file that
+  fails to parse is never overwritten.
+- **One wildcard.** The model cannot write `.pooprusteek/`, but `bash` can. The
+  trust hash is the safety net: the next check sees a different file and asks
+  again. This is stated in the README, not hidden.
+
+Deeper: `reference/CONFIG.md`, `.docs/secrets-and-config.md`.
 
 ## TWO RUN MODES (`main.rs`)
 

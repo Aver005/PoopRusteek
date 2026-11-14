@@ -68,12 +68,16 @@ impl CompatProtocol for AnthropicProtocol {
         state: &mut Self::StreamState,
         emit: &mut dyn FnMut(CompletionChunk),
     ) -> SseFlow {
+        if let Some(usage) = anthropic_compat::stream_usage(payload) {
+            state.merge_usage(usage);
+        }
         match anthropic_compat::parse_stream_event(payload) {
             StreamEvent::Text(text) => {
                 emit(CompletionChunk {
                     content: text,
                     tool_calls: Vec::new(),
                     finish_reason: None,
+                    usage: None,
                 });
                 SseFlow::Continue
             }
@@ -105,6 +109,7 @@ impl CompatProtocol for AnthropicProtocol {
                     finish_reason: Some(
                         state.finish_reason().unwrap_or_else(|| "stop".to_string()),
                     ),
+                    usage: state.usage(),
                 });
                 SseFlow::Done
             }
@@ -118,6 +123,15 @@ impl CompatProtocol for AnthropicProtocol {
         let page: anthropic_compat::ModelsPage = serde_json::from_slice(body)?;
         Ok(page.data.into_iter().map(|model| model.id).collect())
     }
+
+    fn parse_limits(
+        headers: &reqwest::header::HeaderMap,
+        now: std::time::SystemTime,
+    ) -> Option<crate::provider::failure::RateLimitHeaders> {
+        Some(crate::provider::failure::parse_anthropic_limits(
+            headers, now,
+        ))
+    }
 }
 
 /// Пустой кусок: поток жив. Большой родной `write` льётся аргументами дольше
@@ -127,6 +141,7 @@ fn heartbeat(emit: &mut dyn FnMut(CompletionChunk)) -> SseFlow {
         content: String::new(),
         tool_calls: Vec::new(),
         finish_reason: None,
+        usage: None,
     });
     SseFlow::Continue
 }
@@ -146,5 +161,68 @@ mod heartbeat_tests {
         });
         assert!(matches!(flow, SseFlow::Continue));
         assert_eq!(beats, 1);
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::provider::compat_client::CompatProtocol;
+
+    fn run(payloads: &[&str]) -> Vec<CompletionChunk> {
+        let mut state = anthropic_compat::AnthropicStreamState::default();
+        let mut out = Vec::new();
+        for payload in payloads {
+            AnthropicProtocol::handle_sse_payload(payload, &mut state, &mut |c| out.push(c));
+        }
+        out
+    }
+
+    /// Вход приходит в `message_start`, итог выхода — в `message_delta`; кэш входит во вход.
+    #[test]
+    fn usage_from_start_and_delta_lands_on_the_terminal_chunk() {
+        let chunks = run(&[
+            r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42,"output_tokens_details":{"thinking_tokens":7}}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let last = chunks.last().unwrap();
+        assert_eq!(last.finish_reason.as_deref(), Some("stop"));
+        let usage = last.usage.clone().expect("usage on the terminal chunk");
+        assert_eq!(usage.prompt_tokens, 125);
+        assert_eq!(usage.completion_tokens, 42);
+        assert_eq!(usage.total_tokens, 167);
+        assert_eq!(usage.cache_read_tokens, Some(100));
+        assert_eq!(usage.cache_write_tokens, Some(20));
+        assert_eq!(usage.reasoning_tokens, Some(7));
+    }
+
+    #[test]
+    fn a_stream_without_usage_events_has_no_usage() {
+        let chunks = run(&[
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        assert!(chunks.last().unwrap().usage.is_none());
+    }
+
+    #[test]
+    fn a_blocking_response_counts_cache_in_the_prompt() {
+        let body = br#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":10}}"#;
+        let response = AnthropicProtocol::parse_response(body).unwrap();
+        let usage = response.usage.unwrap();
+        assert_eq!((usage.prompt_tokens, usage.total_tokens), (13, 17));
+    }
+
+    #[test]
+    fn a_blocking_response_without_usage_reports_none() {
+        let body = br#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#;
+        assert!(
+            AnthropicProtocol::parse_response(body)
+                .unwrap()
+                .usage
+                .is_none()
+        );
     }
 }

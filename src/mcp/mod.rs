@@ -5,6 +5,7 @@ pub mod jsonrpc;
 pub mod manager;
 pub mod oauth;
 pub mod oauth_store;
+pub mod project;
 pub mod transport;
 pub mod types;
 

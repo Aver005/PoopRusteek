@@ -17,8 +17,7 @@ impl Command for HomeCommand {
         "/home"
     }
 
-    fn execute(&self, _args: &str, state: &mut AppState, _config: &Config) -> CommandResult {
-        state.clear_chat_view();
-        CommandResult::Handled
+    fn execute(&self, _args: &str, _state: &mut AppState, _config: &Config) -> CommandResult {
+        CommandResult::GoHome
     }
 }

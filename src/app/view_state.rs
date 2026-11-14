@@ -303,9 +303,6 @@ mod onboarding_tests {
 pub struct PickerItem {
     pub text: String,
     pub value: String,
-    /// Render this row flagged (e.g. yellow) — used by `/sessions` to mark
-    /// sessions whose remote link was found dead.
-    pub warn: bool,
 }
 
 impl PickerItem {
@@ -313,13 +310,7 @@ impl PickerItem {
         Self {
             text: text.into(),
             value: value.into(),
-            warn: false,
         }
-    }
-
-    pub fn warn(mut self, on: bool) -> Self {
-        self.warn = on;
-        self
     }
 }
 
@@ -331,7 +322,6 @@ pub enum PickerMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PickerKind {
-    Sessions,
     Whitelist,
     Skills,
     Chats,
@@ -354,21 +344,6 @@ pub struct PickerState {
 }
 
 impl PickerState {
-    pub fn new(title: impl Into<String>, items: Vec<PickerItem>, mode: PickerMode) -> Self {
-        let all_items = items.clone();
-        Self {
-            title: title.into(),
-            all_items,
-            items,
-            checked: Vec::new(),
-            persistent_checked: Vec::new(),
-            cursor: ListCursor::default(),
-            mode,
-            kind: PickerKind::Sessions,
-            search: String::new(),
-        }
-    }
-
     pub fn new_with_kind(
         title: impl Into<String>,
         items: Vec<PickerItem>,
@@ -528,7 +503,15 @@ impl Grant {
                 Some(scope) => format!("Always: {tool} · {}", scope.describe()),
                 None => format!("Always: {tool}"),
             },
-            Grant::Tool => format!("\u{26A0} Always: {tool} · ANYTHING"),
+            Grant::Tool => format!(
+                "{} Always: {tool} · any {}",
+                crate::tui::glyphs::get().warn,
+                if matches!(tool, "bash" | "powershell") {
+                    "command"
+                } else {
+                    "call"
+                }
+            ),
         }
     }
 
@@ -683,11 +666,14 @@ pub enum Modal {
     /// `/mcp add` — paste-JSON / step-by-step wizard for adding a new MCP
     /// server. State lives in `app::mcp_add` (its own module — see there).
     McpAdd(crate::app::mcp_add::McpAddState),
-    /// `/providers add` — step-by-step wizard for adding an
-    /// OpenAI-compatible provider. State lives in `app::providers`. Boxed
-    /// for the same reason as `McpAdd`'s wizard: four `InputState` fields
-    /// would otherwise size every `Modal`.
-    ProviderAdd(Box<crate::app::providers::ProviderAddState>),
+    /// Мастер добавления аккаунта: тип → имя → адрес и модель → секрет.
+    AccountWizard(Box<crate::app::gateway_view::wizard::AccountWizard>),
+    /// Скрытый ввод секрета (`/secrets set <имя>`): значение только здесь, под маской.
+    SecretPrompt(Box<crate::app::gateway_view::forms::SecretPrompt>),
+    /// Ограничения и избранные модели аккаунта.
+    AccountLimits(Box<crate::app::gateway_view::forms::LimitsForm>),
+    /// Проектный конфиг просит изменить, куда уходят запросы; по умолчанию — отказ.
+    Trust(Box<crate::app::gateway_view::forms::TrustDialog>),
 }
 
 // ─── /delete — session deletion picker ────────────────────────────
@@ -1220,7 +1206,7 @@ mod picker_tests {
     use crossterm::event::KeyCode;
 
     fn multi_picker() -> PickerState {
-        PickerState::new(
+        PickerState::new_with_kind(
             "pick",
             vec![
                 PickerItem::new("alpha", "a"),
@@ -1228,6 +1214,7 @@ mod picker_tests {
                 PickerItem::new("gamma", "c"),
             ],
             PickerMode::Multi,
+            PickerKind::Chats,
         )
     }
 
@@ -1250,7 +1237,7 @@ mod picker_tests {
     fn every_letter_is_searchable_including_j_and_k() {
         // Раньше 'j' и 'k' были вырезаны из фильтра ради навигации, поэтому
         // ни "json", ни "kubernetes" в пикере было не найти.
-        let mut picker = PickerState::new(
+        let mut picker = PickerState::new_with_kind(
             "pick",
             vec![
                 PickerItem::new("json parser", "a"),
@@ -1258,6 +1245,7 @@ mod picker_tests {
                 PickerItem::new("alpha", "c"),
             ],
             PickerMode::Single,
+            PickerKind::Chats,
         );
         picker.update_search("j".to_string());
         assert_eq!(picker.items.len(), 1);
@@ -1321,7 +1309,7 @@ mod grant_tests {
         let narrow = Grant::Scope.label("bash", Some(&scope));
         assert!(narrow.contains("cargo test"), "{narrow}");
         let widest = Grant::Tool.label("bash", Some(&scope));
-        assert!(widest.contains("ANYTHING"), "{widest}");
+        assert!(widest.contains("any command"), "{widest}");
         assert!(!widest.contains("cargo test"), "{widest}");
     }
 }

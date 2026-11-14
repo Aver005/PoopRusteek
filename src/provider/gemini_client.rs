@@ -23,6 +23,8 @@ pub struct GeminiProtocol;
 #[derive(Default)]
 pub struct GeminiStreamState {
     tool_calls: Vec<crate::provider::ToolCall>,
+    /// `usageMetadata` накопительный; в итог идёт последнее виденное.
+    usage: Option<crate::provider::Usage>,
 }
 
 impl CompatProtocol for GeminiProtocol {
@@ -87,11 +89,15 @@ impl CompatProtocol for GeminiProtocol {
         };
         let (text, calls, finish) = gemini_compat::extract_piece(&chunk);
         state.tool_calls.extend(calls);
+        if let Some(metadata) = &chunk.usage_metadata {
+            state.usage = Some(metadata.to_usage());
+        }
         if !text.is_empty() {
             emit(CompletionChunk {
                 content: text,
                 tool_calls: Vec::new(),
                 finish_reason: None,
+                usage: None,
             });
         }
         if let Some(reason) = finish {
@@ -99,6 +105,7 @@ impl CompatProtocol for GeminiProtocol {
                 content: String::new(),
                 tool_calls: std::mem::take(&mut state.tool_calls),
                 finish_reason: Some(reason),
+                usage: state.usage.take(),
             });
             return SseFlow::Done;
         }
@@ -211,5 +218,50 @@ mod tests {
         );
         assert!(matches!(flow, SseFlow::Done));
         assert_eq!(chunks[0].finish_reason.as_deref(), Some("length"));
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_metadata_lands_on_the_terminal_chunk() {
+        let mut state = GeminiStreamState::default();
+        let mut out = Vec::new();
+        let mut feed = |payload: &str| {
+            GeminiProtocol::handle_sse_payload(payload, &mut state, &mut |c| out.push(c));
+        };
+        feed(
+            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":1,"totalTokenCount":9}}"#,
+        );
+        feed(
+            r#"{"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":15,"cachedContentTokenCount":2,"thoughtsTokenCount":4}}"#,
+        );
+        let last = out.last().unwrap();
+        assert!(last.finish_reason.is_some());
+        let usage = last.usage.clone().expect("usage on the terminal chunk");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (8, 3, 15)
+        );
+        assert_eq!(usage.cache_read_tokens, Some(2));
+        assert_eq!(usage.reasoning_tokens, Some(4));
+    }
+
+    #[test]
+    fn a_stream_without_usage_metadata_has_no_usage() {
+        let mut state = GeminiStreamState::default();
+        let mut out = Vec::new();
+        GeminiProtocol::handle_sse_payload(
+            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}]}"#,
+            &mut state,
+            &mut |c| out.push(c),
+        );
+        assert!(out.last().unwrap().usage.is_none());
     }
 }
