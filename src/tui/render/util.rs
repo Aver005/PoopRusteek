@@ -82,25 +82,39 @@ pub(super) fn format_date(rfc3339: &str) -> String {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Подмена часов для снимков: иначе подвал менялся бы от запуска к запуску.
-    static FIXED_CLOCK: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
+/// Сколько клеток левой части остаётся при любой длине правой.
+const MIN_LEFT_COLS: usize = 10;
 
-/// Зафиксировать время в подвале (только тесты и снимки).
-#[cfg(test)]
-pub(crate) fn fix_clock(text: &str) {
-    FIXED_CLOCK.with(|clock| *clock.borrow_mut() = Some(text.to_string()));
-}
-
-/// Текущее время `ЧЧ:ММ` для подвала.
-pub(super) fn clock_label() -> String {
-    #[cfg(test)]
-    if let Some(fixed) = FIXED_CLOCK.with(|clock| clock.borrow().clone()) {
-        return fixed;
+/// Части по порядку, урезанные до `max` клеток: режется первая не влезшая, с `…`.
+fn fit_spans<'a>(spans: Vec<Span<'a>>, max: usize) -> (Vec<Span<'a>>, usize) {
+    let mut used = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        let width = UnicodeWidthStr::width(span.content.as_ref());
+        if used + width <= max {
+            used += width;
+            out.push(span);
+            continue;
+        }
+        let cut = truncate(span.content.as_ref(), max - used);
+        used += UnicodeWidthStr::width(cut.as_str());
+        out.push(Span::styled(cut, span.style));
+        break;
     }
-    chrono::Local::now().format("%H:%M").to_string()
+    (out, used)
+}
+
+/// Строка ровно в `width` клеток: слева суть, справа метка. Правая часть не
+/// отнимает у левой больше, чем оставляет ей [`MIN_LEFT_COLS`].
+pub(super) fn split_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
+    let (right, right_w) = fit_spans(right, width.saturating_sub(MIN_LEFT_COLS + 1));
+    let gap = usize::from(right_w > 0);
+    let (mut spans, left_w) = fit_spans(left, width.saturating_sub(right_w + gap));
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(left_w + right_w)),
+    ));
+    spans.extend(right);
+    Line::from(spans)
 }
 
 pub(super) fn provider_label(config: &Config) -> String {
@@ -199,6 +213,37 @@ pub(super) fn highlight_json(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cells(line: &Line) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    #[test]
+    fn a_split_line_is_exactly_as_wide_as_asked() {
+        for width in 0..40 {
+            let line = split_line(
+                vec![Span::raw("claude-max"), Span::raw(" · подписка")],
+                vec![Span::raw("oauth token expired, run /accounts auth")],
+                width,
+            );
+            assert_eq!(cells(&line), width, "width {width}");
+        }
+    }
+
+    #[test]
+    fn a_long_right_side_never_eats_the_whole_left() {
+        let line = split_line(
+            vec![Span::raw("claude-max")],
+            vec![Span::raw("oauth token expired, run /accounts auth")],
+            29,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("claude-max"), "{text}");
+        assert!(text.contains('…'), "{text}");
+    }
 
     #[test]
     fn truncate_to_zero_width_gives_nothing_not_an_ellipsis() {

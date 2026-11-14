@@ -3,7 +3,7 @@
 //! и исчезает в простое. Высота — не больше [`MAX_DOCK_ROWS`] строк.
 
 use super::segments::{Fitted, Segment, Tone, fit_segments};
-use super::util::truncate;
+use super::util::split_line;
 use crate::app::AppState;
 use crate::app::conversation::{Conversation, ConversationKind};
 use crate::app::events::GoalStage;
@@ -15,7 +15,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthStr;
 
 /// Меньше всего строк панели: на низком окне остальное уходит в «+N».
 pub(crate) const MAX_DOCK_ROWS: u16 = 4;
@@ -33,34 +32,34 @@ const QUEUE_PREVIEW_CHARS: usize = 60;
 
 /// Что делает фокусный чат прямо сейчас.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MainRow {
-    tick: u64,
-    tool: Option<(String, String)>,
-    elapsed_secs: u64,
-    tokens: u32,
-    tokens_per_sec: u32,
+pub(super) struct MainRow {
+    pub tick: u64,
+    pub tool: Option<(String, String)>,
+    pub elapsed_secs: u64,
+    pub tokens: u32,
+    pub tokens_per_sec: u32,
 }
 
 /// Суб-агент или побочный чат в работе.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ChildRow {
-    label: String,
-    tool: Option<(String, String)>,
-    elapsed_secs: u64,
+pub(super) struct ChildRow {
+    pub label: String,
+    pub tool: Option<(String, String)>,
+    pub elapsed_secs: u64,
     /// Сколько уже идёт его инструмент (если он есть).
-    tool_secs: Option<u64>,
+    pub tool_secs: Option<u64>,
 }
 
 /// Содержимое панели без привязки к ширине.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct DockModel {
-    main: Option<MainRow>,
-    children: Vec<ChildRow>,
+pub(super) struct DockModel {
+    pub main: Option<MainRow>,
+    pub children: Vec<ChildRow>,
     /// Сколько сообщений ждёт, что первое, и стоит ли очередь после упавшего хода.
-    queue: Option<(usize, String, bool)>,
+    pub queue: Option<(usize, String, bool)>,
     /// Сколько агентов не поместилось. Показаны отдельной строкой дерева;
     /// ни с очередью, ни со сводкой GOAL они не смешиваются.
-    hidden_agents: usize,
+    pub hidden_agents: usize,
     summary: Vec<SummaryItem>,
 }
 
@@ -139,7 +138,7 @@ fn work_is_active(state: &AppState, children_running: usize) -> bool {
         || (focused.queue_paused && !focused.queued.is_empty())
 }
 
-fn model(state: &AppState) -> DockModel {
+pub(super) fn model(state: &AppState) -> DockModel {
     let focused_id = state.conversations.focused_id();
     let running_children: Vec<&Conversation> = state
         .conversations
@@ -257,12 +256,12 @@ pub(crate) fn height(state: &AppState) -> u16 {
 }
 
 /// `m:ss`.
-fn clock(secs: u64) -> String {
+pub(super) fn clock(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// «1.8k» для больших чисел.
-fn compact_count(value: u32) -> String {
+pub(super) fn compact_count(value: u32) -> String {
     if value >= 1000 {
         format!("{}.{}k", value / 1000, (value % 1000) / 100)
     } else {
@@ -270,7 +269,7 @@ fn compact_count(value: u32) -> String {
     }
 }
 
-fn tool_text(tool: &Option<(String, String)>) -> (String, String) {
+pub(super) fn tool_text(tool: &Option<(String, String)>) -> (String, String) {
     match tool {
         Some((name, summary)) => (name.clone(), summary.clone()),
         None => ("thinking".to_string(), String::new()),
@@ -278,45 +277,20 @@ fn tool_text(tool: &Option<(String, String)>) -> (String, String) {
 }
 
 /// Строка «слева — суть, справа — время», усечённая под ширину.
-fn two_sided<'a>(
-    width: usize,
-    lead: Vec<Span<'a>>,
-    lead_text: &str,
-    right: &str,
-    theme: &Theme,
-) -> Line<'a> {
-    let right_width = UnicodeWidthStr::width(right);
-    let room = width.saturating_sub(right_width + 1);
-    let lead_width = UnicodeWidthStr::width(lead_text);
-    let mut spans = lead;
-    if lead_width > room {
-        // Не помещается — режем последний кусок: он самый длинный (суть вызова).
-        if let Some(last) = spans.pop() {
-            let keep =
-                room.saturating_sub(lead_width - UnicodeWidthStr::width(last.content.as_ref()));
-            spans.push(Span::styled(
-                truncate(last.content.as_ref(), keep),
-                last.style,
-            ));
-        }
-    }
-    let used: usize = spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    let gap = width.saturating_sub(used + right_width).max(1);
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled(
-        right.to_string(),
-        Style::default().fg(theme.text_dim),
-    ));
-    Line::from(spans)
+fn two_sided<'a>(width: usize, lead: Vec<Span<'a>>, right: &str, theme: &Theme) -> Line<'a> {
+    split_line(
+        lead,
+        vec![Span::styled(
+            right.to_string(),
+            Style::default().fg(theme.text_dim),
+        )],
+        width,
+    )
 }
 
 fn main_line<'a>(row: &MainRow, width: usize, theme: &Theme) -> Line<'a> {
     let spin = glyphs::get().spin(row.tick);
     let (name, summary) = tool_text(&row.tool);
-    let lead_text = format!(" {spin} {name} · {summary}");
     let mut lead = vec![
         Span::styled(
             format!(" {spin} "),
@@ -345,7 +319,7 @@ fn main_line<'a>(row: &MainRow, width: usize, theme: &Theme) -> Line<'a> {
         right.push_str(&format!(" · {} t/s", row.tokens_per_sec));
     }
     right.push(' ');
-    two_sided(width, lead, &lead_text, &right, theme)
+    two_sided(width, lead, &right, theme)
 }
 
 fn child_line<'a>(row: &ChildRow, last: bool, width: usize, theme: &Theme) -> Line<'a> {
@@ -356,7 +330,6 @@ fn child_line<'a>(row: &ChildRow, last: bool, width: usize, theme: &Theme) -> Li
     } else {
         format!("{name} {summary}")
     };
-    let lead_text = format!(" {branch} agent {} · {detail}", row.label);
     let lead = vec![
         Span::styled(format!(" {branch} "), Style::default().fg(theme.text_dim)),
         Span::styled("agent ", Style::default().fg(theme.text_dim)),
@@ -365,7 +338,7 @@ fn child_line<'a>(row: &ChildRow, last: bool, width: usize, theme: &Theme) -> Li
     ];
     // У агента с инструментом показываем, как давно идёт именно он.
     let right = format!("{} ", clock(row.tool_secs.unwrap_or(row.elapsed_secs)));
-    two_sided(width, lead, &lead_text, &right, theme)
+    two_sided(width, lead, &right, theme)
 }
 
 fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &Theme) -> Line<'a> {
@@ -374,16 +347,14 @@ fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &
         let text = format!(
             " turn failed \u{00B7} {count} queued \u{00B7} Enter sends the next \u{00B7} Esc returns them to the input"
         );
-        let lead_text = text.clone();
         let lead = vec![Span::styled(
             text,
             Style::default()
                 .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
         )];
-        return two_sided(width, lead, &lead_text, "", theme);
+        return two_sided(width, lead, "", theme);
     }
-    let lead_text = format!(" queued {count} \u{00B7} next: {next}");
     let lead = vec![
         Span::styled(
             format!(" queued {count}"),
@@ -394,7 +365,7 @@ fn queue_line<'a>(count: usize, next: &str, paused: bool, width: usize, theme: &
             Style::default().fg(theme.text_soft),
         ),
     ];
-    two_sided(width, lead, &lead_text, "", theme)
+    two_sided(width, lead, "", theme)
 }
 
 fn tone_style(tone: Tone, theme: &Theme) -> Style {

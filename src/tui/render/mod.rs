@@ -6,7 +6,7 @@
 //! - [`util`], [`segments`], [`layout`] — pure text/format/layout helpers
 //!   (no drawing); `layout::Regions` is the only place heights are computed
 //! - [`popup`] — the shared popup/modal skeleton every modal builds on
-//! - [`dock`], [`composer`], [`footer`], [`welcome`], [`onboarding`], [`mcp`],
+//! - [`header`], [`dock`], [`composer`], [`footer`], [`welcome`], [`onboarding`], [`mcp`],
 //!   [`modals`] — the actual views; [`draw_frame`] below only dispatches.
 
 mod accounts;
@@ -16,10 +16,12 @@ mod chrome;
 mod composer;
 mod dock;
 mod footer;
+mod header;
 mod layout;
 mod mcp;
 mod modals;
 mod onboarding;
+mod panel;
 mod popup;
 mod search;
 mod segments;
@@ -28,9 +30,7 @@ mod util;
 mod welcome;
 
 pub(crate) use approval::{ApprovalShape, viewport as approval_viewport};
-pub(crate) use layout::{MAX_INPUT_ROWS, SIDEBAR_AUTO_COLS, SIDEBAR_MIN_COLS, SIDEBAR_WIDTH};
-#[cfg(test)]
-pub(crate) use util::fix_clock;
+pub(crate) use layout::{MAX_INPUT_ROWS, SIDEBAR_AUTO_COLS, SIDEBAR_MIN_COLS};
 
 use crate::app::AppState;
 use crate::app::events::View;
@@ -48,11 +48,6 @@ use std::cell::RefCell;
 const MIN_COLS: u16 = 40;
 const MIN_ROWS: u16 = 10;
 
-/// Левое поле переписки и самая широкая строка текста: длиннее читать трудно.
-const TRANSCRIPT_LEFT_MARGIN: u16 = 1;
-const TRANSCRIPT_RIGHT_MARGIN: u16 = 1;
-const TRANSCRIPT_MAX_WIDTH: u16 = 110;
-
 thread_local! {
     /// Last title written to the terminal — OSC title changes are emitted
     /// only on change, not on every frame.
@@ -64,38 +59,11 @@ fn brand_title() -> String {
     format!("PoopRusteek {}", crate::tui::glyphs::UNICODE.brand)
 }
 
-/// The window title for the current app state: the brand on the landing /
-/// onboarding / management screens, a truncated chat title (from the
-/// chat's first real message) once a conversation has content.
+/// Название окна: на главной и служебных экранах — бренд, в чате — его название.
 fn window_title(state: &AppState) -> String {
-    if state.view != View::Chat {
-        return brand_title();
-    }
-    let title = state
-        .focused()
-        .messages
-        .iter()
-        .find(|message| {
-            !message.ui_only
-                && matches!(
-                    message.role,
-                    crate::provider::Role::User | crate::provider::Role::Assistant
-                )
-                && !message.visible_content().trim().is_empty()
-        })
-        .map(|message| {
-            let first_line = message
-                .visible_content()
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            util::truncate(&first_line, 40)
-        });
-    match title {
-        Some(title) if !title.is_empty() => title,
-        _ => brand_title(),
+    match header::chat_title(state) {
+        Some(title) => util::truncate(&title, 40),
+        None => brand_title(),
     }
 }
 
@@ -133,12 +101,21 @@ fn is_welcome(state: &AppState) -> bool {
 
 /// Чего экран хочет от раскладки.
 fn needs_for(state: &AppState, area: Rect) -> Needs {
-    Needs {
-        dock_rows: dock::height(state),
-        input_rows: widgets::input::visible_rows(&state.input.buffer, area.width),
+    let sidebar = !is_welcome(state) && state.stats_panel_visible(area.width);
+    let mut needs = Needs {
+        dock_rows: 0,
+        input_rows: 1,
         attachments: !state.attached_files.is_empty(),
-        sidebar: !is_welcome(state) && state.stats_panel_visible(area.width),
+        sidebar,
+    };
+    // Ширина поля от его высоты не зависит: меряем перенос по настоящей ширине.
+    let probe = Regions::compute(area, &needs);
+    needs.input_rows = widgets::input::visible_rows(&state.input.buffer, probe.input.width);
+    // Открытая панель показывает то же, что док, в секции «Now»: дважды не рисуем.
+    if probe.sidebar.is_none() {
+        needs.dock_rows = dock::height(state);
     }
+    needs
 }
 
 /// Раскладка экрана чата. Одна и та же для приветствия и переписки.
@@ -170,20 +147,6 @@ pub(crate) fn scroll_after_height_change(offset: u32, old: u16, new: u16) -> u32
     (i64::from(offset) + i64::from(old) - i64::from(new)).max(0) as u32
 }
 
-/// Область текста внутри переписки: слева поле, ширина ограничена.
-fn transcript_text_area(transcript: Rect) -> Rect {
-    let x = transcript.x + TRANSCRIPT_LEFT_MARGIN.min(transcript.width);
-    let room = transcript
-        .width
-        .saturating_sub(TRANSCRIPT_LEFT_MARGIN + TRANSCRIPT_RIGHT_MARGIN);
-    Rect::new(
-        x,
-        transcript.y,
-        room.min(TRANSCRIPT_MAX_WIDTH),
-        transcript.height,
-    )
-}
-
 /// Экран чата: приветствие или переписка сверху, снизу всегда одно и то же.
 fn draw_chat_screen(
     frame: &mut ratatui::Frame,
@@ -193,29 +156,18 @@ fn draw_chat_screen(
     theme: &Theme,
 ) -> Option<(u16, u16)> {
     let regions = chat_regions(state, area);
+    header::render_header(frame, regions.header, state, theme);
     if is_welcome(state) {
         welcome::render_welcome(frame, regions.transcript, state, config, theme);
     } else {
-        widgets::chat::render_chat(
-            frame,
-            transcript_text_area(regions.transcript),
-            state,
-            theme,
-        );
-        if let Some(sidebar) = regions.sidebar {
-            // Панель сама рисуется у правого края области, зазор слева — её разделитель.
-            let strip = Rect::new(
-                regions.transcript.x,
-                sidebar.y,
-                sidebar.right() - regions.transcript.x,
-                sidebar.height,
-            );
-            widgets::panel::render_stats_panel(frame, strip, state, config, theme);
-        }
+        widgets::chat::render_chat(frame, regions.transcript, state, theme);
+    }
+    if let Some(sidebar) = regions.sidebar {
+        panel::render_panel(frame, sidebar, state, config, theme);
     }
     attach::render_attach_bar(frame, regions.attach, state, theme);
     dock::render_dock(frame, regions.dock, state, theme);
-    composer::render_rule(frame, regions.rule, state, theme);
+    composer::render_input_box(frame, regions.input_box, state, theme);
     let cursor = widgets::input::render_input(frame, regions.input, state, theme);
     footer::render_footer(
         frame,
@@ -223,10 +175,11 @@ fn draw_chat_screen(
         state,
         config,
         theme,
-        regions.dock.height > 0,
+        // Работу уже показывает док или панель: подвал её не повторяет.
+        regions.dock.height > 0 || regions.sidebar.is_some(),
     );
     if state.autocomplete.visible {
-        modals::render_autocomplete(frame, regions.rule, state, theme);
+        modals::render_autocomplete(frame, regions.input_box, state, theme);
     }
     cursor
 }
@@ -367,10 +320,10 @@ mod tests {
 
     /// Номер строки, где нарисован знак приглашения ввода.
     fn prompt_row(terminal: &Terminal<TestBackend>) -> Option<u16> {
-        let prompt = crate::tui::glyphs::get().prompt;
+        let prompt = format!(" {} ", crate::tui::glyphs::get().prompt);
         (0..terminal.backend().buffer().area.height)
             .rev()
-            .find(|y| row_text(terminal, *y).starts_with(&format!(" {prompt} ")))
+            .find(|y| row_text(terminal, *y).contains(&prompt))
     }
 
     fn config_with_unicode() -> Config {
@@ -380,7 +333,7 @@ mod tests {
     }
 
     /// Поле ввода стоит на одной и той же строке от низа на обоих экранах и
-    /// на любом размере окна: вторая снизу, над подвалом.
+    /// на любом размере окна: в рамке прямо над подвалом.
     #[test]
     fn the_input_sits_on_the_same_row_from_the_bottom_on_every_screen_and_size() {
         let config = config_with_unicode();
@@ -395,7 +348,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     prompt_row(&terminal),
-                    Some(rows - 2),
+                    Some(rows - 3),
                     "{cols}x{rows} welcome={welcome}"
                 );
             }
@@ -408,9 +361,9 @@ mod tests {
             for welcome in [true, false] {
                 let state = state_for(welcome, cols, rows);
                 let regions = chat_regions(&state, Rect::new(0, 0, cols, rows));
-                assert_eq!(regions.input.y, rows - 2, "{cols}x{rows}");
+                assert_eq!(regions.input.y, rows - 3, "{cols}x{rows}");
                 assert_eq!(regions.footer.y, rows - 1, "{cols}x{rows}");
-                assert_eq!(regions.input.bottom() + regions.footer.height, rows);
+                assert_eq!(regions.input_box.bottom() + regions.footer.height, rows);
             }
         }
     }
@@ -427,9 +380,22 @@ mod tests {
                 draw_frame(frame, &state, &config);
             })
             .unwrap();
-        assert_eq!(prompt_row(&terminal), Some(rows - 2));
+        assert_eq!(prompt_row(&terminal), Some(rows - 3));
         let regions = chat_regions(&state, Rect::new(0, 0, cols, rows));
         assert_eq!(regions.dock.height, 1);
+    }
+
+    /// Перенос в поле меряется по его настоящей ширине: рамка, поля и панель
+    /// уже окна, и длинная строка должна получить столько рядов, сколько займёт.
+    #[test]
+    fn a_long_input_gets_the_rows_it_wraps_to_inside_the_box() {
+        let mut state = state_for(false, 120, 40);
+        state.show_stats_panel = Some(true);
+        state.input.buffer = "x".repeat(150);
+        let regions = chat_regions(&state, Rect::new(0, 0, 120, 40));
+        let wrapped = widgets::input::visible_rows(&state.input.buffer, regions.input.width);
+        assert!(wrapped >= 2, "{wrapped}");
+        assert_eq!(regions.input.height, wrapped);
     }
 
     #[test]
@@ -448,14 +414,14 @@ mod tests {
 
     #[test]
     fn the_stats_panel_is_hidden_by_default_below_the_auto_width() {
-        let mut state = state_for(false, 120, 40);
+        let mut state = state_for(false, 119, 40);
         assert!(
-            chat_regions(&state, Rect::new(0, 0, 120, 40))
+            chat_regions(&state, Rect::new(0, 0, 119, 40))
                 .sidebar
                 .is_none()
         );
         assert!(
-            chat_regions(&state, Rect::new(0, 0, 160, 40))
+            chat_regions(&state, Rect::new(0, 0, 120, 40))
                 .sidebar
                 .is_some()
         );
@@ -468,7 +434,7 @@ mod tests {
         );
         state.show_stats_panel = Some(true);
         assert!(
-            chat_regions(&state, Rect::new(0, 0, 120, 40))
+            chat_regions(&state, Rect::new(0, 0, 100, 40))
                 .sidebar
                 .is_some()
         );
@@ -496,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_explains_why_the_panel_is_not_shown() {
+    fn ctrl_b_explains_why_the_panel_is_not_shown() {
         let welcome = state_for(true, 200, 40);
         assert!(
             welcome
@@ -507,7 +473,7 @@ mod tests {
         assert!(
             narrow
                 .stats_panel_blocker()
-                .is_some_and(|r| r.contains("95"))
+                .is_some_and(|r| r.contains(&SIDEBAR_MIN_COLS.to_string()))
         );
         let wide = state_for(false, 160, 40);
         assert_eq!(wide.stats_panel_blocker(), None);

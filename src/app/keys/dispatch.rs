@@ -37,6 +37,8 @@ impl App {
             CommandResult::LoadSession(id) => {
                 self.handle_load_session(&id).await?;
             }
+            CommandResult::SetPanel(mode) => self.set_panel(mode),
+            CommandResult::SetLanding(style) => self.set_landing(style),
             CommandResult::Quit => {
                 let _ = self.state.background.shutdown_all().await;
                 return Ok(true);

@@ -71,9 +71,7 @@ type TokenCacheValue = (u32, u64);
 thread_local! {
     static MSG_CACHE: RefCell<HashMap<CacheKey, CachedMsg>> = RefCell::new(HashMap::new());
     /// Token estimates keyed without `wrap_width` (unlike [`MSG_CACHE`]),
-    /// since a token count doesn't depend on the viewport. Shared with the
-    /// stats panel (`widgets::panel::compute_totals`) so it doesn't need to
-    /// know the chat viewport's wrap width just to look up a token count.
+    /// since a token count doesn't depend on the viewport.
     static TOKEN_CACHE: RefCell<HashMap<TokenCacheKey, TokenCacheValue>> = RefCell::new(HashMap::new());
     /// Wrapped row counts (value: `(fingerprint, rows)`) for non-assistant
     /// bubbles — user/system/tool messages and the empty-assistant

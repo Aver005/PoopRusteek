@@ -1,18 +1,21 @@
-//! Правило над полем ввода: подпись слева и подсказки клавиш справа. Подсказки
-//! зависят от того, что происходит сейчас, и сокращаются под ширину.
+//! Рамка поля ввода. В простое она пустая; когда что-то происходит (идёт ход,
+//! ждёт очередь, открыто автодополнение, настраивается GOAL), справа в верхней
+//! границе — подсказка клавиш, сокращённая под ширину.
 
 use crate::app::AppState;
+use crate::tui::glyphs;
 use crate::tui::theme::Theme;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Borders};
 use unicode_width::UnicodeWidthStr;
 
-const RULE: &str = "\u{2500}";
+/// Клеток рамки, которые подсказка не занимает: углы и линия по краям.
+const HINT_MARGIN: usize = 6;
 
-/// Варианты подсказки клавиш от полного к самому короткому.
+/// Варианты подсказки от полного к самому короткому. Пусто — в простое.
 fn hint_variants(state: &AppState) -> &'static [&'static str] {
     if state.autocomplete.visible {
         &[
@@ -40,60 +43,44 @@ fn hint_variants(state: &AppState) -> &'static [&'static str] {
             "Esc return queued",
         ]
     } else {
-        &[
-            "Enter send \u{00B7} Shift+Enter newline \u{00B7} / commands \u{00B7} @ file",
-            "Enter send \u{00B7} / commands",
-            "Enter send",
-        ]
+        &[]
     }
 }
 
-/// Подпись слева: что это за поле и сколько сообщений ждёт в очереди.
-fn label(state: &AppState) -> String {
-    match state.focused().queued.len() {
-        0 => "message".to_string(),
-        n => format!("message \u{00B7} {n} queued"),
-    }
+/// Подсказка, что помещается в рамку шириной `width`.
+pub(super) fn box_hint(state: &AppState, width: usize) -> Option<&'static str> {
+    hint_variants(state)
+        .iter()
+        .copied()
+        .find(|hint| UnicodeWidthStr::width(*hint) + HINT_MARGIN <= width)
 }
 
-/// Строка правила нужной ширины: `── message ───── hints ─`.
-pub(super) fn rule_text(state: &AppState, width: usize) -> (String, String, String) {
-    let left = format!("{RULE}{RULE} {} ", label(state));
-    let left_width = UnicodeWidthStr::width(left.as_str());
-    if left_width >= width {
-        // Совсем узко: подпись не помещается, остаётся голая линия.
-        return (RULE.repeat(width), String::new(), String::new());
-    }
-    for hint in hint_variants(state) {
-        let right = format!(" {hint} {RULE}");
-        let right_width = UnicodeWidthStr::width(right.as_str());
-        if left_width + right_width < width {
-            let fill = RULE.repeat(width - left_width - right_width);
-            return (left, fill, right);
-        }
-    }
-    let fill = RULE.repeat(width.saturating_sub(left_width));
-    (left, fill, String::new())
-}
-
-pub(super) fn render_rule(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    if area.height == 0 {
+/// Нарисовать рамку вокруг поля ввода. Само поле рисует `widgets::input`.
+pub(super) fn render_input_box(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.height < 2 || area.width < 4 {
         return;
     }
-    let (left, fill, right) = rule_text(state, area.width as usize);
-    let rule_style = Style::default().fg(theme.border).bg(theme.bg);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(RULE.repeat(2), rule_style),
-            Span::styled(
-                left.trim_start_matches(RULE).to_string(),
-                Style::default().fg(theme.text_soft).bg(theme.bg),
-            ),
-            Span::styled(fill, rule_style),
-            Span::styled(right, Style::default().fg(theme.text_dim).bg(theme.bg)),
-        ])),
-        area,
-    );
+    let border_type = if glyphs::get().ascii {
+        BorderType::Plain
+    } else {
+        BorderType::Rounded
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        // Поле — главное на экране: рамка заметнее линий шапки и подвала.
+        .border_style(Style::default().fg(theme.text_dim).bg(theme.bg))
+        .style(Style::default().bg(theme.input_bg));
+    if let Some(hint) = box_hint(state, usize::from(area.width)) {
+        block = block.title_top(
+            Line::from(Span::styled(
+                format!(" {hint} "),
+                Style::default().fg(theme.text_dim).bg(theme.bg),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
+    frame.render_widget(block, area);
 }
 
 #[cfg(test)]
@@ -106,47 +93,27 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_always_fills_the_width() {
-        let state = state();
-        for width in 10..140 {
-            let (left, fill, right) = rule_text(&state, width);
-            let total = UnicodeWidthStr::width(format!("{left}{fill}{right}").as_str());
-            assert_eq!(total, width, "width {width}");
-        }
+    fn an_idle_box_has_no_hint() {
+        assert_eq!(box_hint(&state(), 120), None);
     }
 
     #[test]
     fn hints_shrink_before_they_disappear() {
-        let state = state();
-        let (_, _, wide) = rule_text(&state, 120);
-        let (_, _, narrow) = rule_text(&state, 40);
-        let (_, _, tiny) = rule_text(&state, 14);
+        let mut state = state();
+        state.focused_mut().generation.active = true;
+        let wide = box_hint(&state, 120).expect("wide");
+        let narrow = box_hint(&state, 30).expect("narrow");
         assert!(wide.contains("Shift+Enter"));
-        assert!(!narrow.is_empty() && !narrow.contains("Shift+Enter"));
-        assert!(tiny.is_empty());
+        assert!(!narrow.contains("Shift+Enter"));
+        assert_eq!(box_hint(&state, 10), None);
     }
 
     #[test]
     fn a_running_turn_advertises_cancel_and_queue() {
         let mut state = state();
         state.focused_mut().generation.active = true;
-        let (_, _, right) = rule_text(&state, 100);
-        assert!(right.contains("Esc cancel") && right.contains("Enter queue"));
-    }
-
-    #[test]
-    fn the_label_counts_queued_messages() {
-        let mut state = state();
-        assert_eq!(label(&state), "message");
-        state
-            .focused_mut()
-            .queued
-            .push_back(crate::app::conversation::QueuedMessage {
-                text: "next".to_string(),
-                chips: Vec::new(),
-                named: Vec::new(),
-            });
-        assert!(label(&state).contains("1 queued"));
+        let hint = box_hint(&state, 100).expect("hint");
+        assert!(hint.contains("Esc cancel") && hint.contains("Enter queue"));
     }
 
     #[test]
@@ -160,10 +127,10 @@ mod tests {
                 chips: Vec::new(),
                 named: Vec::new(),
             });
-        let (_, _, right) = rule_text(&state, 120);
+        let hint = box_hint(&state, 120).expect("hint");
         assert!(
-            right.contains("Enter send next") && right.contains("Esc return"),
-            "{right}"
+            hint.contains("Enter send next") && hint.contains("Esc return"),
+            "{hint}"
         );
     }
 }

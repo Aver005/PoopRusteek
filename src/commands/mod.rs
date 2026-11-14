@@ -102,6 +102,10 @@ pub enum CommandResult {
     /// `spawn_blocking`, текст результата приходит в чат событием.
     Detached(Box<dyn FnOnce() -> String + Send>),
     LoadSession(String),
+    /// `/panel` — показать, скрыть, автомат; `None` — переключить.
+    SetPanel(Option<crate::config::PanelMode>),
+    /// `/landing` — вид главной; `None` — переключить.
+    SetLanding(Option<crate::config::LandingStyle>),
     ResetProvider,
     Quit,
     Error(String),
@@ -317,6 +321,8 @@ impl CommandRegistry {
         self.register(Box::new(defs::rag_limit::RagLimitCommand));
         self.register(Box::new(defs::search::SearchCommand));
         self.register(Box::new(defs::themes::ThemesCommand));
+        self.register(Box::new(defs::view::PanelCommand));
+        self.register(Box::new(defs::view::LandingCommand));
         self.register(Box::new(defs::serve::ServeCommand));
         self.register(Box::new(defs::serve::ServerCommand));
         self.register(Box::new(defs::provider_models::RefetchProvidersCommand));

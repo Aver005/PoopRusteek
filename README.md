@@ -160,12 +160,12 @@ It copies your own token into the clipboard — paste it into the token box and 
 | `Esc` | Cancel generation · cancel GOAL setup · return the queue to the input when idle. `/clear` wipes the chat, `Ctrl+C` quits |
 | `Ctrl+C` | Cancel generation / quit |
 | `Ctrl+L` | Redraw the screen and jump to the latest message (it does not clear the chat) |
-| `Ctrl+P` | Toggle the stats panel |
+| `Ctrl+B` | Show / hide the side panel (also `/panel on\|off\|auto`; the choice is saved in `[ui] panel`) |
 | `Ctrl+A` | Select all input |
 | `↑` / `↓` | Input history / scroll |
 | `PageUp` / `PageDown` | Scroll history |
 
-The landing screen keeps the card and the session list on top and the input always at the bottom. While a turn, a sub-agent or the GOAL loop is running, the **activity dock** above the input shows what is happening (at most four rows, then `+N more`); it is not a log of background jobs. Keys for that screen: `↓`/`↑` moves the session cursor, `Enter` opens, `Esc` returns to typing; typing wins over navigation.
+The landing screen keeps the card and the session list on top and the input always at the bottom. While a turn, a sub-agent or the GOAL loop is running, the **activity dock** above the input shows what is happening (at most four rows, then `+N more`); it is not a log of background jobs. With the side panel open (automatic from 120 columns) the dock steps aside and the panel's **Now** section shows the same. Keys for that screen: `↓`/`↑` moves the session cursor, `Enter` opens, `Esc` returns to typing; typing wins over navigation.
 
 ## 💬 Commands
 

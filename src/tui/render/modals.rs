@@ -594,8 +594,8 @@ fn render_question(frame: &mut Frame, area: Rect, qs: &QuestionState, theme: &Th
 
 const AUTOCOMPLETE_VISIBLE: usize = 8;
 
-/// Подсказки команд и файлов над правилом поля ввода. `anchor` — строка
-/// правила: окно встаёт прямо над ней и ничего из ввода не перекрывает.
+/// Подсказки команд и файлов над полем ввода. `anchor` — рамка поля:
+/// окно встаёт прямо над ней и ничего из ввода не перекрывает.
 pub(super) fn render_autocomplete(
     frame: &mut Frame,
     anchor: Rect,

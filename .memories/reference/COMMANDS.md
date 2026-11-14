@@ -31,11 +31,11 @@
 `Pin` · `ShowUsage` · `PromptSecret` · `ReloadConfig` · `SetProviderTools` ·
 `OpenModels` · `SwitchModel` · `Rag` · `ConfirmUndo` · `Instructions` ·
 `SearchHistory` · `OpenThemes` · `OpenThemeWizard` · `SetTheme` · `Serve` ·
-`Update` · `ProviderModels` · `ResetProvider`…
+`Update` · `ProviderModels` · `SetPanel` · `SetLanding` · `ResetProvider`…
 `Detached` is how blocking work (keyring, files) leaves the event loop: the
 closure runs on `spawn_blocking` and its text comes back as an event.
 
-## FULL COMMAND LIST (57 distinct commands + 2 `/cwd` aliases = 59 registered names)
+## FULL COMMAND LIST (59 distinct commands + 2 `/cwd` aliases = 61 registered names)
 
 | Command | Aliases | Args | What it does | File |
 |---------|---------|------|--------------|------|
@@ -95,6 +95,8 @@ closure runs on `spawn_blocking` and its text comes back as an event.
 | `/delete` | — | `[session_id]` | Delete sessions both remotely (DeepSeek account) **and** their local copies; opens a picker when no id given | `defs/delete.rs` |
 | `/delete-local` | — | `[session_id]` | Delete only the local session file(s); the DeepSeek account copy is left intact | `defs/delete.rs` |
 | `/themes` | — | `[new\|<name>]` | Theme gallery (full-screen `View::Themes`): 10 built-in presets + `[[ui.custom_themes]]` entries; moving the cursor redraws the *whole frame* in the highlighted theme (live preview — `ThemesViewState::preview_theme` resolved in `render()`), Enter applies + saves `ui.theme`. `n`/`e`/`d` = new/edit/delete custom themes. `new`/`add`/`create` arg jumps straight into the step-by-step wizard (name → base preset → one step per `theme::ROLES` color role, hex prefilled from the base so Enter-through is fast, Ctrl+S = finish early → confirm saves + applies). `<name>` switches directly (validated against presets+customs). Intents: `OpenThemes`/`OpenThemeWizard`/`SetTheme` | `defs/themes.rs`, `app/themes.rs`, `keys/themes.rs`, `tui/render/themes.rs`, `tui/theme.rs` |
+| `/panel` | — | `[on\|off\|auto]` | Right side panel of the chat (fixed 30 columns; sections Now / Context / Accounts / Tools). Bare `/panel` (and `Ctrl+B`) toggles; the choice is saved to `[ui] panel` through `App::set_panel`. `auto` = shown from `SIDEBAR_AUTO_COLS` (120) columns. Intent `SetPanel` | `defs/view.rs`, `app/ui_prefs.rs`, `tui/render/panel.rs` |
+| `/landing` | — | `[center\|sheet]` | Home screen style, saved to `[ui] landing` (`App::set_landing`). Bare `/landing` switches to the other one. Intent `SetLanding` | `defs/view.rs`, `app/ui_prefs.rs`, `tui/render/welcome.rs` |
 
 ## NOTES & GOTCHAS
 

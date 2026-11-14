@@ -146,7 +146,7 @@ composer,footer,segments,chrome}.rs` (new skeleton and activity dock),
 | `src/tui/markdown.rs` | Markdown + syntect highlight renderer; bold/italic/strikethrough now actually apply their style (were previously no-ops) | ~300 |
 | `src/tui/widgets/input.rs` | Multi-line input, cursor, selection, wrapping | ~270 |
 | `src/tui/widgets/chat.rs` | Chat history widget; now has a per-message thread-local markdown/syntect render cache (fingerprint-keyed, 4096-entry eviction) plus cached token estimates — the core fix for the render-perf critical | ~500 |
-| `src/tui/widgets/panel.rs` | Right stats panel; `mcp_row_layout` extracted and made testable, fixing the gap-underflow crash | ~330 |
+| `src/tui/render/panel.rs` | Right side panel of the chat (2026-11-14, replaced `widgets/panel.rs`): fixed `SIDEBAR_WIDTH` 30, sections Now (from `dock::model`) / Context / Accounts (shared `accounts::gauge_cells`) / Tools; empty sections hidden. `render/header.rs` — header line + `chat_title`; footer is its mirror | ~350 |
 | `src/tui/widgets/status.rs` | Status bar; display-width gap fixed | ~110 |
 
 ## COMMANDS

@@ -47,5 +47,6 @@ pub mod undo;
 pub mod update;
 pub mod usage;
 pub mod version;
+pub mod view;
 pub mod whitelist;
 pub mod wipe;

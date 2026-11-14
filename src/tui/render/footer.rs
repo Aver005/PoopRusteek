@@ -1,7 +1,9 @@
-//! Нижняя строка: слева провайдер и модель, MCP, GOAL; справа заполнение окна
-//! контекста и время. При нехватке места части сокращаются по приоритету
+//! Подвал — линия-зеркало шапки: `─ модель · ctx 38% · 1 queued ──── провайдер ─`.
+//! Слева то, что меняется по ходу работы, справа — кто отвечает (потом там же
+//! будут лимиты). При нехватке места части сокращаются по приоритету
 //! (`segments`), а не обрезаются как попало.
 
+use super::header::RULE;
 use super::segments::{Fitted, Segment, Tone, fit_segments, fitted_width};
 use super::util::provider_label;
 use crate::app::AppState;
@@ -14,22 +16,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-/// Клеток в шкале заполнения контекста.
-const CTX_BAR_CELLS: usize = 8;
 /// Сообщения состояния, которые не стоит повторять в подвале.
 const QUIET_STATUSES: [&str; 4] = ["Ready", "Thinking...", "Tool finished", ""];
+/// Клеток, которые подвал оставляет линии: края и хотя бы две в середине.
+const RULE_COLS: usize = 4;
 
-/// Шкала `███░░░░░` для `percent` процентов.
-fn ctx_bar(percent: u8) -> String {
-    let filled = (usize::from(percent.min(100)) * CTX_BAR_CELLS + 50) / 100;
-    format!(
-        "{}{}",
-        "\u{2588}".repeat(filled),
-        "\u{2591}".repeat(CTX_BAR_CELLS - filled)
-    )
-}
-
-fn goal_label(state: &AppState) -> Option<String> {
+pub(super) fn goal_label(state: &AppState) -> Option<String> {
     if !state.goal.mode {
         return None;
     }
@@ -85,33 +77,59 @@ fn gateway_model(state: &AppState) -> Option<String> {
     last_decision_model(snapshot)
 }
 
-fn left_segments(state: &AppState, config: &Config, dock_visible: bool) -> Vec<Segment> {
-    let mut left = Vec::new();
+/// Модель, что отвечает: со шлюзом — по его выбору, без него — из конфига.
+fn model_label(state: &AppState, config: &Config) -> Option<String> {
     if state.gateway_view.enabled {
-        // Со шлюзом `[provider]` и `active_provider` ничего не значат: называем то, что отвечает.
-        if let Some(model) = gateway_model(state) {
-            left.push(Segment::new(1, Tone::Plain, format!(" {model}")));
-        }
+        gateway_model(state)
     } else {
-        let model = config.active_model();
-        left.push(
-            Segment::new(
-                1,
-                Tone::Plain,
-                format!(" {} \u{00B7} {model}", provider_label(config)),
-            )
-            .or_short(format!(" {model}")),
-        );
+        Some(config.active_model().to_string())
     }
-    if let Some(account) = account_indicator(state) {
-        left.push(Segment::new(2, Tone::Plain, format!(" \u{00B7} {account}")));
+}
+
+/// Заполнение окна контекста. Пока размер окна не известен или в чате пусто,
+/// не показываем: выдуманный процент хуже, чем его отсутствие.
+fn context_segment(state: &AppState, config: &Config) -> Option<Segment> {
+    if state.focused().messages.is_empty() {
+        return None;
     }
-    if !dock_visible && let Some(goal) = goal_label(state) {
+    let budget = crate::context::spec::budget_from_config(config, state.provider_context_window);
+    let snapshot = budget.snapshot(state.focused().context_used)?;
+    let percent = snapshot.percent_used();
+    let server = match &state.focused().provider {
+        Some(provider) if provider.keeps_server_side_history() => " srv",
+        _ => "",
+    };
+    Some(
+        Segment::new(
+            2,
+            Tone::Dim,
+            format!(" \u{00B7} ctx {}{server}", snapshot.label()),
+        )
+        .or_short(format!(" \u{00B7} ctx {percent}%{server}"))
+        .or_short(format!(" \u{00B7} {percent}%")),
+    )
+}
+
+fn left_segments(state: &AppState, config: &Config, work_shown: bool) -> Vec<Segment> {
+    let mut left = Vec::new();
+    if let Some(model) = model_label(state, config) {
+        left.push(Segment::new(1, Tone::Plain, format!(" {model}")));
+    }
+    left.extend(context_segment(state, config));
+    let queued = state.focused().queued.len();
+    if queued > 0 {
+        left.push(Segment::new(
+            1,
+            Tone::Accent,
+            format!(" \u{00B7} {queued} queued"),
+        ));
+    }
+    if !work_shown && let Some(goal) = goal_label(state) {
         left.push(Segment::new(2, Tone::Accent, format!(" \u{00B7} {goal}")));
     }
     if state.mcp_status.server_count > 0 {
         left.push(Segment::new(
-            3,
+            4,
             Tone::Dim,
             format!(
                 " \u{00B7} mcp {}/{}",
@@ -131,7 +149,7 @@ fn left_segments(state: &AppState, config: &Config, dock_visible: bool) -> Vec<S
             format!(" \u{00B7} chats {chats}"),
         ));
     }
-    if !dock_visible {
+    if !work_shown {
         if state.background.total > 0 {
             left.push(Segment::new(
                 3,
@@ -156,17 +174,14 @@ fn left_segments(state: &AppState, config: &Config, dock_visible: bool) -> Vec<S
             )),
         );
     }
+    left.push(Segment::new(0, Tone::Dim, " "));
     left
 }
 
-fn right_segments(
-    state: &AppState,
-    config: &Config,
-    dock_visible: bool,
-    clock: &str,
-) -> Vec<Segment> {
+/// Справа: ошибки и кто отвечает. Со шлюзом это аккаунт, без него — провайдер.
+fn right_segments(state: &AppState, config: &Config, work_shown: bool) -> Vec<Segment> {
     let mut right = Vec::new();
-    if !dock_visible && state.error_count > 0 {
+    if !work_shown && state.error_count > 0 {
         let glyph = crate::tui::glyphs::get().warn;
         let noun = if state.error_count == 1 {
             "error"
@@ -177,33 +192,13 @@ fn right_segments(
             Segment::new(
                 0,
                 Tone::Error,
-                format!("{glyph} {} {noun}  ", state.error_count),
+                format!(" {glyph} {} {noun}", state.error_count),
             )
-            .or_short(format!("{glyph} {}  ", state.error_count)),
+            .or_short(format!(" {glyph} {}", state.error_count)),
         );
     }
-    // Заполнение окна показываем, только когда размер окна известен: выдуманный
-    // процент от угаданного окна хуже, чем его отсутствие.
-    // И пока в чате нет сообщений: на приветствии окно ещё ничем не занято.
-    let budget = crate::context::spec::budget_from_config(config, state.provider_context_window);
-    let snapshot = budget.snapshot(state.focused().context_used);
-    if let Some(snapshot) = snapshot.filter(|_| !state.focused().messages.is_empty()) {
-        let percent = snapshot.percent_used();
-        let server = match &state.focused().provider {
-            Some(provider) if provider.keeps_server_side_history() => " srv",
-            _ => "",
-        };
-        right.push(
-            Segment::new(
-                2,
-                Tone::Dim,
-                format!("ctx {} {}{server}  ", ctx_bar(percent), snapshot.label()),
-            )
-            .or_short(format!("ctx {} {percent}%{server}  ", ctx_bar(percent)))
-            .or_short(format!("ctx {percent}%  ")),
-        );
-    }
-    right.push(Segment::new(5, Tone::Dim, format!("{clock} ")));
+    let provider = account_indicator(state).unwrap_or_else(|| provider_label(config));
+    right.push(Segment::new(1, Tone::Plain, format!(" {provider} ")));
     right
 }
 
@@ -218,18 +213,17 @@ fn tone_style(tone: Tone, theme: &Theme) -> Style {
     }
 }
 
-/// Подвал в клетках: слева группа, справа группа, между ними пустота.
+/// Части подвала, уместившиеся между линиями по краям в `width` клеток.
 pub(super) fn footer_parts(
     state: &AppState,
     config: &Config,
     width: usize,
-    dock_visible: bool,
-    clock: &str,
+    work_shown: bool,
 ) -> (Vec<Fitted>, Vec<Fitted>) {
     fit_segments(
-        width,
-        left_segments(state, config, dock_visible),
-        right_segments(state, config, dock_visible, clock),
+        width.saturating_sub(RULE_COLS),
+        left_segments(state, config, work_shown),
+        right_segments(state, config, work_shown),
     )
 }
 
@@ -239,25 +233,28 @@ pub(super) fn render_footer(
     state: &AppState,
     config: &Config,
     theme: &Theme,
-    dock_visible: bool,
+    work_shown: bool,
 ) {
     if area.height == 0 {
         return;
     }
-    let width = area.width as usize;
-    let clock = super::util::clock_label();
-    let (left, right) = footer_parts(state, config, width, dock_visible, &clock);
-    let gap = width.saturating_sub(fitted_width(&left) + fitted_width(&right));
-    let mut spans: Vec<Span> = left
-        .into_iter()
-        .map(|part| Span::styled(part.text, tone_style(part.tone, theme)))
-        .collect();
-    spans.push(Span::styled(" ".repeat(gap), Style::default().bg(theme.bg)));
+    let width = usize::from(area.width);
+    let (left, right) = footer_parts(state, config, width, work_shown);
+    let rule = Style::default().fg(theme.border).bg(theme.bg);
+    // Края — по одной клетке линии; пробелы при надписях несут сами части.
+    let fill = width.saturating_sub(fitted_width(&left) + fitted_width(&right) + 2);
+    let mut spans = vec![Span::styled(RULE, rule)];
+    spans.extend(
+        left.into_iter()
+            .map(|part| Span::styled(part.text, tone_style(part.tone, theme))),
+    );
+    spans.push(Span::styled(RULE.repeat(fill), rule));
     spans.extend(
         right
             .into_iter()
             .map(|part| Span::styled(part.text, tone_style(part.tone, theme))),
     );
+    spans.push(Span::styled(RULE, rule));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg)),
         area,
@@ -283,7 +280,6 @@ pub(super) fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState
 mod tests {
     use super::*;
     use crate::app::conversation::Conversation;
-    use unicode_width::UnicodeWidthStr;
 
     fn state() -> AppState {
         AppState::new(Conversation::fresh_main(None))
@@ -299,20 +295,12 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_fills_in_proportion() {
-        assert_eq!(ctx_bar(0), "\u{2591}".repeat(8));
-        assert_eq!(ctx_bar(100), "\u{2588}".repeat(8));
-        assert_eq!(ctx_bar(38).chars().filter(|c| *c == '\u{2588}').count(), 3);
-        assert_eq!(UnicodeWidthStr::width(ctx_bar(250).as_str()), 8);
-    }
-
-    #[test]
     fn the_footer_names_the_model_once() {
         let config = Config::default();
         let model = config.active_model().to_string();
-        let parts = footer_parts(&state(), &config, 120, false, "14:02");
+        let parts = footer_parts(&state(), &config, 120, false);
         assert_eq!(line(&parts).matches(model.as_str()).count(), 1);
-        assert!(line(&parts).contains("14:02"));
+        assert!(line(&parts).contains(&provider_label(&config)));
     }
 
     #[test]
@@ -321,10 +309,13 @@ mod tests {
         let mut state = state();
         state.error_count = 3;
         for width in 20..160 {
-            let parts = footer_parts(&state, &config, width, false, "14:02");
+            let parts = footer_parts(&state, &config, width, false);
             let used = fitted_width(&parts.0) + fitted_width(&parts.1);
             // Защищённый маркер ошибок может быть шире совсем узкого подвала.
-            assert!(used <= width.max(14), "width {width}: used {used}");
+            assert!(
+                used <= width.saturating_sub(4).max(14),
+                "width {width}: used {used}"
+            );
             assert!(
                 line(&parts).contains('3'),
                 "width {width}: the error count is protected"
@@ -337,9 +328,9 @@ mod tests {
         let config = Config::default();
         let mut state = state();
         state.error_count = 2;
-        let with_dock = footer_parts(&state, &config, 120, true, "14:02");
+        let with_dock = footer_parts(&state, &config, 120, true);
         assert!(!line(&with_dock).contains("errors"));
-        let without = footer_parts(&state, &config, 120, false, "14:02");
+        let without = footer_parts(&state, &config, 120, false);
         assert!(line(&without).contains("2 errors"));
     }
 
@@ -357,13 +348,13 @@ mod tests {
         let mut config = Config::default();
         config.context.context_window = 32_000;
         let mut state = state();
-        let empty = footer_parts(&state, &config, 120, false, "14:02");
+        let empty = footer_parts(&state, &config, 120, false);
         assert!(!line(&empty).contains("ctx"), "{}", line(&empty));
         state
             .focused_mut()
             .messages
             .push(crate::provider::ChatMessage::user("hi"));
-        let started = footer_parts(&state, &config, 120, false, "14:02");
+        let started = footer_parts(&state, &config, 120, false);
         assert!(line(&started).contains("ctx"), "{}", line(&started));
     }
 }

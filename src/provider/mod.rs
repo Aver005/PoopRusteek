@@ -140,8 +140,6 @@ pub struct ChatMessage {
     pub think_elapsed_secs: f64,
     #[serde(skip)]
     pub references_count: u32,
-    #[serde(skip)]
-    pub search_triggered: bool,
 }
 
 fn now_rfc3339() -> String {
@@ -172,7 +170,6 @@ impl ChatMessage {
             status: None,
             think_elapsed_secs: 0.0,
             references_count: 0,
-            search_triggered: false,
         }
     }
 

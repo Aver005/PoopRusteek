@@ -33,7 +33,7 @@ use unicode_width::UnicodeWidthStr;
 const WIDE_COLS: u16 = 110;
 const GAUGE_CELLS: usize = 10;
 
-fn tone_color(tone: Tone, theme: &Theme) -> Color {
+pub(super) fn tone_color(tone: Tone, theme: &Theme) -> Color {
     match tone {
         Tone::Ok => theme.success,
         Tone::Warn => theme.warning,
@@ -42,7 +42,7 @@ fn tone_color(tone: Tone, theme: &Theme) -> Color {
     }
 }
 
-fn mark_glyph(mark: Mark) -> &'static str {
+pub(super) fn mark_glyph(mark: Mark) -> &'static str {
     let g = glyphs::get();
     match mark {
         Mark::Ready => g.radio_on,
@@ -55,6 +55,11 @@ fn mark_glyph(mark: Mark) -> &'static str {
 
 /// Шкала лимита: сплошная — показание сервера, штриховая — оценка.
 fn gauge(line: &LimitLine, theme: &Theme) -> Vec<Span<'static>> {
+    gauge_cells(line, GAUGE_CELLS, theme)
+}
+
+/// Та же шкала на `cells` клеток: её же рисует правая панель чата.
+pub(super) fn gauge_cells(line: &LimitLine, cells: usize, theme: &Theme) -> Vec<Span<'static>> {
     let g = glyphs::get();
     let Some(pct) = line.pct else {
         return vec![Span::styled(
@@ -62,9 +67,6 @@ fn gauge(line: &LimitLine, theme: &Theme) -> Vec<Span<'static>> {
             Style::default().fg(theme.text_dim),
         )];
     };
-    let filled = ((pct / 100.0) * GAUGE_CELLS as f32)
-        .round()
-        .clamp(0.0, GAUGE_CELLS as f32) as usize;
     let color = if line.stale {
         theme.text_dim
     } else if pct >= DEFAULT_HARD_PCT {
@@ -79,15 +81,28 @@ fn gauge(line: &LimitLine, theme: &Theme) -> Vec<Span<'static>> {
     } else {
         g.gauge_full
     };
+    let mut spans = gauge_bar(pct, cells, fill, color, theme);
+    spans.push(Span::styled(
+        format!(" {}{pct:>3.0}%", if line.estimate { "~" } else { " " }),
+        Style::default().fg(color),
+    ));
+    spans
+}
+
+/// Голая шкала `███░░░` на `cells` клеток для доли `pct` процентов.
+pub(super) fn gauge_bar(
+    pct: f32,
+    cells: usize,
+    fill: &'static str,
+    color: Color,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let filled = ((pct.clamp(0.0, 100.0) / 100.0) * cells as f32).round() as usize;
     vec![
         Span::styled(fill.repeat(filled), Style::default().fg(color)),
         Span::styled(
-            g.gauge_empty.repeat(GAUGE_CELLS - filled),
+            glyphs::get().gauge_empty.repeat(cells - filled),
             Style::default().fg(theme.text_dim),
-        ),
-        Span::styled(
-            format!(" {}{pct:>3.0}%", if line.estimate { "~" } else { " " }),
-            Style::default().fg(color),
         ),
     ]
 }

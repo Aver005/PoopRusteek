@@ -179,6 +179,9 @@ pub fn render_input(
     state: &AppState,
     theme: &Theme,
 ) -> Option<(u16, u16)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
     let input = &state.input.buffer;
     let cursor = state.input.cursor.min(input.chars().count());
     let layout = InputLayout::new(input, area.width);

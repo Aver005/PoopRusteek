@@ -159,7 +159,8 @@ evaluator = "cheap"
 при первом запуске), но больше не пишется: `Config.providers` помечен
 `skip_serializing_if`. `active_provider` работает только при выключенном шлюзе.
 
-Остальные секции: `[provider]` (DeepSeek web), `[ui]` (theme, glyphs),
+Остальные секции: `[provider]` (DeepSeek web), `[ui]` (theme, glyphs,
+`panel` = auto|shown|hidden — правая панель чата, `landing` = center|sheet — вид главной),
 `[agent]`, `[context]`, `[mcp]`, `[skills]`, `[instructions]`, `[semantic]`,
 `[server]`, `[provider_models]`, `[update]`.
 

@@ -996,7 +996,6 @@ fn capture(
 ) -> Shot {
     let mut config = config_template.clone();
     config.ui.theme = theme.to_string();
-    crate::tui::render::fix_clock("14:02");
     let mut state = (scene.build)(&mut config);
     state.terminal_rows = height;
     state.terminal_cols = width;

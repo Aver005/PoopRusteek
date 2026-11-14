@@ -502,6 +502,51 @@ pub struct UiConfig {
     /// `auto` | `unicode` | `ascii` — см. [`GlyphMode`].
     #[serde(default)]
     pub glyphs: GlyphMode,
+    /// Правая панель чата: `auto` (по ширине окна) | `shown` | `hidden`.
+    #[serde(default)]
+    pub panel: PanelMode,
+    /// Вид главной: `center` (поле по центру) | `sheet` (лист без рамок).
+    #[serde(default)]
+    pub landing: LandingStyle,
+}
+
+/// Когда видна правая панель чата. Ctrl+B и `/panel` записывают сюда выбор человека.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelMode {
+    #[default]
+    Auto,
+    Shown,
+    Hidden,
+}
+
+impl PanelMode {
+    /// `None` — решает ширина окна.
+    pub fn forced(self) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::Shown => Some(true),
+            Self::Hidden => Some(false),
+        }
+    }
+}
+
+/// Вид главной страницы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LandingStyle {
+    #[default]
+    Center,
+    Sheet,
+}
+
+impl LandingStyle {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Sheet => "sheet",
+        }
+    }
 }
 
 fn default_ui_theme() -> String {
@@ -514,6 +559,8 @@ impl Default for UiConfig {
             theme: default_ui_theme(),
             custom_themes: Vec::new(),
             glyphs: GlyphMode::default(),
+            panel: PanelMode::default(),
+            landing: LandingStyle::default(),
         }
     }
 }

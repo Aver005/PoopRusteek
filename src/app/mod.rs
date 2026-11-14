@@ -29,6 +29,7 @@ pub mod system_prompt;
 pub mod themes;
 mod timers;
 pub mod titles;
+mod ui_prefs;
 pub mod view_state;
 
 use crate::commands::CommandRegistry;
@@ -381,7 +382,7 @@ pub struct AppState {
     /// reload`, а не на каждый ход (инвариант 1).
     pub instructions_section: String,
     /// Боковая панель: `None` — по ширине окна (с `SIDEBAR_AUTO_COLS` колонок
-    /// включена), `Some` — решение человека (`Ctrl+P`).
+    /// включена), `Some` — решение человека (`Ctrl+B`, `/panel`, `[ui] panel`).
     pub show_stats_panel: Option<bool>,
     pub attached_files: Vec<crate::provider::AttachedFile>,
 
@@ -595,6 +596,7 @@ impl App {
         // Всё остальное — значения по умолчанию из `AppState::new`; здесь
         // только то, что читается с диска и что решает наличие провайдера.
         let mut state = AppState::new(main_conversation);
+        state.show_stats_panel = config.ui.panel.forced();
         state.input.history = crate::session::load_history();
         let whitelist = crate::whitelist::load();
         state.approved_tools = whitelist.whitelist;
