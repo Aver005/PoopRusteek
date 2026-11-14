@@ -157,8 +157,8 @@ It copies your own token into the clipboard — paste it into the token box and 
 | `Enter` | Send. During a turn, ordinary text is queued and sent when the turn ends; `/commands` and GOAL-setup text are not queued |
 | `Shift+Enter` | Insert a newline |
 | `Tab` / `Shift+Tab` | Switch to next / previous chat |
-| `Esc` | Cancel generation · cancel GOAL setup · return the queue to the input when idle. `/clear` wipes the chat, `Ctrl+C` quits |
-| `Ctrl+C` | Cancel generation / quit |
+| `Esc` | Cancel generation · cancel GOAL setup · return the queue to the input · when idle, leave the chat for the home screen (the chat stays in `/resume`) |
+| `Ctrl+C` | Cancel generation · in a chat, go home · on the home screen, quit |
 | `Ctrl+L` | Redraw the screen and jump to the latest message (it does not clear the chat) |
 | `Ctrl+B` | Show / hide the side panel (also `/panel on\|off\|auto`; the choice is saved in `[ui] panel`) |
 | `Ctrl+A` | Select all input |

@@ -70,7 +70,7 @@ pub(super) fn render_input_box(frame: &mut Frame, area: Rect, state: &AppState, 
         .border_type(border_type)
         // Поле — главное на экране: рамка заметнее линий шапки и подвала.
         .border_style(Style::default().fg(theme.text_dim).bg(theme.bg))
-        .style(Style::default().bg(theme.input_bg));
+        .style(Style::default().bg(theme.bg));
     if let Some(hint) = box_hint(state, usize::from(area.width)) {
         block = block.title_top(
             Line::from(Span::styled(

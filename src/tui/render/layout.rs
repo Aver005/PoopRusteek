@@ -30,6 +30,8 @@ pub(crate) const SIDE_MARGIN: u16 = 3;
 const NARROW_COLUMN_COLS: u16 = 50;
 /// Столько строк под переписку оставляем при любых аппетитах остальных.
 const MIN_TRANSCRIPT_ROWS: u16 = 3;
+/// Пустую строку под шапкой даём, только если середине остаётся больше стольких строк.
+const HEADER_GAP_MIN_BODY: u16 = 6;
 /// Верхняя и нижняя граница рамки поля ввода.
 pub(super) const BOX_BORDERS: u16 = 2;
 
@@ -72,11 +74,13 @@ impl Regions {
         let footer_h = u16::from(area.height > header_h);
         let header = Rect::new(area.x, area.y, area.width, header_h);
         let footer = Rect::new(area.x, area.bottom() - footer_h, area.width, footer_h);
+        // Пустая строка под шапкой: отделяет её от переписки, как рамка поля — от подвала.
+        let gap = u16::from(footer.y - header.bottom() > HEADER_GAP_MIN_BODY);
         let body = Rect::new(
             area.x,
-            header.bottom(),
+            header.bottom() + gap,
             area.width,
-            footer.y - header.bottom(),
+            footer.y - header.bottom() - gap,
         );
 
         let sidebar =
@@ -183,7 +187,8 @@ mod tests {
                             let r = Regions::compute(area, &needs(dock, input, attach, sidebar));
                             assert_eq!(r.header.y, 0, "{w}x{h}");
                             assert_eq!(r.footer.bottom(), h, "{w}x{h}");
-                            assert_eq!(r.transcript.y, r.header.bottom(), "{w}x{h}");
+                            // Под шапкой пустая строка (в этих размерах место для неё есть).
+                            assert_eq!(r.transcript.y, r.header.bottom() + 1, "{w}x{h}");
                             assert_eq!(r.input_box.bottom(), r.footer.y, "{w}x{h}");
                             assert_eq!(r.dock.bottom(), r.input_box.y, "{w}x{h}");
                             assert_eq!(r.attach.bottom(), r.dock.y, "{w}x{h}");
@@ -228,6 +233,7 @@ mod tests {
             let area = Rect::new(0, 0, w, h);
             let r = Regions::compute(area, &needs(4, 5, true, true));
             let total = r.header.height
+                + 1
                 + r.transcript.height
                 + r.attach.height
                 + r.dock.height
@@ -242,7 +248,7 @@ mod tests {
                 assert!(r.transcript.right() < side.x, "{w}x{h}");
                 assert!(r.input_box.right() < side.x, "{w}x{h}");
                 assert!(side.right() <= w, "{w}x{h}");
-                assert_eq!(side.y, r.header.bottom(), "{w}x{h}");
+                assert_eq!(side.y, r.header.bottom() + 1, "{w}x{h}");
                 assert_eq!(side.bottom(), r.footer.y, "{w}x{h}");
             }
         }

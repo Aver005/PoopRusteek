@@ -40,6 +40,9 @@ impl App {
             CommandResult::SetPanel(mode) => self.set_panel(mode),
             CommandResult::SetLanding(style) => self.set_landing(style),
             CommandResult::OpenResume => self.open_resume(),
+            CommandResult::GoHome => {
+                self.go_home();
+            }
             CommandResult::Quit => {
                 let _ = self.state.background.shutdown_all().await;
                 return Ok(true);
@@ -587,6 +590,29 @@ mod tests {
             .map(|m| m.content.clone())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// `/home` ставит пустую беседу на место текущей, а занятую не трогает.
+    /// Беседа пустая: сохранять нечего, тест не пишет в настоящую папку данных.
+    #[tokio::test]
+    async fn going_home_swaps_in_a_blank_chat_but_never_a_busy_one() {
+        let mut app = app().await;
+        let before = app.state.conversations.focused_id();
+        app.state.focused_mut().generation.active = true;
+        app.apply_command_result(CommandResult::GoHome)
+            .await
+            .unwrap();
+        assert_eq!(app.state.conversations.focused_id(), before);
+        assert!(app.state.status_message.contains("still working"));
+
+        app.state.focused_mut().generation.active = false;
+        app.apply_command_result(CommandResult::GoHome)
+            .await
+            .unwrap();
+        let after = app.state.conversations.focused_id();
+        assert_ne!(after, before);
+        assert!(!app.state.conversations.contains(before));
+        assert_eq!(app.state.conversations.iter().count(), 1);
     }
 
     /// Ошибка разбора быстрой формы с ключом: ни строка, ни ключ не попадают в чат и сессию.

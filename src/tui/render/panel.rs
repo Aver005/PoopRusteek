@@ -15,7 +15,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 /// Отступ содержимого от разделителя и от правого края окна.
 const PAD: u16 = 1;
@@ -68,7 +68,8 @@ pub(super) fn render_panel(
     if area.width <= 2 * PAD || area.height == 0 {
         return;
     }
-    frame.render_widget(Clear, area);
+    // Фон темы, а не `Clear`: тот красит клетки цветом терминала, и панель чернела.
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
     // Разделитель — в колонке слева от панели: раскладка оставляет её пустой.
     if let Some(sep_x) = area.x.checked_sub(1) {
         let sep = Style::default().fg(theme.border).bg(theme.bg);

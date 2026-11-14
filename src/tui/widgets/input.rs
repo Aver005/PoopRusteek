@@ -190,11 +190,11 @@ pub fn render_input(
     let top_row = scroll_top_row(cursor_row, layout.visual.len(), visible_rows, 0);
     let glyph = crate::tui::glyphs::get();
 
-    let base = Style::default().fg(theme.fg).bg(theme.input_bg);
-    let blank = Style::default().bg(theme.input_bg);
+    let base = Style::default().fg(theme.fg).bg(theme.bg);
+    let blank = Style::default().bg(theme.bg);
     let prompt = Span::styled(
         format!(" {} ", glyph.prompt),
-        Style::default().fg(theme.accent).bg(theme.input_bg),
+        Style::default().fg(theme.accent).bg(theme.bg),
     );
     let indent = Span::styled(" ".repeat(GUTTER), blank);
 
@@ -204,7 +204,7 @@ pub fn render_input(
             prompt,
             Span::styled(
                 placeholder(state),
-                Style::default().fg(theme.text_dim).bg(theme.input_bg),
+                Style::default().fg(theme.text_dim).bg(theme.bg),
             ),
         ]));
     } else {
@@ -259,7 +259,7 @@ pub fn render_input(
     }
 
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.input_bg)),
+        Paragraph::new(lines).style(Style::default().bg(theme.bg)),
         area,
     );
     cursor_position(&layout, cursor, cursor_row, top_row, area)

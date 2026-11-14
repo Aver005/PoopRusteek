@@ -177,6 +177,14 @@ fn left_segments(state: &AppState, config: &Config, work_shown: bool, home: bool
             )),
         );
     }
+    // Первая часть не начинается с точки: на главной модели слева нет.
+    if let Some(first) = left.first_mut() {
+        for text in &mut first.variants {
+            if let Some(rest) = text.strip_prefix(" \u{00B7} ") {
+                *text = format!(" {rest}");
+            }
+        }
+    }
     left.push(Segment::new(0, Tone::Dim, " "));
     left
 }
@@ -339,13 +347,14 @@ pub(super) fn render_sheet_footer(
     );
 }
 
-/// Линия `─ части ──── части ─` ровно на ширину `area`.
+/// Линия `─ части ──── части ` ровно на ширину `area`.
 fn draw_rule(frame: &mut Frame, area: Rect, parts: (Vec<Fitted>, Vec<Fitted>), theme: &Theme) {
     let width = usize::from(area.width);
     let (left, right) = parts;
     let rule = Style::default().fg(theme.border).bg(theme.bg);
-    // Края — по одной клетке линии; пробелы при надписях несут сами части.
-    let fill = width.saturating_sub(fitted_width(&left) + fitted_width(&right) + 2);
+    // Зеркало шапки: та начинается пробелом и кончается линией, подвал — наоборот.
+    // Последняя клетка пустая ещё и потому, что угол экрана консоль рисует не всегда.
+    let fill = width.saturating_sub(fitted_width(&left) + fitted_width(&right) + 1);
     let mut spans = vec![Span::styled(RULE, rule)];
     spans.extend(
         left.into_iter()
@@ -357,7 +366,6 @@ fn draw_rule(frame: &mut Frame, area: Rect, parts: (Vec<Fitted>, Vec<Fitted>), t
             .into_iter()
             .map(|part| Span::styled(part.text, tone_style(part.tone, theme))),
     );
-    spans.push(Span::styled(RULE, rule));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg)),
         area,

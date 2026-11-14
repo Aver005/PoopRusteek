@@ -38,6 +38,11 @@ impl App {
                     self.cancel_focused_turn().await;
                     return Ok(false);
                 }
+                // Из чата — на главную, с главной — выход.
+                if !self.state.focused().messages.is_empty() {
+                    self.go_home();
+                    return Ok(false);
+                }
                 let _ = self.state.background.shutdown_all().await;
                 return Ok(true);
             }
@@ -57,10 +62,11 @@ impl App {
                     let count = self.state.restore_queued_to_input();
                     self.state.status_message =
                         format!("{count} queued message(s) returned to the input");
-                } else {
-                    // В простое Esc ничего не стирает и не выходит: чат чистит
-                    // только `/clear`, выход — Ctrl+C.
+                } else if self.state.input.selection_anchor.is_some() {
                     self.state.input.selection_anchor = None;
+                } else if !self.state.focused().messages.is_empty() {
+                    // В простое Esc уводит из чата на главную; сам чат остаётся в `/resume`.
+                    self.go_home();
                 }
             }
             KeyCode::Tab => {

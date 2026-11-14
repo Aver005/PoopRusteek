@@ -283,9 +283,46 @@ impl App {
         if self.state.modal.is_some() {
             return;
         }
+        let blank = self.blank_conversation();
+        let has_provider = blank.provider.is_some();
+        self.state.conversations.open(blank);
+        self.state.scroll_offset = 0;
+        self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();
+        self.state.focused_mut().messages.push(ChatMessage::system(
+            "New chat opened. /chats or Tab to switch between chats.",
+        ));
+    }
+
+    /// Выйти на главную (Esc, Ctrl+C, `/home`): пустая беседа встаёт на место
+    /// текущей. Та уже сохранена и открывается из `/resume`. `false` — нельзя.
+    pub(crate) fn go_home(&mut self) -> bool {
+        let old = self.state.conversations.focused_id();
+        let busy = self.state.focused().generation.active
+            || self.state.focused().agent_task.is_some()
+            || self
+                .state
+                .conversations
+                .iter()
+                .any(|conv| conv.parent == Some(old) && conv.is_streaming());
+        if busy {
+            self.state.status_message =
+                "This chat is still working: Esc stops it, then Esc again goes home".to_string();
+            return false;
+        }
+        self.auto_save_session();
+        let blank = self.blank_conversation();
+        self.state.conversations.open(blank);
+        self.state.conversations.remove(old);
+        self.state.scroll_offset = 0;
+        self.state.autocomplete = crate::app::AutocompleteState::default();
+        self.state.status_message = "Ready".to_string();
+        true
+    }
+
+    /// Пустая беседа со своим форком провайдера и новым id сессии.
+    fn blank_conversation(&self) -> conversation::Conversation {
         let provider = self.state.focused().provider.as_ref().map(|p| p.fork());
-        let has_provider = provider.is_some();
-        self.state.conversations.open(conversation::Conversation {
+        conversation::Conversation {
             id: conversation::ConversationId::next(),
             kind: conversation::ConversationKind::Session,
             parent: None,
@@ -307,12 +344,7 @@ impl App {
             current_tool: None,
             queued: std::collections::VecDeque::new(),
             queue_paused: false,
-        });
-        self.state.scroll_offset = 0;
-        self.state.status_message = if has_provider { "Ready" } else { "No provider" }.to_string();
-        self.state.focused_mut().messages.push(ChatMessage::system(
-            "New chat opened. /chats or Tab to switch between chats.",
-        ));
+        }
     }
 
     /// Switch focus to another conversation (its stream keeps running).

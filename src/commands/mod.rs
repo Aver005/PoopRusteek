@@ -108,6 +108,8 @@ pub enum CommandResult {
     SetLanding(Option<crate::config::LandingStyle>),
     /// `/resume`, `/sessions` — экран выбора сессии.
     OpenResume,
+    /// `/home` — на главную: пустая беседа вместо текущей, та остаётся в `/resume`.
+    GoHome,
     ResetProvider,
     Quit,
     Error(String),
