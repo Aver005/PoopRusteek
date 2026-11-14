@@ -1251,7 +1251,7 @@ async fn drive(
                                     "source": answered.source,
                                 }),
                             );
-                            verdict.questions.push(state.question.clone());
+                            verdict.questions.push(state.question);
                             record_question(&request, answered.answer.clone());
                             verdict.answered.push(answered);
                         }

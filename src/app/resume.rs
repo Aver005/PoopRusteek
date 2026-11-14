@@ -125,16 +125,24 @@ mod tests {
         state
     }
 
+    /// Разделители и хвостовой слэш не важны нигде, регистр — только на Windows.
     #[test]
-    fn the_current_project_is_matched_whatever_the_separators_and_case() {
+    fn the_current_project_is_matched_whatever_the_separators() {
         let state = state();
-        let ids: Vec<_> = state
-            .visible("e:\\demo")
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect();
-        assert_eq!(ids, ["a", "b"]);
-        assert_eq!(state.scope_len("e:\\demo"), 2);
+        let ids = |folder: &str| -> Vec<String> {
+            state.visible(folder).iter().map(|s| s.id.clone()).collect()
+        };
+        if cfg!(windows) {
+            assert_eq!(ids("e:\\demo\\"), ["a", "b"]);
+        } else {
+            assert_eq!(ids("E:\\demo\\"), ["b"]);
+            assert_eq!(ids("E:\\Demo"), ["a"]);
+        }
+    }
+
+    #[test]
+    fn an_unknown_folder_shows_every_project() {
+        assert_eq!(state().visible("").len(), 3);
     }
 
     #[test]
