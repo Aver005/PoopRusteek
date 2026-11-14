@@ -56,6 +56,15 @@ fn read_value(prompt: &str) -> Result<Secret, String> {
     let mut value = String::new();
     let outcome = loop {
         match read() {
+            Ok(Event::Key(key))
+                if key.kind != KeyEventKind::Release
+                    && crate::clipboard::is_paste_shortcut(&key) =>
+            {
+                match crate::clipboard::read() {
+                    Ok(text) => value.push_str(text.trim()),
+                    Err(e) => break Err(format!("cannot read the clipboard: {e}")),
+                }
+            }
             Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => match key.code {
                 KeyCode::Enter => break Ok(()),
                 KeyCode::Esc => break Err("cancelled".to_string()),

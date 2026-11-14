@@ -17,11 +17,16 @@ const WHEEL_STEP: usize = 3;
 
 impl App {
     pub(crate) fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
+        use crossterm::event::{MouseButton, MouseEventKind};
         let up = match mouse.kind {
             MouseEventKind::ScrollUp => true,
             MouseEventKind::ScrollDown => false,
-            // Clicks, drags and moves are not wired to anything yet.
+            // Захват мыши забирает у консоли её вставку по правому клику — делаем её сами.
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.paste_from_clipboard();
+                return;
+            }
+            // Other clicks, drags and moves are not wired to anything yet.
             _ => return,
         };
 

@@ -15,7 +15,7 @@
 //! box, the wizard "extra" step) keep them.
 
 use crate::app::App;
-use crate::app::events::{Modal, View};
+use crate::app::events::{AppEvent, Modal, View};
 use crate::app::mcp_add::{McpAddState, WizardStep};
 use crate::app::search::SearchFocus;
 use crate::app::themes::ThemeWizardStep;
@@ -38,6 +38,18 @@ fn single_line_secret(text: &str) -> Result<&str, &'static str> {
 }
 
 impl App {
+    /// Читает буфер обмена в фоне и отдаёт текст в тот же путь, что и обычная вставка.
+    pub(crate) fn paste_from_clipboard(&self) {
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let event = match crate::clipboard::read() {
+                Ok(text) => AppEvent::Paste(text),
+                Err(error) => AppEvent::PasteFailed(error.to_string()),
+            };
+            let _ = event_tx.send(event);
+        });
+    }
+
     /// Брошенные файлы — чипами в поле ввода у курсора.
     fn attach_dropped(&mut self, paths: &[std::path::PathBuf]) {
         let workspace = self.state.workspace();

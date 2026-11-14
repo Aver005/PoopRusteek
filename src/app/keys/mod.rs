@@ -86,6 +86,12 @@ fn apply_text_key(
 
 impl App {
     pub(crate) async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> AppResult<bool> {
+        // Вставка одинакова везде: текст уходит в то поле, что сейчас в фокусе.
+        if crate::clipboard::is_paste_shortcut(&key) {
+            self.paste_from_clipboard();
+            return Ok(false);
+        }
+
         // Onboarding view captures all keys while it is active.
         if self.state.view == View::Onboarding {
             return self.handle_onboarding_key(key).await;

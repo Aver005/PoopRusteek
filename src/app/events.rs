@@ -159,12 +159,14 @@ pub enum AppEvent {
     // TUI events
     Key(crossterm::event::KeyEvent),
     // Mouse wheel scrolls the focused window (chat transcript, MCP details,
-    // approval modal, search results). Clicks are ignored for now.
+    // approval modal, search results); a right click pastes.
     Mouse(crossterm::event::MouseEvent),
-    // A bracketed paste (whole clipboard as one chunk). Routed to whatever
-    // text field currently has focus so multi-line pastes never fire an early
-    // submit. See `keys::paste`.
+    // A bracketed paste (whole clipboard as one chunk), or the clipboard read
+    // on Ctrl+V / Shift+Insert / right click. Routed to whatever text field
+    // currently has focus so multi-line pastes never fire an early submit. See `keys::paste`.
     Paste(String),
+    /// Буфер обмена не прочитался: причина уходит в строку статуса.
+    PasteFailed(String),
     /// Отрисовка сама спрашивает размер у терминала; размер нужен клавишам —
     /// они приходят раньше кадра, а шаг страницы и перенос строк обязаны совпасть с экраном.
     Resize {

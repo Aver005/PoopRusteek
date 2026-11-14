@@ -978,6 +978,9 @@ impl App {
                 self.state.terminal_cols = cols;
             }
             AppEvent::Paste(text) => self.handle_paste(text),
+            AppEvent::PasteFailed(reason) => {
+                self.state.status_message = format!("Paste failed: {reason}");
+            }
             AppEvent::OnboardingActionDone { action, ok } => {
                 self.state.onboarding.report(action, ok);
             }
